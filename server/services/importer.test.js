@@ -1970,6 +1970,31 @@ describe('commitImport series admission (#10763)', () => {
     expect(result.remappedIssues).toMatchObject([{ title: 'Imported', arcPosition: 2, requestedSeasonNumber: 7 }]);
   });
 
+  it('a failed publication keeps no issue, even one whose write lands after the failure', async () => {
+    const { uni, ser } = await setupForCommit();
+    const facade = issuesSvc.issueStore();
+    const realSave = facade.saveOneNow;
+    let lateWrite = null;
+    const spy = vi.spyOn(facade, 'saveOneNow').mockImplementation(async (id, record) => {
+      if (record.title === 'Fails') throw new Error('simulated write failure');
+      if (record.title !== 'Late') return realSave(id, record);
+      // Lands after the sibling's rejection — a rollback that didn't wait for
+      // it would delete the row first and see it recreated.
+      lateWrite = new Promise((resolve) => setTimeout(resolve, 30)).then(() => realSave(id, record));
+      return lateWrite;
+    });
+    try {
+      await expect(importerSvc.commitImport({
+        universeId: uni.id, seriesId: ser.id,
+        issues: [{ title: 'Late', proseExcerpt: 'l' }, { title: 'Fails', proseExcerpt: 'f' }],
+      })).rejects.toMatchObject({ code: importerSvc.ERR_PARTIAL_COMMIT_ISSUES });
+    } finally {
+      spy.mockRestore();
+    }
+    await lateWrite;
+    expect(await issuesSvc.listIssues({ seriesId: ser.id })).toEqual([]);
+  });
+
   it('releases admission after a failed commit so the next one into the series proceeds', async () => {
     const { uni, ser } = await setupForCommit();
     mockCreateIssuesBatch.mockRejectedValueOnce(new Error('simulated write failure'));

@@ -266,15 +266,23 @@ export function createIssuesBatch(seriesIdInput, inputs = []) {
     state.issues.push(...created);
     // One series-wide renumber covers every volume the batch touched.
     await renumberInline(state, seriesId, null);
-    await saveIssuesNow(state.issues.filter((i) => i.seriesId === seriesId)).catch(async (err) => {
-      // Promise.all may have landed some of the new rows before one failed.
-      // None was announced to peers yet, so remove them outright rather than
-      // tombstoning — the caller sees nothing of a batch that threw.
+    // allSettled, not saveIssuesNow's Promise.all: a rollback started on the
+    // first rejection could delete a new row while its own save is still in
+    // flight, and that save would then recreate it after the caller was told
+    // nothing was kept.
+    const saves = await Promise.allSettled(
+      state.issues.filter((i) => i.seriesId === seriesId).map((iss) => saveIssueNow(iss)),
+    );
+    const failed = saves.find((r) => r.status === 'rejected');
+    if (failed) {
+      // None of the new rows was announced to peers yet, so remove them
+      // outright rather than tombstoning — the caller sees nothing of a batch
+      // that threw.
       await Promise.all(created.map((iss) => store().deleteOne(iss.id).catch((delErr) =>
         console.error(`❌ createIssuesBatch rollback: failed to remove issue ${iss.id}: ${delErr.message}`),
       )));
-      throw err;
-    });
+      throw failed.reason;
+    }
     emitRecordUpdated('series', seriesId);
     return created;
   });
