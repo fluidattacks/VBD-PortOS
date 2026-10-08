@@ -263,6 +263,9 @@ export function createIssuesBatch(seriesIdInput, inputs = []) {
       if (!next) throw codedError('Invalid issue payload', ERR_VALIDATION);
       return next;
     });
+    // Numbers before the renumber, so a failed batch can put the existing
+    // issues it shifted back where they were.
+    const priorNumbers = new Map(state.issues.map((iss) => [iss.id, iss.number]));
     state.issues.push(...created);
     // One series-wide renumber covers every volume the batch touched.
     await renumberInline(state, seriesId, null);
@@ -276,11 +279,18 @@ export function createIssuesBatch(seriesIdInput, inputs = []) {
     const failed = saves.find((r) => r.status === 'rejected');
     if (failed) {
       // None of the new rows was announced to peers yet, so remove them
-      // outright rather than tombstoning — the caller sees nothing of a batch
-      // that threw.
-      await Promise.all(created.map((iss) => store().deleteOne(iss.id).catch((delErr) =>
-        console.error(`❌ createIssuesBatch rollback: failed to remove issue ${iss.id}: ${delErr.message}`),
-      )));
+      // outright rather than tombstoning, and restore the numbers the
+      // renumber shifted on existing issues — the caller sees nothing of a
+      // batch that threw.
+      const shifted = state.issues.filter((iss) => priorNumbers.has(iss.id) && iss.number !== priorNumbers.get(iss.id));
+      await Promise.all([
+        ...created.map((iss) => store().deleteOne(iss.id).catch((delErr) =>
+          console.error(`❌ createIssuesBatch rollback: failed to remove issue ${iss.id}: ${delErr.message}`),
+        )),
+        ...shifted.map((iss) => saveIssueNow({ ...iss, number: priorNumbers.get(iss.id) }).catch((saveErr) =>
+          console.error(`❌ createIssuesBatch rollback: failed to restore number on issue ${iss.id}: ${saveErr.message}`),
+        )),
+      ]);
       throw failed.reason;
     }
     emitRecordUpdated('series', seriesId);

@@ -1995,6 +1995,32 @@ describe('commitImport series admission (#10763)', () => {
     expect(await issuesSvc.listIssues({ seriesId: ser.id })).toEqual([]);
   });
 
+  it('a failed publication restores the numbers it shifted on existing issues', async () => {
+    const { uni, ser } = await setupForCommit();
+    const seeded = await seriesSvc.updateSeries(ser.id, { seasons: [{ number: 1, title: 'S1' }] });
+    const existing = await issuesSvc.createIssue({
+      seriesId: ser.id, title: 'Existing', seasonId: seeded.seasons[0].id, arcPosition: 5,
+    });
+    expect(existing.number).toBe(1);
+    const facade = issuesSvc.issueStore();
+    const realSave = facade.saveOneNow;
+    const spy = vi.spyOn(facade, 'saveOneNow').mockImplementation(async (id, record) => {
+      if (record.title === 'Fails') throw new Error('simulated write failure');
+      return realSave(id, record);
+    });
+    try {
+      // Sorts before the existing issue in the same volume, so the batch
+      // renumbers it to 2 — and that save succeeds.
+      await expect(importerSvc.commitImport({
+        universeId: uni.id, seriesId: ser.id,
+        issues: [{ title: 'Fails', arcPosition: 1, seasonNumber: 1, proseExcerpt: 'f' }],
+      })).rejects.toMatchObject({ code: importerSvc.ERR_PARTIAL_COMMIT_ISSUES });
+    } finally {
+      spy.mockRestore();
+    }
+    expect((await issuesSvc.getIssue(existing.id)).number).toBe(1);
+  });
+
   it('releases admission after a failed commit so the next one into the series proceeds', async () => {
     const { uni, ser } = await setupForCommit();
     mockCreateIssuesBatch.mockRejectedValueOnce(new Error('simulated write failure'));
