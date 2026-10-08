@@ -18,8 +18,8 @@ import {
   store, queueSeriesIssuesWrite, readState, readStateForSeries,
   saveIssueNow, saveIssuesNow, renumberInline, sanitizeIssue,
   snapshotRunHistory, ISSUE_ID_RE,
-  ERR_NOT_FOUND, ERR_VALIDATION, ERR_DUPLICATE, ERR_SEASON_LOCKED,
-  TITLE_MAX, SERIES_ID_MAX, ISSUES_PER_RESPONSE_MAX,
+  ERR_NOT_FOUND, ERR_VALIDATION, ERR_DUPLICATE, ERR_SEASON_LOCKED, ERR_ARC_POSITION_CONFLICT,
+  TITLE_MAX, SERIES_ID_MAX, ISSUES_PER_RESPONSE_MAX, ARC_POSITION_MAX,
 } from './issuesShared.js';
 import { isStr, trimTo } from '../../lib/textUtils.js';
 import { codedError } from '../../lib/codedError.js';
@@ -181,6 +181,102 @@ export function createIssue(input = {}, { preloadedSeries = null } = {}) {
     // New issue = series-level change for any active share subscription.
     emitRecordUpdated('series', next.seriesId);
     return next;
+  });
+}
+
+/**
+ * Publish a planned set of new issues into one series as ONE queued write
+ * (#10763) — the importer's publication boundary.
+ *
+ * `createIssue` lets any arcPosition land, so a caller that validated its
+ * positions against an earlier read could be invalidated by any other writer
+ * queued in between. This rechecks the whole set against the series' live
+ * issues read inside the series write tail, all-or-nothing: an explicit
+ * `arcPosition` already held by a live issue rejects the batch with
+ * `ERR_ARC_POSITION_CONFLICT` before anything is written, and an input that
+ * omits `arcPosition` is allocated from that same fresh state (one past the
+ * highest position in use, counting the batch's own explicit ones).
+ *
+ * Inputs take createIssue's fields (`title`, `seasonId`, `arcPosition`,
+ * `arcRole`, `stages`). Returns the created issues in input order.
+ */
+export function createIssuesBatch(seriesIdInput, inputs = []) {
+  const seriesId = trimTo(seriesIdInput, SERIES_ID_MAX);
+  if (!seriesId) return Promise.reject(codedError('seriesId is required', ERR_VALIDATION));
+  if (!Array.isArray(inputs) || inputs.length === 0) {
+    return Promise.reject(codedError('At least one issue is required', ERR_VALIDATION));
+  }
+  const titles = inputs.map((input) => trimTo(input?.title, TITLE_MAX));
+  if (titles.some((title) => !title)) {
+    return Promise.reject(codedError(`title is required (1..${TITLE_MAX} chars)`, ERR_VALIDATION));
+  }
+  const explicitPosition = (input) => (
+    Number.isInteger(input?.arcPosition) && input.arcPosition >= 1 ? input.arcPosition : null
+  );
+  return queueSeriesIssuesWrite(seriesId, async () => {
+    const state = await readStateForSeries(seriesId);
+    const occupied = new Set();
+    for (const iss of state.issues) {
+      if (iss.seriesId === seriesId && !iss.deleted && Number.isInteger(iss.arcPosition) && iss.arcPosition >= 1) {
+        occupied.add(iss.arcPosition);
+      }
+    }
+    const used = new Set(occupied);
+    for (const input of inputs) {
+      const pos = explicitPosition(input);
+      if (pos === null) continue;
+      if (occupied.has(pos)) {
+        throw codedError(
+          `arcPosition ${pos} is already held by another issue in this series — no issues were created.`,
+          ERR_ARC_POSITION_CONFLICT,
+        );
+      }
+      if (used.has(pos)) throw codedError(`Duplicate arcPosition ${pos} in the batch`, ERR_VALIDATION);
+      used.add(pos);
+    }
+    let nextFree = used.size === 0 ? 1 : Math.max(...used) + 1;
+    const now = new Date().toISOString();
+    const created = inputs.map((input, idx) => {
+      let arcPosition = explicitPosition(input);
+      if (arcPosition === null) {
+        if (nextFree > ARC_POSITION_MAX) {
+          throw codedError(
+            `Cannot auto-assign arcPosition — next free slot (${nextFree}) exceeds the max of ${ARC_POSITION_MAX}.`,
+            ERR_VALIDATION,
+          );
+        }
+        arcPosition = nextFree++;
+      }
+      const next = sanitizeIssue({
+        id: `iss-${randomUUID()}`,
+        seriesId,
+        number: 0,
+        title: titles[idx],
+        status: 'draft',
+        seasonId: input.seasonId ?? null,
+        arcPosition,
+        arcRole: input.arcRole ?? null,
+        stages: input.stages || {},
+        createdAt: now,
+        updatedAt: now,
+      });
+      if (!next) throw codedError('Invalid issue payload', ERR_VALIDATION);
+      return next;
+    });
+    state.issues.push(...created);
+    // One series-wide renumber covers every volume the batch touched.
+    await renumberInline(state, seriesId, null);
+    await saveIssuesNow(state.issues.filter((i) => i.seriesId === seriesId)).catch(async (err) => {
+      // Promise.all may have landed some of the new rows before one failed.
+      // None was announced to peers yet, so remove them outright rather than
+      // tombstoning — the caller sees nothing of a batch that threw.
+      await Promise.all(created.map((iss) => store().deleteOne(iss.id).catch((delErr) =>
+        console.error(`❌ createIssuesBatch rollback: failed to remove issue ${iss.id}: ${delErr.message}`),
+      )));
+      throw err;
+    });
+    emitRecordUpdated('series', seriesId);
+    return created;
   });
 }
 

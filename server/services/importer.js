@@ -30,7 +30,7 @@ import {
   createSeries,
   updateSeries,
 } from './pipeline/series.js';
-import { createIssue, deleteIssue, listIssues } from './pipeline/issues.js';
+import { createIssuesBatch, deleteIssue, listIssues } from './pipeline/issues.js';
 import { reformatManuscriptText } from './pipeline/manuscriptFix.js';
 import { sanitizeArc, sanitizeSeasonList, buildSeason, ARC_SHAPE_IDS, ARC_ROLES } from '../lib/storyArc.js';
 import { COMIC_NUM, COMIC_HEADER_TAIL } from '../lib/comicScriptParser.js';
@@ -40,6 +40,7 @@ import { IMPORTER_CONTENT_TYPES, IMPORTER_PROSE_EXCERPT_MAX } from '../lib/valid
 export { IMPORTER_PROSE_EXCERPT_MAX };
 import { mergeExtractedBible, BIBLE_KIND } from '../lib/storyBible.js';
 import { isStr } from '../lib/textUtils.js';
+import { createKeyCachedQueue } from '../lib/createKeyCachedQueue.js';
 import {
   deriveImportId, getImportSession, recordImportProgress, withImportLock, SESSION_STATUS,
 } from './importerSessions.js';
@@ -1042,99 +1043,56 @@ export async function retryIssueSplit({
  * a second tab, a retry after a reload dropped the client's own markers —
  * replays the recorded result or resumes at the issues instead of re-sending
  * canon/arc and duplicating the issue set. Absent, the commit behaves as before.
+ *
+ * Every commit into a series — any importId, a same-id retry, or an older
+ * client sending none — is admitted one at a time per series (#10763). The
+ * position checks below read the series' issue inventory and allocate from
+ * it; two manuscripts committed side by side would otherwise both pass
+ * against the same snapshot and land duplicate arcPositions.
  */
 export async function commitImport(args = {}) {
   const { importId = null } = args;
   return importId ? withImportLock(importId, () => commitImportOnce(args)) : commitImportOnce(args);
 }
 
-async function commitImportOnce({
-  universeId,
-  seriesId,
-  importId = null,
-  canonSelections = {},
-  arc = null,
-  seasons = [],
-  issues = [],
-  // Content type drives which stage each issue's verbatim excerpt seeds (see
-  // the stage-seed block below). Absent → prose-seed (prior behavior).
-  contentType = null,
-  // Opt-in AI cleanup: run each seeded excerpt through the manuscript-reformat
-  // pass before seeding so imported prose/scripts arrive already-clean (issue
-  // #1335). Best-effort + per-issue (one LLM call each), so it defaults off.
-  cleanupFormatting = false,
-  // Destructive replace: wipes existing issues, overwrites arc + seasons.
-  // Universe canon still merges additively (it's shared across series, so
-  // a per-series destructive replace would be too coarse). Default false.
-  replaceMode = false,
-} = {}) {
+// Per-series commit admission (#10763). Held from the fresh inventory read
+// through the last write, so the collision check and the positions it
+// allocates stay true until the issues are published. Different series run
+// concurrently. Never re-entered from inside a commit, and the import lock is
+// always taken outside it, so the two cannot deadlock.
+const seriesCommitQueue = createKeyCachedQueue();
+
+async function commitImportOnce(args) {
+  assertCommitPayload(args);
+  const { seriesId, issues, contentType = null, cleanupFormatting = false } = args;
+  let issuesToCreate = issues;
+  if (cleanupFormatting) {
+    // The optional AI cleanup (issue #1335) is one LLM call per issue — minutes
+    // for a long manuscript. Check the commit against current state first so a
+    // doomed or already-committed import never burns those calls, then run them
+    // OUTSIDE the series admission so one slow import doesn't hold up every
+    // other commit into the series. Admission below re-checks fresh state.
+    // Positions are assigned after this, so formatting never sees them.
+    const precheck = await admitCommit(args);
+    if (precheck.replay) return precheck.replay;
+    issuesToCreate = await reformatSeededExcerpts(issues, { contentType });
+  }
+  return seriesCommitQueue(seriesId, async () => {
+    const plan = await admitCommit({ ...args, issues: issuesToCreate });
+    return plan.replay || applyCommit(plan);
+  });
+}
+
+const hasExplicitArcPosition = (proposal) => Number.isInteger(proposal?.arcPosition) && proposal.arcPosition >= 1;
+
+// Payload-only checks — no reads — so a malformed commit fails before it
+// queues behind another import or spends an LLM call. Mirrors the route's Zod
+// limits because commitImport is also called directly (tests, internal callers).
+function assertCommitPayload({ universeId, seriesId, issues = [], seasons = [] } = {}) {
   if (!isStr(universeId)) throw codedError('universeId is required', ERR_VALIDATION);
   if (!isStr(seriesId)) throw codedError('seriesId is required', ERR_VALIDATION);
   if (!Array.isArray(issues) || issues.length === 0) {
     throw codedError('At least one issue is required', ERR_VALIDATION);
-  }
-
-  // Read for validation (universeId/seriesId linkage, lock checks, the
-  // arcPosition/season-number gates below) and for the up-front counts used
-  // to size auto-assigned positions and the additive issue-count target.
-  // NOT the source of truth the universe/series writes below merge against —
-  // `cleanupFormatting` can spend minutes in per-issue LLM calls after this
-  // read, so a concurrent edit to universe canon or series seasons could
-  // land in that window. The actual canon/season merges use the mutator form
-  // of `updateUniverse`/`updateSeries`, which re-reads the freshest persisted
-  // record inside the write queue (issue #8453) — this snapshot is stale by
-  // the time those writes run.
-  const universe = await getUniverse(universeId);
-  const series = await getSeries(seriesId);
-
-  // Defensive: refuse commit when series.universeId is set AND differs,
-  // OR when series.universeId is missing entirely. A legacy series
-  // persisted before universeId became standard would otherwise silently
-  // be re-homed to whichever universe the caller routed through. createSeries
-  // sets universeId today, so a missing value implies hand-edited / pre-link
-  // legacy data — flag it so the caller decides rather than silently linking.
-  if (series.universeId !== universe.id) {
-    if (series.universeId) {
-      throw codedError(
-        `Series "${series.name}" is linked to a different universe — commit refused to avoid cross-linking.`,
-        ERR_VALIDATION,
-      );
-    }
-    throw codedError(
-      `Series "${series.name}" has no universeId — commit refused. Link the series to a universe explicitly before importing.`,
-      ERR_VALIDATION,
-    );
-  }
-
-  // An earlier attempt at this same import (#9943). Replace mode wipes and
-  // rewrites the series, so it is idempotent by construction and never consults
-  // the session; additive mode would duplicate, so it does.
-  const session = importId && !replaceMode ? await resolveImportSession(importId, series.id) : null;
-  if (session?.status === SESSION_STATUS.COMMITTED) {
-    // Answered before the locked-arc gate: nothing is written, so a lock added
-    // since the commit cannot turn a recorded success into an error.
-    return {
-      universe,
-      series,
-      createdIssueIds: session.createdIssueIds,
-      remappedIssues: session.remappedIssues,
-      replayed: true,
-    };
-  }
-  if (session?.status === SESSION_STATUS.ARC_PERSISTED) {
-    // The server kept canon/arc/seasons from the attempt whose issues rolled
-    // back. Resending them would overwrite edits made since, so the server
-    // drops them itself rather than trusting the client to have remembered.
-    canonSelections = {};
-    arc = null;
-    seasons = [];
-  }
-
-  if (series.locked?.arc === true) {
-    throw codedError(
-      `Series "${series.name}" has a locked arc — commit refused. Unlock the arc to import.`,
-      ERR_LOCKED,
-    );
   }
 
   // Thread C fix — fail-fast validation BEFORE any state mutation. Run
@@ -1182,11 +1140,11 @@ async function commitImportOnce({
   // issues array — downstream sorting collapses ties to insertion order
   // and the renumber pass would silently re-key, leaving the user
   // wondering why issue #3 became #4. Auto-assign for omitted positions
-  // happens below.
+  // happens in admitCommit.
   const seenArcPositions = new Set();
   for (let i = 0; i < issues.length; i++) {
-    const pos = issues[i]?.arcPosition;
-    if (Number.isInteger(pos) && pos >= 1) {
+    if (hasExplicitArcPosition(issues[i])) {
+      const pos = issues[i].arcPosition;
       if (seenArcPositions.has(pos)) {
         throw codedError(
           `Duplicate arcPosition ${pos} at issue position ${i + 1} — commit refused before any state changed.`,
@@ -1196,62 +1154,6 @@ async function commitImportOnce({
       seenArcPositions.add(pos);
     }
   }
-  // Auto-assign sequential arcPositions to incoming issues that omit one.
-  // Mirrors the seasons auto-assign in the merge path. Issues with an
-  // explicit position keep it; gaps get filled by the next free integer.
-  // Seed nextFree from the UNION of explicit incoming positions AND any
-  // pre-existing series.issues[].arcPosition — re-import on a series
-  // that already has issues at [1..3] would otherwise auto-assign
-  // starting at 1 again and create duplicate positions. createIssue
-  // doesn't enforce arcPosition uniqueness, so the collision would
-  // silently land on disk and the renumber pass would arbitrarily
-  // order the ties.
-  // Cap at ARC_POSITION_MAX (matching the wire schema's `.max(9999)`)
-  // so a value the wire wouldn't accept can't reach createIssue via the
-  // service auto-assign path.
-  const existingIssues = await listIssues({ seriesId: series.id });
-  // In replace mode we'll wipe these before creating the new set, so any
-  // arcPosition that's currently occupied by an existing issue is fair
-  // game. In additive merge mode (default), occupied positions are
-  // off-limits — collisions silently land on disk today since
-  // createIssue doesn't enforce uniqueness.
-  const existingArcPositions = new Set();
-  if (!replaceMode) {
-    for (const ex of existingIssues) {
-      if (Number.isInteger(ex.arcPosition) && ex.arcPosition >= 1) {
-        existingArcPositions.add(ex.arcPosition);
-      }
-    }
-    // Symmetry with the auto-assign branch: reject incoming issues whose
-    // EXPLICIT arcPosition collides with an arcPosition already used by an
-    // existing issue on the series. The auto-assign branch dodges this via
-    // the union-set seed; the explicit-position branch would otherwise let
-    // createIssue happily land a duplicate.
-    for (let i = 0; i < issues.length; i++) {
-      const pos = issues[i]?.arcPosition;
-      if (Number.isInteger(pos) && pos >= 1 && existingArcPositions.has(pos)) {
-        throw codedError(
-          `Issue at position ${i + 1} explicit arcPosition ${pos} collides with an existing issue on the series — commit refused before any state changed. Either renumber the incoming issue or omit arcPosition to auto-assign.`,
-          ERR_VALIDATION,
-        );
-      }
-    }
-  }
-  const allUsedArcPositions = new Set([...seenArcPositions, ...existingArcPositions]);
-  let nextFreeArcPos = (allUsedArcPositions.size === 0) ? 1 : Math.max(...allUsedArcPositions) + 1;
-  const issuesWithPositions = issues.map((proposal) => {
-    if (Number.isInteger(proposal.arcPosition) && proposal.arcPosition >= 1) {
-      return proposal;
-    }
-    if (nextFreeArcPos > ARC_POSITION_MAX) {
-      throw codedError(
-        `Cannot auto-assign arcPosition — next free slot (${nextFreeArcPos}) exceeds the max of ${ARC_POSITION_MAX}. Free up a position or set issue.arcPosition explicitly.`,
-        ERR_VALIDATION,
-      );
-    }
-    const assigned = nextFreeArcPos++;
-    return { ...proposal, arcPosition: assigned };
-  });
 
   // Same contract for seasons: route Zod enforces `number: int 1..99`,
   // commitImport mirrors both the floor AND the ceiling so the service is
@@ -1277,18 +1179,151 @@ async function commitImportOnce({
       seenSeasonNumbers.add(s.number);
     }
   }
+}
 
-  // Optional AI cleanup of the seeded excerpts (issue #1335). Runs AFTER all
-  // the cheap fail-fast validation (so a bad payload never burns LLM calls) but
-  // BEFORE any destructive write (the wipe + universe/series writes below), so
-  // the heavy per-issue reformat happens while the on-disk state is untouched.
-  // Best-effort — `reformatSeededExcerpts` falls back to the verbatim excerpt
-  // per issue, so import never breaks. Returns a fresh array; the create loop
-  // below seeds from it.
-  const issuesToCreate = cleanupFormatting
-    ? await reformatSeededExcerpts(issuesWithPositions, { contentType })
-    : issuesWithPositions;
+/**
+ * Checks a commit against the current universe / series / session / issue
+ * inventory and plans its positions. Returns `{ replay }` for an import already
+ * committed, else the plan `applyCommit` executes. Inside the series admission
+ * this read is the one the writes rely on; before it (the formatting precheck)
+ * it is only a fail-fast.
+ */
+async function admitCommit({
+  universeId,
+  seriesId,
+  importId = null,
+  canonSelections = {},
+  arc = null,
+  seasons = [],
+  issues = [],
+  // Content type drives which stage each issue's verbatim excerpt seeds (see
+  // the stage-seed block below). Absent → prose-seed (prior behavior).
+  contentType = null,
+  // Destructive replace: wipes existing issues, overwrites arc + seasons.
+  // Universe canon still merges additively (it's shared across series, so
+  // a per-series destructive replace would be too coarse). Default false.
+  replaceMode = false,
+}) {
+  // Read for validation (universeId/seriesId linkage, lock checks, the
+  // arcPosition gates below) and for the up-front counts used to size
+  // auto-assigned positions and the additive issue-count target. NOT the
+  // source of truth the universe/series writes below merge against — the
+  // canon/season merges use the mutator form of `updateUniverse` /
+  // `updateSeries`, which re-reads the freshest persisted record inside the
+  // write queue (issue #8453), so an edit made outside the importer still
+  // survives.
+  const universe = await getUniverse(universeId);
+  const series = await getSeries(seriesId);
 
+  // Defensive: refuse commit when series.universeId is set AND differs,
+  // OR when series.universeId is missing entirely. A legacy series
+  // persisted before universeId became standard would otherwise silently
+  // be re-homed to whichever universe the caller routed through. createSeries
+  // sets universeId today, so a missing value implies hand-edited / pre-link
+  // legacy data — flag it so the caller decides rather than silently linking.
+  if (series.universeId !== universe.id) {
+    if (series.universeId) {
+      throw codedError(
+        `Series "${series.name}" is linked to a different universe — commit refused to avoid cross-linking.`,
+        ERR_VALIDATION,
+      );
+    }
+    throw codedError(
+      `Series "${series.name}" has no universeId — commit refused. Link the series to a universe explicitly before importing.`,
+      ERR_VALIDATION,
+    );
+  }
+
+  // An earlier attempt at this same import (#9943). Replace mode wipes and
+  // rewrites the series, so it is idempotent by construction and never consults
+  // the session; additive mode would duplicate, so it does.
+  const session = importId && !replaceMode ? await resolveImportSession(importId, series.id) : null;
+  if (session?.status === SESSION_STATUS.COMMITTED) {
+    // Answered before the locked-arc gate: nothing is written, so a lock added
+    // since the commit cannot turn a recorded success into an error.
+    return {
+      replay: {
+        universe,
+        series,
+        createdIssueIds: session.createdIssueIds,
+        remappedIssues: session.remappedIssues,
+        replayed: true,
+      },
+    };
+  }
+  if (session?.status === SESSION_STATUS.ARC_PERSISTED) {
+    // The server kept canon/arc/seasons from the attempt whose issues rolled
+    // back. Resending them would overwrite edits made since, so the server
+    // drops them itself rather than trusting the client to have remembered.
+    canonSelections = {};
+    arc = null;
+    seasons = [];
+  }
+
+  if (series.locked?.arc === true) {
+    throw codedError(
+      `Series "${series.name}" has a locked arc — commit refused. Unlock the arc to import.`,
+      ERR_LOCKED,
+    );
+  }
+
+  // Omitted arcPositions are allocated by createIssuesBatch at publication,
+  // from the inventory it reads inside the series issue write tail: one past
+  // the highest position in use, counting this batch's explicit ones (so a
+  // re-import onto issues at [1..3] continues at 4, never re-uses 1).
+  const existingIssues = await listIssues({ seriesId: series.id });
+  // In replace mode we'll wipe these before creating the new set, so any
+  // arcPosition that's currently occupied by an existing issue is fair
+  // game. In additive merge mode (default), occupied positions are
+  // off-limits.
+  const existingArcPositions = new Set();
+  if (!replaceMode) {
+    for (const ex of existingIssues) {
+      if (Number.isInteger(ex.arcPosition) && ex.arcPosition >= 1) {
+        existingArcPositions.add(ex.arcPosition);
+      }
+    }
+    // Reject incoming issues whose EXPLICIT arcPosition collides with an
+    // existing issue on the series HERE, before any write — the publication
+    // recheck in createIssuesBatch would catch it too, but only after the
+    // canon/series writes below had already landed.
+    for (let i = 0; i < issues.length; i++) {
+      const pos = issues[i]?.arcPosition;
+      if (hasExplicitArcPosition(issues[i]) && existingArcPositions.has(pos)) {
+        throw codedError(
+          `Issue at position ${i + 1} explicit arcPosition ${pos} collides with an existing issue on the series — commit refused before any state changed. Either renumber the incoming issue or omit arcPosition to auto-assign.`,
+          ERR_VALIDATION,
+        );
+      }
+    }
+  }
+  // Fail fast — before any write — when that allocation would run past
+  // ARC_POSITION_MAX (the wire schema's `.max(9999)`).
+  const omittedCount = issues.filter((p) => !hasExplicitArcPosition(p)).length;
+  if (omittedCount > 0) {
+    const allUsedArcPositions = [
+      ...issues.filter(hasExplicitArcPosition).map((p) => p.arcPosition),
+      ...existingArcPositions,
+    ];
+    const firstFree = allUsedArcPositions.length === 0 ? 1 : Math.max(...allUsedArcPositions) + 1;
+    if (firstFree + omittedCount - 1 > ARC_POSITION_MAX) {
+      throw codedError(
+        `Cannot auto-assign arcPosition — next free slot (${ARC_POSITION_MAX + 1}) exceeds the max of ${ARC_POSITION_MAX}. Free up a position or set issue.arcPosition explicitly.`,
+        ERR_VALIDATION,
+      );
+    }
+  }
+
+  return {
+    universe, series, importId, canonSelections, arc, seasons, contentType, replaceMode,
+    existingIssues, issues,
+  };
+}
+
+async function applyCommit({
+  universe, series, importId, canonSelections, arc, seasons, contentType, replaceMode,
+  existingIssues, issues,
+}) {
   // Wipe BEFORE universe + series writes so any delete failure aborts the
   // commit cleanly — universe canon + series arc are still in their
   // pre-import state, and no new issues have been created yet. Without this
@@ -1355,13 +1390,14 @@ async function commitImportOnce({
   // If the user supplied no canon at all (arc-only import), skip the
   // updateUniverse round-trip entirely.
   //
-  // Mutator form (issue #8453): `cleanupFormatting` above can spend minutes
-  // in per-issue LLM calls between the up-front `getUniverse` read and this
-  // write. Merging against the stale `universe` snapshot here would silently
-  // drop any canon edit a concurrent tab/job made to the SAME array during
-  // that window (mergeExtractedBible rebuilds the whole array from its base
-  // list). Merging against `latest` — the freshest persisted record, read
-  // inside updateUniverse's write queue — closes that race.
+  // Mutator form (issue #8453): the series admission serializes importer
+  // commits into ONE series, but the universe is shared across series and is
+  // edited outside the importer too, so the `universe` snapshot read in
+  // admitCommit can already be stale. Merging against it would silently drop
+  // a concurrent canon edit to the SAME array (mergeExtractedBible rebuilds
+  // the whole array from its base list). Merging against `latest` — the
+  // freshest persisted record, read inside updateUniverse's write queue —
+  // closes that race.
   const updatedUniverse = selectedKindMap.length > 0
     ? await updateUniverse(universe.id, (latest) => Object.fromEntries(
         selectedKindMap.map(([selectionKey, kind, storageKey]) => [
@@ -1384,7 +1420,7 @@ async function commitImportOnce({
   // the extracted arc + the count of issues being created. replaceMode
   // overwrites (user-confirmed wipe); additive only fills fields the series
   // doesn't already have, so a re-import never clobbers a hand-edited bible.
-  const issueCount = issuesWithPositions.length;
+  const issueCount = issues.length;
   const arcLogline = sanitizedArc?.logline || '';
   const arcPremise = sanitizedArc?.summary || sanitizedArc?.protagonistArc || '';
   const biblePatch = {};
@@ -1416,12 +1452,11 @@ async function commitImportOnce({
       ...biblePatch,
     });
   } else if (sanitizedArc || seasons.length > 0 || Object.keys(biblePatch).length > 0) {
-    // Mutator form (issue #8453): same race as the universe write above —
-    // `cleanupFormatting` can run for minutes before this write, during which
-    // a concurrent tab/job may add or edit a season on this series.
-    // `mergeSeasons` rebuilds the whole array from its base list, so merging
-    // against the stale `series` snapshot captured before that window would
-    // silently drop the concurrent edit. Recompute the seasons merge and the
+    // Mutator form (issue #8453): same race as the universe write above — a
+    // tab or job outside the importer may add or edit a season on this series
+    // between admitCommit's read and this write. `mergeSeasons` rebuilds the
+    // whole array from its base list, so merging against the stale `series`
+    // snapshot would silently drop the concurrent edit. Recompute the seasons merge and the
     // empty-field fill-ins against `latest` — the freshest persisted record,
     // read inside updateSeries's write queue.
     updatedSeries = await updateSeries(series.id, (latest) => {
@@ -1480,93 +1515,85 @@ async function commitImportOnce({
     });
   }
 
-  const createdIssueIds = [];
   // Surface season-remap events so the UI can warn "issue 3 wanted season 5
   // but landed in S2 — Diaspora." Each entry carries the actual landed
   // season's number + title so the client toast can be specific, not just
   // "first season" (which can lie when seasons are sparsely numbered).
-  const remappedIssues = [];
+  // Keyed by batch index until publication settles each issue's arcPosition.
+  const remaps = [];
+  const batch = issues.map((proposal, idx) => {
+    let seasonId = fallbackSeasonId;
+    if (proposal.seasonNumber != null) {
+      const matched = seasonByNumber.get(proposal.seasonNumber);
+      if (matched) {
+        seasonId = matched.id;
+      } else {
+        remaps.push({
+          idx,
+          title: proposal.title,
+          requestedSeasonNumber: proposal.seasonNumber,
+          actualSeasonId: fallbackSeasonId,
+          // Surface the landed season's number + title so the UI can
+          // render a precise toast ("Issue 'Cold Iron' landed in S2 —
+          // Diaspora") instead of an inaccurate "first season".
+          actualSeasonNumber: fallbackSeason?.number ?? null,
+          actualSeasonTitle: fallbackSeason?.title ?? null,
+        });
+      }
+    }
+    // Bundle stage seeds into the initial create payload so the serialized
+    // write tail handles one write per issue instead of
+    // create + updateStage(prose) + updateStage(idea).
+    const stages = {};
+    if (proposal.proseExcerpt) {
+      // Route the verbatim excerpt to the stage that matches the source form
+      // (see CONTENT_TYPE_SEED_STAGE): a script-form type seeds its script
+      // stage ready (comic-script → comicScript, screenplay → teleplay) so the
+      // pipeline renders the user's verbatim script instead of regenerating
+      // it; prose-like types seed stages.prose.
+      stages[seedStageFor(contentType)] = { status: 'ready', output: proposal.proseExcerpt };
+    }
+    const ideaSeed = [
+      proposal.logline && `Logline: ${proposal.logline}`,
+      proposal.synopsis && `Synopsis: ${proposal.synopsis}`,
+    ].filter(Boolean).join('\n\n');
+    if (ideaSeed) {
+      // `idea` is seeded with input only — the user/LLM still needs to
+      // run the idea stage to produce `output`. `isStageReady` requires
+      // both `status in {'ready','edited'}` AND non-empty output, so
+      // marking 'ready' here would mislabel it to status-only consumers
+      // while failing readiness predicates downstream. 'empty' matches
+      // the actual state: input present, generation not yet performed.
+      stages.idea = { status: 'empty', input: ideaSeed };
+    }
+    return {
+      title: proposal.title,
+      seasonId,
+      // null → allocated by the batch from fresh state (see admitCommit).
+      arcPosition: hasExplicitArcPosition(proposal) ? proposal.arcPosition : null,
+      arcRole: proposal.arcRole,
+      stages,
+    };
+  });
 
-  // Thread C fix — issue-loop with rollback on failure. The universe +
-  // series are already written above. If createIssue throws mid-loop (e.g.
-  // transient FS error) we delete every issue created so far and re-throw,
-  // leaving the universe + series in their updated state but with no partial
-  // issue set. The universe + series writes are kept because they represent
-  // user-confirmed data; only the issue set is all-or-nothing from the
-  // commit's perspective.
+  // Thread C fix — the issue set is all-or-nothing. The universe + series
+  // are already written above and are kept (they represent user-confirmed
+  // data). createIssuesBatch publishes every issue in one queued write, after
+  // re-checking the explicit positions against the series' live issues read
+  // inside that write — so a non-import writer that took one of them since
+  // admission rejects the batch here, loudly, instead of landing a duplicate.
+  let created;
   try {
-    for (const proposal of issuesToCreate) {
-      let seasonId = fallbackSeasonId;
-      if (proposal.seasonNumber != null) {
-        const matched = seasonByNumber.get(proposal.seasonNumber);
-        if (matched) {
-          seasonId = matched.id;
-        } else {
-          remappedIssues.push({
-            title: proposal.title,
-            arcPosition: proposal.arcPosition,
-            requestedSeasonNumber: proposal.seasonNumber,
-            actualSeasonId: fallbackSeasonId,
-            // Surface the landed season's number + title so the UI can
-            // render a precise toast ("Issue 'Cold Iron' landed in S2 —
-            // Diaspora") instead of an inaccurate "first season".
-            actualSeasonNumber: fallbackSeason?.number ?? null,
-            actualSeasonTitle: fallbackSeason?.title ?? null,
-          });
-        }
-      }
-      // Bundle stage seeds into the initial createIssue payload so the
-      // serialized write tail handles one write per issue instead of
-      // create + updateStage(prose) + updateStage(idea).
-      const stages = {};
-      if (proposal.proseExcerpt) {
-        // Route the verbatim excerpt to the stage that matches the source form
-        // (see CONTENT_TYPE_SEED_STAGE): a script-form type seeds its script
-        // stage ready (comic-script → comicScript, screenplay → teleplay) so the
-        // pipeline renders the user's verbatim script instead of regenerating
-        // it; prose-like types seed stages.prose.
-        stages[seedStageFor(contentType)] = { status: 'ready', output: proposal.proseExcerpt };
-      }
-      const ideaSeed = [
-        proposal.logline && `Logline: ${proposal.logline}`,
-        proposal.synopsis && `Synopsis: ${proposal.synopsis}`,
-      ].filter(Boolean).join('\n\n');
-      if (ideaSeed) {
-        // `idea` is seeded with input only — the user/LLM still needs to
-        // run the idea stage to produce `output`. `isStageReady` requires
-        // both `status in {'ready','edited'}` AND non-empty output, so
-        // marking 'ready' here would mislabel it to status-only consumers
-        // while failing readiness predicates downstream. 'empty' matches
-        // the actual state: input present, generation not yet performed.
-        stages.idea = { status: 'empty', input: ideaSeed };
-      }
-      const issue = await createIssue({
-        seriesId: updatedSeries.id,
-        title: proposal.title,
-        seasonId,
-        arcPosition: proposal.arcPosition,
-        arcRole: proposal.arcRole,
-        stages,
-      });
-      createdIssueIds.push(issue.id);
-    }
+    created = await createIssuesBatch(updatedSeries.id, batch);
   } catch (issueErr) {
-    // Roll back any issues already written so the system isn't left with a
-    // partial issue set. Rollback failures are logged but don't mask the
-    // original error — the user gets the real error and can re-commit.
-    for (const id of createdIssueIds) {
-      await deleteIssue(id).catch((delErr) =>
-        console.error(`❌ commitImport rollback: failed to delete issue ${id}: ${delErr.message}`),
-      );
-    }
     // `context.arcAlreadyPersisted` tells the client to drop arc + seasons +
     // canon from the retry payload — otherwise the retry overwrites any edits
     // (parallel tab, collaborator) made to the persisted state after the
     // failure. `skipArcOnRetry` is the imperative form of the same signal.
-    const n = issues.length;
+    const n = batch.length;
     const partial = Object.assign(
       new Error(
-        `The universe and series were updated successfully, but ${createdIssueIds.length} of ${n} issue${n === 1 ? '' : 's'} failed and were rolled back — retry to create the remaining issues. (Original error: ${issueErr.message})`,
+        `The universe and series were updated successfully, but the ${n} issue${n === 1 ? '' : 's'} could not be created and none were kept — retry to create them. (Original error: ${issueErr.message})`,
       ),
       {
         code: ERR_PARTIAL_COMMIT_ISSUES,
@@ -1580,6 +1607,12 @@ async function commitImportOnce({
     );
     throw partial;
   }
+  const createdIssueIds = created.map((issue) => issue.id);
+  const remappedIssues = remaps.map(({ idx, title, ...rest }) => ({
+    title,
+    arcPosition: created[idx].arcPosition,
+    ...rest,
+  }));
 
   // Promote any import-draft shell now that the commit fully succeeded (issue
   // #727). analyzeImport creates brand-new universe/series records as import

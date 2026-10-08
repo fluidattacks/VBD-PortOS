@@ -62,16 +62,18 @@ tryReadFile: vi.fn().mockResolvedValue(null),
   runStagedLLM: (...args) => mockRunStagedLLM(...args),
 }));
 
-// Mock `./pipeline/issues.js` so a single test can force `createIssue` to
-// throw mid-loop and exercise the ERR_PARTIAL_COMMIT_ISSUES rollback path.
-// `vi.hoisted` keeps the mock fn ref reachable from both the mock factory
-// (hoisted before imports) and the beforeEach reset (runs later). Default
-// behavior passes through to the real module so the dozen other tests that
-// expect real createIssue behavior keep working unchanged.
+// Mock `./pipeline/issues.js` so a test can force the importer's issue
+// publication (`createIssuesBatch`) to fail and exercise the
+// ERR_PARTIAL_COMMIT_ISSUES path, or hold it at a barrier to interleave two
+// commits deterministically (#10763). `vi.hoisted` keeps the mock fn refs
+// reachable from both the mock factory (hoisted before imports) and the
+// beforeEach reset (runs later). Default behavior passes through to the real
+// module so every other test sees real issue writes.
 // `mockDeleteIssue` follows the same pattern so the replaceMode-abort test
 // can force a delete failure mid-wipe.
-const { mockCreateIssue, mockDeleteIssue, realIssuesRef } = vi.hoisted(() => ({
+const { mockCreateIssue, mockCreateIssuesBatch, mockDeleteIssue, realIssuesRef } = vi.hoisted(() => ({
   mockCreateIssue: vi.fn(),
+  mockCreateIssuesBatch: vi.fn(),
   mockDeleteIssue: vi.fn(),
   realIssuesRef: { current: null },
 }));
@@ -81,6 +83,7 @@ vi.mock('./pipeline/issues.js', async () => {
   return {
     ...actual,
     createIssue: (...args) => mockCreateIssue(...args),
+    createIssuesBatch: (...args) => mockCreateIssuesBatch(...args),
     deleteIssue: (...args) => mockDeleteIssue(...args),
   };
 });
@@ -89,6 +92,7 @@ const importerSvc = await import('./importer.js');
 const universeSvc = await import('./universeBuilder.js');
 const seriesSvc = await import('./pipeline/series.js');
 const issuesSvc = await import('./pipeline/issues.js');
+const { deriveImportId } = await import('./importerSessions.js');
 
 // Per-test: wipe every file under tempRoot so each test starts with a clean
 // data dir. We can't rmSync the dir itself because the universeBuilder
@@ -105,11 +109,12 @@ function wipeTempRoot() {
 beforeEach(() => {
   wipeTempRoot();
   mockRunStagedLLM.mockReset();
-  // Default createIssue + deleteIssue to pass-through to the real module —
-  // only the rollback and replace-abort tests override these to inject
-  // failures.
+  // Default the issue writes to pass-through to the real module — only the
+  // rollback, replace-abort, and interleaving tests override these.
   mockCreateIssue.mockReset();
   mockCreateIssue.mockImplementation((...args) => realIssuesRef.current.createIssue(...args));
+  mockCreateIssuesBatch.mockReset();
+  mockCreateIssuesBatch.mockImplementation((...args) => realIssuesRef.current.createIssuesBatch(...args));
   mockDeleteIssue.mockReset();
   mockDeleteIssue.mockImplementation((...args) => realIssuesRef.current.deleteIssue(...args));
 });
@@ -1469,19 +1474,13 @@ describe('commitImport', () => {
     expect(remap.actualSeasonId).toBeDefined();
   });
 
-  // Round-8 review: missing test for the ERR_PARTIAL_COMMIT_ISSUES rollback
-  // path. Inject a createIssue failure on the 2nd of 3 issues; assert that
-  // the rollback deletes the 1st (already created), surfaces the partial
-  // code, and leaves the universe + series writes intact (those are
-  // idempotent + user-confirmed, so we don't roll them back).
-  it('rolls back created issues + throws ERR_PARTIAL_COMMIT_ISSUES when createIssue fails mid-loop', async () => {
+  // Round-8 review: the ERR_PARTIAL_COMMIT_ISSUES path. A failed issue
+  // publication keeps none of the issue set, surfaces the partial code, and
+  // leaves the universe + series writes intact (those are idempotent +
+  // user-confirmed, so we don't roll them back).
+  it('keeps no issues + throws ERR_PARTIAL_COMMIT_ISSUES when issue publication fails', async () => {
     const { uni, ser } = await setupForCommit();
-    let call = 0;
-    mockCreateIssue.mockImplementation(async (...args) => {
-      call++;
-      if (call === 2) throw new Error('simulated mid-loop FS error');
-      return realIssuesRef.current.createIssue(...args);
-    });
+    mockCreateIssuesBatch.mockRejectedValueOnce(new Error('simulated mid-loop FS error'));
 
     let caught;
     try {
@@ -1763,12 +1762,7 @@ describe('commitImport import sessions (#9943)', () => {
   it('resumes after a rolled-back issue loop without resending canon or the arc', async () => {
     wireDefaultLLMResponses();
     const preview = await analyze();
-    let call = 0;
-    mockCreateIssue.mockImplementation(async (...args) => {
-      call++;
-      if (call === 2) throw new Error('simulated mid-loop FS error');
-      return realIssuesRef.current.createIssue(...args);
-    });
+    mockCreateIssuesBatch.mockRejectedValueOnce(new Error('simulated mid-loop FS error'));
     await expect(importerSvc.commitImport(payloadFor(preview))).rejects.toMatchObject({
       code: importerSvc.ERR_PARTIAL_COMMIT_ISSUES,
     });
@@ -1842,6 +1836,177 @@ describe('commitImport import sessions (#9943)', () => {
     await importerSvc.commitImport(body);
     await importerSvc.commitImport(body);
     expect(await issuesSvc.listIssues({ seriesId: ser.id })).toHaveLength(2);
+  });
+});
+
+// #10763: commits into one series are admitted one at a time, whatever their
+// importId, and the issue publication rechecks positions against fresh state.
+// Each interleaving test holds the FIRST commit's issue publication at a
+// barrier — the point where the issue's reproduction found both commits had
+// already passed the collision check — and lets the second commit run into it.
+describe('commitImport series admission (#10763)', () => {
+  function holdFirstPublication() {
+    let reached;
+    let release;
+    const reachedP = new Promise((resolve) => { reached = resolve; });
+    const releaseP = new Promise((resolve) => { release = resolve; });
+    mockCreateIssuesBatch.mockImplementationOnce(async (...args) => {
+      reached();
+      await releaseP;
+      return realIssuesRef.current.createIssuesBatch(...args);
+    });
+    return { reached: reachedP, release };
+  }
+  const importIdFor = (ser, source) => deriveImportId({ seriesId: ser.id, source });
+  const livePositions = async (ser) => (await issuesSvc.listIssues({ seriesId: ser.id }))
+    .map((i) => i.arcPosition).sort((a, b) => a - b);
+
+  it('two manuscripts claiming one explicit position: one commits, the other is refused before any write', async () => {
+    const { uni, ser } = await setupForCommit();
+    const held = holdFirstPublication();
+    const first = importerSvc.commitImport({
+      universeId: uni.id, seriesId: ser.id, importId: importIdFor(ser, 'manuscript A'),
+      canonSelections: { characters: [{ name: 'Aria' }] },
+      issues: [{ title: 'A1', arcPosition: 1, proseExcerpt: 'a' }],
+    });
+    await held.reached;
+    const second = importerSvc.commitImport({
+      universeId: uni.id, seriesId: ser.id, importId: importIdFor(ser, 'manuscript B'),
+      canonSelections: { characters: [{ name: 'Intruder' }] },
+      arc: { logline: 'B logline', summary: 'B summary', shape: 'rags-to-riches' },
+      issues: [{ title: 'B1', arcPosition: 1, proseExcerpt: 'b' }],
+    });
+    const secondOutcome = second.then(() => null, (err) => err);
+    held.release();
+
+    await expect(first).resolves.toMatchObject({ createdIssueIds: [expect.any(String)] });
+    const err = await secondOutcome;
+    expect(err?.code).toBe(importerSvc.ERR_VALIDATION);
+    expect(err.message).toMatch(/collides with an existing issue/);
+    expect((await issuesSvc.listIssues({ seriesId: ser.id })).map((i) => i.title)).toEqual(['A1']);
+    // The refused batch wrote nothing: no canon, no arc.
+    const universeAfter = await universeSvc.getUniverse(uni.id);
+    expect(universeAfter.characters.map((c) => c.name)).toEqual(['Aria']);
+    expect((await seriesSvc.getSeries(ser.id)).arc?.shape).not.toBe('rags-to-riches');
+  });
+
+  it('concurrent manuscripts with omitted positions get distinct sequential positions', async () => {
+    const { uni, ser } = await setupForCommit();
+    const held = holdFirstPublication();
+    const first = importerSvc.commitImport({
+      universeId: uni.id, seriesId: ser.id, importId: importIdFor(ser, 'manuscript A'),
+      issues: [{ title: 'A1', proseExcerpt: 'a' }, { title: 'A2', proseExcerpt: 'a2' }],
+    });
+    await held.reached;
+    const second = importerSvc.commitImport({
+      universeId: uni.id, seriesId: ser.id, importId: importIdFor(ser, 'manuscript B'),
+      issues: [{ title: 'B1', proseExcerpt: 'b' }],
+    });
+    held.release();
+    await Promise.all([first, second]);
+    expect(await livePositions(ser)).toEqual([1, 2, 3]);
+  });
+
+  it('applies the same admission to legacy commits with no importId', async () => {
+    const { uni, ser } = await setupForCommit();
+    const held = holdFirstPublication();
+    const body = (title) => ({ universeId: uni.id, seriesId: ser.id, issues: [{ title, arcPosition: 1, proseExcerpt: 'p' }] });
+    const first = importerSvc.commitImport(body('Legacy A'));
+    await held.reached;
+    const second = importerSvc.commitImport(body('Legacy B')).then(() => null, (err) => err);
+    held.release();
+    await first;
+    expect((await second)?.code).toBe(importerSvc.ERR_VALIDATION);
+    expect(await livePositions(ser)).toEqual([1]);
+  });
+
+  it('lets a commit into an unrelated series proceed while one series is held', async () => {
+    const { uni, ser } = await setupForCommit();
+    const other = await seriesSvc.createSeries({ name: 'Other S', universeId: uni.id, ephemeral: true });
+    const held = holdFirstPublication();
+    const first = importerSvc.commitImport({
+      universeId: uni.id, seriesId: ser.id, issues: [{ title: 'Held', arcPosition: 1, proseExcerpt: 'h' }],
+    });
+    await held.reached;
+    // Resolves while the first series is still held — no shared admission.
+    const result = await importerSvc.commitImport({
+      universeId: uni.id, seriesId: other.id, issues: [{ title: 'Free', arcPosition: 1, proseExcerpt: 'f' }],
+    });
+    expect(result.createdIssueIds).toHaveLength(1);
+    held.release();
+    await first;
+    expect(await livePositions(ser)).toEqual([1]);
+  });
+
+  it('a plain issue create racing the import cannot silently duplicate an accepted position', async () => {
+    const { uni, ser } = await setupForCommit();
+    // An ordinary create lands on the series after admission, before publication.
+    mockCreateIssuesBatch.mockImplementationOnce(async (...args) => {
+      await realIssuesRef.current.createIssue({ seriesId: ser.id, title: 'Manual', arcPosition: 1 });
+      return realIssuesRef.current.createIssuesBatch(...args);
+    });
+    await expect(importerSvc.commitImport({
+      universeId: uni.id, seriesId: ser.id, issues: [{ title: 'Imported', arcPosition: 1, proseExcerpt: 'i' }],
+    })).rejects.toMatchObject({
+      code: importerSvc.ERR_PARTIAL_COMMIT_ISSUES,
+      message: expect.stringMatching(/already held by another issue/),
+    });
+    expect((await issuesSvc.listIssues({ seriesId: ser.id })).map((i) => i.title)).toEqual(['Manual']);
+  });
+
+  it('re-allocates an omitted position from fresh state when a plain create took the planned slot', async () => {
+    const { uni, ser } = await setupForCommit();
+    mockCreateIssuesBatch.mockImplementationOnce(async (...args) => {
+      await realIssuesRef.current.createIssue({ seriesId: ser.id, title: 'Manual', arcPosition: 1 });
+      return realIssuesRef.current.createIssuesBatch(...args);
+    });
+    const result = await importerSvc.commitImport({
+      universeId: uni.id, seriesId: ser.id,
+      seasons: [{ number: 1, title: 'S1' }],
+      issues: [{ title: 'Imported', seasonNumber: 7, proseExcerpt: 'i' }],
+    });
+    expect(await livePositions(ser)).toEqual([1, 2]);
+    // The remap toast reports where the issue actually landed.
+    expect(result.remappedIssues).toMatchObject([{ title: 'Imported', arcPosition: 2, requestedSeasonNumber: 7 }]);
+  });
+
+  it('releases admission after a failed commit so the next one into the series proceeds', async () => {
+    const { uni, ser } = await setupForCommit();
+    mockCreateIssuesBatch.mockRejectedValueOnce(new Error('simulated write failure'));
+    await expect(importerSvc.commitImport({
+      universeId: uni.id, seriesId: ser.id, issues: [{ title: 'Fails', arcPosition: 1, proseExcerpt: 'f' }],
+    })).rejects.toMatchObject({ code: importerSvc.ERR_PARTIAL_COMMIT_ISSUES });
+    const result = await importerSvc.commitImport({
+      universeId: uni.id, seriesId: ser.id, issues: [{ title: 'Works', arcPosition: 1, proseExcerpt: 'w' }],
+    });
+    expect(result.createdIssueIds).toHaveLength(1);
+  });
+
+  it('runs cleanupFormatting outside the admission: another commit lands while the reformat is in flight', async () => {
+    const { uni, ser } = await setupForCommit();
+    let releaseReformat;
+    const reformatGate = new Promise((resolve) => { releaseReformat = resolve; });
+    let reformatStarted;
+    const started = new Promise((resolve) => { reformatStarted = resolve; });
+    mockRunStagedLLM.mockImplementation(async () => {
+      reformatStarted();
+      await reformatGate;
+      return { content: 'The vault loomed in the dark.', runId: 'r1' };
+    });
+    const slow = importerSvc.commitImport({
+      universeId: uni.id, seriesId: ser.id, contentType: 'short-story', cleanupFormatting: true,
+      issues: [{ title: 'Slow', proseExcerpt: 'The vault  loomed in the\ndark.' }],
+    });
+    await started;
+    // Completes while the slow commit's LLM pass is still pending.
+    await importerSvc.commitImport({
+      universeId: uni.id, seriesId: ser.id, issues: [{ title: 'Fast', proseExcerpt: 'f' }],
+    });
+    releaseReformat();
+    await slow;
+    // The slow commit allocated from the state it found AFTER formatting.
+    const byTitle = Object.fromEntries((await issuesSvc.listIssues({ seriesId: ser.id })).map((i) => [i.title, i.arcPosition]));
+    expect(byTitle).toEqual({ Fast: 1, Slow: 2 });
   });
 });
 
