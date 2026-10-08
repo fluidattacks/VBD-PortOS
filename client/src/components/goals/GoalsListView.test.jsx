@@ -1,0 +1,397 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { render, screen, act } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { MemoryRouter, Routes, Route, useLocation, useParams } from 'react-router';
+import { stubSequentialLayout, pressKey, pressKeyTimes, dndAnnouncement } from '../../test/dndKeyboardDrag';
+
+const { toastError, toastSuccess, organizeGoals, createGoal, applyGoalOrganization, updateGoal } = vi.hoisted(() => ({
+  toastError: vi.fn(),
+  toastSuccess: vi.fn(),
+  organizeGoals: vi.fn(),
+  createGoal: vi.fn(),
+  applyGoalOrganization: vi.fn(),
+  updateGoal: vi.fn(),
+}));
+
+vi.mock('../ui/Toast', () => ({
+  default: Object.assign(() => {}, { error: toastError, success: toastSuccess }),
+}));
+vi.mock('../../services/api', () => ({
+  createGoal,
+  organizeGoals,
+  applyGoalOrganization,
+  updateGoal,
+}));
+vi.mock('../../hooks/useProviderModels', async () => {
+  const { useState } = await import('react');
+  const providers = [
+    { id: 'provider-1', name: 'Example Provider', models: ['example-model', 'example-alternate'] },
+    { id: 'provider-2', name: 'Other Provider', models: ['other-default', 'other-alternate'] },
+  ];
+  return {
+    default: () => {
+      const [selectedProviderId, setSelectedProviderId] = useState('provider-1');
+      const [selectedModel, setSelectedModel] = useState('example-model');
+      return {
+        providers, selectedProviderId, selectedModel,
+        availableModels: providers.find(p => p.id === selectedProviderId)?.models || [],
+        setSelectedProviderId: id => { setSelectedProviderId(id); setSelectedModel(providers.find(p => p.id === id)?.models[0] || ''); },
+        setSelectedModel, loading: false,
+      };
+    },
+  };
+});
+
+// The real detail panel drags in the whole goal-editing surface (and its own API reads);
+// these tests are about WHICH goal the URL opens, so a stand-in that reports the goal it
+// was handed — and exposes its close/refresh callbacks — is the honest seam.
+// For lifecycle tests (#8108), the mock tracks whether edit state persists across goal switches.
+vi.mock('./GoalDetailPanel', async (importOriginal) => {
+  const actual = await importOriginal();
+  const React = await import('react');
+  return {
+    ...actual,
+    default: ({ goal, onClose, onRefresh }) => {
+      const [isEditing, setIsEditing] = React.useState(false);
+      const [formTitle, setFormTitle] = React.useState('');
+
+      return (
+        <div>
+          <span data-testid="detail-panel-goal">{goal.title}</span>
+          {isEditing && (
+            <div data-testid="edit-form">
+              <input
+                data-testid="edit-form-title"
+                value={formTitle}
+                onChange={(e) => setFormTitle(e.target.value)}
+                placeholder="Edit title"
+              />
+              <button type="button" onClick={() => setIsEditing(false)}>cancel-edit</button>
+            </div>
+          )}
+          {!isEditing && (
+            <button type="button" onClick={() => { setIsEditing(true); setFormTitle(goal.title); }}>
+              start-edit
+            </button>
+          )}
+          <button type="button" onClick={onClose}>close-detail</button>
+          <button type="button" onClick={onRefresh}>refresh-detail</button>
+        </div>
+      );
+    },
+  };
+});
+
+import GoalsListView from './GoalsListView';
+
+// Invented placeholder goals — never real records from a running install.
+const GOALS = [
+  { id: 'g1', title: 'Sail across an ocean', category: 'mastery', horizon: 'lifetime', goalType: 'apex', children: [] },
+  { id: 'g2', title: 'Restore the boat', category: 'creative', horizon: '3-year', children: [] },
+];
+// The Organize button only renders once there are >= 2 goals to reorganize.
+const DATA = { roots: GOALS, flat: GOALS };
+
+// Mirrors pages/Goals.jsx: the route owns which goal is open, the view just reads it.
+function RoutedList({ onRefresh, data }) {
+  const { goalId } = useParams();
+  return <GoalsListView data={data} onRefresh={onRefresh} selectedGoalId={goalId} />;
+}
+
+function LocationProbe() {
+  return <span data-testid="pathname">{useLocation().pathname}</span>;
+}
+
+const currentPath = () => screen.getByTestId('pathname').textContent;
+
+const renderList = async (onRefresh = vi.fn(), { path = '/goals/list', data = DATA } = {}) => {
+  render(
+    <MemoryRouter initialEntries={[path]}>
+      <Routes>
+        <Route path="/goals/list" element={<RoutedList onRefresh={onRefresh} data={data} />} />
+        <Route path="/goals/list/:goalId" element={<RoutedList onRefresh={onRefresh} data={data} />} />
+      </Routes>
+      <LocationProbe />
+    </MemoryRouter>,
+  );
+  await act(async () => {});
+  return onRefresh;
+};
+
+// A minimal suggestion that forces applyOrganizationSuggestion down the "create a new
+// apex first" branch, so a rejected createGoal makes it return false.
+const NEW_APEX_SUGGESTION = {
+  apexGoal: { existingId: null, suggestedTitle: 'Example apex', suggestedDescription: '' },
+  organization: [{ id: 'g1', goalType: 'sub-apex', suggestedParentId: '__new_apex__' }],
+  suggestedSubApex: [],
+};
+
+const clickOrganize = async (user) => {
+  await user.click(screen.getByRole('button', { name: /organize/i }));
+  await act(async () => {});
+};
+
+beforeEach(() => {
+  vi.clearAllMocks();
+});
+
+describe('handleOrganize error toasting', () => {
+  // Guards #3515: this handler owns the "Failed to organize goals" toast, so the
+  // request helper must be told to stay quiet — otherwise a failed AI run stacks
+  // two error toasts on top of each other.
+  it('asks the API helper to stay silent and toasts the failure exactly once', async () => {
+    const user = userEvent.setup();
+    organizeGoals.mockRejectedValue(new Error('Organization failed'));
+    await renderList();
+
+    await clickOrganize(user);
+
+    expect(organizeGoals).toHaveBeenCalledWith(
+      { providerId: 'provider-1', model: 'example-model' },
+      { silent: true },
+    );
+    expect(toastError).toHaveBeenCalledTimes(1);
+    expect(toastError).toHaveBeenCalledWith('Failed to organize goals');
+  });
+});
+
+describe('handleOrganize apply-failure path', () => {
+  // Guards #3516: applyOrganizationSuggestion folds every API failure into a `false`
+  // return. Ignoring it toasted "Goal hierarchy applied" over a backend that never
+  // took the change.
+  it('toasts an error and no success when applying the hierarchy fails', async () => {
+    const user = userEvent.setup();
+    organizeGoals.mockResolvedValue(NEW_APEX_SUGGESTION);
+    createGoal.mockRejectedValue(new Error('apex create failed'));
+    const onRefresh = await renderList();
+
+    await clickOrganize(user);
+
+    expect(createGoal).not.toHaveBeenCalled();
+    expect(updateGoal).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: 'Apply Changes' }));
+
+    // The apply helper stays silent so this handler is the only toast source.
+    expect(createGoal).toHaveBeenCalledWith(expect.objectContaining({ goalType: 'apex' }), { silent: true });
+    expect(applyGoalOrganization).not.toHaveBeenCalled();
+    expect(toastSuccess).not.toHaveBeenCalled();
+    expect(toastError).toHaveBeenCalledTimes(1);
+    expect(toastError).toHaveBeenCalledWith('Failed to apply goal hierarchy');
+    // Still refreshed — a partial apply must not leave a stale list on screen.
+    expect(onRefresh).toHaveBeenCalled();
+  });
+
+  it('toasts success and refreshes when the hierarchy applies cleanly', async () => {
+    const user = userEvent.setup();
+    organizeGoals.mockResolvedValue(NEW_APEX_SUGGESTION);
+    createGoal.mockResolvedValue({ id: 'apex-1' });
+    applyGoalOrganization.mockResolvedValue(true);
+    const onRefresh = await renderList();
+
+    await clickOrganize(user);
+    expect(createGoal).not.toHaveBeenCalled();
+    expect(updateGoal).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: 'Apply Changes' }));
+
+    expect(toastError).not.toHaveBeenCalled();
+    expect(toastSuccess).toHaveBeenCalledWith('Goal hierarchy applied');
+    expect(onRefresh).toHaveBeenCalled();
+  });
+});
+
+it('dismisses the suggestion without changing goals', async () => {
+  const user = userEvent.setup();
+  organizeGoals.mockResolvedValue(NEW_APEX_SUGGESTION);
+  await renderList();
+  await clickOrganize(user);
+  await user.click(screen.getByRole('button', { name: 'Dismiss' }));
+  expect(screen.queryByText('Goal Organization')).not.toBeInTheDocument();
+  expect(createGoal).not.toHaveBeenCalled();
+  expect(updateGoal).not.toHaveBeenCalled();
+});
+
+// #4121: which goal is open lives in the URL, never in local state — so a specific goal is
+// shareable, bookmarkable, reload-safe, and linkable from the Character sheet's Goals card.
+describe('routed goal selection', () => {
+  it('opens no panel on the bare list route', async () => {
+    await renderList();
+    expect(screen.queryByTestId('detail-panel-goal')).not.toBeInTheDocument();
+  });
+
+  it('navigates to the goal\'s own route when a row is clicked', async () => {
+    const user = userEvent.setup();
+    await renderList();
+
+    await user.click(screen.getByText('Restore the boat'));
+
+    expect(currentPath()).toBe('/goals/list/g2');
+    expect(screen.getByTestId('detail-panel-goal')).toHaveTextContent('Restore the boat');
+  });
+
+  it('opens the deep-linked goal on mount, without a click', async () => {
+    await renderList(vi.fn(), { path: '/goals/list/g1' });
+    expect(screen.getByTestId('detail-panel-goal')).toHaveTextContent('Sail across an ocean');
+  });
+
+  it('closes the panel by returning to the index when the open goal is clicked again', async () => {
+    const user = userEvent.setup();
+    await renderList(vi.fn(), { path: '/goals/list/g1' });
+
+    // Click the goal row (not the panel text) to toggle it closed
+    const sailTextElements = screen.getAllByText('Sail across an ocean');
+    const listRowElement = sailTextElements.find(el => el.closest('div[role="button"]'));
+    await user.click(listRowElement);
+
+    expect(currentPath()).toBe('/goals/list');
+    expect(screen.queryByTestId('detail-panel-goal')).not.toBeInTheDocument();
+  });
+
+  it('returns to the index when the panel closes or the goal is mutated', async () => {
+    const user = userEvent.setup();
+    const onRefresh = await renderList(vi.fn(), { path: '/goals/list/g1' });
+
+    await user.click(screen.getByRole('button', { name: 'refresh-detail' }));
+
+    expect(currentPath()).toBe('/goals/list');
+    expect(onRefresh).toHaveBeenCalled();
+  });
+
+  it('shows a not-found fallback for a stale or deleted goal id', async () => {
+    await renderList(vi.fn(), { path: '/goals/list/deleted-goal' });
+
+    expect(screen.getByText('Goal not found')).toBeInTheDocument();
+    expect(screen.queryByTestId('detail-panel-goal')).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Back to goals' })).toHaveAttribute('href', '/goals/list');
+  });
+
+  it('does NOT claim "not found" when the goal tree itself failed to load', async () => {
+    // The sentinel rule: "we could not read your goals" must never render as "this goal
+    // does not exist" — the deep link may be perfectly valid.
+    await renderList(vi.fn(), { path: '/goals/list/g1', data: null });
+    expect(screen.queryByText('Goal not found')).not.toBeInTheDocument();
+  });
+});
+
+// Guards #7243: every goal row carries a grip that dnd-kit makes a focusable
+// role="button" announcing itself as draggable, but the view registered a
+// PointerSensor only — so the handle advertised a keyboard interaction that did
+// nothing. Reparenting is also reachable through GoalEditForm's "Parent Goal"
+// select, so this is not the hard block LibraryPane was; the dead affordance in
+// front of every goal in the tree is the defect.
+describe('GoalsListView keyboard reparenting (#7243)', () => {
+  let restoreLayout;
+  beforeEach(() => {
+    updateGoal.mockResolvedValue({ id: 'g2', parentId: 'g1' });
+    restoreLayout = stubSequentialLayout();
+  });
+  afterEach(() => restoreLayout());
+
+  const pickUp = async (goalTitle) => {
+    await renderList();
+    const handle = screen.getByLabelText(`Reparent ${goalTitle}`);
+    handle.focus();
+    await pressKey('Space', handle);
+  };
+
+  it('reparents a goal with Space, arrows and Space', async () => {
+    await pickUp('Restore the boat');
+    expect(dndAnnouncement()).toMatch(/Restore the boat/);
+
+    // Drop targets in document order are the root zone, then each goal row.
+    // Walk to the top of that list (the getter clamps rather than wrapping),
+    // then step down one to the first goal row.
+    await pressKeyTimes('ArrowUp', 3);
+    expect(dndAnnouncement()).toMatch(/over the top level/);
+    await pressKey('ArrowDown');
+    expect(dndAnnouncement()).toMatch(/under "Sail across an ocean"/);
+
+    await pressKey('Space');
+    expect(updateGoal).toHaveBeenCalledWith('g2', { parentId: 'g1' }, { silent: true });
+  });
+
+  it('cancels on Escape without reparenting', async () => {
+    await pickUp('Restore the boat');
+    await pressKeyTimes('ArrowUp', 3);
+    await pressKey('ArrowDown');
+    await pressKey('Escape');
+
+    expect(updateGoal).not.toHaveBeenCalled();
+    expect(dndAnnouncement()).toMatch(/Cancelled moving Restore the boat/);
+  });
+});
+
+// Guards #8108: GoalDetailPanel must have a key={goal.id} so that switching goals
+// remounts the component and resets all useGoalDetail state (editing, form, proposed phases).
+// Without the key, switching goals reuses the component instance and the edit form survives,
+// causing saveEdit to send the old goal's form data to the new goal's id.
+describe('GoalDetailPanel lifecycle and state reset on goal switch (#8108)', () => {
+  it('resets edit state when switching from goal A to goal B', async () => {
+    const user = userEvent.setup();
+    await renderList(vi.fn(), { path: '/goals/list/g1' });
+
+    // Start with goal A (Sail across an ocean) open
+    expect(screen.getByTestId('detail-panel-goal')).toHaveTextContent('Sail across an ocean');
+
+    // Enter edit mode for goal A
+    await user.click(screen.getByRole('button', { name: 'start-edit' }));
+    expect(screen.getByTestId('edit-form')).toBeInTheDocument();
+
+    // Navigate to goal B by clicking it in the list
+    // Use getAllByText and get the second match (the list row, not the detail panel)
+    const boatTextElements = screen.getAllByText('Restore the boat');
+    const listRowElement = boatTextElements.find(el => el.closest('div[role="button"]'));
+    await user.click(listRowElement);
+
+    // Goal B should now be displayed, and edit form should be closed (remounted state resets)
+    expect(screen.getByTestId('detail-panel-goal')).toHaveTextContent('Restore the boat');
+    expect(screen.queryByTestId('edit-form')).not.toBeInTheDocument();
+  });
+
+  it('does not carry over edited values from goal A to goal B', async () => {
+    const user = userEvent.setup();
+    updateGoal.mockResolvedValue({ id: 'g1' });
+    await renderList(vi.fn(), { path: '/goals/list/g1' });
+
+    // Start with goal A, enter edit, and the form should show A's title
+    await user.click(screen.getByRole('button', { name: 'start-edit' }));
+    const editInput = screen.getByTestId('edit-form-title');
+    expect(editInput).toHaveValue('Sail across an ocean');
+
+    // Switch to goal B
+    const boatTextElements = screen.getAllByText('Restore the boat');
+    const listRowElement = boatTextElements.find(el => el.closest('div[role="button"]'));
+    await user.click(listRowElement);
+
+    // Now we should be viewing goal B, and edit mode should be reset
+    expect(screen.getByTestId('detail-panel-goal')).toHaveTextContent('Restore the boat');
+    expect(screen.queryByTestId('edit-form')).not.toBeInTheDocument();
+
+    // Verify no updateGoal was called with goal B's id and old form data
+    expect(updateGoal).not.toHaveBeenCalled();
+  });
+});
+
+// #9712: selecting the route must reach the request, without starting AI work
+// until Organize is clicked; a pending request still locks all three controls.
+it('organizes with the chosen provider and model only after submission', async () => {
+  const user = userEvent.setup();
+  let finish;
+  organizeGoals.mockReturnValue(new Promise(resolve => { finish = resolve; }));
+  await renderList();
+  const provider = screen.getByRole('combobox', { name: 'AI Provider' });
+  const model = screen.getByRole('combobox', { name: 'Model' });
+  await user.selectOptions(provider, 'provider-2');
+  await user.selectOptions(model, 'other-alternate');
+  expect(organizeGoals).not.toHaveBeenCalled();
+
+  await user.click(screen.getByRole('button', { name: 'Organize' }));
+  expect(organizeGoals).toHaveBeenCalledWith(
+    { providerId: 'provider-2', model: 'other-alternate' }, { silent: true },
+  );
+  expect(provider).toBeDisabled();
+  expect(model).toBeDisabled();
+  expect(screen.getByRole('button', { name: 'Analyzing...' })).toBeDisabled();
+  await act(async () => { finish(NEW_APEX_SUGGESTION); });
+  expect(screen.getByText('Goal Organization')).toBeInTheDocument();
+  expect(createGoal).not.toHaveBeenCalled();
+});

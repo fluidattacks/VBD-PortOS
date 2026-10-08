@@ -1,0 +1,226 @@
+import { describe, it, expect, vi } from 'vitest';
+import { act, fireEvent, render, screen } from '@testing-library/react';
+import { MemoryRouter } from 'react-router';
+import MtplxServerCard from './MtplxServerCard.jsx';
+
+const renderCard = async (status, props = {}) => {
+  const handlers = {
+    onRefresh: vi.fn(),
+    onSaveLaunch: vi.fn(),
+    onStart: vi.fn(),
+    onStop: vi.fn(),
+    onInstall: vi.fn(),
+    // The checkpoint manager loads upstream's default listing on mount.
+    onSearchModels: vi.fn().mockResolvedValue({ models: [], error: null }),
+    onPullModel: vi.fn(),
+    onRemoveModel: vi.fn(),
+  };
+  render(
+    <MemoryRouter>
+      <MtplxServerCard status={status} loading={false} busy={false} actionInProgress={null} {...handlers} {...props} />
+    </MemoryRouter>,
+  );
+  // The checkpoint manager fetches its default listing on mount — settle it so
+  // its state update lands inside act().
+  await act(async () => {});
+  return handlers;
+};
+
+describe('MtplxServerCard', () => {
+  // The card saves the launch line used by both explicit and on-demand starts,
+  // so the user's checkpoint choice survives a stop/start cycle they never see.
+  it('saves the cached checkpoint and port the user picked', async () => {
+    const handlers = await renderCard({
+      installed: true,
+      running: false,
+      supported: true,
+      port: 8000,
+      cachedModels: ['Example/Qwen-MTP', 'Example/Other-MTP'],
+    });
+
+    fireEvent.change(screen.getByLabelText('Checkpoint'), { target: { value: 'Example/Other-MTP' } });
+    fireEvent.change(screen.getByLabelText('Port'), { target: { value: '8010' } });
+    fireEvent.click(screen.getByRole('button', { name: /Save configuration/ }));
+
+    expect(handlers.onSaveLaunch).toHaveBeenCalledWith({ model: 'Example/Other-MTP', port: 8010 });
+  });
+
+  // An untouched port stays off the saved config so a lazy start falls through
+  // to the shipped default; an untouched checkpoint is saved as an explicit
+  // `null`, which is what CLEARS a previously-saved pick back to "Auto".
+  it('omits an untouched port and clears an untouched checkpoint', async () => {
+    const handlers = await renderCard({ installed: true, running: false, supported: true, cachedModels: ['Example/Qwen-MTP'] });
+    fireEvent.click(screen.getByRole('button', { name: /Save configuration/ }));
+    expect(handlers.onSaveLaunch).toHaveBeenCalledWith({ model: null });
+  });
+
+  it('offers an in-app download instead of a config that cannot bind', async () => {
+    // No start downloads weights, and `mtplx serve` exits before it binds a port
+    // on an empty cache — so the card offers the download itself rather than
+    // naming a terminal command (PRD NR-9).
+    const handlers = await renderCard({ installed: true, running: false, supported: true, cachedModels: [], cacheError: null });
+    expect(screen.getByText(/model cache is empty/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Save configuration/ })).toBeDisabled();
+    expect(screen.queryByText(/in a terminal/i)).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: /Download default checkpoint/ }));
+    // `null` = MTPLX's own verified default, the checkpoint the readiness
+    // checklist pulls — not a repo id the card invented.
+    expect(handlers.onPullModel).toHaveBeenCalledWith(null);
+    expect(handlers.onSearchModels).toHaveBeenCalled();
+  });
+
+  it('downloads a searched checkpoint and removes a cached one', async () => {
+    const handlers = await renderCard(
+      {
+        installed: true,
+        running: false,
+        supported: true,
+        cachedModels: ['Example/Cached-MTP'],
+        cachedModelRows: [{ repo: 'Example/Cached-MTP', sizeBytes: 1024, hasRuntimeContract: true, valid: true }],
+      },
+      {
+        onSearchModels: vi.fn().mockResolvedValue({
+          models: [{ repo: 'Example/New-MTP', name: 'New MTP', owner: 'Example', downloads: 12, license: 'apache-2.0' }],
+          error: null,
+        }),
+      },
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: /^Download$/ }));
+    expect(handlers.onPullModel).toHaveBeenCalledWith('Example/New-MTP');
+
+    // Removal is confirm-then-delete inline — no window.confirm.
+    fireEvent.click(screen.getByRole('button', { name: /^Remove$/ }));
+    fireEvent.click(screen.getByRole('button', { name: /^Delete$/ }));
+    expect(handlers.onRemoveModel).toHaveBeenCalledWith('Example/Cached-MTP');
+  });
+
+  it("shows a search hit's age in days, and no age for a repo the Hub had no date for", async () => {
+    // The age is what says whether a checkpoint is worth a multi-gigabyte pull, and
+    // a dateless row must stay silent rather than rendering a placeholder age.
+    const publishedAt = new Date(Date.now() - 5 * 24 * 3600 * 1000).toISOString();
+    await renderCard(
+      { installed: true, running: false, supported: true, cachedModels: [] },
+      {
+        onSearchModels: vi.fn().mockResolvedValue({
+          models: [
+            { repo: 'Example/Dated-MTP', name: 'Dated MTP', owner: 'Example', downloads: 12, publishedAt },
+            { repo: 'Example/Undated-MTP', name: 'Undated MTP', owner: 'Example', downloads: 3, publishedAt: null },
+          ],
+          error: null,
+        }),
+      },
+    );
+
+    expect(await screen.findByText(/published 5 days ago/)).toBeInTheDocument();
+    expect(screen.getByText(/Example\/Undated-MTP/)).not.toHaveTextContent(/published/);
+  });
+
+  it('marks an already-cached search hit instead of offering to download it again', async () => {
+    await renderCard(
+      {
+        installed: true,
+        running: false,
+        supported: true,
+        cachedModels: ['Example/Cached-MTP'],
+        cachedModelRows: [{ repo: 'Example/Cached-MTP', sizeBytes: 1024, valid: true }],
+      },
+      {
+        onSearchModels: vi.fn().mockResolvedValue({
+          models: [{ repo: 'Example/Cached-MTP', name: 'Cached MTP', owner: 'Example' }],
+          error: null,
+        }),
+      },
+    );
+    expect(await screen.findByText('Cached')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^Download$/ })).toBeNull();
+  });
+
+  it('still lets the config be saved when the cache could not be READ — unreadable is not empty', async () => {
+    const handlers = await renderCard({ installed: true, running: false, supported: true, cachedModels: [], cacheError: '`mtplx models` timed out' });
+    const save = screen.getByRole('button', { name: /Save configuration/ });
+    expect(save).not.toBeDisabled();
+    fireEvent.click(save);
+    expect(handlers.onSaveLaunch).toHaveBeenCalled();
+  });
+
+  it('says MTPLX starts on demand while offering an explicit Start button', async () => {
+    const handlers = await renderCard({ installed: true, running: false, supported: true, cachedModels: ['Example/Qwen-MTP', 'Example/Other-MTP'] });
+    expect(screen.getByText(/starts on demand/i)).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('Checkpoint'), { target: { value: 'Example/Other-MTP' } });
+    fireEvent.change(screen.getByLabelText('Port'), { target: { value: '8010' } });
+    fireEvent.click(screen.getByRole('button', { name: /^Start MTPLX/ }));
+    expect(handlers.onStart).toHaveBeenCalledWith({ model: 'Example/Other-MTP', port: 8010 });
+  });
+
+  it('will not offer to stop a server started outside PortOS', async () => {
+    await renderCard({ installed: true, running: true, managed: false, supported: true, endpoint: 'http://127.0.0.1:8000/v1' });
+    expect(screen.getByText(/Started outside PortOS/)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Stop MTPLX/ })).toBeNull();
+  });
+
+  // A measured assessment relaunches this daemon with tuning flags and leaves
+  // them on, so every later request through the `mtplx` provider runs under
+  // them. A card showing only the model would report the server as plain
+  // "running" while it serves with, say, MTP decoding switched off.
+  it('names the tuning flags the running daemon was launched with', async () => {
+    await renderCard({
+      installed: true, running: true, managed: true, supported: true,
+      endpoint: 'http://127.0.0.1:8000/v1',
+      config: { model: 'Example/Qwen-MTP', port: 8000, tuning: { generationMode: 'ar' } },
+      tuningFlags: ['--generation-mode', 'ar'],
+    });
+    expect(screen.getByText('--generation-mode ar')).toBeInTheDocument();
+  });
+
+  it('says nothing about tuning for a daemon running on plain defaults', async () => {
+    await renderCard({
+      installed: true, running: true, managed: true, supported: true,
+      endpoint: 'http://127.0.0.1:8000/v1',
+      config: { model: 'Example/Qwen-MTP', port: 8000, tuning: {} },
+      tuningFlags: [],
+    });
+    expect(screen.queryByText(/Tuning:/)).toBeNull();
+  });
+
+  it('offers the install when the binary is missing', async () => {
+    const handlers = await renderCard({ installed: false, running: false, supported: true });
+    fireEvent.click(screen.getByRole('button', { name: /Install MTPLX/ }));
+    expect(handlers.onInstall).toHaveBeenCalled();
+  });
+
+  // The Homebrew `mtplx` is a wrapper that downloads MTPLX itself on first run,
+  // so "on PATH" and "can serve a request" are two different facts. A card that
+  // conflated them offered a Start button guaranteed to fail.
+  it('offers the runtime download, not a Start button, when only the wrapper is installed', async () => {
+    const handlers = await renderCard({
+      installed: true, runtimeReady: false, running: false, supported: true, port: 8000, cachedModels: [],
+    });
+
+    expect(screen.getByText(/Installed — runtime not yet downloaded/)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Start MTPLX/ })).toBeNull();
+    // Nor the checkpoint panel: every action in it invokes the same wrapper.
+    expect(screen.queryByRole('button', { name: /Download default checkpoint/ })).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: /Download MTPLX runtime/ }));
+    expect(handlers.onInstall).toHaveBeenCalled();
+  });
+
+  // A peer, or a tab left open across an upgrade, sends a payload predating the
+  // field. Reading its absence as "not downloaded" would replace a working
+  // card with a download prompt.
+  it('treats a status payload with no runtimeReady as ready', async () => {
+    await renderCard({
+      installed: true, running: false, supported: true, port: 8000, cachedModels: ['Example/Qwen-MTP'],
+    });
+    expect(screen.queryByText(/runtime not yet downloaded/)).toBeNull();
+    expect(screen.getByRole('button', { name: /Start MTPLX/ })).toBeInTheDocument();
+  });
+
+  it('says why, and offers nothing, on a host that cannot run MLX', async () => {
+    await renderCard({ installed: false, running: false, supported: false, unsupportedReason: 'MTPLX runs only on macOS with Apple Silicon.' });
+    expect(screen.getByText('MTPLX runs only on macOS with Apple Silicon.')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Install MTPLX/ })).toBeNull();
+  });
+});

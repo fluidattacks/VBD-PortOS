@@ -1,0 +1,168 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { __resetToolUseModelIdsCache } from '../../../hooks/useToolUseModelIds.js';
+
+vi.mock('../../../services/api', () => ({
+  relaunchCosAgent: vi.fn(),
+}));
+const apiLocalLlm = vi.hoisted(() => ({
+  getToolUseModels: vi.fn(),
+}));
+vi.mock('../../../services/apiLocalLlm', () => apiLocalLlm);
+vi.mock('../../ui/Toast', () => ({
+  default: { success: vi.fn(), error: vi.fn() },
+}));
+
+import * as api from '../../../services/api';
+import toast from '../../ui/Toast';
+import RelaunchAgentModal from './RelaunchAgentModal';
+
+const PROVIDERS = [
+  { id: 'claude', name: 'Claude', enabled: true, models: ['claude-opus-5', 'claude-sonnet-5'] },
+  { id: 'codex', name: 'Codex', enabled: true, models: ['gpt-5'] },
+];
+
+// A run stalled on a usage limit: still `running`, pinned to the provider that
+// stopped answering.
+const STALLED_AGENT = {
+  id: 'agent-live',
+  taskId: 'task-abc',
+  status: 'running',
+  metadata: { taskDescription: 'Ship the thing', provider: 'claude', model: 'claude-opus-5' },
+};
+
+const renderModal = (props = {}) => render(
+  <RelaunchAgentModal
+    agent={STALLED_AGENT}
+    providers={PROVIDERS}
+    apps={[]}
+    onDone={vi.fn()}
+    onClose={vi.fn()}
+    {...props}
+  />
+);
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  __resetToolUseModelIdsCache();
+  apiLocalLlm.getToolUseModels.mockResolvedValue({ models: [] });
+  api.relaunchCosAgent.mockResolvedValue({ success: true, taskId: 'task-abc', mode: 'requeued' });
+});
+
+// A prototype getter spy would otherwise survive a failing assertion and leak
+// into every test that runs after it.
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+describe('RelaunchAgentModal', () => {
+  it('submits the stalled run\'s own settings when the user changes nothing', async () => {
+    const user = userEvent.setup();
+    renderModal();
+
+    await user.click(screen.getByRole('button', { name: 'Relaunch Agent' }));
+
+    await waitFor(() => expect(api.relaunchCosAgent).toHaveBeenCalledWith(
+      'agent-live',
+      expect.objectContaining({ provider: 'claude', model: 'claude-opus-5' }),
+      { silent: true },
+    ));
+  });
+
+  it('sends the newly picked provider and drops the model pinned to the old one', async () => {
+    const user = userEvent.setup();
+    const onDone = vi.fn();
+    const onClose = vi.fn();
+    renderModal({ onDone, onClose });
+
+    await user.selectOptions(screen.getByRole('combobox', { name: /provider/i }), 'codex');
+    await user.click(screen.getByRole('button', { name: 'Relaunch Agent' }));
+
+    await waitFor(() => expect(api.relaunchCosAgent).toHaveBeenCalled());
+    const [, overrides] = api.relaunchCosAgent.mock.calls[0];
+    expect(overrides.provider).toBe('codex');
+    // A model from the provider the user just left would be unrunnable; blank is
+    // "server default", which is what clearing it means.
+    expect(overrides.model).toBeUndefined();
+    expect(onDone).toHaveBeenCalled();
+    expect(onClose).toHaveBeenCalled();
+  });
+
+  // `already-active` and `superseded` deliberately queue NOTHING server-side, so
+  // a relaunch must not claim it restarted the work.
+  it.each([
+    ['already-active', /already queued or running/i],
+    ['superseded', /later agent/i],
+  ])('reports the %s outcome without claiming the task was relaunched', async (mode, pattern) => {
+    const user = userEvent.setup();
+    api.relaunchCosAgent.mockResolvedValue({ success: true, taskId: 'task-abc', mode });
+    renderModal();
+
+    await user.click(screen.getByRole('button', { name: 'Relaunch Agent' }));
+
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith(expect.stringMatching(pattern)));
+    expect(toast.success).not.toHaveBeenCalledWith(expect.stringMatching(/queued again/i));
+  });
+
+  // A task description is the agent's whole prompt. Rendered in full it pushes
+  // the provider/model selects and the Relaunch button off a phone screen, so
+  // the dialog must open on a clamped preview and cap the expanded body's height.
+  it('opens the task prompt collapsed and caps it in a scroll box when expanded', async () => {
+    // jsdom reports 0 for scrollHeight and clientHeight alike, so nothing ever
+    // measures as overflowing without this.
+    vi.spyOn(HTMLElement.prototype, 'scrollHeight', 'get').mockReturnValue(500);
+    const user = userEvent.setup();
+    const prompt = Array.from({ length: 200 }, (_, i) => `step ${i}`).join('\n');
+    renderModal({ agent: { ...STALLED_AGENT, metadata: { ...STALLED_AGENT.metadata, taskDescription: prompt } } });
+
+    const preview = document.getElementById('relaunch-task-agent-live');
+    expect(preview.className).toContain('line-clamp-3');
+
+    await user.click(screen.getByRole('button', { name: /show more/i }));
+
+    const expanded = document.getElementById('relaunch-task-agent-live');
+    expect(expanded.className).not.toContain('line-clamp-3');
+    expect(expanded.className).toContain('max-h-48');
+    expect(expanded.className).toContain('overflow-y-auto');
+    // The way back matters most on a phone — expanding must not strand the user
+    // in the prompt with the form below it out of reach.
+    expect(screen.getByRole('button', { name: /show less/i })).toBeInTheDocument();
+  });
+
+  it('says the task is running when the server started it, not that it is queued', async () => {
+    const user = userEvent.setup();
+    api.relaunchCosAgent.mockResolvedValue({ success: true, taskId: 'task-abc', mode: 'requeued', spawned: true });
+    renderModal();
+
+    await user.click(screen.getByRole('button', { name: 'Relaunch Agent' }));
+
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith(expect.stringMatching(/running again/i)));
+    expect(toast.success).not.toHaveBeenCalledWith(expect.stringMatching(/queued/i));
+  });
+
+  it('names why a relaunched task stayed queued instead of leaving the user to hunt for it', async () => {
+    const user = userEvent.setup();
+    api.relaunchCosAgent.mockResolvedValue({
+      success: true, taskId: 'task-abc', mode: 'requeued',
+      spawned: false, spawnHold: 'No available agent slots (3/3)',
+    });
+    renderModal();
+
+    await user.click(screen.getByRole('button', { name: 'Relaunch Agent' }));
+
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith(expect.stringMatching(/No available agent slots \(3\/3\)/)));
+  });
+
+  it('keeps the dialog open and surfaces the error when the relaunch fails', async () => {
+    const user = userEvent.setup();
+    const onClose = vi.fn();
+    api.relaunchCosAgent.mockRejectedValue(new Error('Agent agent-live is completed, not running'));
+    renderModal({ onClose });
+
+    await user.click(screen.getByRole('button', { name: 'Relaunch Agent' }));
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith(expect.stringMatching(/not running/i)));
+    expect(onClose).not.toHaveBeenCalled();
+  });
+});

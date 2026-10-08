@@ -1,0 +1,192 @@
+/**
+ * Universe store facade — file-backend dispatcher behavior (#1014).
+ *
+ * NODE_ENV=test selects the file backend (collectionStore over a real tmpdir),
+ * so this exercises the facade WITHOUT a database: the read/write/delete surface
+ * the service uses, the local-only runs API + 200 cap, cascade-remove, and the
+ * mutation epoch that record writes bump (and runs deliberately do NOT) — the
+ * signal dataSync folds into its fingerprint so the storage swap stays invisible
+ * to federation.
+ */
+
+import { describe, it, expect, beforeEach, afterAll } from 'vitest';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { vi } from 'vitest';
+
+const TEST_DATA_ROOT = mkdtempSync(join(tmpdir(), 'universe-store-test-'));
+
+vi.mock('../../lib/fileUtils.js', async (importOriginal) => {
+  const actual = await importOriginal();
+  return { ...actual, PATHS: { ...actual.PATHS, data: TEST_DATA_ROOT } };
+});
+
+const { getUniverseStore, _resetUniverseStore, getUniverseMutationEpoch } = await import('./store.js');
+
+// Minimal sanitizer that just passes the record through — the facade's sanitize
+// hook is the service's sanitizeTemplate in production; here we only assert the
+// hook is applied (loadOne runs it, loadOneRaw does not).
+const passthroughSanitize = (r) => (r ? { ...r, _sanitized: true } : r);
+
+describe('universe store facade — file backend', () => {
+  beforeEach(() => {
+    rmSync(join(TEST_DATA_ROOT, 'universes'), { recursive: true, force: true });
+    _resetUniverseStore();
+  });
+  afterAll(() => rmSync(TEST_DATA_ROOT, { recursive: true, force: true }));
+
+  it('selects the file backend under NODE_ENV=test', async () => {
+    const s = getUniverseStore(passthroughSanitize);
+    await s.listIds();
+    expect(s.getBackendName()).toBe('file');
+  });
+
+  it('writeRecord persists, loadOneRaw returns verbatim, loadOne sanitizes', async () => {
+    const s = getUniverseStore(passthroughSanitize);
+    await s.writeRecord('u-1', { id: 'u-1', name: 'Aurora' });
+    expect(await s.loadOneRaw('u-1')).toEqual({ id: 'u-1', name: 'Aurora' });
+    expect(await s.loadOne('u-1')).toEqual({ id: 'u-1', name: 'Aurora', _sanitized: true });
+    expect((await s.listIds())).toEqual(['u-1']);
+  });
+
+  it('listRaw returns every record verbatim (no sanitize) in one bulk read', async () => {
+    const s = getUniverseStore(passthroughSanitize);
+    await s.writeRecord('u-1', { id: 'u-1', name: 'A' });
+    await s.writeRecord('u-2', { id: 'u-2', name: 'B' });
+    const all = await s.listRaw();
+    expect(all.map((r) => r.id).sort()).toEqual(['u-1', 'u-2']);
+    expect(all.every((r) => !('_sanitized' in r))).toBe(true); // raw, not sanitized
+  });
+
+  it('listLiveIds returns only non-deleted ids', async () => {
+    const s = getUniverseStore(passthroughSanitize);
+    await s.writeRecord('u-1', { id: 'u-1', name: 'Live' });
+    await s.writeRecord('u-2', { id: 'u-2', name: 'Dead', deleted: true, deletedAt: '2026-01-01T00:00:00.000Z' });
+    await s.writeRecord('u-3', { id: 'u-3', name: 'Ghost', ephemeral: true });
+    // Ephemeral (but not deleted) counts as live — matches db.listLiveIds'
+    // `WHERE deleted = FALSE` (it doesn't filter on ephemeral either).
+    expect((await s.listLiveIds()).sort()).toEqual(['u-1', 'u-3']);
+  });
+
+  it('listTombstoneIdsBefore returns only tombstones older than the cutoff, keeping unparseable deletedAt', async () => {
+    const s = getUniverseStore(passthroughSanitize);
+    await s.writeRecord('u-live', { id: 'u-live', name: 'Live' });
+    await s.writeRecord('u-old', { id: 'u-old', name: 'Old', deleted: true, deletedAt: '2026-01-01T00:00:00.000Z' });
+    await s.writeRecord('u-new', { id: 'u-new', name: 'New', deleted: true, deletedAt: '2026-06-01T00:00:00.000Z' });
+    // Non-parseable deletedAt is conservatively KEPT — never a candidate,
+    // regardless of cutoff (mirrors the JS filter this projection replaces).
+    await s.writeRecord('u-bad', { id: 'u-bad', name: 'Bad', deleted: true, deletedAt: 'not-a-date' });
+    const cutoff = Date.parse('2026-03-01T00:00:00.000Z');
+    expect(await s.listTombstoneIdsBefore(cutoff)).toEqual(['u-old']);
+  });
+
+  it('listStyles projects to the style fields and drops tombstones', async () => {
+    const s = getUniverseStore(passthroughSanitize);
+    await s.writeRecord('u-1', {
+      id: 'u-1', name: 'A', logline: 'nope', createdAt: '2026-01-01T00:00:00.000Z',
+      influences: { embrace: ['ink'], avoid: [] },
+    });
+    await s.writeRecord('u-2', { id: 'u-2', name: 'B', deleted: true });
+    // Same row keys db.listStyles returns — the service derives tokens from
+    // them, so the two backends must hand it the identical shape.
+    expect(await s.listStyles()).toEqual([{
+      id: 'u-1',
+      name: 'A',
+      influences: { embrace: ['ink'], avoid: [] },
+      stylePrompt: undefined,
+      negativePrompt: undefined,
+      createdAt: '2026-01-01T00:00:00.000Z',
+    }]);
+  });
+
+  it('deleteRecord removes the record', async () => {
+    const s = getUniverseStore(passthroughSanitize);
+    await s.writeRecord('u-1', { id: 'u-1', name: 'X' });
+    await s.deleteRecord('u-1');
+    expect(await s.loadOneRaw('u-1')).toBeNull();
+    expect(await s.listIds()).toEqual([]);
+  });
+
+  it('record writes AND deletes bump the mutation epoch; reads do not', async () => {
+    const s = getUniverseStore(passthroughSanitize);
+    const e0 = getUniverseMutationEpoch();
+    await s.writeRecord('u-1', { id: 'u-1', name: 'X' });
+    const e1 = getUniverseMutationEpoch();
+    expect(e1).toBeGreaterThan(e0);
+    await s.loadOne('u-1');
+    await s.listIds();
+    expect(getUniverseMutationEpoch()).toBe(e1); // reads don't bump
+    await s.deleteRecord('u-1');
+    expect(getUniverseMutationEpoch()).toBeGreaterThan(e1);
+  });
+
+  it('runs API stores/loads, caps at 200, and does NOT bump the epoch', async () => {
+    const s = getUniverseStore(passthroughSanitize);
+    const before = getUniverseMutationEpoch();
+    for (let i = 0; i < 205; i += 1) {
+      await s.appendRun({ id: `run-${i}`, universeId: 'u-1', jobIds: [], promptCount: i, createdAt: new Date(1700000000000 + i).toISOString() });
+    }
+    const all = await s.loadRuns();
+    expect(all.length).toBe(200);
+    expect(getUniverseMutationEpoch()).toBe(before); // runs are local-only
+  });
+
+  it('loadRuns scopes by universeId; removeRunsForUniverses drops only those', async () => {
+    const s = getUniverseStore(passthroughSanitize);
+    await s.appendRun({ id: 'r-a', universeId: 'u-A', jobIds: [], promptCount: 1, createdAt: '2026-01-01T00:00:00.000Z' });
+    await s.appendRun({ id: 'r-b', universeId: 'u-B', jobIds: [], promptCount: 1, createdAt: '2026-01-01T00:00:01.000Z' });
+    expect((await s.loadRuns('u-A')).map((r) => r.id)).toEqual(['r-a']);
+    await s.removeRunsForUniverses(['u-A']);
+    expect((await s.loadRuns()).map((r) => r.universeId)).toEqual(['u-B']);
+  });
+
+  // #7261 — the run log lives in the type index's `config` slot, read-modify-
+  // written on every append. An unreadable index must reject the write rather
+  // than silently restart the history from an empty array.
+  it('run writers reject on an unreadable index.json and leave it byte-identical', async () => {
+    const s = getUniverseStore(passthroughSanitize);
+    await s.appendRun({ id: 'r-keep', universeId: 'u-1', jobIds: [], promptCount: 1, createdAt: '2026-01-01T00:00:00.000Z' });
+
+    const indexPath = join(TEST_DATA_ROOT, 'universes', 'index.json');
+    const truncated = readFileSync(indexPath, 'utf8').slice(0, -3);
+    writeFileSync(indexPath, truncated);
+
+    await expect(s.appendRun({ id: 'r-new', universeId: 'u-1', jobIds: [], promptCount: 2, createdAt: '2026-01-02T00:00:00.000Z' })).rejects.toThrow(/Unreadable JSON file/);
+    await expect(s.removeRunsForUniverses(['u-1'])).rejects.toThrow(/Unreadable JSON file/);
+    await expect(s.loadRuns()).rejects.toThrow(/Unreadable JSON file/);
+    expect(readFileSync(indexPath, 'utf8')).toBe(truncated);
+  });
+
+  it('loadRuns returns newest-first (created_at DESC, id DESC) to match the PG backend', async () => {
+    const s = getUniverseStore(passthroughSanitize);
+    await s.appendRun({ id: 'r-old', universeId: 'u-1', jobIds: [], promptCount: 1, createdAt: '2026-01-01T00:00:00.000Z' });
+    await s.appendRun({ id: 'r-new', universeId: 'u-1', jobIds: [], promptCount: 1, createdAt: '2026-01-02T00:00:00.000Z' });
+    expect((await s.loadRuns()).map((r) => r.id)).toEqual(['r-new', 'r-old']);
+  });
+
+  it('rejects ids outside the collectionStore allowlist on writeRecord/deleteRecord (backend parity)', async () => {
+    const s = getUniverseStore(passthroughSanitize);
+    await expect(s.writeRecord('bad/id', { id: 'bad/id', name: 'X' })).rejects.toThrow(/invalid record id/);
+    await expect(s.writeRecord('a'.repeat(129), { id: 'a'.repeat(129), name: 'X' })).rejects.toThrow(/invalid record id/);
+    await expect(s.deleteRecord('bad/id')).rejects.toThrow(/invalid record id/);
+    // A valid id still works.
+    await s.writeRecord('ok-1', { id: 'ok-1', name: 'X' });
+    expect(await s.loadOneRaw('ok-1')).toEqual({ id: 'ok-1', name: 'X' });
+  });
+
+  it('queueRecordWrite throws on a bad id so mergeUniversesFromSync .catch skips it (parity)', async () => {
+    const s = getUniverseStore(passthroughSanitize);
+    // Throws synchronously, exactly like collectionStore.queueRecordWrite — the
+    // merge path wraps each write in a try/.catch so the bad record is skipped.
+    expect(() => s.queueRecordWrite('bad/id', async () => 'never')).toThrow(/invalid record id/);
+  });
+
+  it('verifySchemaVersion reports the file collection version', async () => {
+    const s = getUniverseStore(passthroughSanitize);
+    await s.writeRecord('u-1', { id: 'u-1', name: 'X' });
+    const status = await s.verifySchemaVersion();
+    expect(status.ok).toBe(true);
+    expect(status.type).toBe('universes');
+  });
+});

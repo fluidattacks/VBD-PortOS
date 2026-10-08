@@ -1,0 +1,874 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+// Mock the heavy dependency graph so the hooks can be driven without a live LLM,
+// forge, or app store. Each helper is a controllable spy set up per-test.
+vi.mock('../apps.js', () => ({
+  PORTOS_APP_ID: 'portos-default',
+  getAppById: vi.fn(),
+  updateAppLayeredIntelligence: vi.fn().mockResolvedValue(undefined)
+}));
+
+vi.mock('../../lib/workTracker.js', async (importActual) => {
+  const actual = await importActual();
+  return {
+    // Real pure host→API-host mapping so the forge gate is exercised through
+    // the exact enterprise-aware resolution production uses (#3358).
+    githubApiHost: actual.githubApiHost,
+    resolveAppWorkTracker: vi.fn().mockResolvedValue({ resolved: 'github', forge: 'gh', host: 'github.com' }),
+    resolveRepoForgeTarget: vi.fn().mockResolvedValue({ forge: 'github', apiHost: 'github.com' })
+  };
+});
+
+// Only `tryReadFile` is stubbed — the rest passes through so the real validator this
+// suite imports for the #4166 end-to-end case can load its own module graph (its
+// constants reach `PATHS`/`DAY` through here). fileUtils has no load-time side effects.
+vi.mock('../../lib/fileUtils.js', async (importOriginal) => ({
+  ...(await importOriginal()),
+  tryReadFile: vi.fn().mockResolvedValue(null)
+}));
+
+// The provider-type guard in buildTaskInput looks the pinned provider up to
+// reject an api-only (harnessless) provider. Default to a CLI provider so the
+// happy path passes; the dedicated test overrides it to an api provider.
+vi.mock('../providers.js', () => ({
+  getProviderById: vi.fn(async (id) => ({ id, type: 'cli' }))
+}));
+
+// The forge-reachability gate (#3358) — the gh probe LI runs before it burns a
+// provider call on a proposal it could neither dedup nor file. Reachable by
+// default; individual cases override it.
+const ensureForgeReachableMock = vi.fn(async () => ({ ok: true, status: 'ok', detail: null, remedy: null }));
+vi.mock('../github.js', () => ({
+  ensureForgeReachable: (...args) => ensureForgeReachableMock(...args)
+}));
+
+// When no per-app provider is pinned, the guard falls back to the global LI
+// schedule provider via getTaskInterval. Default to no global pin so the
+// no-provider path stays inert.
+vi.mock('../taskSchedule.js', () => ({
+  getTaskInterval: vi.fn(async () => ({ providerId: null, model: null }))
+}));
+
+vi.mock('../layeredIntelligence.js', () => ({
+  getEffectiveConfig: vi.fn(() => ({ providerId: 'ollama', model: 'qwen', allowedScopes: ['app-improvement'], sources: {} })),
+  buildPrompt: vi.fn(() => 'REASONING PROMPT'),
+  gatherSources: vi.fn().mockResolvedValue({ goals: 'be great' }),
+  listForgeIssues: vi.fn().mockResolvedValue({ ok: true, issues: [] }),
+  listBlockingIssues: vi.fn().mockResolvedValue({ ok: true, issues: [] }),
+  isAppParked: vi.fn(() => false),
+  validateReasonerResponse: vi.fn(() => ({ proposal: null, pause: null, invalidFields: [] })),
+  isScopeAllowed: vi.fn(() => true),
+  isProposalDuplicate: vi.fn(() => false),
+  checkSemanticDuplicate: vi.fn().mockResolvedValue({ available: false, duplicate: false }),
+  isHandoffEligible: vi.fn(() => false),
+  buildHandoffTask: vi.fn(() => ({ description: 'handoff' })),
+  filerForTracker: vi.fn((resolved) => (resolved === 'github' || resolved === 'gitlab') ? 'forge' : (resolved === 'jira' ? 'jira' : 'plan')),
+  trackerSupportsPause: vi.fn((resolved) => resolved !== 'plan'),
+  resolveBlockOnIssue: vi.fn(() => null),
+  fileProposalToForge: vi.fn().mockResolvedValue({ success: true, number: 77 }),
+  applyBlockingLabel: vi.fn().mockResolvedValue({ success: true }),
+  appendProposalToPlan: vi.fn().mockResolvedValue({ success: true }),
+  extractPlanSlugs: vi.fn(() => []),
+  listJiraIssues: vi.fn().mockResolvedValue({ ok: true, issues: [] }),
+  listJiraBlockingIssues: vi.fn().mockResolvedValue({ ok: true, issues: [] }),
+  fileProposalToJira: vi.fn().mockResolvedValue({ success: true, key: 'PROJ-1' }),
+  resolveJiraBlockKey: vi.fn(() => null),
+  applyJiraBlockingLabel: vi.fn().mockResolvedValue({ success: true }),
+  computeOutcomesReport: vi.fn(() => ''),
+  // Delivery block folded into cosMetrics (#3085). Both are pure and unit-tested in
+  // layeredIntelligence.test.js; spies here so the hook's WIRING can be asserted —
+  // that the POST-reconciliation outcomes are what get projected, and that the
+  // re-rendered document (not gatherSources' first pass) reaches buildPrompt.
+  computeDeliveryMetrics: vi.fn(() => ({
+    delivery: { totalApproved: 3, totalDelivered: 0, currentDeliveryRate: 0 },
+    deliveryByScope: { 'app-improvement': { approved: 3, delivered: 0 } }
+  })),
+  formatDeliveryThrottleGuidance: vi.fn(() => 'LI proposal throttle: unavailable — no delivery data'),
+  renderCosMetricsSource: vi.fn(() => 'RE-RENDERED COS METRICS'),
+  // selfEval (#2700). The summary's own semantics (signal sentinels, confidence,
+  // degraded guidance) are unit-tested in layeredIntelligence.test.js; these are
+  // spies so the hook's WIRING can be asserted — which inputs it feeds in.
+  computeSelfEvalSummary: vi.fn(() => 'LI self-evaluation:\n- Reasoning confidence: low'),
+  // Per-proposal-domain execution awareness (#2765). Semantics are unit-tested in
+  // layeredIntelligence.test.js; a spy here so the hook's WIRING (computed from the
+  // loaded outcomes and passed to buildPrompt) can be asserted.
+  computeProposalExecutionAwareness: vi.fn(() => ''),
+  // Cross-reference analysis (#2764 §3). Semantics are unit-tested in
+  // layeredIntelligence.test.js; a spy here so the hook's WIRING (computed from the
+  // loaded outcomes and passed to buildPrompt) can be asserted.
+  computeCrossReferenceAnalysis: vi.fn(() => ''),
+  // Hand-off routing gate (#2764 §4). Semantics are unit-tested in
+  // layeredIntelligence.test.js; here it's a spy so the hook's WIRING (consulted
+  // before enqueuing, suppressing on handoff:false) can be asserted. Defaults to
+  // "allow the hand-off" so the existing hand-off path is unaffected.
+  computeHandoffRouting: vi.fn(() => ({ handoff: true, reason: null })),
+  // Hard exclusion gate (#2824). Semantics are unit-tested in
+  // layeredIntelligence.test.js; here spies so the hook's WIRING (the notice fed to
+  // buildPrompt, the gate consulted before filing and suppressing on excluded:true)
+  // can be asserted. Default to "not excluded" / "no notice" so the existing filing
+  // path is unaffected.
+  computeHardExclusionGate: vi.fn(() => ({ excluded: false, reason: null })),
+  computeHardExclusionNotice: vi.fn(() => ''),
+  computeLiExecutionHealth: vi.fn(() => ({
+    rate: null, sample: 0, source: null, confident: false,
+    deliveryRate: null, deliverySample: 0, deliveryConfident: false
+  })),
+  readLiTaskMetrics: vi.fn().mockResolvedValue({ read: true, metrics: null }),
+  // The predicate's own semantics (listing vs. either sentinel) are unit-tested in
+  // layeredIntelligence.test.js; here it's a spy so the hook's WIRING can be
+  // asserted — that the gathered plannedWork string is what gets classified.
+  hasPlannedWorkListing: vi.fn((s) => typeof s === 'string' && !!s.trim())
+}));
+
+// Outcome-store I/O (#2428) — spies so the hook's feedback-loop wiring can be
+// asserted without touching the real collection store on disk.
+vi.mock('../layeredIntelligenceOutcomes.js', () => ({
+  recordFiledProposal: vi.fn().mockResolvedValue(true),
+  listOutcomesResult: vi.fn().mockResolvedValue({ read: true, outcomes: [] }),
+  reconcileOutcomes: vi.fn().mockResolvedValue(0),
+  // The routing gate (#2764 §4) reads the app's history lazily on the hand-off path.
+  listOutcomes: vi.fn().mockResolvedValue([])
+}));
+
+import { buildTaskInput, isTaskOutputPayload, processTaskOutput } from './layeredIntelligenceHooks.js';
+import * as li from '../layeredIntelligence.js';
+import { recordFiledProposal, listOutcomesResult, reconcileOutcomes, listOutcomes } from '../layeredIntelligenceOutcomes.js';
+import * as apps from '../apps.js';
+import { resolveAppWorkTracker, resolveRepoForgeTarget } from '../../lib/workTracker.js';
+import { tryReadFile } from '../../lib/fileUtils.js';
+import { getProviderById } from '../providers.js';
+import { getTaskInterval } from '../taskSchedule.js';
+// The REAL validator (its own module, so untouched by the `../layeredIntelligence.js`
+// mock above) — used by the #4166 end-to-end case so the envelope→reason verdict is
+// exercised through production validation, not a hand-written stub of it.
+import { validateReasonerResponse as realValidateReasonerResponse } from '../layeredIntelligence/proposal.js';
+// The shared heading both sides of the sentinel pointer use: this hook's prompt
+// names the section, agentPromptBuilder emits it.
+import { PROGRAMMATIC_OUTPUT_COMPLETION_HEADING } from '../../lib/agentSentinel.js';
+
+const APP = { id: 'app-1', name: 'App One', repoPath: '/repo', taskTypeOverrides: {} };
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  resolveAppWorkTracker.mockResolvedValue({ resolved: 'github', forge: 'gh' });
+  resolveRepoForgeTarget.mockResolvedValue({ forge: 'github', apiHost: 'github.com' });
+  getProviderById.mockImplementation(async (id) => ({ id, type: 'cli' }));
+  getTaskInterval.mockResolvedValue({ providerId: null, model: null });
+  li.getEffectiveConfig.mockReturnValue({ providerId: 'ollama', model: 'qwen', allowedScopes: ['app-improvement'], sources: {} });
+  li.filerForTracker.mockImplementation((r) => (r === 'github' || r === 'gitlab') ? 'forge' : (r === 'jira' ? 'jira' : 'plan'));
+  li.trackerSupportsPause.mockImplementation((r) => r !== 'plan');
+  // clearAllMocks resets call history but NOT a mockResolvedValue an individual test
+  // set, so restore the module default here — otherwise a test that hands back a
+  // `cosMetricsByType` (#3085) leaks the re-render into every later assertion on sources.
+  li.gatherSources.mockResolvedValue({ goals: 'be great' });
+  li.renderCosMetricsSource.mockReturnValue('RE-RENDERED COS METRICS');
+  listOutcomesResult.mockResolvedValue({ read: true, outcomes: [] });
+  li.listBlockingIssues.mockResolvedValue({ ok: true, issues: [] });
+  li.listForgeIssues.mockResolvedValue({ ok: true, issues: [] });
+  li.isAppParked.mockReturnValue(false);
+  // Hard exclusion gate (#2824): re-establish "disarmed" defaults each test —
+  // clearAllMocks resets call history but NOT a mockReturnValue an individual test set,
+  // so without this a test that arms the gate would leak into later ones.
+  li.computeHardExclusionGate.mockReturnValue({ excluded: false, reason: null });
+  li.computeHardExclusionNotice.mockReturnValue('');
+  // Same leak guard for the validator (#4166): a test that hands back a non-empty
+  // `invalidFields` would otherwise make every later run read as unparseable-response.
+  li.validateReasonerResponse.mockReturnValue({ proposal: null, pause: null, invalidFields: [] });
+});
+
+describe('buildTaskInput', () => {
+  it('skips with no-app when app is missing', async () => {
+    expect(await buildTaskInput({})).toEqual({ skip: { reason: 'no-app' } });
+  });
+
+  it('skips a parked app before building a prompt', async () => {
+    li.listBlockingIssues.mockResolvedValue({ ok: true, issues: [{ number: 5 }] });
+    li.isAppParked.mockReturnValue(true);
+    const res = await buildTaskInput({ app: APP });
+    expect(res).toEqual({ skip: { reason: 'blocking-open' } });
+    expect(li.gatherSources).not.toHaveBeenCalled();
+  });
+
+  it('skips when a failed blocking read could resume parked work', async () => {
+    li.listBlockingIssues.mockResolvedValue({ ok: false, issues: [] });
+    expect(await buildTaskInput({ app: APP })).toEqual({ skip: { reason: 'blocking-read-failed' } });
+  });
+
+  it('skips before spawning a reasoner when the gh probe is not ok (#3358)', async () => {
+    // Every downstream guard reads the forge (park check, dedup, filing), so a
+    // run started here would burn a provider call on a proposal it could neither
+    // dedup nor file — and an unreadable tracker would look like "no duplicates".
+    ensureForgeReachableMock.mockResolvedValueOnce({ ok: false, status: 'unreachable', detail: 'dial tcp' });
+    expect(await buildTaskInput({ app: APP })).toEqual({ skip: { reason: 'forge-unreachable' } });
+    expect(li.listBlockingIssues).not.toHaveBeenCalled();
+    expect(li.gatherSources).not.toHaveBeenCalled();
+  });
+
+  it('skips when the pinned provider is an api-only (harnessless) provider', async () => {
+    getProviderById.mockResolvedValue({ id: 'ollama', type: 'api' });
+    const res = await buildTaskInput({ app: APP });
+    expect(res).toEqual({ skip: { reason: 'provider-not-agent-capable' } });
+    // Short-circuits before any tracker/source I/O — nothing doomed is built.
+    expect(li.gatherSources).not.toHaveBeenCalled();
+    expect(li.listBlockingIssues).not.toHaveBeenCalled();
+  });
+
+  it('proceeds when neither a per-app nor a global provider is pinned (inherits the default coding agent)', async () => {
+    li.getEffectiveConfig.mockReturnValue({ providerId: null, model: null, allowedScopes: ['app-improvement'], sources: {} });
+    const res = await buildTaskInput({ app: APP });
+    expect(res.skip).toBeUndefined();
+    // Falls back to the global schedule pin (none here), so no provider lookup.
+    expect(getProviderById).not.toHaveBeenCalled();
+    expect(res.prompt).toContain('REASONING PROMPT');
+  });
+
+  it('skips on an api-only GLOBAL schedule provider when no per-app provider is pinned', async () => {
+    li.getEffectiveConfig.mockReturnValue({ providerId: null, model: null, allowedScopes: ['app-improvement'], sources: {} });
+    getTaskInterval.mockResolvedValue({ providerId: 'ollama', model: null });
+    getProviderById.mockResolvedValue({ id: 'ollama', type: 'api' });
+    const res = await buildTaskInput({ app: APP });
+    expect(res).toEqual({ skip: { reason: 'provider-not-agent-capable' } });
+    expect(getProviderById).toHaveBeenCalledWith('ollama');
+  });
+
+  it('self-heals a stale api per-app provider by adopting a CLI/TUI schedule pin (migration-184 residue)', async () => {
+    // Per-app override carries an api provider (what migration 184 copied from the
+    // pre-#2322 layeredIntelligence.providerId); the global Schedule page pins a
+    // real CLI/TUI provider + its matched model. LI must run on the pin, not wedge.
+    li.getEffectiveConfig.mockReturnValue({ providerId: 'ollama', model: 'qwen', allowedScopes: ['app-improvement'], sources: {} });
+    getTaskInterval.mockResolvedValue({ providerId: 'claude-ollama-tui', model: 'qwen3:35b' });
+    getProviderById.mockImplementation(async (id) => ({ id, type: id === 'claude-ollama-tui' ? 'tui' : 'api' }));
+    const res = await buildTaskInput({ app: APP });
+    expect(res.skip).toBeUndefined();
+    expect(res.prompt).toContain('REASONING PROMPT');
+    // Healed to the pin's provider + its matched model (not the stale api pair).
+    expect(res.providerId).toBe('claude-ollama-tui');
+    expect(res.model).toBe('qwen3:35b');
+  });
+
+  it('skips (does not adopt) when the schedule pin references an unresolvable provider id', async () => {
+    // Stale api per-app override + a schedule pin pointing at a provider that no
+    // longer resolves (deleted/renamed). providerTypeOf(pin) → null; adopting it
+    // would re-wedge on a doomed id, so the heal must fall through to the skip.
+    li.getEffectiveConfig.mockReturnValue({ providerId: 'ollama', model: 'qwen', allowedScopes: ['app-improvement'], sources: {} });
+    getTaskInterval.mockResolvedValue({ providerId: 'ghost-provider', model: null });
+    getProviderById.mockImplementation(async (id) => (id === 'ghost-provider' ? null : { id, type: 'api' }));
+    const res = await buildTaskInput({ app: APP });
+    expect(res).toEqual({ skip: { reason: 'provider-not-agent-capable' } });
+    expect(li.gatherSources).not.toHaveBeenCalled();
+  });
+
+  it('still skips when the per-app AND the schedule pin are both api-only (no CLI/TUI anywhere)', async () => {
+    li.getEffectiveConfig.mockReturnValue({ providerId: 'ollama', model: 'qwen', allowedScopes: ['app-improvement'], sources: {} });
+    getTaskInterval.mockResolvedValue({ providerId: 'lmstudio', model: null });
+    getProviderById.mockResolvedValue({ id: 'any', type: 'api' });
+    const res = await buildTaskInput({ app: APP });
+    expect(res).toEqual({ skip: { reason: 'provider-not-agent-capable' } });
+    expect(li.gatherSources).not.toHaveBeenCalled();
+  });
+
+  it('keeps an explicit per-app model when the provider is absent but a non-api schedule pin resolves', async () => {
+    // No per-app PROVIDER, but a per-app MODEL is set, and the global schedule pins
+    // a real CLI provider. The resolved provider is the pin; the model must stay the
+    // per-app model (matching the pre-refactor net spawn behavior), not the pin's.
+    li.getEffectiveConfig.mockReturnValue({ providerId: null, model: 'my-model', allowedScopes: ['app-improvement'], sources: {} });
+    getTaskInterval.mockResolvedValue({ providerId: 'claude-cli', model: 'pin-model' });
+    getProviderById.mockImplementation(async (id) => ({ id, type: 'cli' }));
+    const res = await buildTaskInput({ app: APP });
+    expect(res.skip).toBeUndefined();
+    expect(res.providerId).toBe('claude-cli');
+    expect(res.model).toBe('my-model');
+  });
+
+  it('adopts the schedule pin provider + model when neither a per-app provider nor model is set', async () => {
+    // No per-app provider AND no per-app model → the resolved provider/model are
+    // both the pin's, so the hook fully owns the resolution (not delegated to the
+    // generator's interval.providerId/model).
+    li.getEffectiveConfig.mockReturnValue({ providerId: null, model: null, allowedScopes: ['app-improvement'], sources: {} });
+    getTaskInterval.mockResolvedValue({ providerId: 'claude-cli', model: 'pin-model' });
+    getProviderById.mockImplementation(async (id) => ({ id, type: 'cli' }));
+    const res = await buildTaskInput({ app: APP });
+    expect(res.skip).toBeUndefined();
+    expect(res.providerId).toBe('claude-cli');
+    expect(res.model).toBe('pin-model');
+  });
+
+  it('skips a jira-tracked app with no usable jira config', async () => {
+    resolveAppWorkTracker.mockResolvedValue({ resolved: 'jira', forge: null });
+    const res = await buildTaskInput({ app: { ...APP, jira: { enabled: false } } });
+    expect(res).toEqual({ skip: { reason: 'jira-not-configured' } });
+  });
+
+  it('returns the reasoning prompt + the app-chosen provider/model on the happy path', async () => {
+    const res = await buildTaskInput({ app: APP });
+    expect(res.skip).toBeUndefined();
+    expect(res.prompt).toContain('REASONING PROMPT');
+    // The completion contract is appended. It must point at the briefing section
+    // that prints the sentinel path (the filename carries the agent id, which
+    // this hook cannot know) — by the SHARED heading constant, so the pointer
+    // can't drift from the section agentPromptBuilder emits.
+    expect(res.prompt).toContain('completion sentinel');
+    expect(res.prompt).toContain('inspect repository files and run read-only commands');
+    expect(res.prompt).toContain(PROGRAMMATIC_OUTPUT_COMPLETION_HEADING);
+    // ...and it must NOT name any other filename. A prompt that says 'not a bare
+    // `.agent-done`' is the only place the agent would learn that wrong
+    // filename exists, so naming it at all — even to forbid it — is the bug.
+    expect(res.prompt).not.toContain('.agent-done');
+    expect(res.providerId).toBe('ollama');
+    expect(res.model).toBe('qwen');
+  });
+
+  it('threads the resolved tracker coords into gatherSources so plannedWork can read the backlog (#2698)', async () => {
+    // gatherSources has no way to know WHERE the app's work lives — the hook is
+    // the only place the tracker is resolved, so it must hand it over or the
+    // plannedWork source silently no-ops.
+    await buildTaskInput({ app: APP });
+    expect(li.gatherSources).toHaveBeenCalledWith(
+      APP,
+      expect.anything(),
+      { tracker: { filer: 'forge', forgeCli: 'gh', cwd: '/repo', jira: null }, isPortos: expect.any(Boolean) }
+    );
+  });
+
+  it('threads jira coords into gatherSources for a jira-tracked app (#2698)', async () => {
+    resolveAppWorkTracker.mockResolvedValue({ resolved: 'jira', forge: null });
+    const jiraApp = { ...APP, jira: { enabled: true, instanceId: 'i1', projectKey: 'PROJ' } };
+    await buildTaskInput({ app: jiraApp });
+    expect(li.gatherSources).toHaveBeenCalledWith(
+      jiraApp,
+      expect.anything(),
+      { tracker: expect.objectContaining({ filer: 'jira', jira: expect.objectContaining({ instanceId: 'i1', projectKey: 'PROJ' }) }), isPortos: expect.any(Boolean) }
+    );
+  });
+
+  it('passes the gathered plannedWork source through to buildPrompt (#2698)', async () => {
+    li.gatherSources.mockResolvedValue({ goals: 'be great', plannedWork: '2 item(s):\n- #3 Ship X' });
+    await buildTaskInput({ app: APP });
+    expect(li.buildPrompt).toHaveBeenCalledWith(expect.objectContaining({
+      sources: expect.objectContaining({ plannedWork: expect.stringContaining('#3 Ship X') })
+    }));
+  });
+
+  it('classifies the gathered plannedWork string and tells computeOutcomesReport (#2698)', async () => {
+    li.getEffectiveConfig.mockReturnValue({ providerId: 'ollama', model: 'qwen', allowedScopes: ['app-improvement'], sources: { outcomes: true } });
+    li.gatherSources.mockResolvedValue({ goals: 'g', plannedWork: '1 item(s):\n- #3 Ship X' });
+    li.hasPlannedWorkListing.mockReturnValue(true);
+    await buildTaskInput({ app: APP });
+    // The gathered string — not some other value — is what gets classified.
+    expect(li.hasPlannedWorkListing).toHaveBeenCalledWith('1 item(s):\n- #3 Ship X');
+    expect(li.computeOutcomesReport).toHaveBeenCalledWith(expect.objectContaining({ hasPlannedWork: true }));
+
+    // A sentinel (empty/unreadable tracker) or an absent source is NOT a listing:
+    // the warning must not tell the reasoner to go review a backlog that isn't there.
+    li.computeOutcomesReport.mockClear();
+    li.hasPlannedWorkListing.mockReturnValue(false);
+    await buildTaskInput({ app: APP });
+    expect(li.computeOutcomesReport).toHaveBeenCalledWith(expect.objectContaining({ hasPlannedWork: false }));
+  });
+
+  it('skips the outcomes feedback loop when the source toggle is off', async () => {
+    li.getEffectiveConfig.mockReturnValue({ providerId: 'ollama', model: 'qwen', allowedScopes: ['app-improvement'], sources: {} });
+    await buildTaskInput({ app: APP });
+    expect(reconcileOutcomes).not.toHaveBeenCalled();
+    expect(listOutcomesResult).not.toHaveBeenCalled();
+    expect(li.buildPrompt).toHaveBeenCalledWith(expect.objectContaining({ outcomesReport: '' }));
+  });
+
+  it('reconciles + folds the outcomes report into the prompt when enabled', async () => {
+    li.getEffectiveConfig.mockReturnValue({ providerId: 'ollama', model: 'qwen', allowedScopes: ['app-improvement'], sources: { outcomes: true } });
+    listOutcomesResult.mockResolvedValue({ read: true, outcomes: [{ slug: 's', outcome: 'merged', scope: 'app-improvement' }] });
+    li.computeOutcomesReport.mockReturnValue('Recent LI proposals:\n- Total filed: 1');
+    await buildTaskInput({ app: APP });
+    expect(reconcileOutcomes).toHaveBeenCalledWith(expect.objectContaining({ appId: 'app-1' }));
+    expect(listOutcomesResult).toHaveBeenCalledWith(expect.objectContaining({ appId: 'app-1' }));
+    expect(li.buildPrompt).toHaveBeenCalledWith(expect.objectContaining({ outcomesReport: expect.stringContaining('Total filed: 1') }));
+  });
+
+  it('re-renders cosMetrics with the post-reconciliation delivery block (#3085)', async () => {
+    const metricsByType = { 'user-task': { lifetimeSuccessRate: 92, lifetimeCompleted: 25 } };
+    li.getEffectiveConfig.mockReturnValue({ providerId: 'ollama', model: 'qwen', allowedScopes: ['app-improvement'], sources: { cosMetrics: true, outcomes: true } });
+    li.gatherSources.mockResolvedValue({ goals: 'be great', cosMetrics: 'FIRST PASS', cosMetricsByType: metricsByType });
+    const outcomes = [{ slug: 's', outcome: 'merged', scope: 'app-improvement' }];
+    listOutcomesResult.mockResolvedValue({ read: true, outcomes });
+    await buildTaskInput({ app: APP });
+    // The records projected must be the reconciled ones the liOutcomes block also reads —
+    // a pre-reconcile snapshot would report a different approval count in the same prompt.
+    expect(li.computeDeliveryMetrics).toHaveBeenCalledWith(outcomes);
+    expect(li.renderCosMetricsSource).toHaveBeenCalledWith({
+      metricsByType,
+      delivery: expect.objectContaining({ delivery: expect.objectContaining({ totalApproved: 3 }) })
+    });
+    const { sources } = li.buildPrompt.mock.calls.at(-1)[0];
+    expect(sources.cosMetrics).toBe('RE-RENDERED COS METRICS');
+    // The hand-off key is internal to the re-render — it must never reach buildPrompt,
+    // where it would render as a bogus `### cosMetricsByType` source block.
+    expect('cosMetricsByType' in sources).toBe(false);
+  });
+
+  it('re-renders cosMetrics with NO delivery block when outcomes were not gathered (#3085)', async () => {
+    // Outcomes source off: omit the block rather than emit zeros, which would read as
+    // "nothing has ever been approved" instead of "we have no delivery data".
+    li.getEffectiveConfig.mockReturnValue({ providerId: 'ollama', model: 'qwen', allowedScopes: ['app-improvement'], sources: { cosMetrics: true } });
+    li.gatherSources.mockResolvedValue({ cosMetrics: 'FIRST PASS', cosMetricsByType: { 'user-task': {} } });
+    await buildTaskInput({ app: APP });
+    expect(li.computeDeliveryMetrics).not.toHaveBeenCalled();
+    expect(li.renderCosMetricsSource).toHaveBeenCalledWith(expect.objectContaining({ delivery: null }));
+  });
+
+  it('renders NO delivery block when the outcome store was unreadable (#3085)', async () => {
+    // A FAILED read is not an empty history: `read: false` must not project as
+    // "0 approved", which would tell the reasoner delivery is fine when we simply
+    // cannot see it. Distinct from the source-off case above — same required outcome,
+    // different cause, and only this one goes through the outcomes pipeline.
+    li.getEffectiveConfig.mockReturnValue({ providerId: 'ollama', model: 'qwen', allowedScopes: ['app-improvement'], sources: { cosMetrics: true, outcomes: true } })
+    li.gatherSources.mockResolvedValue({ cosMetrics: 'FIRST PASS', cosMetricsByType: { 'user-task': {} } })
+    listOutcomesResult.mockResolvedValue({ read: false, outcomes: [] })
+    await buildTaskInput({ app: APP })
+    expect(li.computeDeliveryMetrics).not.toHaveBeenCalled()
+    expect(li.renderCosMetricsSource).toHaveBeenCalledWith(expect.objectContaining({ delivery: null }))
+  })
+
+  it('leaves cosMetrics alone when the source is off (#3085)', async () => {
+    li.getEffectiveConfig.mockReturnValue({ providerId: 'ollama', model: 'qwen', allowedScopes: ['app-improvement'], sources: { outcomes: true } });
+    li.gatherSources.mockResolvedValue({ goals: 'be great' });
+    await buildTaskInput({ app: APP });
+    expect(li.renderCosMetricsSource).not.toHaveBeenCalled();
+  });
+
+  it('skips the selfEval REPORT when the source toggle is off, but still arms the hard-exclusion notice (#2700/#2824)', async () => {
+    li.getEffectiveConfig.mockReturnValue({ providerId: 'ollama', model: 'qwen', allowedScopes: ['app-improvement'], sources: {} });
+    await buildTaskInput({ app: APP });
+    expect(li.computeSelfEvalSummary).not.toHaveBeenCalled();
+    // The selfEval source toggle no longer gates the execution-health read: the hard-
+    // exclusion gate (#2824) enforces regardless of any source toggle, so its reasoner-
+    // facing notice must arm under the same condition — which needs the health stats.
+    expect(li.readLiTaskMetrics).toHaveBeenCalled();
+    expect(li.computeHardExclusionNotice).toHaveBeenCalledWith(expect.objectContaining({
+      liTaskStats: expect.objectContaining({ read: true })
+    }));
+    // The delivery throttle is not part of the optional selfEval source: every LI
+    // prompt gets it, including this source-off run (#3160).
+    expect(li.computeLiExecutionHealth).toHaveBeenCalledWith(
+      expect.objectContaining({ read: true }),
+      []
+    );
+    expect(li.formatDeliveryThrottleGuidance).toHaveBeenCalled();
+    expect(li.buildPrompt).toHaveBeenCalledWith(expect.objectContaining({
+      selfEvalReport: '',
+      deliveryThrottleReport: expect.stringContaining('LI proposal throttle')
+    }));
+  });
+
+  it('folds the selfEval summary into the prompt when enabled (#2700)', async () => {
+    li.getEffectiveConfig.mockReturnValue({ providerId: 'ollama', model: 'qwen', allowedScopes: ['app-improvement'], sources: { selfEval: true } });
+    li.computeSelfEvalSummary.mockReturnValue('LI self-evaluation:\n- Reasoning confidence: high');
+    await buildTaskInput({ app: APP });
+    expect(li.readLiTaskMetrics).toHaveBeenCalled();
+    expect(li.buildPrompt).toHaveBeenCalledWith(expect.objectContaining({
+      selfEvalReport: expect.stringContaining('Reasoning confidence: high')
+    }));
+  });
+
+  it('folds the hard-exclusion notice into the prompt from the same liTaskStats (#2824)', async () => {
+    li.getEffectiveConfig.mockReturnValue({ providerId: 'ollama', model: 'qwen', allowedScopes: ['app-improvement'], sources: { selfEval: true } });
+    li.computeHardExclusionNotice.mockReturnValue('HARD EXCLUSION GATE ARMED — 30%');
+    await buildTaskInput({ app: APP });
+    // Health stats are read once and fed to BOTH selfEval and the notice.
+    expect(li.readLiTaskMetrics).toHaveBeenCalledTimes(1);
+    expect(li.computeHardExclusionNotice).toHaveBeenCalledWith(expect.objectContaining({
+      liTaskStats: expect.objectContaining({ read: true })
+    }));
+    expect(li.buildPrompt).toHaveBeenCalledWith(expect.objectContaining({
+      hardExclusionNotice: 'HARD EXCLUSION GATE ARMED — 30%'
+    }));
+  });
+
+  it('reads outcomes DIRECTLY for the hard-exclusion notice when the outcomes source is off (#2824)', async () => {
+    // The enforcement gate reads outcomes directly (independent of the prompt-source
+    // toggle), so the notice's failing-domain list must too — else a domain the gate
+    // would exclude on is silently absent from the prompt. With the outcomes SOURCE off,
+    // the gathered `outcomes` is null, so the notice falls back to a direct listOutcomes read.
+    li.getEffectiveConfig.mockReturnValue({ providerId: 'ollama', model: 'qwen', allowedScopes: ['app-improvement'], sources: { selfEval: true } });
+    listOutcomes.mockResolvedValue([{ scope: 'app-improvement', executionOutcome: 'failure' }]);
+    await buildTaskInput({ app: APP });
+    expect(listOutcomes).toHaveBeenCalledWith(expect.objectContaining({ appId: 'app-1' }));
+    expect(li.computeHardExclusionNotice).toHaveBeenCalledWith(expect.objectContaining({
+      outcomes: [{ scope: 'app-improvement', executionOutcome: 'failure' }]
+    }));
+  });
+
+  it('passes outcomes to selfEval as null (not []) when the outcomes source is off (#2700)', async () => {
+    // The sentinel that keeps "we never gathered outcomes" from reaching the
+    // reasoner as "this app has never had a proposal merged".
+    li.getEffectiveConfig.mockReturnValue({ providerId: 'ollama', model: 'qwen', allowedScopes: ['app-improvement'], sources: { selfEval: true } });
+    await buildTaskInput({ app: APP });
+    expect(li.computeSelfEvalSummary).toHaveBeenCalledWith(expect.objectContaining({ outcomes: null }));
+  });
+
+  it('passes the gathered outcomes to selfEval when both sources are on (#2700)', async () => {
+    li.getEffectiveConfig.mockReturnValue({ providerId: 'ollama', model: 'qwen', allowedScopes: ['app-improvement'], sources: { outcomes: true, selfEval: true } });
+    listOutcomesResult.mockResolvedValue({ read: true, outcomes: [{ slug: 's', outcome: 'merged', scope: 'app-improvement' }] });
+    await buildTaskInput({ app: APP });
+    expect(li.computeSelfEvalSummary).toHaveBeenCalledWith(expect.objectContaining({
+      outcomes: [{ slug: 's', outcome: 'merged', scope: 'app-improvement' }]
+    }));
+  });
+
+  it('passes outcomes to selfEval as null when the outcome STORE could not be read (#2700)', async () => {
+    // An unreadable store must not reach the reasoner as "you have never filed a
+    // proposal" — that invites it to re-file work it already filed.
+    li.getEffectiveConfig.mockReturnValue({ providerId: 'ollama', model: 'qwen', allowedScopes: ['app-improvement'], sources: { outcomes: true, selfEval: true } });
+    listOutcomesResult.mockResolvedValue({ read: false, outcomes: [] });
+    await buildTaskInput({ app: APP });
+    expect(li.computeSelfEvalSummary).toHaveBeenCalledWith(expect.objectContaining({ outcomes: null }));
+  });
+
+  it('distinguishes a read-but-empty outcome store from an unreadable one (#2700)', async () => {
+    li.getEffectiveConfig.mockReturnValue({ providerId: 'ollama', model: 'qwen', allowedScopes: ['app-improvement'], sources: { outcomes: true, selfEval: true } });
+    listOutcomesResult.mockResolvedValue({ read: true, outcomes: [] });
+    await buildTaskInput({ app: APP });
+    // Read fine, nothing filed → `[]`, NOT the null "unavailable" sentinel.
+    expect(li.computeSelfEvalSummary).toHaveBeenCalledWith(expect.objectContaining({ outcomes: [] }));
+  });
+
+  it('passes existingIssues to selfEval, and null when the tracker read failed (#2700)', async () => {
+    li.getEffectiveConfig.mockReturnValue({ providerId: 'ollama', model: 'qwen', allowedScopes: ['app-improvement'], sources: { selfEval: true } });
+    li.listForgeIssues.mockResolvedValue({ ok: true, issues: [{ slug: 'a', state: 'open' }] });
+    await buildTaskInput({ app: APP });
+    expect(li.computeSelfEvalSummary).toHaveBeenCalledWith(expect.objectContaining({
+      existingIssues: [{ slug: 'a', state: 'open' }]
+    }));
+
+    // A blown read yields `[]` from readIssues — which must NOT reach selfEval as
+    // "you have filed nothing", or it licenses a duplicate re-file off a blind read.
+    li.computeSelfEvalSummary.mockClear();
+    li.listForgeIssues.mockResolvedValue({ ok: false, issues: [] });
+    await buildTaskInput({ app: APP });
+    expect(li.computeSelfEvalSummary).toHaveBeenCalledWith(expect.objectContaining({ existingIssues: null }));
+  });
+
+  it('runs the feedback loop on a plan tracker when outcomes is enabled (#2435)', async () => {
+    resolveAppWorkTracker.mockResolvedValue({ resolved: 'plan', forge: null });
+    li.getEffectiveConfig.mockReturnValue({ providerId: 'ollama', model: 'qwen', allowedScopes: ['app-improvement'], sources: { outcomes: true } });
+    // The plan branch reads PLAN.md → a checked item reconciles like a forge issue.
+    tryReadFile.mockResolvedValue('- [x] [lil-add-metrics] done');
+    li.extractPlanSlugs.mockReturnValue([{ slug: 'add-metrics', state: 'closed' }]);
+    listOutcomesResult.mockResolvedValue({ read: true, outcomes: [{ slug: 'add-metrics', outcome: 'merged', scope: 'app-improvement' }] });
+    li.computeOutcomesReport.mockReturnValue('Recent LI proposals:\n- Total filed: 1');
+    await buildTaskInput({ app: APP });
+    expect(reconcileOutcomes).toHaveBeenCalledWith(expect.objectContaining({
+      appId: 'app-1',
+      existingIssues: [{ slug: 'add-metrics', state: 'closed' }]
+    }));
+    expect(listOutcomesResult).toHaveBeenCalledWith(expect.objectContaining({ appId: 'app-1' }));
+    expect(li.buildPrompt).toHaveBeenCalledWith(expect.objectContaining({ outcomesReport: expect.stringContaining('Total filed: 1') }));
+  });
+});
+
+describe('processTaskOutput', () => {
+  beforeEach(() => {
+    apps.getAppById.mockResolvedValue(APP);
+  });
+
+  it('records a no-op when the agent failed', async () => {
+    const out = await processTaskOutput({ appId: 'app-1', success: false, payload: { proposal: {} } });
+    expect(out).toMatchObject({ action: 'no-op', reason: 'agent-failed' });
+    expect(apps.updateAppLayeredIntelligence).toHaveBeenCalledWith('app-1', expect.objectContaining({ lastRunAction: 'no-op' }));
+    expect(li.fileProposalToForge).not.toHaveBeenCalled();
+  });
+
+  it('records unparseable-response when the payload is null', async () => {
+    li.validateReasonerResponse.mockReturnValue({ proposal: null, pause: null, invalidFields: [] });
+    const out = await processTaskOutput({ appId: 'app-1', success: true, payload: null });
+    expect(out).toMatchObject({ action: 'no-op', reason: 'unparseable-response' });
+  });
+
+  it('records unparseable-response when the payload parsed but is not a reasoner envelope (#2727)', async () => {
+    // Garbage that still parses as JSON: a bare scalar/array, or an object carrying
+    // none of the documented keys. All of it used to land on `no-proposal` — the
+    // SAME reason a well-formed "nothing to propose" response gets — so garbage was
+    // indistinguishable from a correct empty answer and got recorded as a
+    // successful run. `{}` is reachable: the sentinel envelope only requires
+    // `payload` to be an object.
+    li.validateReasonerResponse.mockReturnValue({ proposal: null, pause: null, invalidFields: [] });
+    for (const payload of ['just some prose', 42, ['a', 'b'], true, {}, { foo: 1 }]) {
+      const out = await processTaskOutput({ appId: 'app-1', success: true, payload });
+      expect(out).toMatchObject({ action: 'no-op', reason: 'unparseable-response' });
+    }
+  });
+
+  it('still records no-proposal for a well-formed envelope that proposes nothing (#2727)', async () => {
+    // The other side of the sentinel: the reasoner answered correctly and simply
+    // had nothing to file. That is a successful run, not malformed output. Any ONE
+    // documented key makes it a real answer.
+    li.validateReasonerResponse.mockReturnValue({ proposal: null, pause: null, invalidFields: [] });
+    for (const payload of [{ analysis: 'nothing worth proposing', proposal: null }, { proposal: null }, { analysis: '' }]) {
+      const out = await processTaskOutput({ appId: 'app-1', success: true, payload });
+      expect(out).toMatchObject({ action: 'no-op', reason: 'no-proposal' });
+    }
+  });
+
+  it('records unparseable-response when a supplied proposal failed validation (#2727)', async () => {
+    // The reasoner ATTEMPTED a proposal and emitted the wrong shape (no scope/title,
+    // bad slug). That is malformed output, not "I looked and found nothing" — both
+    // used to land on `no-proposal` and count as a successful run.
+    li.validateReasonerResponse.mockReturnValue({ proposal: null, pause: null, invalidFields: ['proposal'] });
+    const out = await processTaskOutput({ appId: 'app-1', success: true, payload: { analysis: 'x', proposal: { title: '' } } });
+    expect(out).toMatchObject({ action: 'no-op', reason: 'unparseable-response' });
+  });
+
+  it('records unparseable-response for a wrong-typed NON-deliverable field (#4166)', async () => {
+    // `{"analysis": 7}` is an envelope (it carries a documented key) that supplies a
+    // field it then gets wrong. Pre-#4166 the deliverable-only check let it through as
+    // `no-proposal`, i.e. a successful run indistinguishable from a correct empty
+    // answer. Any field validateReasonerResponse reports in `invalidFields` now counts.
+    for (const [payload, invalidFields] of [
+      [{ analysis: 7 }, ['analysis']],
+      [{ analysis: 'x', pause: { reason: 'no target' } }, ['pause']],
+      [{ analysis: [], pause: 3 }, ['analysis', 'pause']]
+    ]) {
+      li.validateReasonerResponse.mockReturnValue({ proposal: null, pause: null, invalidFields });
+      const out = await processTaskOutput({ appId: 'app-1', success: true, payload });
+      expect(out).toMatchObject({ action: 'no-op', reason: 'unparseable-response' });
+    }
+  });
+
+  it('reaches the same verdict through the REAL validator (#4166)', async () => {
+    // End-to-end over the two halves this suite otherwise stubs apart: the real
+    // envelope validation feeding the real reason classification.
+    li.validateReasonerResponse.mockImplementation(realValidateReasonerResponse);
+    for (const payload of [{ analysis: 7 }, { analysis: 'x', pause: { reason: 'no target' } }, { proposal: { title: '' } }]) {
+      const out = await processTaskOutput({ appId: 'app-1', success: true, payload });
+      expect(out).toMatchObject({ action: 'no-op', reason: 'unparseable-response' });
+    }
+    for (const payload of [{ analysis: 'nothing worth proposing', proposal: null }, { analysis: '' }]) {
+      const out = await processTaskOutput({ appId: 'app-1', success: true, payload });
+      expect(out).toMatchObject({ action: 'no-op', reason: 'no-proposal' });
+    }
+  });
+
+  it('logs which envelope fields were unusable (#4166)', async () => {
+    // `unparseable-response` alone can't tell an operator whether the model returned
+    // no JSON at all or one wrong-typed key — the offending names must reach the log.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    li.validateReasonerResponse.mockReturnValue({ proposal: null, pause: null, invalidFields: ['analysis', 'pause'] });
+    await processTaskOutput({ appId: 'app-1', success: true, payload: { analysis: 7, pause: 3 } });
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('analysis, pause'));
+    warn.mockRestore();
+  });
+
+  it('treats an explicit proposal:null as a legitimate empty answer, not malformed (#2727)', async () => {
+    li.validateReasonerResponse.mockReturnValue({ proposal: null, pause: null, invalidFields: [] });
+    const out = await processTaskOutput({ appId: 'app-1', success: true, payload: { analysis: 'nothing to propose', proposal: null } });
+    expect(out).toMatchObject({ action: 'no-op', reason: 'no-proposal' });
+  });
+
+  it('does not touch the tracker when there is no proposal to dedup (#2727)', async () => {
+    // readIssues is an unbounded forge call and only the has-a-proposal branch
+    // consumes it. Since the #2727 hoist the hook runs while the agent still holds
+    // a CoS concurrency slot, so the common no-op path must not shell out to `gh`.
+    li.validateReasonerResponse.mockReturnValue({ proposal: null, pause: null, invalidFields: [] });
+    li.listForgeIssues.mockClear();
+    await processTaskOutput({ appId: 'app-1', success: true, payload: { analysis: 'nothing to do', proposal: null } });
+    expect(li.listForgeIssues).not.toHaveBeenCalled();
+    expect(li.fileProposalToForge).not.toHaveBeenCalled();
+  });
+
+  it('still reads the tracker to dedup when there IS a proposal (#2727)', async () => {
+    // The other side of the scoping: the dedup read must still happen on the path
+    // that consumes it, against FRESH tracker state.
+    li.validateReasonerResponse.mockReturnValue({
+      proposal: { scope: 'app-improvement', slug: 'fresh-idea', title: 'Fresh idea', body: 'x' },
+      pause: null
+    });
+    li.listForgeIssues.mockClear();
+    li.fileProposalToForge.mockResolvedValue({ success: true, number: 12 });
+    await processTaskOutput({ appId: 'app-1', success: true, payload: { proposal: { slug: 'fresh-idea' } } });
+    expect(li.listForgeIssues).toHaveBeenCalled();
+  });
+
+  it('files a fresh, in-scope proposal and records the ref', async () => {
+    li.validateReasonerResponse.mockReturnValue({
+      proposal: { scope: 'app-improvement', slug: 'add-telemetry', title: 'Add telemetry', body: 'do it' },
+      pause: null
+    });
+    li.fileProposalToForge.mockResolvedValue({ success: true, number: 77 });
+    const out = await processTaskOutput({ appId: 'app-1', success: true, payload: { proposal: {} } });
+    expect(li.fileProposalToForge).toHaveBeenCalled();
+    expect(li.fileProposalToForge).toHaveBeenCalledWith(expect.objectContaining({ hostname: 'github.com' }));
+    expect(out).toMatchObject({ action: 'filed', filedNumber: 77, reason: null });
+    expect(apps.updateAppLayeredIntelligence).toHaveBeenCalledWith('app-1', expect.objectContaining({ lastRunAction: 'filed', lastRunRef: '#77' }));
+  });
+
+  it('hard-excludes a proposal before filing when the gate fires (#2824)', async () => {
+    li.validateReasonerResponse.mockReturnValue({
+      proposal: { scope: 'loop-meta', slug: 'fix-loop', title: 'Fix the loop', body: 'do it' },
+      pause: null
+    });
+    li.computeHardExclusionGate.mockReturnValue({ excluded: true, rule: 'self-improve-scope', reason: 'LI execution health 30% (< 75%) — self-improve-scoped proposals (loop-meta) are excluded' });
+    const out = await processTaskOutput({ appId: 'app-1', success: true, payload: { proposal: {} } });
+    // The gate was consulted with the validated proposal…
+    expect(li.computeHardExclusionGate).toHaveBeenCalledWith(expect.objectContaining({
+      proposal: expect.objectContaining({ scope: 'loop-meta' })
+    }));
+    // …and filing was suppressed entirely.
+    expect(li.fileProposalToForge).not.toHaveBeenCalled();
+    expect(out).toMatchObject({ action: 'excluded', reason: 'hard-gate-excluded' });
+  });
+
+  it('records the filed proposal for the feedback loop only when outcomes is enabled', async () => {
+    li.validateReasonerResponse.mockReturnValue({
+      proposal: { scope: 'app-improvement', slug: 'add-telemetry', title: 'Add telemetry', body: 'do it' },
+      pause: null
+    });
+    li.fileProposalToForge.mockResolvedValue({ success: true, number: 77 });
+
+    // Off: no outcome record written.
+    li.getEffectiveConfig.mockReturnValue({ allowedScopes: ['app-improvement'], sources: {} });
+    await processTaskOutput({ appId: 'app-1', success: true, payload: { proposal: {} } });
+    expect(recordFiledProposal).not.toHaveBeenCalled();
+
+    // On: the filed proposal is recorded with its ref, scope, and tracker.
+    li.getEffectiveConfig.mockReturnValue({ allowedScopes: ['app-improvement'], sources: { outcomes: true } });
+    await processTaskOutput({ appId: 'app-1', success: true, payload: { proposal: {} } });
+    expect(recordFiledProposal).toHaveBeenCalledWith(expect.objectContaining({
+      appId: 'app-1', slug: 'add-telemetry', issueRef: '#77', scope: 'app-improvement', tracker: 'github'
+    }));
+  });
+
+  it('records a plan-filed proposal for the feedback loop (#2435)', async () => {
+    // A `plan` tracker now reconciles outcomes too — a proposal appended to
+    // PLAN.md is recorded so a later run can read back its checked/unchecked fate.
+    resolveAppWorkTracker.mockResolvedValue({ resolved: 'plan', forge: null });
+    li.validateReasonerResponse.mockReturnValue({
+      proposal: { scope: 'app-improvement', slug: 'add-metrics', title: 'Add metrics', body: 'do it' },
+      pause: null
+    });
+    li.appendProposalToPlan.mockResolvedValue({ success: true });
+    li.getEffectiveConfig.mockReturnValue({ allowedScopes: ['app-improvement'], sources: { outcomes: true } });
+    const out = await processTaskOutput({ appId: 'app-1', success: true, payload: { proposal: {} } });
+    expect(li.appendProposalToPlan).toHaveBeenCalled();
+    expect(out).toMatchObject({ action: 'filed', reason: null });
+    expect(recordFiledProposal).toHaveBeenCalledWith(expect.objectContaining({
+      appId: 'app-1', slug: 'add-metrics', scope: 'app-improvement', tracker: 'plan'
+    }));
+  });
+
+  it('hands off a trivial+safe proposal in a healthy domain (routing allows) (#2764 §4)', async () => {
+    li.validateReasonerResponse.mockReturnValue({
+      proposal: { scope: 'app-improvement', slug: 'quick-fix', title: 'Quick fix', body: 'x', complexity: 'trivial', safe: true },
+      pause: null
+    });
+    li.fileProposalToForge.mockResolvedValue({ success: true, number: 88 });
+    li.isHandoffEligible.mockReturnValue(true);
+    li.computeHandoffRouting.mockReturnValue({ handoff: true, reason: null });
+    li.getEffectiveConfig.mockReturnValue({ allowedScopes: ['app-improvement'], sources: { outcomes: true }, handoff: { enabled: true } });
+    const enqueueHandoff = vi.fn().mockResolvedValue({ id: 't-1', duplicate: false });
+    const out = await processTaskOutput({ appId: 'app-1', success: true, payload: { proposal: {} } }, { enqueueHandoff });
+    // The routing gate was consulted with the loaded history, then allowed the enqueue.
+    expect(listOutcomes).toHaveBeenCalledWith(expect.objectContaining({ appId: 'app-1' }));
+    expect(li.computeHandoffRouting).toHaveBeenCalled();
+    expect(enqueueHandoff).toHaveBeenCalled();
+    expect(out).toMatchObject({ action: 'filed', reason: null, handedOff: true, handoffRouted: false });
+  });
+
+  it('files but does NOT auto-hand-off a trivial+safe proposal in a chronically-failing domain (#2764 §4)', async () => {
+    li.validateReasonerResponse.mockReturnValue({
+      proposal: { scope: 'app-improvement', slug: 'risky-here', title: 'Risky here', body: 'x', complexity: 'trivial', safe: true },
+      pause: null
+    });
+    li.fileProposalToForge.mockResolvedValue({ success: true, number: 89 });
+    li.isHandoffEligible.mockReturnValue(true);
+    // The domain's own hand-offs chronically fail → route to a human instead.
+    li.computeHandoffRouting.mockReturnValue({
+      handoff: false,
+      domain: 'app-improvement',
+      rate: 33,
+      n: 3,
+      cause: 'failing mostly on planning (2)',
+      reason: 'app-improvement hand-offs succeed 33% over 3 executed — filing for human review instead of auto-hand-off (failing mostly on planning (2))'
+    });
+    li.getEffectiveConfig.mockReturnValue({ allowedScopes: ['app-improvement'], sources: { outcomes: true }, handoff: { enabled: true } });
+    const enqueueHandoff = vi.fn().mockResolvedValue({ id: 't-2', duplicate: false });
+    const out = await processTaskOutput({ appId: 'app-1', success: true, payload: { proposal: {} } }, { enqueueHandoff });
+    // Filed for a human, but the coding agent was NOT enqueued.
+    expect(li.fileProposalToForge).toHaveBeenCalled();
+    expect(enqueueHandoff).not.toHaveBeenCalled();
+    // The proposal WAS filed successfully — filing-for-human is the good outcome, not a failure.
+    expect(out).toMatchObject({
+      action: 'filed',
+      reason: null,
+      handedOff: false,
+      handoffRouted: true,
+      handoffRoutingReason: expect.stringContaining('filing for human review instead of auto-hand-off')
+    });
+  });
+
+  it('reports a re-proposed already-tracked PLAN slug as duplicate without resetting its outcome (#2435)', async () => {
+    // Since #2620 a checked `- [x]` item stays within the dedup window, so this
+    // path normally never reaches the append. Belt-and-suspenders: should the
+    // dedup guard ever miss, appendProposalToPlan writes nothing (tag already
+    // present) and returns duplicate — the hook must NOT report `filed` or
+    // record a fresh outcome.
+    resolveAppWorkTracker.mockResolvedValue({ resolved: 'plan', forge: null });
+    li.validateReasonerResponse.mockReturnValue({
+      proposal: { scope: 'app-improvement', slug: 'add-metrics', title: 'Add metrics', body: 'do it' },
+      pause: null
+    });
+    li.isProposalDuplicate.mockReturnValue(false); // simulate a dedup-guard miss
+    li.appendProposalToPlan.mockResolvedValue({ success: true, duplicate: true });
+    li.getEffectiveConfig.mockReturnValue({ allowedScopes: ['app-improvement'], sources: { outcomes: true } });
+    const out = await processTaskOutput({ appId: 'app-1', success: true, payload: { proposal: {} } });
+    expect(out).toMatchObject({ action: 'duplicate', reason: 'duplicate' });
+    expect(recordFiledProposal).not.toHaveBeenCalled();
+  });
+
+  it('suppresses an exact-duplicate proposal without filing', async () => {
+    li.validateReasonerResponse.mockReturnValue({
+      proposal: { scope: 'app-improvement', slug: 'dup', title: 'Dup', body: 'x' },
+      pause: null
+    });
+    li.isProposalDuplicate.mockReturnValue(true);
+    const out = await processTaskOutput({ appId: 'app-1', success: true, payload: { proposal: {} } });
+    expect(li.fileProposalToForge).not.toHaveBeenCalled();
+    expect(out).toMatchObject({ action: 'duplicate', reason: 'duplicate' });
+  });
+
+  it('suppresses filing when the tracker read failed (avoids a blind duplicate)', async () => {
+    li.validateReasonerResponse.mockReturnValue({
+      proposal: { scope: 'app-improvement', slug: 's', title: 'T', body: 'b' },
+      pause: null
+    });
+    li.listForgeIssues.mockResolvedValue({ ok: false, issues: [] });
+    const out = await processTaskOutput({ appId: 'app-1', success: true, payload: { proposal: {} } });
+    expect(li.fileProposalToForge).not.toHaveBeenCalled();
+    expect(out).toMatchObject({ action: 'tracker-read-failed', reason: 'tracker-read-failed' });
+  });
+
+  it('no-ops when the app cannot be loaded', async () => {
+    apps.getAppById.mockResolvedValue(null);
+    const out = await processTaskOutput({ appId: 'missing', success: true, payload: {} });
+    expect(out).toEqual({ action: 'no-op', reason: 'app-not-found' });
+  });
+});
+
+describe('isTaskOutputPayload (#3640)', () => {
+  // The transcript rescue in agentFinalization adopts printed JSON only when this
+  // says it is a reasoner envelope, and processTaskOutput then judges it by the
+  // SAME predicate — a looser rescue would hand the hook a shape it rejects as
+  // `unparseable-response`.
+  it('accepts an object carrying any documented reasoner key', () => {
+    expect(isTaskOutputPayload({ analysis: 'a' })).toBe(true);
+    expect(isTaskOutputPayload({ proposal: null })).toBe(true);
+    expect(isTaskOutputPayload({ pause: { until: 'x' } })).toBe(true);
+  });
+
+  it('rejects a non-envelope: junk objects, arrays, scalars, and inherited keys', () => {
+    expect(isTaskOutputPayload({})).toBe(false);
+    expect(isTaskOutputPayload({ tokens: 1200 })).toBe(false);
+    expect(isTaskOutputPayload([{ analysis: 'a' }])).toBe(false);
+    expect(isTaskOutputPayload('analysis')).toBe(false);
+    expect(isTaskOutputPayload(null)).toBe(false);
+    expect(isTaskOutputPayload(Object.create({ analysis: 'inherited' }))).toBe(false);
+  });
+});

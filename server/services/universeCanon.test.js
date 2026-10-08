@@ -1,0 +1,743 @@
+import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
+import { rmSync, mkdirSync } from 'fs';
+import { mockNoPeerSync, mockNoPeers, mockPathsDataRoot } from '../lib/mockPathsDataRoot.js';
+
+// Real tmpdir backing the per-record store. `mockPathsDataRoot` redirects
+// PATHS.data so collectionStore lands under tempRoot/universes/. Everything
+// else from fileUtils (atomicWrite, readJSONFile, ensureDir) is the real impl.
+const { tempRoot, makeProxy, cleanup } = mockPathsDataRoot({ prefix: 'portos-universe-canon-' });
+afterAll(cleanup);
+
+vi.mock('../lib/fileUtils.js', async () => {
+  const actual = await vi.importActual('../lib/fileUtils.js');
+  return {
+    ...makeProxy(actual),
+    // Stub: pretend every referenced sheet file exists, so the GET-time lazy
+    // `pruneStaleReferenceSheets` doesn't null out pointers between seed and
+    // assertion. The purge tests below don't depend on stale-collapse behavior.
+    resolveImageRef: vi.fn((filename) => (filename ? `${tempRoot}/image-refs/${filename}` : null)),
+  };
+});
+
+let uuidCounter = 0;
+const mockUuid = (n) => `uuid-${String(n).padStart(8, '0')}`;
+vi.mock('crypto', async () => {
+  const actual = await vi.importActual('crypto');
+  return { ...actual, randomUUID: () => mockUuid(++uuidCounter) };
+});
+
+// Stub instances.js so createUniverse's fire-and-forget autoSubscribeRecordToAllPeers
+// doesn't fan the fixture out to real peers (getPeers reads the live registry via a
+// dataPath closure to the real PATHS once the post-return microtask runs outside this
+// file's fileUtils mock window). Mirrors importer.test.js / promoteToPipeline.test.js.
+vi.mock('./instances.js', () => mockNoPeers());
+vi.mock('./sharing/peerSync.js', () => mockNoPeerSync());
+
+// The bible extractor + staged-LLM runner + prompt-refine helpers all reach
+// out to live AI providers. Stub them to return deterministic shapes so we
+// can test lock semantics without spinning up a model.
+const extractBibleMock = vi.fn();
+vi.mock('./bibleExtractor.js', () => ({
+  extractBible: (...args) => extractBibleMock(...args),
+}));
+
+const runStagedLLMMock = vi.fn();
+vi.mock('./stageRunner.js', () => ({
+  runStagedLLM: (...args) => runStagedLLMMock(...args),
+}));
+
+const runPromptRefineMock = vi.fn();
+vi.mock('./pipeline/refineHelpers.js', () => ({
+  runPromptRefine: (...args) => runPromptRefineMock(...args),
+}));
+
+const svc = await import('./universeBuilder.js');
+const canonSvc = await import('./universeCanon.js');
+
+const seedUniverseWithCharacters = async (characters) => {
+  const w = await svc.createUniverse({
+    name: 'Test Universe',
+    starterPrompt: 'test seed',
+    stylePrompt: 'test style',
+  });
+  // Bypass the route schema to plant canon entries directly via updateUniverse.
+  return svc.updateUniverse(w.id, { characters });
+};
+
+beforeEach(() => {
+  rmSync(tempRoot, { recursive: true, force: true });
+  mkdirSync(tempRoot, { recursive: true });
+  uuidCounter = 0;
+  extractBibleMock.mockReset();
+  runStagedLLMMock.mockReset();
+  runPromptRefineMock.mockReset();
+});
+
+describe('universeCanon — setCanonEntryLock', () => {
+  it('toggles locked: true on the target entry and persists', async () => {
+    const w = await seedUniverseWithCharacters([
+      { name: 'Alex', physicalDescription: 'jacket' },
+    ]);
+    const entryId = w.characters[0].id;
+    const { entry } = await canonSvc.setCanonEntryLock(w.id, 'character', entryId, true);
+    expect(entry.locked).toBe(true);
+    // Persisted: a fresh read finds it locked.
+    const reread = (await svc.listUniverses())[0];
+    expect(reread.characters.find((c) => c.id === entryId).locked).toBe(true);
+  });
+
+  it('persists explicit locked: false on unlock so the bit survives round-trips', async () => {
+    // After PR #N the universe-builder canon contract is "locked by default":
+    // a missing `locked` field reads as locked. Unlock therefore MUST persist
+    // explicit `false` rather than collapsing to absent — otherwise the next
+    // read of the same record would re-lock it.
+    const w = await seedUniverseWithCharacters([
+      { name: 'Alex', physicalDescription: 'jacket', locked: true },
+    ]);
+    const entryId = w.characters[0].id;
+    const { entry } = await canonSvc.setCanonEntryLock(w.id, 'character', entryId, false);
+    expect(entry.locked).toBe(false);
+    const reread = (await svc.listUniverses())[0];
+    expect(reread.characters.find((c) => c.id === entryId).locked).toBe(false);
+  });
+
+  it('rejects unknown kind with a 400-coded ServerError', async () => {
+    const w = await seedUniverseWithCharacters([
+      { name: 'Alex', physicalDescription: 'jacket' },
+    ]);
+    await expect(
+      canonSvc.setCanonEntryLock(w.id, 'monster', w.characters[0].id, true),
+    ).rejects.toMatchObject({ status: 400, code: 'UNIVERSE_CANON_INVALID_KIND' });
+  });
+
+  it('rejects unknown entry with a 404-coded ServerError', async () => {
+    const w = await seedUniverseWithCharacters([
+      { name: 'Alex', physicalDescription: 'jacket' },
+    ]);
+    await expect(
+      canonSvc.setCanonEntryLock(w.id, 'character', 'chr-not-real', true),
+    ).rejects.toMatchObject({ status: 404, code: 'UNIVERSE_CANON_NOT_FOUND' });
+  });
+});
+
+describe('universeCanon — removeCanonEntry', () => {
+  it('drops only the target entry, persists, and scrubs neither its image refs nor its catalog link', async () => {
+    // Removal is scoped to the canon array: it must not purge imageRefs (the
+    // files stay in the gallery) or the shared catalog ingredient the entry
+    // points at. Asserting on the RETURNED entry proves the service hands back
+    // the record whole rather than a stripped shell; the sibling assertions
+    // prove no cross-entry ref purge ran.
+    const w = await seedUniverseWithCharacters([
+      { name: 'Alex', physicalDescription: 'jacket', imageRefs: ['alex-a.png', 'alex-b.png'], primaryImageRef: 'alex-a.png', ingredientId: 'ing-alex' },
+      { name: 'Blair', physicalDescription: 'scarf', imageRefs: ['blair.png'], ingredientId: 'ing-blair' },
+    ]);
+    const target = w.characters.find((c) => c.name === 'Alex');
+    const { entry, universe } = await canonSvc.removeCanonEntry(w.id, 'character', target.id);
+    expect(entry.name).toBe('Alex');
+    expect(entry.imageRefs).toEqual(['alex-a.png', 'alex-b.png']);
+    expect(entry.primaryImageRef).toBe('alex-a.png');
+    expect(entry.ingredientId).toBe('ing-alex');
+    expect(universe.characters.map((c) => c.name)).toEqual(['Blair']);
+    const survivor = universe.characters[0];
+    expect(survivor.imageRefs).toEqual(['blair.png']);
+    expect(survivor.ingredientId).toBe('ing-blair');
+    // Persisted: a fresh read no longer carries the removed entry.
+    const reread = (await svc.listUniverses())[0];
+    expect(reread.characters.map((c) => c.name)).toEqual(['Blair']);
+  });
+
+  it('removes a locked entry — the lock guards AI rewrites, not user removal', async () => {
+    const w = await seedUniverseWithCharacters([
+      { name: 'Alex', physicalDescription: 'jacket', locked: true },
+    ]);
+    const target = w.characters[0];
+    const { universe } = await canonSvc.removeCanonEntry(w.id, 'character', target.id);
+    expect(universe.characters).toEqual([]);
+  });
+
+  it('removes from the places and objects buckets too', async () => {
+    const seeded = await seedUniverseWithCharacters([]);
+    const w = await svc.updateUniverse(seeded.id, {
+      places: [{ name: 'The Vault', slugline: 'INT. THE VAULT', description: 'a room' }],
+      objects: [{ name: 'The Key', description: 'brass' }],
+    });
+    const afterPlace = await canonSvc.removeCanonEntry(w.id, 'place', w.places[0].id);
+    expect(afterPlace.universe.places).toEqual([]);
+    expect(afterPlace.universe.objects).toHaveLength(1);
+    const afterObject = await canonSvc.removeCanonEntry(w.id, 'object', w.objects[0].id);
+    expect(afterObject.universe.objects).toEqual([]);
+  });
+
+  it('rejects unknown kind with a 400-coded ServerError', async () => {
+    const w = await seedUniverseWithCharacters([{ name: 'Alex', physicalDescription: 'jacket' }]);
+    await expect(
+      canonSvc.removeCanonEntry(w.id, 'monster', w.characters[0].id),
+    ).rejects.toMatchObject({ status: 400, code: 'UNIVERSE_CANON_INVALID_KIND' });
+  });
+
+  it('rejects unknown entry with a 404-coded ServerError', async () => {
+    const w = await seedUniverseWithCharacters([{ name: 'Alex', physicalDescription: 'jacket' }]);
+    await expect(
+      canonSvc.removeCanonEntry(w.id, 'character', 'chr-not-real'),
+    ).rejects.toMatchObject({ status: 404, code: 'UNIVERSE_CANON_NOT_FOUND' });
+  });
+});
+
+describe('universeCanon — applyCanonImageCorrection', () => {
+  it('overwrites the descriptor field and pins the image as primaryImageRef', async () => {
+    const w = await seedUniverseWithCharacters([
+      { name: 'Alex', physicalDescription: 'stale description', imageRefs: ['old.png'], locked: false },
+    ]);
+    const entryId = w.characters[0].id;
+    const { entry } = await canonSvc.applyCanonImageCorrection(w.id, 'character', entryId, {
+      description: 'a corrected description', imageFilename: 'new.png',
+    });
+    expect(entry.physicalDescription).toBe('a corrected description');
+    expect(entry.imageRefs).toEqual(['old.png', 'new.png']);
+    expect(entry.primaryImageRef).toBe('new.png');
+    // Persisted: a fresh read reflects the same correction.
+    const reread = (await svc.listUniverses())[0];
+    const rereadEntry = reread.characters.find((c) => c.id === entryId);
+    expect(rereadEntry.physicalDescription).toBe('a corrected description');
+    expect(rereadEntry.primaryImageRef).toBe('new.png');
+  });
+
+  it('does not duplicate the image if it is already in imageRefs', async () => {
+    const w = await seedUniverseWithCharacters([
+      { name: 'Alex', physicalDescription: 'stale', imageRefs: ['already-there.png'], locked: false },
+    ]);
+    const entryId = w.characters[0].id;
+    const { entry } = await canonSvc.applyCanonImageCorrection(w.id, 'character', entryId, {
+      description: 'corrected', imageFilename: 'already-there.png',
+    });
+    expect(entry.imageRefs).toEqual(['already-there.png']);
+    expect(entry.primaryImageRef).toBe('already-there.png');
+  });
+
+  it('rejects a locked entry with a 409-coded ServerError', async () => {
+    const w = await seedUniverseWithCharacters([
+      { name: 'Alex', physicalDescription: 'stale', locked: true },
+    ]);
+    await expect(
+      canonSvc.applyCanonImageCorrection(w.id, 'character', w.characters[0].id, {
+        description: 'corrected', imageFilename: 'new.png',
+      }),
+    ).rejects.toMatchObject({ status: 409, code: 'UNIVERSE_CANON_LOCKED' });
+  });
+
+  it('rejects unknown kind with a 400-coded ServerError', async () => {
+    const w = await seedUniverseWithCharacters([{ name: 'Alex', physicalDescription: 'stale' }]);
+    await expect(
+      canonSvc.applyCanonImageCorrection(w.id, 'monster', w.characters[0].id, {
+        description: 'corrected', imageFilename: 'new.png',
+      }),
+    ).rejects.toMatchObject({ status: 400, code: 'UNIVERSE_CANON_INVALID_KIND' });
+  });
+
+  it('rejects unknown entry with a 404-coded ServerError', async () => {
+    const w = await seedUniverseWithCharacters([{ name: 'Alex', physicalDescription: 'stale' }]);
+    await expect(
+      canonSvc.applyCanonImageCorrection(w.id, 'character', 'chr-not-real', {
+        description: 'corrected', imageFilename: 'new.png',
+      }),
+    ).rejects.toMatchObject({ status: 404, code: 'UNIVERSE_CANON_NOT_FOUND' });
+  });
+
+  it('rejects a blank description', async () => {
+    const w = await seedUniverseWithCharacters([{ name: 'Alex', physicalDescription: 'stale' }]);
+    await expect(
+      canonSvc.applyCanonImageCorrection(w.id, 'character', w.characters[0].id, {
+        description: '   ', imageFilename: 'new.png',
+      }),
+    ).rejects.toMatchObject({ status: 400, code: 'VALIDATION_ERROR' });
+  });
+});
+
+describe('universeCanon — setCanonKindLockAll', () => {
+  it('locks every entry of the kind, counts only entries whose state changed', async () => {
+    // Two already-locked + one explicitly-unlocked: only the unlocked entry
+    // should count toward `changed`. Pins the "no-op on already-target"
+    // contract that the toast relies on for "Locked N characters".
+    const w = await seedUniverseWithCharacters([
+      { name: 'Alex', physicalDescription: 'a', locked: true },
+      { name: 'Beth', physicalDescription: 'b', locked: true },
+      { name: 'Cara', physicalDescription: 'c', locked: false },
+    ]);
+    const result = await canonSvc.setCanonKindLockAll(w.id, 'character', true);
+    expect(result.changed).toBe(1);
+    expect(result.total).toBe(3);
+    expect(result.locked).toBe(true);
+    // Persisted: every entry comes back `locked: true` on the next read.
+    const reread = (await svc.listUniverses())[0];
+    expect(reread.characters.every((c) => c.locked === true)).toBe(true);
+  });
+
+  it('unlock-all writes explicit locked:false so the bit survives the lock-by-default sanitizer', async () => {
+    const w = await seedUniverseWithCharacters([
+      { name: 'Alex', physicalDescription: 'a', locked: true },
+      { name: 'Beth', physicalDescription: 'b', locked: true },
+    ]);
+    const result = await canonSvc.setCanonKindLockAll(w.id, 'character', false);
+    expect(result.changed).toBe(2);
+    const reread = (await svc.listUniverses())[0];
+    expect(reread.characters.every((c) => c.locked === false)).toBe(true);
+  });
+
+  it('short-circuits a write when nothing changes', async () => {
+    const w = await seedUniverseWithCharacters([
+      { name: 'Alex', physicalDescription: 'a', locked: true },
+    ]);
+    const result = await canonSvc.setCanonKindLockAll(w.id, 'character', true);
+    expect(result.changed).toBe(0);
+    expect(result.total).toBe(1);
+  });
+
+  it('rejects unknown kind with a 400-coded ServerError', async () => {
+    const w = await seedUniverseWithCharacters([]);
+    await expect(
+      canonSvc.setCanonKindLockAll(w.id, 'monster', true),
+    ).rejects.toMatchObject({ status: 400, code: 'UNIVERSE_CANON_INVALID_KIND' });
+  });
+});
+
+describe('universeCanon — refineUniverseCharacter respects locks', () => {
+  it('refuses with 409 when the target character is locked', async () => {
+    const w = await seedUniverseWithCharacters([
+      { name: 'Alex', physicalDescription: 'jacket', locked: true },
+    ]);
+    await expect(
+      canonSvc.refineUniverseCharacter(w.id, w.characters[0].id),
+    ).rejects.toMatchObject({ status: 409, code: 'UNIVERSE_CANON_LOCKED' });
+    // No LLM call was made — the guard fires before runPromptRefine.
+    expect(runPromptRefineMock).not.toHaveBeenCalled();
+  });
+
+  it('proceeds when the character is unlocked', async () => {
+    // Universe canon is locked-by-default — seed entries with explicit
+    // `locked: false` to put them in the unlocked state the refine guard
+    // requires.
+    const w = await seedUniverseWithCharacters([
+      { name: 'Alex', physicalDescription: 'jacket', locked: false },
+      { name: 'Beth', physicalDescription: 'coat', locked: false },
+    ]);
+    runPromptRefineMock.mockResolvedValue({
+      refined: 'fresh description', changes: [], rationale: 'distinct from Beth',
+      runId: 'run-1', providerId: 'test', model: 'test',
+    });
+    const result = await canonSvc.refineUniverseCharacter(w.id, w.characters[0].id);
+    expect(runPromptRefineMock).toHaveBeenCalledTimes(1);
+    expect(result.entry.physicalDescription).toBe('fresh description');
+  });
+});
+
+describe('universeCanon — differentiateUniverseCast respects locks', () => {
+  it('skips locked entries at apply time even though the LLM saw them', async () => {
+    // Beth is explicitly unlocked so the cast isn't all-locked (the guard
+    // before the LLM call) while Alex stays protected at apply time.
+    const w = await seedUniverseWithCharacters([
+      { name: 'Alex', physicalDescription: 'jacket', locked: true },
+      { name: 'Beth', physicalDescription: 'coat', locked: false },
+    ]);
+    const [alex, beth] = w.characters;
+    runStagedLLMMock.mockResolvedValue({
+      content: {
+        characters: [
+          { id: alex.id, physicalDescription: 'rewritten alex (should be ignored)' },
+          { id: beth.id, physicalDescription: 'rewritten beth' },
+        ],
+        rationale: 'differentiated',
+      },
+      runId: 'run-2', providerId: 'test', model: 'test',
+    });
+    const result = await canonSvc.differentiateUniverseCast(w.id);
+    expect(result.touched).toBe(1);
+    expect(result.skippedLocked).toBe(1);
+    const refreshed = (await svc.listUniverses())[0];
+    expect(refreshed.characters.find((c) => c.id === alex.id).physicalDescription).toBe('jacket');
+    expect(refreshed.characters.find((c) => c.id === beth.id).physicalDescription).toBe('rewritten beth');
+  });
+
+  it('rejects when every character is locked', async () => {
+    const w = await seedUniverseWithCharacters([
+      { name: 'Alex', physicalDescription: 'a', locked: true },
+      { name: 'Beth', physicalDescription: 'b', locked: true },
+    ]);
+    await expect(
+      canonSvc.differentiateUniverseCast(w.id),
+    ).rejects.toMatchObject({ status: 400, code: 'UNIVERSE_CANON_ALL_LOCKED' });
+    expect(runStagedLLMMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('universeCanon — extractCanonFromProse passes autoLock + sourceSeriesId through', () => {
+  it('autoLock=true makes newly-inserted entries locked + stamps sourceSeriesId', async () => {
+    const w = await seedUniverseWithCharacters([]);
+    extractBibleMock.mockImplementation(async ({ kind }) => ({
+      extracted: kind === 'character' ? [{ name: 'NewbyChar' }] : [],
+      runId: 'r', providerId: 'p', model: 'm',
+    }));
+    const result = await canonSvc.extractCanonFromProse(w.id, {
+      corpus: 'some prose',
+      kinds: ['character'],
+      source: 'series-extract',
+      autoLock: true,
+      sourceSeriesId: 'ser-active',
+    });
+    const inserted = result.universe.characters.find((c) => c.name === 'NewbyChar');
+    expect(inserted.locked).toBe(true);
+    expect(inserted.source).toBe('series-extract');
+    expect(inserted.sourceSeriesId).toBe('ser-active');
+  });
+
+  it('without an explicit autoLock=false, new entries lock by default', async () => {
+    // The universe-builder default is "lock new canon on insert" so users
+    // don't have to chase batch extracts with a Lock All click; only an
+    // explicit `autoLock: false` opts out.
+    const w = await seedUniverseWithCharacters([]);
+    extractBibleMock.mockImplementation(async ({ kind }) => ({
+      extracted: kind === 'character' ? [{ name: 'Newby' }] : [],
+      runId: 'r', providerId: 'p', model: 'm',
+    }));
+    const result = await canonSvc.extractCanonFromProse(w.id, {
+      corpus: 'some prose',
+      kinds: ['character'],
+    });
+    const inserted = result.universe.characters.find((c) => c.name === 'Newby');
+    expect(inserted.locked).toBe(true);
+    expect(inserted.source).toBe('series-extract'); // default new vocab
+  });
+
+  it('autoLock=false opts out so the entry lands unlocked', async () => {
+    const w = await seedUniverseWithCharacters([]);
+    extractBibleMock.mockImplementation(async ({ kind }) => ({
+      extracted: kind === 'character' ? [{ name: 'Optout' }] : [],
+      runId: 'r', providerId: 'p', model: 'm',
+    }));
+    const result = await canonSvc.extractCanonFromProse(w.id, {
+      corpus: 'some prose',
+      kinds: ['character'],
+      autoLock: false,
+    });
+    const inserted = result.universe.characters.find((c) => c.name === 'Optout');
+    expect(inserted.locked).not.toBe(true);
+  });
+});
+
+describe('universeCanon — extractCanonFromProse per-kind resilience', () => {
+  it('one kind failing still merges the others and reports failures[]', async () => {
+    const w = await seedUniverseWithCharacters([]);
+    extractBibleMock.mockImplementation(async ({ kind }) => {
+      if (kind === 'object') throw new Error('safety refused');
+      return {
+        extracted: [{ name: `New-${kind}` }],
+        runId: 'r', providerId: 'p', model: 'm',
+      };
+    });
+    const result = await canonSvc.extractCanonFromProse(w.id, {
+      corpus: 'some prose',
+      parallel: true,
+    });
+    // Characters + places landed despite objects throwing.
+    expect(result.universe.characters.some((c) => c.name === 'New-character')).toBe(true);
+    expect(result.universe.places.some((p) => p.name === 'New-place')).toBe(true);
+    expect(result.failures).toEqual([{ kind: 'object', error: 'safety refused' }]);
+    // `results` only carries the kinds that succeeded.
+    expect(result.results.objects).toBeUndefined();
+  });
+
+  it('throws UNIVERSE_CANON_EXTRACT_ALL_FAILED only when EVERY kind fails', async () => {
+    const w = await seedUniverseWithCharacters([]);
+    extractBibleMock.mockImplementation(async () => { throw new Error('boom'); });
+    await expect(canonSvc.extractCanonFromProse(w.id, { corpus: 'p', parallel: true }))
+      .rejects.toMatchObject({ code: 'UNIVERSE_CANON_EXTRACT_ALL_FAILED' });
+  });
+
+  it('forwards modelOverride to extractBible', async () => {
+    const w = await seedUniverseWithCharacters([]);
+    extractBibleMock.mockImplementation(async () => ({ extracted: [], runId: 'r', providerId: 'p', model: 'm' }));
+    await canonSvc.extractCanonFromProse(w.id, {
+      corpus: 'p', kinds: ['character'], providerOverride: 'anthropic', modelOverride: 'claude-x',
+    });
+    expect(extractBibleMock).toHaveBeenCalledWith(expect.objectContaining({
+      providerOverride: 'anthropic', modelOverride: 'claude-x',
+    }));
+  });
+});
+
+describe('universeCanon — describeCanonFromProse (strictly prose-grounded)', () => {
+  it('fills physicalDescription for a sufficient char and reports a none char without inventing', async () => {
+    const w = await seedUniverseWithCharacters([
+      { name: 'Mara', physicalDescription: '', locked: false },
+      { name: 'Ghost', physicalDescription: '', locked: false },
+    ]);
+    const [mara, ghost] = w.characters;
+    runStagedLLMMock.mockResolvedValue({
+      content: {
+        descriptions: [
+          { id: mara.id, sufficiency: 'sufficient', description: 'tall woman, copper braid, freckles', evidence: ['her copper braid'] },
+          { id: ghost.id, sufficiency: 'none', description: '', note: 'only named in dialogue' },
+        ],
+      },
+      runId: 'run-d', providerId: 'test', model: 'test',
+    });
+    const result = await canonSvc.describeCanonFromProse(w.id, {
+      corpus: 'Mara has a copper braid. Ghost is mentioned.',
+      targets: [{ id: mara.id, kind: 'character' }, { id: ghost.id, kind: 'character' }],
+    });
+    expect(result.report.filled).toBe(1);
+    expect(result.report.none.map((g) => g.id)).toEqual([ghost.id]);
+    const refreshed = (await svc.listUniverses())[0];
+    expect(refreshed.characters.find((c) => c.id === mara.id).physicalDescription).toContain('copper braid');
+    // The un-describable noun stays blank — the whole point of the red flag.
+    expect(refreshed.characters.find((c) => c.id === ghost.id).physicalDescription).toBe('');
+  });
+
+  it('skips locked + already-described targets and never calls the LLM when nothing is left', async () => {
+    const w = await seedUniverseWithCharacters([
+      { name: 'Locked', physicalDescription: '', locked: true },
+      { name: 'Done', physicalDescription: 'already has a look', locked: false },
+    ]);
+    const [locked, done] = w.characters;
+    const result = await canonSvc.describeCanonFromProse(w.id, {
+      corpus: 'some prose',
+      targets: [{ id: locked.id, kind: 'character' }, { id: done.id, kind: 'character' }],
+    });
+    expect(runStagedLLMMock).not.toHaveBeenCalled();
+    expect(result.report.filled).toBe(0);
+    expect(result.report.skippedLocked.map((g) => g.id)).toEqual([locked.id]);
+    expect(result.report.unmatched).toBe(1); // `Done` already described
+  });
+
+  it('grades thin into report.thin while still filling the grounded fragment', async () => {
+    const w = await svc.updateUniverse(
+      (await svc.createUniverse({ name: 'U', starterPrompt: 'x', stylePrompt: 'y' })).id,
+      { places: [{ name: 'The Vault', description: '', locked: false }] },
+    );
+    const vault = w.places[0];
+    runStagedLLMMock.mockResolvedValue({
+      content: { descriptions: [{ id: vault.id, sufficiency: 'thin', description: 'a dim concrete room', note: 'no lighting or scale given' }] },
+      runId: 'run-t', providerId: 'test', model: 'test',
+    });
+    const result = await canonSvc.describeCanonFromProse(w.id, {
+      corpus: 'The Vault was dim.',
+      targets: [{ id: vault.id, kind: 'place' }],
+    });
+    expect(result.report.filled).toBe(1);
+    expect(result.report.thin.map((g) => g.id)).toEqual([vault.id]);
+    expect(result.universe.places.find((p) => p.id === vault.id).description).toBe('a dim concrete room');
+  });
+
+  it('rejects an empty corpus and empty targets', async () => {
+    const w = await seedUniverseWithCharacters([]);
+    await expect(canonSvc.describeCanonFromProse(w.id, { corpus: '', targets: [{ id: 'x', kind: 'character' }] }))
+      .rejects.toMatchObject({ code: 'UNIVERSE_CANON_NO_CORPUS' });
+    await expect(canonSvc.describeCanonFromProse(w.id, { corpus: 'p', targets: [] }))
+      .rejects.toMatchObject({ code: 'UNIVERSE_CANON_NO_TARGETS' });
+  });
+});
+
+describe('universeCanon — backfillCanonDescriptionsFromPrompts', () => {
+  it('copies existing prompts into blank per-kind description fields without an LLM call', async () => {
+    const created = await svc.createUniverse({ name: 'U', starterPrompt: 'x', stylePrompt: 'y' });
+    const seeded = await svc.updateUniverse(created.id, {
+      characters: [{ name: 'Courier', prompt: 'patched yellow pressure coat', physicalDescription: '', locked: false }],
+      places: [{ name: 'The Vault', prompt: 'a dim concrete room', description: '', locked: false }],
+      objects: [{ name: 'Compass', prompt: 'brass compass with a cracked face', description: '', locked: false }],
+    });
+
+    const result = await canonSvc.backfillCanonDescriptionsFromPrompts(seeded.id);
+
+    expect(result.report).toMatchObject({
+      filled: 3,
+      byKind: { character: 1, place: 1, object: 1 },
+      alreadyDescribed: 0,
+      missingPrompt: 0,
+      skippedLocked: 0,
+    });
+    expect(result.universe.characters[0].physicalDescription).toContain('yellow pressure coat');
+    expect(result.universe.places[0].description).toBe('a dim concrete room');
+    expect(result.universe.objects[0].description).toContain('brass compass');
+    expect(runStagedLLMMock).not.toHaveBeenCalled();
+  });
+
+  it('preserves authored descriptions and skips locked or promptless blanks', async () => {
+    const created = await svc.createUniverse({ name: 'U', starterPrompt: 'x', stylePrompt: 'y' });
+    const seeded = await svc.updateUniverse(created.id, {
+      characters: [{ name: 'Done', prompt: 'replacement', physicalDescription: 'authored look', locked: false }],
+      places: [{ name: 'Locked', prompt: 'available prompt', description: '', locked: true }],
+      objects: [{ name: 'Unknown', prompt: '', description: '', locked: false }],
+    });
+
+    const result = await canonSvc.backfillCanonDescriptionsFromPrompts(seeded.id);
+
+    expect(result.report).toMatchObject({
+      filled: 0,
+      alreadyDescribed: 1,
+      missingPrompt: 1,
+      skippedLocked: 1,
+    });
+    expect(result.universe.characters[0].physicalDescription).toBe('authored look');
+    expect(result.universe.places[0].description).toBe('');
+    expect(result.universe.objects[0].description).toBe('');
+  });
+});
+
+describe('universeCanon — summarizeDescribeGaps', () => {
+  it('maps the report into a persistable marker', () => {
+    const m = canonSvc.summarizeDescribeGaps({
+      report: {
+        filled: 2,
+        none: [{ id: 'a', name: 'A', kind: 'character', note: 'no look' }],
+        thin: [{ id: 'b', name: 'B', kind: 'place', note: 'sparse' }],
+        skippedLocked: [{ id: 'c', name: 'C', kind: 'object' }],
+      },
+      provider: 'codex', model: 'default',
+    });
+    expect(m.filled).toBe(2);
+    expect(m.none).toEqual([{ id: 'a', name: 'A', kind: 'character', note: 'no look' }]);
+    expect(m.thin[0].id).toBe('b');
+    expect(m.provider).toBe('codex');
+    expect(typeof m.at).toBe('string');
+  });
+});
+
+describe('universeCanon — summarizeCanonExtraction', () => {
+  it('ok when no failures', () => {
+    const m = canonSvc.summarizeCanonExtraction({
+      results: { characters: { extracted: [1, 2] }, places: { extracted: [3] }, objects: { extracted: [] } },
+      provider: 'codex', model: 'default',
+    });
+    expect(m.status).toBe('ok');
+    expect(m.failedKinds).toEqual([]);
+    expect(m.extracted).toEqual({ characters: 2, places: 1, objects: 0 });
+    expect(m.provider).toBe('codex');
+  });
+
+  it('partial when some kinds failed', () => {
+    const m = canonSvc.summarizeCanonExtraction({
+      results: { characters: { extracted: [1] } },
+      failures: [{ kind: 'object', error: 'safety refused' }],
+      provider: 'codex',
+    });
+    expect(m.status).toBe('partial');
+    expect(m.failedKinds).toEqual(['object']);
+    expect(m.error).toContain('object: safety refused');
+  });
+
+  it('failed (all kinds) when passed an error', () => {
+    const m = canonSvc.summarizeCanonExtraction({ error: new Error('401 bad creds'), provider: 'claude' });
+    expect(m.status).toBe('failed');
+    expect(m.error).toContain('401 bad creds');
+    expect(m.failedKinds).toEqual(['character', 'place', 'object']);
+  });
+});
+
+describe('universeCanon — purgeReferenceSheetFromAllUniverses', () => {
+  it('nulls referenceSheetImageRef on every matching character across every universe', async () => {
+    const w1 = await seedUniverseWithCharacters([
+      { name: 'Alex', physicalDescription: 'a', referenceSheetImageRef: 'sheet-A.png' },
+      { name: 'Beth', physicalDescription: 'b', referenceSheetImageRef: 'sheet-B.png' },
+    ]);
+    const w2Initial = await svc.createUniverse({ name: 'Universe Two', starterPrompt: 'x', stylePrompt: 'y' });
+    const w2 = await svc.updateUniverse(w2Initial.id, {
+      characters: [{ name: 'Cara', physicalDescription: 'c', referenceSheetImageRef: 'sheet-A.png' }],
+    });
+
+    const result = await canonSvc.purgeReferenceSheetFromAllUniverses('sheet-A.png');
+    expect(result.cleared).toBe(2);
+
+    const reread = await svc.listUniverses();
+    const reread1 = reread.find((u) => u.id === w1.id);
+    const reread2 = reread.find((u) => u.id === w2.id);
+    expect(reread1.characters.find((c) => c.name === 'Alex').referenceSheetImageRef).toBeNull();
+    // Untouched: Beth's sheet name doesn't match the purge target.
+    expect(reread1.characters.find((c) => c.name === 'Beth').referenceSheetImageRef).toBe('sheet-B.png');
+    expect(reread2.characters.find((c) => c.name === 'Cara').referenceSheetImageRef).toBeNull();
+  });
+
+  it('returns cleared:0 and skips writes when no character matches', async () => {
+    await seedUniverseWithCharacters([
+      { name: 'Alex', physicalDescription: 'a', referenceSheetImageRef: 'sheet-A.png' },
+    ]);
+    const result = await canonSvc.purgeReferenceSheetFromAllUniverses('sheet-missing.png');
+    expect(result.cleared).toBe(0);
+  });
+
+  it('returns cleared:0 when filename is empty / non-string (defensive guard)', async () => {
+    await seedUniverseWithCharacters([
+      { name: 'Alex', physicalDescription: 'a', referenceSheetImageRef: 'sheet-A.png' },
+    ]);
+    expect(await canonSvc.purgeReferenceSheetFromAllUniverses('')).toEqual({ cleared: 0 });
+    expect(await canonSvc.purgeReferenceSheetFromAllUniverses(null)).toEqual({ cleared: 0 });
+    expect(await canonSvc.purgeReferenceSheetFromAllUniverses(undefined)).toEqual({ cleared: 0 });
+  });
+
+  it('also clears matching variant keys inside referenceSheets map (blueprint, etc.)', async () => {
+    // Mixed-shape fixture: Alex has the filename in the map slot, Beth has
+    // the same filename in the legacy field — purge must clear both in one
+    // call, regardless of which storage shape a given character used.
+    const w1 = await seedUniverseWithCharacters([
+      { name: 'Alex', physicalDescription: 'a', referenceSheets: { blueprint: 'shared.png' } },
+      { name: 'Beth', physicalDescription: 'b', referenceSheetImageRef: 'shared.png' },
+      { name: 'Cara', physicalDescription: 'c', referenceSheets: { blueprint: 'other.png', noir: 'shared.png' } },
+    ]);
+    const result = await canonSvc.purgeReferenceSheetFromAllUniverses('shared.png');
+    expect(result.cleared).toBe(3);
+
+    const reread = await svc.getUniverse(w1.id);
+    const alex = reread.characters.find((c) => c.name === 'Alex');
+    const beth = reread.characters.find((c) => c.name === 'Beth');
+    const cara = reread.characters.find((c) => c.name === 'Cara');
+    expect(alex.referenceSheets).toEqual({});
+    expect(beth.referenceSheetImageRef).toBeNull();
+    // Cara only loses the 'noir' key; 'blueprint' (pointing at a different
+    // file) survives the purge.
+    expect(cara.referenceSheets).toEqual({ blueprint: 'other.png' });
+  });
+});
+
+describe('universeCanon — purgeImageRefFromAllUniverses', () => {
+  it('strips a filename from every imageRefs[] across canon kinds', async () => {
+    const w = await seedUniverseWithCharacters([
+      { name: 'Alex', physicalDescription: 'a', imageRefs: ['shared.png', 'other.png'] },
+      { name: 'Beth', physicalDescription: 'b', imageRefs: ['shared.png'] },
+    ]);
+    const result = await canonSvc.purgeImageRefFromAllUniverses('shared.png');
+    expect(result.removed).toBe(2);
+    const reread = (await svc.listUniverses()).find((u) => u.id === w.id);
+    expect(reread.characters.find((c) => c.name === 'Alex').imageRefs).toEqual(['other.png']);
+    expect(reread.characters.find((c) => c.name === 'Beth').imageRefs).toEqual([]);
+  });
+
+  it('returns removed:0 when nothing matches or input is invalid', async () => {
+    await seedUniverseWithCharacters([
+      { name: 'Alex', physicalDescription: 'a', imageRefs: ['only.png'] },
+    ]);
+    expect(await canonSvc.purgeImageRefFromAllUniverses('nope.png')).toEqual({ removed: 0 });
+    expect(await canonSvc.purgeImageRefFromAllUniverses('')).toEqual({ removed: 0 });
+    expect(await canonSvc.purgeImageRefFromAllUniverses(null)).toEqual({ removed: 0 });
+  });
+
+  it('removes an art style reference whose sole image is deleted, so no dangling reference survives', async () => {
+    const w = await svc.createUniverse({
+      name: 'Test Universe',
+      starterPrompt: 'test seed',
+      stylePrompt: 'test style',
+    });
+    // sanitizeStyleReference caps imageRefs to exactly one image, so purging
+    // it must drop the whole entry — a title/prompt with no picture is dead.
+    await svc.updateUniverse(w.id, {
+      styleReferences: [
+        { title: 'Ref A', prompt: 'moody lighting', imageRefs: ['shared.png'] },
+        { title: 'Ref B', prompt: 'bright palette', imageRefs: ['other.png'] },
+      ],
+    });
+
+    const result = await canonSvc.purgeImageRefFromAllUniverses('shared.png');
+    expect(result.removed).toBe(1);
+
+    const reread = (await svc.listUniverses()).find((u) => u.id === w.id);
+    expect(reread.styleReferences).toHaveLength(1);
+    expect(reread.styleReferences[0].title).toBe('Ref B');
+  });
+});

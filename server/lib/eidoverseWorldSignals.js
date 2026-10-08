@@ -1,0 +1,448 @@
+/**
+ * Pure raw-source-to-signal boundary for Eidoverse.
+ * Only bounded aggregates and opaque identities leave this module; private
+ * record contents never become world labels or signal payloads.
+ */
+
+import { createHash } from 'node:crypto';
+import { safeWorldText as safeText } from './eidoverseWorldLabels.js';
+
+const opaqueDigest = (namespace, value, fallback) => {
+  const source = safeText(value, fallback, 256);
+  return createHash('sha256').update(`${namespace}:${source}`).digest('hex').slice(0, 12);
+};
+
+const opaqueId = (namespace, value, fallback) => `${namespace}-${opaqueDigest(namespace, value, fallback)}`;
+
+/**
+ * The install's public host identity. Anyone who can reach the Eidoverse door
+ * reads this, so it is a one-way digest of the federation instance id — never
+ * the hostname, tailnet name, address, OS user, or a filesystem path.
+ */
+export const eidoversePeerId = (peer) => opaqueId('peer', peer.instanceId || peer.id, 'unknown-peer');
+
+export const eidoverseHostId = (instanceId) => `hst_${opaqueDigest('hst', instanceId, 'unknown-instance')}`;
+
+// Closed diagnostic vocabulary. Reasons are requested only by local observation;
+// the normal projection/renderer/federation collection keeps its historical shape.
+export const EIDOVERSE_ATTENTION_REASON_CODES = Object.freeze([
+  'app_not_started', 'app_stopped', 'app_unknown',
+  'backup_failure', 'review_alerts', 'cos_paused',
+  'runtime_data_disk_pressure', 'runtime_data_disk_critical',
+  'memory_pressure', 'memory_critical',
+]);
+
+const coarseStatus = (value) => {
+  const status = String(value || '').toLowerCase();
+  if (/error|failed|unhealthy|offline|crash|blocked/.test(status)) return 'error';
+  if (/paused|stopped|pending|unknown|not.started|todo|to do/.test(status)) return 'attention';
+  if (/active|running|online|healthy|success|progress/.test(status)) return 'active';
+  return 'steady';
+};
+
+/**
+ * CoS task status -> world signal, mapped EXPLICITLY rather than through
+ * `coarseStatus`'s word matcher.
+ *
+ * The generic matcher reads a work queue backwards. `pending` contains the
+ * word "pending", so it lands on `attention`; `challenged` (#2441 — a
+ * sub-agent disputing a reviewer rejection, which is stuck until a human rules
+ * on it) matches nothing at all and lands on `steady`. Because `observePlace`
+ * ORs its sources' attention flags, ONE queued task — the resting state of any
+ * work queue — flipped the Agent Foundry to `attention`, while a genuinely
+ * stuck one stayed silent. The district then read `active` only in the narrow
+ * window where every open task happened to be in flight, so it flapped on
+ * ordinary queue churn and its alarm carried no information.
+ *
+ * Task status is a CLOSED vocabulary (`TASK_STATUS_VALUES` in `taskParser.js`),
+ * so it is decided by name rather than by word-matching. The line it draws:
+ * waiting on a WORKER is ordinary, waiting on a HUMAN is attention.
+ *
+ * Attention is the DEFAULT rather than a listed case, so a status added to the
+ * vocabulary later — or a hand-edited marker `parseTasksMarkdown` could not
+ * represent, which it returns as its raw token — surfaces instead of going
+ * quiet. That matches how the parser itself treats an unrepresentable status:
+ * `toRepresentableTask` parks it as `blocked` with an `unknown-status`
+ * category, i.e. as something a human has to look at.
+ */
+const taskSignalStatus = (task) => {
+  const status = String(task?.status || 'pending').toLowerCase();
+  if (status === 'blocked') return 'error';
+  if (status === 'in_progress') return 'active';
+  if (status === 'pending') return task?.approvalRequired === true ? 'attention' : 'steady';
+  return 'attention';
+};
+
+const finiteOrNull = (value) => typeof value === 'number' && Number.isFinite(value) ? value : null;
+const nonNegativeOrNull = (value) => {
+  const number = finiteOrNull(value);
+  return number === null ? null : Math.max(0, number);
+};
+const percentageOrNull = (value) => {
+  const number = finiteOrNull(value);
+  return number === null ? null : Math.max(0, Math.min(100, number));
+};
+
+function appSummary(apps) {
+  if (!Array.isArray(apps)) return null;
+  return {
+    total: apps.length,
+    online: apps.filter((app) => app.overallStatus === 'online').length,
+    stopped: apps.filter((app) => app.overallStatus === 'stopped').length,
+    notStarted: apps.filter((app) => app.overallStatus === 'not_started').length,
+    unknown: apps.filter((app) => app.overallStatus === 'unknown').length,
+  };
+}
+
+function projectedApps(apps, includeAttentionReasons) {
+  if (!Array.isArray(apps)) return null;
+  const groups = new Map();
+  for (const app of apps) {
+    const status = coarseStatus(app?.overallStatus);
+    const group = groups.get(status) || { count: 0, managed: 0, reasons: new Map() };
+    group.count += 1;
+    if (includeAttentionReasons && ['attention', 'error'].includes(status)) {
+      const code = { not_started: 'app_not_started', stopped: 'app_stopped', unknown: 'app_unknown' }[app?.overallStatus];
+      // Unknown/future spellings retain a coarse reason, never an invented cause.
+      const reason = code || `source_${status}`;
+      group.reasons.set(reason, (group.reasons.get(reason) || 0) + 1);
+    }
+    if (app?.managed === true) group.managed += 1;
+    groups.set(status, group);
+  }
+  return [...groups.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([status, group]) => ({
+      id: `apps-${status}`,
+      label: 'Managed app group',
+      status,
+      count: group.count,
+      managed: group.managed,
+      ...(includeAttentionReasons ? { attentionReasons: [...group.reasons]
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([code, affectedCount]) => ({ code, affectedCount })) } : {}),
+    }));
+}
+
+function projectedProductivity(todayActivity, taskState) {
+  if (!todayActivity) return null;
+  const stats = todayActivity?.stats || {};
+  const queue = {
+    pendingApprovals: Array.isArray(taskState?.awaitingApproval) ? taskState.awaitingApproval.length : null,
+    pendingTasks: Array.isArray(taskState?.tasks)
+      ? taskState.tasks.filter((task) => !['completed', 'done', 'archived'].includes(String(task?.status || '').toLowerCase())).length
+      : null,
+  };
+  queue.total = [queue.pendingApprovals, queue.pendingTasks].every((value) => value !== null)
+    ? queue.pendingApprovals + queue.pendingTasks
+    : null;
+  return [{
+    id: 'summary',
+    label: 'Productivity',
+    completedToday: nonNegativeOrNull(stats.completed),
+    succeededToday: nonNegativeOrNull(stats.succeeded),
+    failedToday: nonNegativeOrNull(stats.failed),
+    successRate: percentageOrNull(stats.successRate),
+    queue,
+    running: todayActivity?.isRunning === true,
+    paused: todayActivity?.isPaused === true,
+  }];
+}
+
+function projectedActivity(calendar) {
+  if (!calendar || !Array.isArray(calendar.weeks)) return null;
+  if (calendar.weeks.length === 0) return [];
+  const days = calendar.weeks
+    .flatMap((week) => Array.isArray(week) ? week : [])
+    .filter((day) => day && typeof day === 'object' && day.isFuture !== true);
+  const today = days.find((day) => day.isToday === true);
+  const activeDays = days
+    .filter((day) => (nonNegativeOrNull(day.tasks) || 0) > 0)
+    .slice(-99)
+    .reverse();
+  const summary = calendar.summary || {};
+  return [
+    {
+      id: 'summary',
+      label: 'Activity calendar',
+      weeks: calendar.weeks.length,
+      activeDays: nonNegativeOrNull(summary.activeDays),
+      totalTasks: nonNegativeOrNull(summary.totalTasks),
+      maxTasks: nonNegativeOrNull(calendar.maxTasks),
+      todayTasks: nonNegativeOrNull(today?.tasks),
+    },
+    ...activeDays.map((day, index) => ({
+      id: opaqueId('activity-day', day.date, `day-${index}`),
+      label: 'Activity day',
+      tasks: nonNegativeOrNull(day.tasks) ?? 0,
+      isToday: day.isToday === true,
+    })),
+  ];
+}
+
+function projectedGoals(goalsData) {
+  if (!Array.isArray(goalsData?.goals)) return null;
+  const goals = goalsData.goals;
+  const children = new Map(goals.map((goal) => [goal?.id, 0]));
+  goals.forEach((goal) => {
+    if (goal?.parentId && children.has(goal.parentId)) children.set(goal.parentId, children.get(goal.parentId) + 1);
+  });
+  return goals.map((goal, index) => {
+    const milestones = Array.isArray(goal?.milestones) ? goal.milestones : [];
+    const todos = Array.isArray(goal?.todos) ? goal.todos : [];
+    return {
+      id: opaqueId('goal', goal?.id, `goal-${index}`),
+      label: 'Active goal',
+      status: coarseStatus(goal?.status || 'active'),
+      progress: percentageOrNull(goal?.progress) ?? 0,
+      milestoneTotal: milestones.length,
+      milestoneDone: milestones.filter((milestone) => milestone?.completed === true || Boolean(safeText(milestone?.completedAt, ''))).length,
+      todoTotal: todos.length,
+      todoPending: todos.filter((todo) => !['completed', 'done'].includes(String(todo?.status || '').toLowerCase()) && todo?.completed !== true).length,
+      childCount: children.get(goal?.id) || 0,
+    };
+  });
+}
+
+function projectedMemory(graph) {
+  if (!graph || !Array.isArray(graph.nodes)) return null;
+  const buckets = new Map();
+  const categoryById = new Map();
+  for (const node of graph.nodes) {
+    const category = safeText(node?.category || node?.brainType, 'other').toLowerCase() || 'other';
+    categoryById.set(node?.id, category);
+    const bucket = buckets.get(category) || { count: 0, importance: 0 };
+    bucket.count += 1;
+    bucket.importance += Math.max(0, finiteOrNull(node?.importance) ?? 1);
+    buckets.set(category, bucket);
+  }
+  const bridgeCounts = new Map();
+  for (const edge of Array.isArray(graph.edges) ? graph.edges : []) {
+    const from = categoryById.get(edge?.source);
+    const to = categoryById.get(edge?.target);
+    if (!from || !to || from === to) continue;
+    bridgeCounts.set(from, (bridgeCounts.get(from) || 0) + 1);
+    bridgeCounts.set(to, (bridgeCounts.get(to) || 0) + 1);
+  }
+  return [...buckets.entries()]
+    .sort(([a, left], [b, right]) => right.count - left.count || a.localeCompare(b))
+    .map(([category, bucket]) => ({
+      id: opaqueId('memory-category', category, 'other'),
+      label: 'Memory category',
+      count: bucket.count,
+      importance: bucket.importance,
+      bridgeCount: bridgeCounts.get(category) || 0,
+      totalMemories: graph.nodes.length,
+      totalEdges: Array.isArray(graph.edges) ? graph.edges.length : 0,
+      hasEmbeddings: graph.hasEmbeddings === true,
+    }));
+}
+
+export function projectedStorage(introspection) {
+  if (!introspection || typeof introspection !== 'object') return null;
+  const items = [];
+  const db = introspection.db;
+  const fsSection = introspection.fs;
+  const dbOnline = Array.isArray(db?.tables);
+  items.push({
+    id: 'database',
+    label: 'PostgreSQL',
+    area: 'database',
+    status: db === null ? 'offline' : (dbOnline ? 'online' : 'unknown'),
+    tableCount: dbOnline ? db.tables.length : null,
+    sizeBytes: finiteOrNull(db?.sizeBytes),
+    migrations: db?.migrations?.applied === undefined ? null : nonNegativeOrNull(db.migrations.applied),
+  });
+  const fsOnline = Array.isArray(fsSection?.domains);
+  items.push({
+    id: 'filesystem',
+    label: 'PortOS data files',
+    area: 'filesystem',
+    status: fsSection === null ? 'offline' : (fsOnline ? 'online' : 'unknown'),
+    domainCount: fsOnline ? fsSection.domains.length : null,
+    sizeBytes: finiteOrNull(fsSection?.totalBytes),
+    fileCount: nonNegativeOrNull(fsSection?.totalFiles),
+  });
+  if (!dbOnline) items.push({ id: 'database-attention', label: 'Data attention', area: 'anomaly', status: db === null ? 'offline' : 'unknown', count: 1 });
+  if (!fsOnline) items.push({ id: 'filesystem-attention', label: 'Data attention', area: 'anomaly', status: fsSection === null ? 'offline' : 'unknown', count: 1 });
+  return items;
+}
+
+function projectedOperations({ cosStatus, review, backupState, notifications, character, voiceConfig, memory, diskPercent, inboxCounts }, includeAttentionReasons) {
+  const values = [cosStatus, review, backupState, notifications, character, voiceConfig, memory, diskPercent, inboxCounts];
+  if (!values.some((value) => value !== null && value !== undefined)) return null;
+  const reasons = [];
+  if (/failed|error|unhealthy/i.test(String(backupState?.status || ''))) reasons.push({ code: 'backup_failure', severity: 'error' });
+  if ((review?.alert || 0) > 0) reasons.push({ code: 'review_alerts', severity: 'attention', affectedCount: nonNegativeOrNull(review.alert) });
+  if (cosStatus?.paused === true) reasons.push({ code: 'cos_paused', severity: 'attention' });
+  const status = reasons.some((reason) => reason.severity === 'error') ? 'error'
+    : reasons.length > 0 ? 'attention' : (cosStatus?.running ? 'active' : 'steady');
+  return [{
+    id: 'overview',
+    label: 'PortOS operations',
+    status,
+    ...(includeAttentionReasons ? { attentionReasons: reasons } : {}),
+    cos: cosStatus ? {
+      running: cosStatus.running === true,
+      paused: cosStatus.paused === true,
+      activeAgents: nonNegativeOrNull(cosStatus.activeAgents),
+      pausedAgents: nonNegativeOrNull(cosStatus.pausedAgents),
+    } : null,
+    ai: cosStatus ? {
+      running: cosStatus.running === true,
+      activeAgents: nonNegativeOrNull(cosStatus.activeAgents),
+    } : null,
+    review: review ? {
+      total: nonNegativeOrNull(review.total),
+      cos: nonNegativeOrNull(review.cos),
+      alerts: nonNegativeOrNull(review.alert),
+    } : null,
+    backup: backupState ? {
+      status: coarseStatus(backupState.status),
+      filesChanged: nonNegativeOrNull(backupState.filesChanged),
+    } : null,
+    notifications: notifications ? {
+      total: nonNegativeOrNull(notifications.total),
+      unread: nonNegativeOrNull(notifications.unread),
+    } : null,
+    inbox: inboxCounts ? {
+      total: nonNegativeOrNull(inboxCounts.total),
+      needsReview: nonNegativeOrNull(inboxCounts.needs_review),
+      classifying: nonNegativeOrNull(inboxCounts.classifying),
+    } : null,
+    character: character ? { level: nonNegativeOrNull(character.level) } : null,
+    voice: voiceConfig ? {
+      enabled: voiceConfig.enabled === true,
+    } : null,
+    memory: memory ? {
+      usedPercent: memory.total > 0 ? Math.round((memory.used / memory.total) * 100) : null,
+    } : null,
+    diskPercent: percentageOrNull(diskPercent),
+  }];
+}
+
+export function projectedJiraTickets(tickets) {
+  const groups = new Map();
+  for (const ticket of Array.isArray(tickets) ? tickets : []) {
+    const rawStatus = String(ticket?.statusCategory || ticket?.status || '').toLowerCase();
+    if (/done|complete|closed/.test(rawStatus)) continue;
+    const status = /progress|active|doing/.test(rawStatus) ? 'active' : (/block|error|fail/.test(rawStatus) ? 'blocked' : 'pending');
+    const current = groups.get(status) || { count: 0, storyPoints: 0, urgent: 0 };
+    current.count += 1;
+    current.storyPoints += nonNegativeOrNull(ticket?.storyPoints) || 0;
+    if (/highest|critical|urgent/i.test(String(ticket?.priority || ''))) current.urgent += 1;
+    groups.set(status, current);
+  }
+  return [...groups.entries()].sort(([left], [right]) => left.localeCompare(right)).map(([status, values]) => ({
+    id: `jira-${status}`,
+    label: 'Current work summary',
+    status,
+    ...values,
+  }));
+}
+
+function healthSnapshot({ apps, cosStatus, review, backupState, notifications, character, voiceConfig, memory, diskPercent }, includeAttentionReasons) {
+  const health = {
+    id: 'overview',
+    label: 'PortOS health',
+    apps: appSummary(apps),
+    cos: cosStatus ? {
+      running: cosStatus.running === true,
+      activeAgents: nonNegativeOrNull(cosStatus.activeAgents),
+      pausedAgents: nonNegativeOrNull(cosStatus.pausedAgents),
+    } : null,
+    review: review ? {
+      total: nonNegativeOrNull(review.total),
+      cos: nonNegativeOrNull(review.cos),
+      alerts: nonNegativeOrNull(review.alert),
+    } : null,
+    backup: backupState ? {
+      status: coarseStatus(backupState.status),
+      filesChanged: nonNegativeOrNull(backupState.filesChanged),
+    } : null,
+    memory: memory ? {
+      usedPercent: memory.total > 0 ? Math.round((memory.used / memory.total) * 100) : null,
+    } : null,
+    notifications: notifications ? {
+      total: nonNegativeOrNull(notifications.total),
+      unread: nonNegativeOrNull(notifications.unread),
+    } : null,
+    character: character ? { level: nonNegativeOrNull(character.level) } : null,
+    voice: voiceConfig ? {
+      enabled: voiceConfig.enabled === true,
+    } : null,
+    diskPercent: percentageOrNull(diskPercent),
+  };
+  const available = [apps, cosStatus, review, backupState, notifications, character, voiceConfig, memory, diskPercent]
+    .some((value) => value !== null && value !== undefined);
+  if (!available) return null;
+  const reasons = [];
+  if (/failed|error|unhealthy/i.test(String(health.backup?.status || ''))) reasons.push({ code: 'backup_failure', severity: 'error' });
+  for (const [value, prefix] of [[health.diskPercent, 'runtime_data_disk'], [health.memory?.usedPercent, 'memory']]) {
+    if ((value ?? 0) >= 95) reasons.push({ code: `${prefix}_critical`, severity: 'error' });
+    else if ((value ?? 0) >= 85) reasons.push({ code: `${prefix}_pressure`, severity: 'attention' });
+  }
+  if ((health.apps?.stopped || 0) > 0) reasons.push({ code: 'app_stopped', severity: 'attention', affectedCount: health.apps.stopped });
+  if ((health.apps?.unknown || 0) > 0) reasons.push({ code: 'app_unknown', severity: 'attention', affectedCount: health.apps.unknown });
+  if ((health.review?.alerts || 0) > 0) reasons.push({ code: 'review_alerts', severity: 'attention', affectedCount: health.review.alerts });
+  if (cosStatus?.paused === true) reasons.push({ code: 'cos_paused', severity: 'attention' });
+  health.status = reasons.some((reason) => reason.severity === 'error') ? 'error' : (reasons.length ? 'attention' : 'healthy');
+  if (includeAttentionReasons) health.attentionReasons = reasons;
+  return health;
+}
+
+/**
+ * Shape already-read local snapshots, resolved Jira signals, and the Set of
+ * available destination peer IDs. Null means unavailable; [] means empty.
+ */
+export function buildEidoverseWorldSignals({
+  apps, agents, taskState, cosStatus, review, featuresState, peers,
+  backupState, notifications, character, voiceConfig, memory, diskPercent,
+  todayActivity, activityCalendar, goalsData, memoryGraph,
+  inboxCounts, introspection, jira, destinations,
+}, { includeAttentionReasons = false } = {}) {
+  const projectedAgents = Array.isArray(agents)
+    ? agents.filter((agent) => ['running', 'paused'].includes(agent?.status)).map((agent, index) => ({
+      id: opaqueId('agent', agent.id, `agent-${index}`), label: 'Active agent', status: coarseStatus(agent.status),
+    }))
+    : null;
+  const projectedTasks = Array.isArray(taskState?.tasks)
+    ? taskState.tasks
+      .filter((task) => !['completed', 'done', 'archived'].includes(String(task?.status || '').toLowerCase()))
+      .map((task, index) => ({
+        id: opaqueId('task', task.id, `task-${index}`), label: 'Active task', status: taskSignalStatus(task),
+      }))
+    : null;
+  const projectedFeatures = Array.isArray(featuresState?.features)
+    ? featuresState.features.map((feature) => ({
+      id: safeText(feature.id, 'feature'), label: 'District feature', enabled: feature.enabled === true,
+    }))
+    : null;
+  const projectedPeers = Array.isArray(peers)
+    ? peers.map((peer) => ({
+      id: eidoversePeerId(peer),
+      label: 'Federated peer',
+      travelAvailable: destinations.has(eidoversePeerId(peer)),
+      enabled: peer.enabled !== false,
+      fullSync: peer.fullSync === true,
+      status: coarseStatus(peer.status),
+    }))
+    : null;
+  const health = healthSnapshot({ apps, cosStatus, review, backupState, notifications, character, voiceConfig, memory, diskPercent }, includeAttentionReasons);
+
+  return {
+    apps: projectedApps(apps, includeAttentionReasons),
+    agents: projectedAgents,
+    tasks: projectedTasks,
+    features: projectedFeatures,
+    peers: projectedPeers,
+    health,
+    productivity: projectedProductivity(todayActivity, taskState),
+    activity: projectedActivity(activityCalendar),
+    goals: projectedGoals(goalsData),
+    memory: projectedMemory(memoryGraph),
+    storage: projectedStorage(introspection),
+    jira,
+    operations: projectedOperations({ cosStatus, review, backupState, notifications, character, voiceConfig, memory, diskPercent, inboxCounts }, includeAttentionReasons),
+  };
+}

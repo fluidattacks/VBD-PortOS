@@ -1,0 +1,443 @@
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+
+// Mock dependencies before importing the module
+vi.mock('../lib/fileUtils.js', () => ({
+tryReadFile: vi.fn().mockResolvedValue(null),
+  ensureDir: vi.fn(),
+  readJSONFile: vi.fn(),
+  PATHS: { cos: '/tmp/test/cos' },
+  atomicWrite: vi.fn()
+}));
+
+vi.mock('fs/promises', () => ({
+  writeFile: vi.fn().mockResolvedValue()
+}));
+
+vi.mock('fs', () => ({
+  existsSync: vi.fn().mockReturnValue(true)
+}));
+
+// Not mocked — the shared launchable-workflow catalog is a pure constant list.
+const { SLASHDO_COMMAND_NAMES, getSlashdoWorkflow } = await import('../lib/slashdoCatalog.js');
+
+// Import after mocking
+const { atomicWrite, readJSONFile } = await import('../lib/fileUtils.js');
+const { writeFile } = await import('fs/promises');
+const {
+  getAllTemplates,
+  getPopularTemplates,
+  recordTemplateUsage,
+  createTemplate,
+  createTemplateFromTask,
+  updateTemplate,
+  deleteTemplate
+} = await import('./taskTemplates.js');
+
+describe('taskTemplates service', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    writeFile.mockReset().mockResolvedValue();
+    readJSONFile.mockReset();
+    // Keep the persistence double stable while several saves overlap.
+    atomicWrite.mockImplementation(async (filePath, data) => writeFile(filePath, JSON.stringify(data)));
+  });
+
+  describe('concurrent mutations (#9787)', () => {
+    const template = { id: 'user-example', name: 'Original', description: 'Example', isBuiltin: false };
+
+    // Every read gets a separate durable snapshot, as a JSON file read does.
+    function usePersistence(state) {
+      let durable = JSON.stringify(state);
+      readJSONFile.mockImplementation(async () => JSON.parse(durable));
+      writeFile.mockImplementation(async (_path, payload) => { durable = payload; });
+    }
+
+    function holdNextWrite(failure) {
+      const started = Promise.withResolvers();
+      const gate = Promise.withResolvers();
+      const persist = writeFile.getMockImplementation();
+      writeFile.mockImplementationOnce(async (...args) => {
+        started.resolve();
+        await gate.promise;
+        if (failure) throw failure;
+        return persist(...args);
+      });
+      return { started: started.promise, release: gate.resolve };
+    }
+
+    it('preserves an authored edit when usage overlaps its pending save', async () => {
+      usePersistence({ userTemplates: [template], usage: {} });
+      const pending = holdNextWrite();
+      const edit = updateTemplate(template.id, { name: 'Edited' });
+      await pending.started;
+      const use = recordTemplateUsage(template.id);
+      pending.release();
+
+      const [edited, count] = await Promise.all([edit, use]);
+      expect(edited.name).toBe('Edited');
+      expect(count).toBe(1);
+      expect((await getAllTemplates()).find(t => t.id === template.id))
+        .toMatchObject({ name: 'Edited', useCount: 1 });
+    });
+
+    it('preserves both concurrent usage increments', async () => {
+      usePersistence({ userTemplates: [template], usage: {} });
+      const pending = holdNextWrite();
+      const first = recordTemplateUsage(template.id);
+      await pending.started;
+      const second = recordTemplateUsage(template.id);
+      pending.release();
+
+      expect(await Promise.all([first, second])).toEqual([1, 2]);
+      expect((await getAllTemplates()).find(t => t.id === template.id).useCount).toBe(2);
+    });
+
+    it('does not restore a deleted template when usage was queued after deletion', async () => {
+      usePersistence({ userTemplates: [template], usage: { [template.id]: 3 } });
+      const pending = holdNextWrite();
+      const deletion = deleteTemplate(template.id);
+      await pending.started;
+      const use = recordTemplateUsage(template.id);
+      pending.release();
+
+      const [deleted, count] = await Promise.all([deletion, use]);
+      expect(deleted.success).toBe(true);
+      expect(count).toBe(1);
+      expect((await getAllTemplates()).find(t => t.id === template.id)).toBeUndefined();
+    });
+
+    it('shares admission across usage, create-from-task, edits and deletion of different templates', async () => {
+      const removed = { ...template, id: 'user-removed' };
+      usePersistence({ userTemplates: [template, removed], usage: {} });
+      const pending = holdNextWrite();
+      const use = recordTemplateUsage('builtin-do-plan-task');
+      await pending.started;
+      const creation = createTemplateFromTask({ description: 'Example task', context: 'Example context' }, 'Saved task');
+      const edit = updateTemplate(template.id, { name: 'Edited' });
+      const deletion = deleteTemplate(removed.id);
+      pending.release();
+
+      const [, created] = await Promise.all([use, creation, edit, deletion]);
+      const saved = await getAllTemplates();
+      expect(saved.find(t => t.id === 'builtin-do-plan-task').useCount).toBe(1);
+      expect(saved.find(t => t.id === template.id).name).toBe('Edited');
+      expect(saved.find(t => t.id === removed.id)).toBeUndefined();
+      expect(saved.find(t => t.id === created.id))
+        .toMatchObject({ name: 'Saved task', description: 'Example task', context: 'Example context', category: 'from-task' });
+    });
+
+    it('propagates a rejected save and lets the next mutation read unchanged durable state', async () => {
+      usePersistence({ userTemplates: [template], usage: {} });
+      const failure = new Error('Synthetic persistence failure');
+      const pending = holdNextWrite(failure);
+      const edit = updateTemplate(template.id, { name: 'Not saved' });
+      const resultsPromise = Promise.allSettled([edit, recordTemplateUsage(template.id)]);
+      await pending.started;
+      pending.release();
+
+      const results = await resultsPromise;
+      expect(results[0]).toEqual({ status: 'rejected', reason: failure });
+      expect(results[1]).toEqual({ status: 'fulfilled', value: 1 });
+      expect((await getAllTemplates()).find(t => t.id === template.id))
+        .toMatchObject({ name: 'Original', useCount: 1 });
+    });
+
+    it('does not retain a failed first creation in the empty-store defaults', async () => {
+      usePersistence(null);
+      const failure = new Error('Synthetic persistence failure');
+      writeFile.mockRejectedValueOnce(failure);
+      await expect(createTemplate({ name: 'Not saved', description: 'Example' })).rejects.toBe(failure);
+
+      const created = await createTemplateFromTask({ description: 'Example task' }, 'Saved task');
+      expect((await getAllTemplates()).filter(t => !t.isBuiltin)).toEqual([{ ...created, useCount: 0 }]);
+    });
+
+    it('preserves strict-read errors without poisoning later queued work', async () => {
+      usePersistence({ userTemplates: [template], usage: {} });
+      const failure = new Error('Synthetic unreadable state');
+      readJSONFile.mockRejectedValueOnce(failure);
+      const results = await Promise.allSettled([
+        updateTemplate(template.id, { name: 'Not saved' }),
+        recordTemplateUsage(template.id)
+      ]);
+
+      expect(results[0]).toEqual({ status: 'rejected', reason: failure });
+      expect(results[1]).toEqual({ status: 'fulfilled', value: 1 });
+      expect(readJSONFile).toHaveBeenCalledWith(expect.any(String), null, { strict: true });
+      expect((await getAllTemplates()).find(t => t.id === template.id))
+        .toMatchObject({ name: 'Original', useCount: 1 });
+    });
+  });
+
+  describe('getAllTemplates', () => {
+    it('returns built-in templates when no user templates exist', async () => {
+      readJSONFile.mockResolvedValue(null);
+
+      const templates = await getAllTemplates();
+
+      expect(templates.length).toBeGreaterThan(0);
+      expect(templates.every(t => t.isBuiltin)).toBe(true);
+      expect(templates.every(t => t.id.startsWith('builtin-'))).toBe(true);
+      expect(templates.every(t => t.useCount === 0)).toBe(true);
+    });
+
+    it('merges built-in and user templates', async () => {
+      readJSONFile.mockResolvedValue({
+        userTemplates: [
+          {
+            id: 'user-abc123',
+            name: 'My Template',
+            description: 'Custom',
+            icon: '🔥',
+            context: 'some context',
+            isBuiltin: false
+          }
+        ],
+        usage: {},
+        lastUpdated: '2025-01-01T00:00:00.000Z'
+      });
+
+      const templates = await getAllTemplates();
+
+      const builtInCount = templates.filter(t => t.isBuiltin).length;
+      const userCount = templates.filter(t => !t.isBuiltin).length;
+
+      expect(builtInCount).toBeGreaterThan(0);
+      expect(userCount).toBe(1);
+      expect(templates.find(t => t.id === 'user-abc123')).toBeDefined();
+    });
+
+    it('includes usage counts from state', async () => {
+      readJSONFile.mockResolvedValue({
+        userTemplates: [
+          {
+            id: 'user-abc123',
+            name: 'My Template',
+            description: 'Custom',
+            icon: '🔥',
+            context: 'some context',
+            isBuiltin: false
+          }
+        ],
+        usage: {
+          'user-abc123': 5,
+          'builtin-do-plan-task': 3
+        },
+        lastUpdated: '2025-01-01T00:00:00.000Z'
+      });
+
+      const templates = await getAllTemplates();
+
+      const userTemplate = templates.find(t => t.id === 'user-abc123');
+      const builtinTemplate = templates.find(t => t.id === 'builtin-do-plan-task');
+
+      expect(userTemplate.useCount).toBe(5);
+      expect(builtinTemplate.useCount).toBe(3);
+    });
+  });
+
+  describe('createTemplate', () => {
+    it('creates with generated ID and correct fields', async () => {
+      readJSONFile.mockResolvedValue({
+        userTemplates: [],
+        usage: {},
+        lastUpdated: null
+      });
+
+      const templateData = {
+        name: 'Test Template',
+        icon: '🚀',
+        description: 'Test description',
+        context: 'Test context',
+        category: 'testing',
+        provider: 'openai',
+        model: 'gpt-4',
+        app: 'test-app'
+      };
+
+      const newTemplate = await createTemplate(templateData);
+
+      expect(newTemplate.id).toMatch(/^user-/);
+      expect(newTemplate.name).toBe('Test Template');
+      expect(newTemplate.icon).toBe('🚀');
+      expect(newTemplate.description).toBe('Test description');
+      expect(newTemplate.context).toBe('Test context');
+      expect(newTemplate.category).toBe('testing');
+      expect(newTemplate.provider).toBe('openai');
+      expect(newTemplate.model).toBe('gpt-4');
+      expect(newTemplate.app).toBe('test-app');
+      expect(newTemplate.isBuiltin).toBe(false);
+      expect(newTemplate.createdAt).toBeDefined();
+
+      expect(writeFile).toHaveBeenCalled();
+    });
+  });
+
+  describe('deleteTemplate', () => {
+    it('returns error for built-in templates', async () => {
+      readJSONFile.mockResolvedValue({
+        userTemplates: [],
+        usage: {},
+        lastUpdated: null
+      });
+
+      const result = await deleteTemplate('builtin-do-plan-task');
+
+      expect(result.error).toBe('Cannot delete built-in templates');
+      expect(writeFile).not.toHaveBeenCalled();
+    });
+
+    it('deletes user templates', async () => {
+      readJSONFile.mockResolvedValue({
+        userTemplates: [
+          {
+            id: 'user-abc123',
+            name: 'My Template',
+            description: 'Custom',
+            icon: '🔥',
+            context: 'some context',
+            isBuiltin: false
+          }
+        ],
+        usage: {
+          'user-abc123': 5
+        },
+        lastUpdated: '2025-01-01T00:00:00.000Z'
+      });
+
+      const result = await deleteTemplate('user-abc123');
+
+      expect(result.success).toBe(true);
+      expect(result.deleted.id).toBe('user-abc123');
+      expect(writeFile).toHaveBeenCalled();
+
+      const savedState = JSON.parse(writeFile.mock.calls[0][1]);
+      expect(savedState.userTemplates.length).toBe(0);
+      expect(savedState.usage['user-abc123']).toBeUndefined();
+    });
+  });
+
+  describe('recordTemplateUsage', () => {
+    it('increments usage counter', async () => {
+      readJSONFile.mockResolvedValue({
+        userTemplates: [],
+        usage: {
+          'builtin-do-plan-task': 3
+        },
+        lastUpdated: '2025-01-01T00:00:00.000Z'
+      });
+
+      const count = await recordTemplateUsage('builtin-do-plan-task');
+
+      expect(count).toBe(4);
+      expect(writeFile).toHaveBeenCalled();
+
+      const savedState = JSON.parse(writeFile.mock.calls[0][1]);
+      expect(savedState.usage['builtin-do-plan-task']).toBe(4);
+    });
+  });
+
+  describe('getPopularTemplates', () => {
+    it('returns sorted by useCount descending', async () => {
+      readJSONFile.mockResolvedValue({
+        userTemplates: [
+          {
+            id: 'user-abc123',
+            name: 'My Template',
+            description: 'Custom',
+            icon: '🔥',
+            context: 'some context',
+            isBuiltin: false
+          }
+        ],
+        usage: {
+          'user-abc123': 10,
+          'builtin-do-plan-task': 3,
+          'builtin-do-next': 7
+        },
+        lastUpdated: '2025-01-01T00:00:00.000Z'
+      });
+
+      const popular = await getPopularTemplates(3);
+
+      expect(popular.length).toBe(3);
+      expect(popular[0].id).toBe('user-abc123');
+      expect(popular[0].useCount).toBe(10);
+      expect(popular[1].id).toBe('builtin-do-next');
+      expect(popular[1].useCount).toBe(7);
+      expect(popular[2].id).toBe('builtin-do-plan-task');
+      expect(popular[2].useCount).toBe(3);
+    });
+  });
+
+  describe('slashdo built-ins (#3089)', () => {
+    it('ships one template per catalog workflow, with implied settings', async () => {
+      readJSONFile.mockResolvedValue(null);
+
+      const templates = await getAllTemplates();
+      const slashdo = templates.filter(t => t.slashdoCommand);
+
+      // Derived from the shared catalog (#3114), so the assertion is convergence
+      // with it — not a hand-copied list that can drift the way the route's
+      // registry and this set already had (`push`/`better-swift` were missing here).
+      expect(slashdo.map(t => t.slashdoCommand)).toEqual([...SLASHDO_COMMAND_NAMES]);
+      // Every one of these either writes no code at all or manages its own
+      // worktree/PR, so none of them want PortOS to wrap another one around it.
+      for (const t of slashdo) {
+        expect(t.settings).toMatchObject({ useWorktree: false, openPR: false, simplify: false });
+      }
+      // …and each carries the catalog's deliverable posture verbatim (#3636), so
+      // the template surface can't quietly drop `worktreeChangesExpected` the way
+      // a hand-copied settings literal would. Which command gets which posture is
+      // pinned in `slashdoCatalog.test.js`; here we only assert the pass-through.
+      for (const t of slashdo) {
+        expect(t.settings).toBe(getSlashdoWorkflow(t.slashdoCommand).settings);
+      }
+      // The BARE command name is what is stored — a rendered `/do:x` string
+      // would be Claude-only, and the provider is unknown at pick time.
+      expect(slashdo.every(t => !t.slashdoCommand.includes('/'))).toBe(true);
+      // Each carries the display fields the quick-template chips render.
+      for (const t of slashdo) {
+        expect(t.id).toBe(`builtin-do-${t.slashdoCommand}`);
+        expect(t.name).toBeTruthy();
+        expect(t.icon).toBeTruthy();
+        expect(t.description).toBeTruthy();
+        expect(t.category).toBe('slashdo');
+        expect(t.isBuiltin).toBe(true);
+      }
+    });
+
+    it('drops the generic phrase stubs the slashdo set replaced', async () => {
+      readJSONFile.mockResolvedValue(null);
+
+      const templates = await getAllTemplates();
+      expect(templates.find(t => t.description === 'Fix the bug where')).toBeUndefined();
+      expect(templates.find(t => t.description === 'Refactor')).toBeUndefined();
+    });
+  });
+
+  describe('orphaned built-in usage counters', () => {
+    it('drops usage entries for builtin-* ids that no longer exist', async () => {
+      readJSONFile.mockResolvedValue({
+        userTemplates: [{ id: 'user-abc123', name: 'Mine', description: 'Custom', isBuiltin: false }],
+        usage: {
+          'builtin-fix-bug': 12,        // removed in #3089
+          'builtin-improve-ux': 4,      // removed in #3089
+          'builtin-do-plan-task': 2,    // still shipped
+          'user-abc123': 9              // user counters are never pruned here
+        },
+        lastUpdated: '2025-01-01T00:00:00.000Z'
+      });
+
+      const count = await recordTemplateUsage('builtin-do-plan-task');
+      expect(count).toBe(3);
+
+      const savedState = JSON.parse(writeFile.mock.calls[0][1]);
+      expect(savedState.usage['builtin-fix-bug']).toBeUndefined();
+      expect(savedState.usage['builtin-improve-ux']).toBeUndefined();
+      expect(savedState.usage['builtin-do-plan-task']).toBe(3);
+      expect(savedState.usage['user-abc123']).toBe(9);
+      expect(savedState.userTemplates.length).toBe(1);
+    });
+  });
+});

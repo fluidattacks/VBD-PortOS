@@ -1,0 +1,122 @@
+// Barrel + composer for the per-domain schema DDL modules (#2832).
+//
+// ensureSchemaImpl() in server/lib/db.js used to inline ~1265 lines of
+// CREATE TABLE / CREATE INDEX / trigger DDL for every domain. That DDL now
+// lives in per-domain modules here, each exporting a plain statement array;
+// this file re-exports them and composes the two ordered lists that
+// ensureSchemaImpl runs on every boot.
+//
+// ORDER IS LOAD-BEARING. The composed lists reproduce the pre-split statement
+// order EXACTLY (foreign-key references, the trigger function preceding its
+// triggers, and catalog_user_types' original post-media position all depend on
+// it), so the executed schema is byte-identical to the inline version.
+//
+// See README.md for the module catalog.
+
+import { coreDdl } from './core.js';
+import { tribeDdl } from './tribe.js';
+import { humanActivityDdl } from './humanActivity.js';
+import { postDdl } from './post.js';
+import { commissionsDdl } from './commissions.js';
+import { userActionsDdl } from './userActions.js';
+import { reviewQueueTriageDdl } from './reviewQueueTriage.js';
+import { cosAgentFeedbackDdl } from './cosAgentFeedback.js';
+import { aiGraphDdl } from './aiGraph.js';
+import { peerExecutionDdl } from './peerExecution.js';
+import { catalogDdl, catalogUserTypesDdl, catalogPendingAppliesDdl } from './catalog.js';
+import { mediaDdl } from './media.js';
+import { universesDdl } from './universes.js';
+import { libraryDdl } from './library.js';
+import { pipelineDdl } from './pipeline.js';
+import { writersRoomDdl } from './writersRoom.js';
+import { loraDdl } from './lora.js';
+import { privacyDdl } from './privacy.js';
+import { stackerNewsDdl } from './stackerNews.js';
+import { xDdl } from './x.js';
+import { mindToolRecipesDdl } from './mindToolRecipes.js';
+import { decksDdl } from './decks.js';
+import { beeperDdl } from './beeper.js';
+import { auditDdl, auditedTables, buildAuditTriggers } from './audit.js';
+import { syncFeedDdl, syncFeedTables, buildSyncFeedTriggers } from './syncFeed.js';
+
+export {
+  coreDdl,
+  tribeDdl,
+  humanActivityDdl,
+  postDdl,
+  commissionsDdl,
+  userActionsDdl,
+  reviewQueueTriageDdl,
+  cosAgentFeedbackDdl,
+  aiGraphDdl,
+  peerExecutionDdl,
+  catalogDdl,
+  catalogUserTypesDdl,
+  catalogPendingAppliesDdl,
+  mediaDdl,
+  universesDdl,
+  libraryDdl,
+  pipelineDdl,
+  writersRoomDdl,
+  loraDdl,
+  privacyDdl,
+  stackerNewsDdl,
+  xDdl,
+  beeperDdl,
+  mindToolRecipesDdl,
+  decksDdl,
+  auditDdl,
+  auditedTables,
+  buildAuditTriggers,
+  syncFeedDdl,
+  syncFeedTables,
+  buildSyncFeedTriggers,
+};
+
+// Phase 1 — the `upgrades` list: memory-sync columns + migration tracker, then
+// the machine-local Tribe / human-activity / POST / commission / user-action /
+// AI-connection-graph tables. Run first, before the catalog block.
+export function buildUpgradeDdl() {
+  return [
+    ...coreDdl,
+    ...tribeDdl,
+    ...humanActivityDdl,
+    ...postDdl,
+    ...commissionsDdl,
+    ...userActionsDdl,
+    ...reviewQueueTriageDdl,
+    ...cosAgentFeedbackDdl,
+    ...aiGraphDdl,
+    ...peerExecutionDdl,
+  ];
+}
+
+// Phase 2 — the `catalogDDL` list: catalog + all creative-app tables, then the
+// record_audit table/function, then the per-table audit triggers. catalog_user_types
+// is threaded in AFTER the media block to match its original position (see catalog.js).
+// `beeperDdl` is appended after `xDdl` (#27) — same external-mirror shape as
+// stackerNews/x, added last of that group, before the audit block. The
+// commit-ordered sync feed (#8315) comes last: its triggers attach to memories
+// and the catalog tables, which must already exist.
+export function buildCatalogDdl() {
+  return [
+    ...catalogDdl,
+    ...mediaDdl,
+    ...catalogUserTypesDdl,
+    ...universesDdl,
+    ...libraryDdl,
+    ...pipelineDdl,
+    ...writersRoomDdl,
+    ...loraDdl,
+    ...privacyDdl,
+    ...stackerNewsDdl,
+    ...xDdl,
+    ...beeperDdl,
+    ...mindToolRecipesDdl,
+    ...decksDdl,
+    ...auditDdl,
+    ...buildAuditTriggers(),
+    ...syncFeedDdl,
+    ...buildSyncFeedTriggers(),
+  ];
+}

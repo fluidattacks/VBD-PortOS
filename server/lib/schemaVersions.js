@@ -1,0 +1,1161 @@
+/**
+ * PortOS schema-version contract for cross-instance sync.
+ *
+ * Two PortOS instances that exchange data (federated peer push, snapshot
+ * sync, share-bucket manifests) need a way to detect a version mismatch
+ * BEFORE applying records the receiver can't parse. Without this, an
+ * upgraded sender silently corrupts a downstream peer whose code doesn't
+ * yet understand a new storage layout.
+ *
+ * `PORTOS_SCHEMA_VERSIONS` is the per-sync-category WIRE contract — distinct
+ * from the storage-layout version stamped on `data/{type}/index.json` (see
+ * each service's local `TYPE_SCHEMA_VERSION` const). Bump the wire contract
+ * for either:
+ *   (a) a storage layout change (e.g. universes 4→5 splitting out of the
+ *       monolithic JSON), OR
+ *   (b) an additive record-shape change that a not-yet-upgraded peer would
+ *       silently strip on round-trip (e.g. pipelineSeries 1→2 for the
+ *       `series.arc.readerMap` field).
+ * For (a) ship the corresponding `scripts/migrations/NNN-…js` to update the
+ * stamped storage version too; for (b) the local storage layout stays put.
+ * The number flows through every outbound payload's `portosMeta.schemaVersions`;
+ * receivers compare incoming vs local and reject ahead-mismatches (sender too
+ * new) or behind-mismatches (sender too old to satisfy a forward-only field).
+ *
+ * Absent categories default to 0. Receivers choose which mismatch directions
+ * to reject; live catalog rows require equality even for unversioned peers.
+ * Future PRs that introduce a layout change for `series`, `issues`, etc.
+ * add an entry here.
+ */
+
+import { join } from 'path';
+import { PATHS, tryReadFile, safeJSONParse } from './fileUtils.js';
+
+export const PORTOS_SCHEMA_VERSIONS = Object.freeze({
+  // Numeric-only peer wire payload (v1); read-through, never imported into local records.
+  // Checked-in `.quality.json` is file schema v2 and must not bump this number.
+  appQuality: 1,
+  // Memory pull negotiates this capability explicitly. Version numbers describe
+  // the sender's local history; receivers retain their own monotonic history.
+  memoryHistory: 1,
+  // Type-level (storage layout) version for `data/universes/{id}/index.json`.
+  // v5 = post-split. Migration 034 introduced it. The independent per-record
+  // shape is currently v5 (stamped inside each record by `sanitizeTemplate`).
+  // v6 = canon characters gained `relationshipLinks[]` (structured
+  // character-to-character links + opposing-force tags, #1287). Additive +
+  // gracefully degrading, but version-gated for the same reason as
+  // `pipelineIssues`/`pipelineSeries` v2: a not-yet-upgraded peer that receives
+  // and re-sanitizes a universe through its relationshipLinks-unaware
+  // `sanitizeCharacter` would silently strip the field and last-writer-wins the
+  // loss back onto the newer peer. Bumping makes the older peer reject the
+  // ahead-version universe transfer instead. Per-category gate → only universe
+  // sync pauses with old peers; pipeline/catalog/etc keep flowing.
+  // v7 = canon objects gained `attachments[]` (structured object↔character
+  // emotional-attachment links — emotion/significance/origin/role, #1288).
+  // Same rationale as v6: additive + gracefully degrading, but version-gated so
+  // a not-yet-upgraded peer that re-sanitizes a universe through its
+  // attachments-unaware `sanitizeObject` can't silently strip the field and
+  // LWW the loss back onto the newer peer.
+  //
+  // v8 adds shared styleReferences[]. Older peers must not sanitize the field
+  // away and LWW-sync that loss back to a newer install.
+  // v9 = `moodBoardId` added (#4188) — the universe's linked mood board. The
+  // pointer rides the wire (mood boards federate, so the id resolves on peers);
+  // same rationale as v6/v7/v8: additive + gracefully degrading, but an older
+  // peer that re-sanitizes a universe through its moodBoardId-unaware
+  // `sanitizeTemplate` would silently strip the link and LWW the loss back.
+  // v10 = character `voiceCanon` and `identityPack` added (#5378). These are
+  // portable, federated production-canon fields; a ≤v9 peer would sanitize
+  // them away and LWW the loss back after an unrelated Universe edit.
+  // v11 = character `psychology` added (#6414) — the optional structured
+  // theory-of-control + survival/connection/status drive profile. Additive and
+  // gracefully degrading, but version-gated for the same reason as v6–v10: a
+  // ≤v10 peer that re-sanitizes a universe through its psychology-unaware
+  // `sanitizeCharacter` would strip the profile and last-writer-wins the loss
+  // back onto the newer peer. Per-category gate → only universe sync pauses
+  // with old peers.
+  // v12 = universe `factual` added (#7616) — the factual/fiction axis that
+  // tells the catalog extractor to read a world's material as lived record
+  // rather than invented story. Persisted only when true, but federated: a
+  // <=v11 peer would strip it in its `factual`-unaware `sanitizeTemplate`
+  // and last-writer-wins the loss back, silently reclassifying the user's
+  // Reality universe as fiction.
+  universes: 12,
+  // v1 = post-split. Migrations 035/036 introduced the pipeline collection
+  // layout for issues and series.
+  // v2 = `stages.audio.audioMode` + `stages.audio.cues[]` added (whole-episode
+  // audio, issue #863). Additive, but version-gated for the same reason
+  // `pipelineSeries 1→2` (readerMap) is: an older, audioMode/cues-unaware peer
+  // that receives and re-sanitizes the record would silently strip the new
+  // fields and last-writer-wins the loss back onto the newer peer. Bumping
+  // makes the older peer reject the ahead-version issue transfer instead.
+  // Per-category gate → only issue sync pauses with old peers; series/universes
+  // keep flowing.
+  // v3 = `issue.arcRole: "climax"` added (#4454). A <=v2 peer rejects the
+  // ahead-version transfer; when its older snapshot is later received by a v3
+  // peer, the merge preserves an existing climax role instead of letting the
+  // older sanitizer's omission LWW-strip or overwrite it.
+  pipelineIssues: 3,
+  // v2 = `series.arc.readerMap` added (Unified Story Builder). Additive +
+  // gracefully-degrading, but version-gated so a not-yet-upgraded peer can't
+  // round-trip a series through its readerMap-unaware sanitizer and LWW-strip
+  // the field back onto a newer peer. Per-category gate → only series sync
+  // pauses with old peers; issues/universes keep flowing.
+  // v3 = `series.arc.tickingClock` added (#1289). Same situation as readerMap:
+  // an additive field INSIDE the series.arc payload, so a ≤v2 peer that receives
+  // and re-sanitizes a series through its tickingClock-unaware `sanitizeArc`
+  // would silently strip the countdown and last-writer-wins the loss back onto
+  // the newer peer. Bump makes the older peer reject the ahead-version series
+  // transfer instead. Per-category gate → only series sync pauses with old peers.
+  // v4 = `series.styleGuide` added (#1303) — a top-level series house-style
+  // field (tense/POV/audience/rating/reading-level/tone/conventions). Same
+  // silent-strip-then-LWW corruption as readerMap/tickingClock, just one level
+  // up: a ≤v3 peer re-sanitizes a series through its styleGuide-unaware
+  // `sanitizeSeries`, drops the guide, and last-writer-wins the loss back onto
+  // the newer peer. Bump makes the older peer reject the ahead-version series
+  // transfer instead. Per-category gate → only series sync pauses with old peers.
+  // v5 = `series.coverImage` added — a top-level derived field holding the
+  // filename of a rendered volume/issue cover, shown as a thumbnail on the
+  // pipeline series list. Derived (any peer can recompute it from its own
+  // seasons/issues), but it's only recomputed on cover-render or the one-time
+  // boot backfill — never on every read — so a ≤v4 peer that re-sanitizes a
+  // series through its coverImage-unaware `sanitizeSeries` would drop the
+  // pointer and LWW the loss back onto the newer peer, where it may never
+  // recompute (a finished series renders no new cover). Gate so the older peer
+  // rejects the ahead-version transfer instead. Per-category gate → only series
+  // sync pauses with old peers.
+  // v6 = `series.characterArcs[]` added (#1293) — per-character story arcs
+  // (want/need, start → end state, transition beats). Same silent-strip-then-LWW
+  // corruption as readerMap/tickingClock/styleGuide: a ≤v5 peer that re-sanitizes
+  // a series through its characterArcs-unaware `sanitizeSeries` would drop the
+  // arcs and last-writer-wins the loss back onto the newer peer. Bump makes the
+  // older peer reject the ahead-version series transfer instead. Per-category
+  // gate → only series sync pauses with old peers.
+  // v7 = `series.factCritical` + `series.factReference` added (#1588) — the
+  // opt-in flag + author-supplied real-world fact reference the gated
+  // `research.fact-accuracy` editorial check reconciles the prose against. Same
+  // silent-strip-then-LWW corruption as styleGuide/characterArcs: a ≤v6 peer
+  // that re-sanitizes a series through its factReference-unaware `sanitizeSeries`
+  // would drop the reference (and reset the flag) and last-writer-wins the loss
+  // back onto the newer peer. Bump makes the older peer reject the ahead-version
+  // series transfer instead. Per-category gate → only series sync pauses with old peers.
+  // v8 = `series.editorialCheckConfig` added (#1591) — a per-series map of
+  // editorial-check config overrides ({ [checkId]: { [key]: value } }) that tune a
+  // check's thresholds (e.g. comic lettering density) for one series without
+  // touching the global catalog. Same silent-strip-then-LWW corruption as
+  // styleGuide/characterArcs: a ≤v7 peer that re-sanitizes a series through its
+  // editorialCheckConfig-unaware `sanitizeSeries` would drop the overrides and
+  // last-writer-wins the loss back onto the newer peer. Bump makes the older peer
+  // reject the ahead-version series transfer instead. Per-category gate → only
+  // series sync pauses with old peers.
+  // v9 = `series.severityWeights` + `series.blockingSeverities` added (#1616) —
+  // per-series overrides of the editorial health-score severity weights (default
+  // high:12/medium:5/low:1) and of which severities count as blocking for each
+  // autopilot gate (arc/beatContinuity/editorial). Both default to `{}` (no
+  // override → frozen defaults apply). Same silent-strip-then-LWW corruption as
+  // editorialCheckConfig: a ≤v8 peer that re-sanitizes a series through its
+  // severityWeights/blockingSeverities-unaware `sanitizeSeries` would drop the
+  // overrides and last-writer-wins the loss back onto the newer peer. Bump makes
+  // the older peer reject the ahead-version series transfer instead. Per-category
+  // gate → only series sync pauses with old peers.
+  // v10 = `series.arc.foreshadowing` added (#2172) — the arc-overview-emitted
+  // plant → reinforce → payoff ledger the Chekhov check consumes. Same additive
+  // field INSIDE the series.arc payload as readerMap (v2) / tickingClock (v3): a
+  // ≤v9 peer that re-sanitizes a series through its foreshadowing-unaware
+  // `sanitizeArc` would silently strip the ledger and last-writer-wins the loss
+  // back onto the newer peer. Bump makes the older peer reject the ahead-version
+  // series transfer instead. Per-category gate → only series sync pauses with old peers.
+  // v11 = `series.styleGuide.voiceExemplars` + `series.styleGuide.voiceAntiExemplars`
+  // added (#2179) — the voice exemplar / anti-exemplar "tuning fork" passages. Same
+  // additive field INSIDE the federated `styleGuide` sub-object as styleGuide itself
+  // (v4): a ≤v10 peer that re-sanitizes a series through its voiceExemplars-unaware
+  // `sanitizeStyleGuide` would silently strip the passages and last-writer-wins the
+  // loss back onto the newer peer (`preserveAbsentAdditiveFields` only restores a
+  // wholly-absent `styleGuide`, not a present-but-sub-field-stripped one). Bump makes
+  // the older peer reject the ahead-version series transfer instead. Per-category gate
+  // → only series sync pauses with old peers.
+  // v12 = `series.exportSettings` added (#2181) — the per-series prose-export
+  // config (trim size, interior font, title-page fields) for the compiled-
+  // manuscript / ePub / print-interior-PDF exports. Top-level additive field
+  // like styleGuide (v4): a ≤v11 peer that re-sanitizes a series through its
+  // exportSettings-unaware `sanitizeSeries` would silently strip it and
+  // last-writer-wins the loss back onto the newer peer
+  // (`preserveAbsentAdditiveFields` restores a wholly-absent `exportSettings`
+  // from a BEHIND-version SAME-schema peer, but a wire-received record from an
+  // OLDER peer must be rejected outright). Bump makes the older peer reject the
+  // ahead-version series transfer instead. Per-category gate → only series sync
+  // pauses with old peers.
+  // v13 = `series.characterArcs[].evolution` added (#6440) — the optional
+  // five-stage character evolution lens (belief under test → pressure → choice
+  // → consequence, with a declared outcome). Same additive field INSIDE an
+  // already-federated sub-object as voiceExemplars (v11) inside styleGuide: a
+  // ≤v12 peer that re-sanitizes a series through its evolution-unaware
+  // `sanitizeCharacterArc` would silently strip the lens and last-writer-wins
+  // the loss back onto the newer peer (`preserveAbsentAdditiveFields` restores
+  // a wholly-absent `characterArcs`, not a present-but-sub-field-stripped
+  // one). Bump makes the older peer reject the ahead-version series transfer
+  // instead. Per-category gate → only series sync pauses with old peers.
+  // v14: author-owned arc.seriesDesign; older sanitizers must not erase it.
+  pipelineSeries: 14,
+  // NOT bumped for the manuscript-review sibling doc now bundled on series
+  // pushes/exports (`data/pipeline-series/{id}/manuscript-review.json`).
+  // Unlike `readerMap` (v2), the review is NOT a field inside the series
+  // record — it's a separate doc that rides a dedicated `manuscriptReview`
+  // payload key, so an older peer never round-trips it through the series
+  // sanitizer (no silent-strip-then-LWW-back corruption — the readerMap gate's
+  // whole reason to exist). It is additive + gracefully degrading: a pre-feature
+  // receiver ignores the unknown key (review just doesn't reach it) and ships
+  // no review back, so the newer peer's `if (manuscriptReview)` receive guard
+  // is a no-op and the local review is preserved. Bumping `pipelineSeries` here
+  // would be actively harmful — it would 409-reject the ENTIRE series push
+  // (record + issues) to every not-yet-upgraded peer over an OPTIONAL doc that
+  // degrades fine. Registering a brand-new gated category would hit the same
+  // whole-payload footgun documented for `videoHistory` below. So manuscript-
+  // review is intentionally UNGATED today (all peers ship review-doc shape v1).
+  // The FIRST incompatible review-doc shape change (manuscriptReview.js
+  // SCHEMA_VERSION 1→2, where an older peer's sanitizer would strip a field and
+  // LWW it back) MUST introduce a gate then — mirroring the catalog
+  // payloadSchemaVersion lockstep note below.
+  // ALSO not bumped for the reverse-outline sibling doc (#1348), bundled on
+  // series pushes/exports as `data/pipeline-series/{id}/reverse-outline.json`
+  // via a dedicated `reverseOutline` payload key. Identical reasoning to the
+  // manuscript-review note above: it's a separate doc (not a series field), so
+  // an older peer never round-trips it through `sanitizeSeries`; it's additive +
+  // gracefully degrading (a pre-#1348 receiver ignores the unknown key and ships
+  // none back, so the newer peer's `if (reverseOutline)` receive guard is a
+  // no-op and the local outline is preserved); and the sender's legacy-strip
+  // retry drops the key so the record/issues still land. Whole-doc LWW on
+  // `generatedAt` means there's no per-field strip-then-LWW-back corruption to
+  // gate against. The FIRST incompatible outline-doc shape change (reverseOutline.js
+  // SCHEMA_VERSION 1→2) MUST introduce a gate then, same as the review above.
+  mediaCollections: 1,
+  // v1 = card decks (PostgreSQL `decks` + `deck_cards`) federated via the
+  // per-record peer-sync push pipeline (record kind `deck`, sync category
+  // `decks`). A brand-NEW synced record type, so it gets its own per-category
+  // gate: a v1 sender pushing to a ≤v0 (pre-feature) receiver is sender-ahead
+  // on `decks` and gets a 409 — only the decks category pauses, every other
+  // category keeps flowing. A v1 receiver still accepts a ≤v0 sender
+  // (sender-behind): pre-feature peers never push a `deck` record at all. The
+  // v2 = deck-level `cardOrientation` + optional `cardOrientationPrompt`.
+  // A v1 peer would round-trip the deck through an unaware projection and
+  // silently strip a user's face-orientation choice, so only the decks
+  // category pauses until that peer upgrades.
+  decks: 2,
+  // v1 = author personas (PostgreSQL `authors` table) federated via the
+  // per-record peer-sync push pipeline (record kind `author`, sync category
+  // `authors`). A brand-NEW synced record type like `storyBuilder` below, so it
+  // gets its own per-category gate: a v1 sender pushing to a ≤v0 (pre-feature)
+  // receiver is sender-ahead on `authors` and gets a 409 (the older peer's
+  // `sanitizeAuthor` would silently strip any future field and LWW it back) —
+  // only the authors category pauses; every other category keeps flowing
+  // (per-category gate via scopeVersionDiff). A v1 receiver still accepts a ≤v0
+  // sender (sender-behind): pre-feature peers never push an `author` record at
+  // all, so there's nothing to gate. The FIRST incompatible author-shape change
+  // MUST bump this to 2 then (where a v1 peer would round-trip the new shape
+  // through an unaware sanitizer).
+  authors: 1,
+  // v1 = music artists/albums/tracks (PostgreSQL `artists`, `albums`, and
+  // `tracks` tables) federated via the per-record peer-sync push pipeline.
+  // Each kind gets its own category gate so an older peer can reject only the
+  // music record type it cannot parse while unrelated categories keep flowing.
+  artists: 1,
+  albums: 1,
+  // tracks v2 = `track.renders[]` render-history added (every generated/uploaded
+  // take, so the studio shows each render as a card + can re-select an earlier
+  // one). Additive + gracefully degrading, but version-gated for the same reason
+  // as the universes relationshipLinks/attachments fields: a ≤v1 peer that
+  // receives and re-sanitizes a track through its renders-unaware `sanitizeTrack`
+  // would silently strip the history (keeping only the active pointer) and
+  // last-writer-wins the loss back onto the newer peer. Bumping makes the older
+  // peer reject the ahead-version track transfer instead. Per-category gate →
+  // only track sync pauses with old peers; artists/albums keep flowing. The
+  // backfill itself needs no migration — `sanitizeTrack` synthesizes a render
+  // from the legacy active pointer on read (see services/tracks/logic.js).
+  // tracks v3 = `track.chiptuneScore`/`chiptunePrompt` (#2911, the LLM-composed
+  // looping 8-bit score). Version-gated for the identical strip-and-push-back
+  // reason as v2: a ≤v2 peer re-sanitizing through its chiptune-unaware
+  // `sanitizeTrack` would silently drop the score and LWW the loss back onto
+  // the composing peer. (As of #2912 the fields DO participate in the
+  // conflict-journal content hash, version-gated so it doesn't retroactively
+  // invalidate a base hash stamped before they existed — see
+  // lib/conflictJournal.js HASH_FIELDS, whose own version number for this
+  // field was chosen to match this one for a human reading both files; the
+  // two mechanisms are otherwise independent — HASH_FIELDS gates a purely
+  // local hash-store concern, not cross-peer wire compatibility.)
+  // tracks v4 = `track.concept` for resumable stepped music-designer drafts.
+  // Older peers must reject the record rather than round-trip it through a
+  // concept-unaware sanitizer and silently erase the saved creative brief.
+  // tracks v5 = render-history entries gained `authoredPrompt` and the explicit
+  // nullable `instrumentalOnly` decision. A <=v4 peer would strip both, then LWW
+  // the ambiguous render back and make a later remix silently change vocal mode.
+  // tracks v6 = render history entries preserve the effective generation
+  // executionProfile. Older peers would strip the measured placement on sync.
+  // tracks v7 = `track.waveSketch`/`waveSketchPrompt` (#8376, the Music
+  // Designer's LLM-drawn wave sketch). Same strip-and-push-back reason as v3:
+  // a <=v6 peer's sketch-unaware sanitizer would drop the drawing and LWW the
+  // loss back. The accepted sender-behind direction is covered by the
+  // absent-key carry in services/tracks/logic.js mergeTrackRecord.
+  // tracks v8 = `track.waveSketch` may hold a `version: 2` painted-spectrogram
+  // canvas (#8464, lib/paintedCanvas.js). A <=v7 peer runs every sketch through
+  // its v1-only normalizeWaveSketch, which strips a painting to null, and would
+  // LWW that loss back — so it must reject the record instead. Stored v1
+  // sketches still normalize and render unchanged; nothing to migrate.
+  // tracks v9 = render-history entries record their provenance `source`
+  // (`'suno'` for a hand-imported Suno export, `'youtube'`, `'upload'`, #8967).
+  // A <=v8 peer's sanitizer would strip it and LWW the unlabelled take back, so
+  // an exported song would silently lose its attribution. Pre-v9 renders read
+  // as `source: ''` (unrecorded); nothing to migrate.
+  // tracks v10 = render-history entries gained `codeProvenance` (#9414: the
+  // language, source, hash, seed, runtime version and settings of a
+  // server-rendered SuperCollider take). A <=v9 peer's sanitizer would strip it
+  // and LWW the unreproducible take back. Absent on every older render; nothing
+  // to migrate.
+  tracks: 10,
+  // v1 = creative ingredients catalog (Postgres tables: catalog_scraps,
+  // catalog_ingredients, catalog_ingredient_sources, catalog_ingredient_refs).
+  // v2 = `catalog_ingredients.search_tsv` expanded to also index the
+  // character canon fields (physicalDescription, personality) and the
+  // type-specific role/motivations/significance fields, so bible-promoted
+  // characters become searchable on their main narrative text. The schema
+  // is a DROP+re-ADD of the STORED generated column (Postgres can't ALTER
+  // its expression); applied in lockstep by `ensureSchema`.
+  // v3 = `catalog_ingredient_refs` gained `deleted`/`deleted_at` soft-delete
+  // tombstones + an UPDATE trigger that bumps sync_sequence on delete/revive.
+  // Older peers (≤v2) hard-DELETE on unlink and never tombstone, so the
+  // version gate prevents a v3 receiver from accepting an older sender's
+  // payload that would silently miss tombstones.
+  //
+  // Per-category gate so a new peer can sync its catalog independently of
+  // whether other categories are version-locked. Since v10, live catalog
+  // rows require an exact version match; tombstones stay version-independent.
+  // `cat-ingredient` and `cat-scrap` record kinds map back
+  // here via RECORD_KIND_SCHEMA_CATEGORIES.
+  //
+  // NOT bumped for the per-record `payload.schemaVersion` stamp added by
+  // catalog-payload-schemaversion: that key is additive JSONB that both old
+  // and new peers store verbatim (`upsertIngredientFromPeer` writes payload
+  // as-is — no sanitizer strips it), and all types are payload-v1 today so no
+  // shape actually changed on the wire. The FIRST type that bumps its
+  // registry `payloadSchemaVersion` to 2 with a genuine shape change (a peer
+  // ≤ that version would round-trip the new shape through an unaware
+  // sanitizer) MUST bump `catalog` here in lockstep.
+  //
+  // v4 = `catalog_ingredient_relations` table (ingredient↔ingredient edges)
+  // + a new `relations: [...]` block in the catalog sync envelope. An older
+  // (≤v3) receiver doesn't understand the relations block, so a v4 sender
+  // pushing to it is sender-ahead on `catalog` and gets a 409 — correct,
+  // since the older peer would silently drop every relation edge. v4 receivers
+  // still accept ≤v3 senders (sender-behind): those envelopes simply carry no
+  // `relations` block and the receiver applies the other four kinds as before.
+  // v5 = `catalog_tags` first-class table (id, label, description?, color?,
+  // parent_id?, created_at, sync_sequence) + a new `tags: [...]` block in the
+  // catalog sync envelope. Same gating rationale as v4: a ≤v4 receiver doesn't
+  // understand the `tags` block, so a v5 sender pushing to it is sender-ahead
+  // and gets a 409 (otherwise the older peer would silently drop every canonical
+  // tag row + its parent hierarchy). The freeform `catalog_ingredients.tags
+  // TEXT[]` column is unchanged — canonical tag rows are an additive index, so
+  // a v5 receiver still accepts ≤v4 ingredient/scrap/ref/relation pushes; those
+  // envelopes simply carry no `tags` block.
+  // v6 = `catalog_ingredient_media` join table (typed image/audio/video/doc
+  // attachments) + a new `media: [...]` block in the catalog sync envelope.
+  // Each media row ships a `media_key` REFERENCE into the receiver's own media
+  // library (data/images + history.jsonl sidecar) — never the bytes. Same
+  // gating rationale as v4/v5: a ≤v5 receiver doesn't understand the `media`
+  // block, so a v6 sender pushing to it is sender-ahead on `catalog` and gets
+  // a 409 (otherwise the older peer would silently drop every attachment). A v6
+  // receiver still accepts ≤v5 senders (sender-behind); those envelopes carry
+  // no `media` block. Media keys that don't resolve against the receiver's own
+  // library surface via the metadata-missing integrity endpoint rather than
+  // failing the apply.
+  // v7 = `catalog_scraps` gained `chunk_index` + `parent_scrap_id` (a long paste
+  // chunks into a parent + N child rows; the extractor unions per-child drafts).
+  // Both fields ride the scrap sync envelope. Same gating rationale as v4–v6: a
+  // ≤v6 receiver doesn't understand child scrap rows, so a v7 sender pushing to
+  // it is sender-ahead and gets a 409. A v7 receiver still accepts ≤v6 senders
+  // (their scraps carry no chunk fields → chunkIndex 0 / parentScrapId null).
+  // v8 = user-defined ingredient types. The definitions are persisted in the
+  // catalogUserTypes store (`catalog_user_types` as of #1001; settings.json
+  // `catalogUserTypes` before that — the move did NOT bump this version because
+  // the wire shape is storage-independent), merge into the active type registry
+  // at boot/runtime, and ride a new additive `catalogTypes: [...]` block in the
+  // catalog sync envelope (LWW-merged into the receiver's own user-type store).
+  // Same gating rationale as v4–v7: a ≤v7 receiver doesn't understand the
+  // `catalogTypes` block, so a v8 sender pushing to it is sender-ahead and gets
+  // a 409 (otherwise the older peer would silently drop every user-type
+  // definition, then reject every ingredient row carrying one of those unknown
+  // types). A v8 receiver still accepts ≤v7 senders (sender-behind); their
+  // envelopes carry no `catalogTypes` block and the receiver applies the other
+  // kinds as before.
+  // v9 = catalog media rows carry bounded Stable Diffusion-compatible
+  // generation provenance (prompt, negative prompt, sampler, seed, model,
+  // and related fields). The metadata field is additive and optional on the
+  // wire; a v9 sender must not push it to a ≤v8 receiver that would silently
+  // drop it. A v9 receiver still accepts ≤v8 media rows without metadata.
+  // v10 = protect structured object `payload.attachments[]` from older
+  // sanitizers. Live catalog transfers now require equal versions in BOTH
+  // directions, including legacy senders with no version. Whole-row LWW from
+  // an older peer can erase fields after an unrelated edit. Tombstone-only
+  // transfers remain version-independent; no local storage migration is needed.
+  // v11 = `catalog_ingredient_refs`/`_relations`/`_media` gained `updated_at`
+  // (#8347) and their `upsertXFromPeer` apply guards now require it to be
+  // strictly newer than the local row's before applying a peer's tombstone
+  // OR revival — a ≤v10 sender's unguarded whole-row apply can revive a
+  // newer local tombstone (soft-delete R at t2, then apply B's still-live
+  // copy of R before B pulls the tombstone) whenever B re-sends R: a
+  // role/caption edit, a reset rewind, or the #8315 upgrade replay that
+  // resends every catalog row once. Same execution-semantics rationale as
+  // v10: this is a receiver-side conflict-resolution change, not just an
+  // additive field, so an equal-version requirement is the only way to know
+  // BOTH sides apply the guard. Tombstone-only transfers already skip the
+  // live-row equality check; a v11 receiver's guard still degrades safely
+  // for a ≤v10 sender's tombstone-less payload (unchanged "no opinion" path).
+  catalog: 11,
+  // v1 = cross-machine resumable Story Builder sessions (#730). Sessions are
+  // local-only by default and excluded from sync; only `sync: true` sessions
+  // ride the `storyBuilder` snapshot category. This is a brand-NEW synced
+  // record type (not a sibling doc on an existing bundle), so it gets its own
+  // per-category gate: a sender ahead on `storyBuilder` would push a session
+  // shape an older receiver's `sanitizeSession` would silently strip and then
+  // LWW back, so a v1 sender pushing to a ≤v0 (pre-feature) receiver is
+  // sender-ahead on `storyBuilder` and gets a 409 — only the storyBuilder
+  // category pauses; every other category keeps flowing (per-category gate via
+  // scopeVersionDiff). A v1 receiver still accepts a ≤v0 sender (sender-behind):
+  // pre-feature peers never send a `storyBuilder` snapshot at all, so there's
+  // nothing to gate. The FIRST incompatible session-shape change MUST bump this
+  // to 2 then (where a v1 peer would round-trip the new shape through an
+  // unaware sanitizer).
+  storyBuilder: 1,
+  // v1 = FableLoom stories federate through the per-record push pipeline
+  // (record kind/category `fableLoom`). A pre-feature receiver has no merge
+  // path for the whole-record story graph, so only this category pauses until
+  // both peers upgrade; unrelated categories continue syncing.
+  // v2 = scene nodes gained portable `visualCanon` bindings plus the latest
+  // render's path-free `visualConditioning` provenance. A v1 peer would strip
+  // both during whole-record LWW, so newer sends must pause until it upgrades.
+  // v3 = typed playback assets retain one visual-conditioning manifest per
+  // rendered clip, so entry/hold/exit provenance cannot overwrite each other.
+  // A v2 peer would strip that map during whole-record LWW.
+  // v4 = the loom pins one canonical protagonist and wardrobe, while each
+  // scene records whether that protagonist is on-screen or speaking through a
+  // side-device off-screen. A v3 peer would silently strip those fields on a
+  // whole-record round trip and could restore wardrobe drift or put a removed
+  // protagonist back into a scene. v4 ALSO introduced per-episode beat outlines
+  // (`episode.storyOutline`) and the series delivery plan
+  // (`seriesPlan.deliveryOptions` / `.interEpisodeVoicemails` /
+  // `.nextSeasonTeaser`) — a v3 peer strips both, so the receiver restores them
+  // from the local record rather than treating the omission as a delete.
+  // v5 = one loom-level render format pins the aspect ratio and concrete
+  // dimensions shared by storyboard stills and motion clips; plot points and
+  // scenes gained durable playable-challenge kinds/phase mappings; and durable
+  // editorial/final-delivery sign-offs let the ordered workflow survive a
+  // reload. A v4 peer would strip those choices and silently reopen completed
+  // gates, erase challenge-to-scene mapping, or reintroduce mixed geometry.
+  // v6 = the loom-level render pin gained image/video backend, model, and
+  // effort preferences. A v5 peer would preserve the format but strip these
+  // additive preferences during an unrelated whole-record update.
+  // v7 = shot duration and dramatic-scene grouping survive whole-record sync.
+  // v8 = `seriesPlan.characterEvolutions[]` — the optional five-stage character
+  // evolution lens per character (#6440). `sanitizeSeriesPlan` omits the key
+  // entirely when no lens is authored, so a ≤v7 peer that re-sanitizes a loom
+  // through its evolution-unaware sanitizer drops every authored lens and
+  // last-writer-wins the loss back onto the newer peer. Bump makes the older
+  // peer reject the ahead-version loom transfer; the receiver additionally
+  // restores local lenses from a <v8 sender that omits the key
+  // (`preserveLegacyCharacterEvolutions`), the same belt-and-braces the
+  // delivery plan got at v4.
+  // v9 = `seriesPlan.seriesDesign` — the optional shared finite/renewable
+  // author brief. A <=v8 peer would strip it during an unrelated whole-record
+  // edit, so newer transfers are gated and legacy omissions restore the local
+  // value through `preserveLegacySeriesDesign`.
+  fableLoom: 9,
+  // v1 = Creative Director projects (PostgreSQL `creative_director_projects`)
+  // federated via the per-record peer-sync push pipeline (record kind
+  // `creativeDirectorProject`, sync category `creativeDirectorProjects`, #1564).
+  // A brand-NEW synced record type like `authors`/`storyBuilder`, so it gets its
+  // own per-category gate: a v1 sender pushing to a ≤v0 (pre-feature) receiver is
+  // sender-ahead on `creativeDirectorProjects` and gets a 409 — only that
+  // category pauses; every other keeps flowing (per-category gate via
+  // scopeVersionDiff). A v1 receiver still accepts a ≤v0 sender (sender-behind):
+  // pre-feature peers never push a `creativeDirectorProject` at all, so there's
+  // nothing to gate. The FIRST incompatible project-shape change MUST bump this
+  // to 2 then (where a v1 peer would round-trip the new shape through an unaware
+  // sanitizer). The project body is LWW-overwritten whole; scene video renders
+  // ride the project's linked media collection (federated separately).
+  // v2 = `directive` + `plan` added (CDO Phase 2, #2184) — the production-plan
+  // layer (a directive brief + a validated `plan.steps[]` the generalized advance
+  // loop executes through the gated tool registry). Additive: a legacy video
+  // project leaves both null and behaves exactly as before. Version-gated for the
+  // same reason as every prior additive field — the project body is
+  // LWW-overwritten WHOLE (`mergeProjectRecord`), so a ≤v1 peer that receives a
+  // plan-driven project, re-sanitizes it through its directive/plan-unaware
+  // path, and pushes back would silently strip both fields and last-writer-wins
+  // the loss onto the newer peer. Bumping makes the older peer reject the
+  // ahead-version project transfer instead. Per-category gate → only CD-project
+  // sync pauses with old peers; every other category keeps flowing. No record
+  // rewrite is needed — existing legacy projects simply lack both keys and the
+  // advance loop treats an absent key identically to null (falsy → legacy video
+  // flow); migration 175 only seeds the new `cd-plan` prompt stage.
+  // v3 = cross-step result references (`{{steps.<stepId>.result.<key>}}` inside
+  // `plan.steps[].args`, #2773). Unlike v2 this is NOT about a sanitizer
+  // round-trip strip (the refs are free-form `args` strings a v2 sanitizer
+  // preserves verbatim) — it's an EXECUTION-semantics break: only the v3 advance
+  // loop resolves the syntax. A v2 peer that receives a running reference-plan and
+  // then boot-recovers it (`recoverInFlightProjects` resets the step to pending)
+  // would dispatch the literal `{{…}}` as e.g. a seriesId, fail/re-plan, and
+  // LWW-push the damaged plan back onto the v3 peer — corrupting the newer peer's
+  // healthy project. Bumping makes the v2 receiver reject the ahead-version
+  // transfer (per-category 409) until it upgrades, so it never mis-executes a
+  // syntax it can't resolve. No record rewrite needed — reference-free projects
+  // are unchanged; the bump only gates cross-version CD-project sync.
+  // v4: Video drafts must stay inert. Older peers ignore workspace and could
+  // start them through the legacy planner; reject transfers until they upgrade.
+  // Existing records remain unchanged and need no data rewrite.
+  // v5: Video artifact revisions and stale-context tracking. A v4 peer can
+  // edit a shot while preserving the old artifact revision, or replace the
+  // treatment and drop its artifact. Gate that loss until both peers upgrade.
+  // v6: Preserve Video treatment history; older writers discard prior snapshots.
+  // v7: Planning binds to resolved source revisions; older writers skip that guard.
+  // v8: Revision-bound approvals and machine-local execution authority.
+  // v9: Bounded owner execution receipts and fail-closed restart reconciliation.
+  // v10: Validated assembled cuts, retained cut history, and explicit standalone audio.
+  creativeDirectorProjects: 10,
+  // v1 = Mood boards (PostgreSQL `mood_boards`) federated via the per-record
+  // peer-sync push pipeline (record kind `moodBoard`, sync category `moodBoards`,
+  // #1564). Same posture as `creativeDirectorProjects` above: a brand-NEW synced
+  // record type with its own per-category gate — a v1 sender pushing to a ≤v0
+  // (pre-feature) receiver is sender-ahead on `moodBoards` and gets a 409 (only
+  // that category pauses); a v1 receiver still accepts a ≤v0 sender (pre-feature
+  // peers never push a `moodBoard`). The board body (name/description/items) is
+  // LWW-overwritten whole; referenced image bytes ride the asset manifest.
+  // v2 = `type: 'video'` board items (#4188). An EXECUTION-semantics break for
+  // v1 receivers, not a sanitizer strip (the whole-record LWW passes unknown
+  // item shapes through verbatim): a v1 renderer treats a non-image item as a
+  // text note (blank card), and its updateItem gates a 'video' item onto the
+  // text editable-keys — so a v1 peer that edits the board can mangle video
+  // items and LWW the damage back. Bumping makes the v1 receiver 409-reject
+  // the ahead-version push until it upgrades. Video bytes ride the existing
+  // asset manifest (`video:<filename>` ref → PATHS.videos, receiver regenerates
+  // the poster thumbnail on pull).
+  // A board's composite `style` prompt, `posterImageRef` and `collageImageRef` are additive on
+  // that same v2 record: whole-record LWW plus every local mutator spreads the
+  // board, so an older peer preserves both keys and does not execute against
+  // them. The poster file rides the asset manifest as a gallery image. No bump.
+  moodBoards: 2,
+  // v1 = Writers Room works (PostgreSQL `writers_room_works` + decomposed
+  // `writers_room_draft_versions`) federated via the per-record peer-sync push
+  // pipeline (record kind `writersRoomWork`, sync category `writersRoomWorks`,
+  // #1565). Same posture as `creativeDirectorProjects`/`moodBoards`: a brand-NEW
+  // synced record type with its own per-category gate — a v1 sender pushing to a
+  // ≤v0 (pre-feature) receiver is sender-ahead on `writersRoomWorks` and gets a
+  // 409 (only that category pauses); a v1 receiver still accepts a ≤v0 sender
+  // (pre-feature peers never push a `writersRoomWork`). The FIRST incompatible
+  // work-shape change MUST bump this to 2 then. The work manifest (metadata +
+  // decomposed draft-version metadata in drafts[]) is LWW-overwritten whole; the
+  // file-primary `.md` draft prose bodies ride a separate body manifest (SHA256
+  // diff + receiver-pull), never round-tripped through the record.
+  // Bible JSON siblings also ride an optional bibleManifest (#6943), with
+  // independent file updatedAt LWW. Older receivers retry without that key;
+  // omission never deletes files. The first incompatible bible shape needs its
+  // own version gate before it can cross peers; this additive transport stays v1.
+  writersRoomWorks: 1,
+  // v1 = Writers Room folders (PostgreSQL `writers_room_folders`) federated via
+  // the per-record peer-sync push pipeline (record kind `writersRoomFolder`,
+  // #1645 — follow-up to #1565). Same posture as `writersRoomWorks`: a brand-NEW
+  // synced record type with its own per-category gate, so a v1 sender pushing to
+  // a ≤v0 (pre-feature) receiver is sender-ahead on `writersRoomFolders` and gets
+  // a 409 (only that category pauses); a v1 receiver still accepts a ≤v0 sender.
+  // Folders are body-less (no file-primary `.md`, no asset manifest) and
+  // LWW-overwritten whole. The FIRST incompatible folder-shape change MUST bump
+  // this to 2. Federating folders requires the soft-delete tombstone columns
+  // (deleted/deleted_at) added in the same change — the LWW merge never
+  // propagates a hard delete.
+  writersRoomFolders: 1,
+  // v1 = Writers Room exercises (PostgreSQL `writers_room_exercises`) federated
+  // via the per-record peer-sync push pipeline (record kind `writersRoomExercise`,
+  // #1645). Body-less + LWW-overwritten whole, same per-category gate semantics as
+  // `writersRoomFolders`. Exercises predate federation and carry no
+  // `updatedAt`/`createdAt` — the wire sanitizer derives a stable LWW key from
+  // their existing `startedAt`/`finishedAt` (see sanitizeExerciseForSync). The
+  // FIRST incompatible exercise-shape change MUST bump this to 2.
+  writersRoomExercises: 1,
+  // v1 = Music Video projects (PostgreSQL `music_video_projects`) federated via
+  // the per-record peer-sync push pipeline (record kind `musicVideoProject`, sync
+  // category `musicVideoProjects`, #1770 — follow-up to #1760 Phase 1). Same
+  // posture as `creativeDirectorProjects`/`writersRoomFolders`: a brand-NEW synced
+  // record type with its own per-category gate — a v1 sender pushing to a ≤v0
+  // (pre-feature) receiver is sender-ahead on `musicVideoProjects` and gets a 409
+  // (only that category pauses); a v1 receiver still accepts a ≤v0 sender
+  // (pre-feature peers never push a `musicVideoProject`). The project body
+  // (metadata + beat-aligned scenes) is LWW-overwritten whole; referenced media
+  // (uploaded audio, scene images/rendered videos) is NOT bundled in this phase —
+  // it federates via its own channels / a follow-up. The FIRST incompatible
+  // project-shape change MUST bump this to 2.
+  // v2 = timed lyric cues, phrase annotations, pacing, and explicit per-shot
+  // `loop` semantics (#8964). The body is still stored verbatim by a v1
+  // receiver, but a v1 peer would mis-execute it and LWW the damage back: its
+  // renderer loops every clip (silently repeating footage in `loop: false`
+  // shots the newer peer refuses to render that way), and its audio-source
+  // change clears the analysis while leaving the lyric/phrase timings aligned
+  // to the OLD track — an edit that then wins LWW onto the upgraded peer.
+  // Gating makes a v1 receiver reject the ahead-version transfer until it
+  // upgrades; pre-#8964 records need no rewrite (absent `loop` = legacy loop).
+  // v3 = immutable scene takes + explicit selection and the project visual spec
+  // (#8965). A v2 receiver stores the body verbatim but mis-executes it: its
+  // completion hooks overwrite `referenceImageId`/`videoHistoryId` with the
+  // newest render — replacing a take the director explicitly selected — and
+  // record no take for it, an edit that then wins LWW onto the upgraded peer.
+  // Gating makes a v2 receiver reject the ahead-version transfer until it
+  // upgrades; pre-#8965 records need no rewrite (a selected slot with no take
+  // is materialized as a `legacy` take on first use).
+  // v4 = performance shots (#8977): `scene.shotMode` and a video take's
+  // immutable `shotInstruction`. A v3 receiver stores both verbatim but
+  // mis-executes them: it renders a performance take from frame 0 instead of
+  // its edit in-point (and may loop it), desyncing the singer from the song,
+  // and submits performance scenes to a cutaway-only lane — edits that then win
+  // LWW onto the upgraded peer. Pre-#8977 records need no rewrite (absent
+  // `shotMode` = cutaway; takes without an instruction render as before).
+  // v5 = authored universe style and cast/place/object snapshots in concept.
+  // Older peers ignore these when generating, losing character continuity.
+  // v6 = word-level lyric timings (`lyricCues[].words`, #9074). A v5 receiver
+  // stores the body verbatim but mis-executes it: an audio-source change clears
+  // startSec/endSec and leaves `words` aligned to the OLD vocal, and that edit
+  // wins LWW onto the upgraded peer. Gating makes a v5 receiver reject the
+  // ahead-version transfer until it upgrades. Records without `words` need no
+  // rewrite.
+  // v7 = composition mode `code` (#9076). A v6 peer's normalizeComposition
+  // collapses an unknown mode to `concat` and would last-writer-wins that
+  // loss back, so the gate rejects the ahead transfer. The older peer is
+  // never handed `mode: "code"` (an enum value it cannot store). It keeps
+  // the concat/composed project it already understands.
+  // v8 = lyric-sheet structure (`lyricMarkers`: section headers and stage
+  // directions anchored to lyric-line indices) and lyric-derived analysis
+  // section names (`audioAnalysis.sections[].labelSource`/`analysisLabel`).
+  // A v7 receiver stores the body verbatim but mis-executes it: its lyric
+  // import replaces the lines without replacing the markers, leaving them
+  // anchored to the wrong lines, and that edit wins LWW onto the upgraded
+  // peer. Records without either field need no rewrite.
+  // v9 = autopilot check-in gates (`automation.checkins.castAndSets`:
+  // `review` | `auto`). A v8 peer's automation normalizer rebuilds the brief
+  // from tools/guidance/budget only, so its next brief edit would drop the
+  // gate and win LWW back onto the upgraded peer, silently turning an
+  // auto-approve setting back into a stop. Gating makes a v8 receiver reject
+  // the ahead-version transfer until it upgrades; a record without the gate
+  // needs no rewrite (absent = `review`). The Cast & Sets checkpoint
+  // (`castAndSets`) and the development artifacts (`devArtifacts`) that ship
+  // with it are wire-local like `productionRuns` (lib/syncWire.js): their files
+  // live under this install's data/music-video/ and are not in the project's
+  // asset manifest, so they are never sent. What an approved check-in writes
+  // into ordinary fields (visual-spec references, concept subjects) syncs.
+  // The fully-autonomous run (`autonomousRun`, services/musicVideo/autonomousService.js)
+  // is wire-local like `productionRuns`: it names this install's providers, Suno
+  // songs and production run, and a peer must never execute it — no bump.
+  // v10 = composition mode `document` (a project-owned HTML composition
+  // document) and `composition.overlay` (its HUD settings). A v9 peer's
+  // normalizeComposition collapses the unknown mode to `concat` and drops the
+  // overlay, and its next composition edit would last-writer-wins both losses
+  // back, so the gate rejects the ahead transfer. The document pointer itself
+  // (`composition.document`) is wire-local like `devArtifacts`: its files live
+  // under this install's data/music-video/<projectId>/composition/ and are not
+  // in the asset manifest, so a peer keeps its own pointer (or none, and then
+  // refuses to render with COMPOSITION_DOCUMENT_MISSING).
+  // v11 = phrase-alignment confidence (`lyricCues[].matched`). Older peers
+  // drop it on edits or retain stale confidence after audio changes. Existing
+  // records need no rewrite: absent means alignment has not measured it.
+  // v12 = code-first production policy and pinned per-shot medium plans.
+  // Older treatment writers drop these fields and can reinterpret them as
+  // footage. Absent policy remains legacy; no existing record needs rewriting.
+  // v13 = authored/applied shot action contracts; older treatment writers drop intent.
+  // Additive optional metadata on existing project records; no backfill is needed.
+  // v14 = selected conditioning source/speaker and separate temporal lip-sync
+  // evidence (#9347). Older peers can drop source intent and pass equal-length
+  // misaligned output, so reject ahead transfers. Absent fields stay legacy.
+  // v15 = versioned take and review dependency evidence. Older peers would
+  // reuse stale passes or render clips derived from a replaced plate. Legacy
+  // evidence remains unknown; no historical verdict is retroactively blessed.
+  // v16 = accepted-prefix continuation edit points and one-generation repair
+  // reservations. Older peers could regenerate accepted footage or duplicate
+  // a submitted suffix after restart. Absent repair metadata stays legacy.
+  // v17 = piecewise audio timing receipts and historical source/timing snapshots.
+  // Optional on legacy records; no backfill. Older peers cannot apply receipts safely.
+  // v18 = named narrative event anchors and bounded section reactivity. Older
+  // composition normalizers drop these fields on edit. Absent remains legacy;
+  // no stored row rewrite is needed. Document manifests remain wire-local.
+  // v19 pins whole-workflow media policy; older peers cannot enforce it.
+  // v20 adds the Eidoverse render mode and scene source. Older normalizers
+  // would collapse the mode to footage and discard the authored scene.
+  musicVideoProjects: 20,
+  // v1 = Creative Commission FEEDBACK federation (PostgreSQL `commission_feedback`)
+  // via the per-record peer-sync push pipeline (record kind `commissionFeedback`,
+  // sync category `commissionFeedback`, #2686 — split-record follow-up to #2657).
+  // The taste reactions federate (so a 👍/👎 carries across a user's machines and
+  // conditions the same commission's next run) while the parent commission stays
+  // machine-local (a synced schedule would double-run). Body-less whole-record
+  // LWW with soft-delete tombstones — the merge never propagates a hard delete.
+  // The FIRST incompatible reaction-shape change MUST bump this to 2.
+  commissionFeedback: 1,
+  // v1 = Creative Commission BRIEF federation (PostgreSQL `creative_commissions`)
+  // via the per-record peer-sync push pipeline (record kind `creativeCommission`,
+  // sync category `creativeCommissions`, #2686). The brief/identity federates so a
+  // synced reaction attaches to the SAME commission on every peer, while
+  // `schedule`/`runs`/`assignment` stay MACHINE-LOCAL (stripped from the wire —
+  // see syncWire's `creativeCommission` case) so only the owning machine fires the
+  // cron (no double-run). Soft-delete tombstones; the FIRST incompatible
+  // brief-shape change MUST bump this to 2.
+  // v2 = per-output-type commissions (#2769): `targetAbility` widened past `video`
+  // and `generation` became per-type (image `imageCount`, music `lengthSeconds`,
+  // series `episodeCount`). A pre-#2769 (v1) peer's sanitizer only understands the
+  // video generation shape, so it would silently drop those type-specific keys on
+  // receive — and could push the video-shaped downgrade back via LWW. The bump
+  // gates mixed-version transfers of this category so a v1 peer never mangles a v2
+  // brief (compareSchemaVersions marks a v2 sender "ahead" of a v1 receiver).
+  // v3 = per-commission render-backend pin (#3135): `generation` gained
+  // `imageMode`/`videoMode` (+ optional `imageModelId`/`videoModelId`), naming the
+  // backend (local diffusion / Codex / Grok) a scheduled fire must render on.
+  // Exactly the #2769 failure mode: `generation` is a FEDERATED field, and a v2
+  // peer's `ABILITY_GENERATION_KEYS` doesn't list these keys — its
+  // `sanitizeGenerationFor` keeps only the keys it knows, so it would silently
+  // strip the user's pinned backend on receive and then push the un-pinned
+  // downgrade back via LWW.
+  // v4 = opt-in Digital Twin musicTaste configuration in the federated brief
+  // (#4347). The bounded config is understood by this sanitizer; a v3 peer
+  // would reconstruct the brief without it and could push that downgrade back
+  // through the brief-scoped LWW merge. Per-run recipes remain local because
+  // syncWire already strips `runs[]`.
+  creativeCommissions: 4,
+  // v1 = standalone media-library federation (#1566). NOT a record kind — it's
+  // the wire contract for the library-level asset manifest a full-sync peer
+  // advertises at GET /api/peer-sync/library-manifest. The receiver-pull sweep
+  // (syncMediaLibraryFromPeer) reads the sender's advertised `schemaVersion` and
+  // GENTLY SKIPS (logs, no reject) a sender ahead of its local `mediaLibrary` —
+  // unlike the push gate's hard 409, because a library sweep is best-effort
+  // background convergence, not an authoritative record transfer. The asset
+  // BYTES themselves are version-agnostic (an image is an image); only the
+  // MANIFEST envelope shape is gated, so the FIRST incompatible manifest-shape
+  // change (new required field, kind semantics) MUST bump this to 2. Adding a
+  // new media KIND to the manifest is additive — the receiver ignores kinds it
+  // can't route (directoryForAssetKind returns null) — and does NOT require a
+  // bump on its own.
+  mediaLibrary: 1,
+  // v1 = completed-agent CoS history federation (#1650, part of epic #1561). NOT
+  // a record kind — it's the wire contract for the archive manifest a full-sync
+  // peer advertises at GET /api/peer-sync/cos-history-manifest. The receiver-pull
+  // sweep (syncCosHistoryFromPeer) reads the sender's advertised `schemaVersion`
+  // and GENTLY SKIPS (logs, no reject) a sender ahead of its local `cosHistory` —
+  // same posture as `mediaLibrary` above, because a history sweep is best-effort
+  // background convergence, not an authoritative record transfer. The archive
+  // BYTES (metadata.json / output.txt / prompt.txt) are version-agnostic; only
+  // the MANIFEST envelope shape is gated, so the FIRST incompatible
+  // manifest-shape change (new required entry field, segment semantics) MUST bump
+  // this to 2.
+  cosHistory: 1,
+  // v1 = live CoS task-list + claim-metadata federation (#1712, second half of
+  // #1650, part of epic #1561). NOT a record kind — it's the wire contract for
+  // the task payload a full-sync peer advertises at GET /api/peer-sync/cos-tasks.
+  // Unlike the immutable, append-only `cosHistory` archives (pure byte
+  // replication), the task files (data/COS-TASKS.md / data/TASKS.md) are mutated
+  // live by BOTH peers and carry `claimedBy`/`claimedAt`/`leaseExpiresAt` (#1563),
+  // so they ride a claim-aware per-task LWW merge (syncCosTasksFromPeer →
+  // cosTaskStore.mergePeerTasks), not the asset path. The receiver reads the
+  // sender's advertised `schemaVersion` and GENTLY SKIPS (logs, no reject) a
+  // sender ahead of its local `cosTasks` — same posture as `mediaLibrary` /
+  // `cosHistory`, because a task sweep is best-effort background convergence, not
+  // an authoritative record transfer. Only the payload envelope + task-entry
+  // shape is gated; the FIRST incompatible change (new required entry field, new
+  // claim semantics) MUST bump this to 2.
+  // v2 = the `challenged` task status + its challenge case/resolution metadata
+  // (#2441). A ≤v1 receiver's `TASK_STATUSES` enum lacks `challenged`, so its
+  // wire validation would REJECT the whole payload (peerCosTasksSchema.safeParse
+  // fails → the sweep skips, never mis-merges). Bumping makes the receiver's
+  // GENTLE schema-ahead skip fire FIRST with a clear "schema v2 > local v1"
+  // log, instead of a confusing blanket "failed validation" skip. The challenge
+  // record itself (`challenge`/`challengeResolution`/`challengeCount`) rides the
+  // permissive `metadata` map and round-trips the markdown store like any other
+  // metadata, so no new top-level wire field is added — only the status vocab
+  // widened. Per-category gate → only cos-tasks sync pauses with old peers.
+  // v3 = the PR-follow-up disposition markers `reviewLoopMergeOnly` /
+  // `reviewLoopLeaveOpen`. This is an EXECUTION-semantics break, not a shape
+  // change: both ride the permissive `metadata` map, so a ≤v2 receiver validates
+  // and stores the task fine — and then MIS-RUNS it. Its prompt builder doesn't
+  // know either marker, so it re-defaults the deliberately-empty reviewer list
+  // back to `[copilot]` and runs a review the task explicitly disabled; on a
+  // GitLab MR (the copilot-only fallback) it emits GitHub-only commands that
+  // cannot land the MR, orphaning it; and on a JIRA hand-off it merges a PR that
+  // must stay open. A claimed-and-mis-run task then LWW-pushes its damaged state
+  // back onto the v3 peer, which is exactly the bump trigger (see the
+  // `creativeDirectorProjects` 2→3 precedent). Per-category gate → only cos-tasks
+  // sync pauses until the peer upgrades.
+  // v4 = the `workTracker` dispatch marker (repo-study / tracker-filing tasks) and
+  // the `reviewerEfforts` per-reviewer effort pins. Same EXECUTION-semantics break
+  // as v3, for the same reason: both ride the permissive `metadata` map, so a ≤v3
+  // receiver validates and stores the task fine — and then MIS-RUNS it.
+  // `taskTypeHooks.isTrackerFilingDispatch` reads `metadata.workTracker` to decide
+  // that a run which filed issues and left the tree clean SATISFIED its criterion;
+  // a ≤v3 peer only knows the `TRACKER_FILING_TASK_TYPES` set, so it grades that
+  // same run a validation miss, finalizes it failed, poisons the provider/model
+  // learning bucket, and LWW-pushes the damaged state back onto the v4 peer.
+  // `reviewerEfforts` is the milder instance: a ≤v3 peer runs the review at the
+  // reviewer CLI's default effort instead of the pinned tier, silently downgrading
+  // a review the user deliberately strengthened. Per-category gate → only cos-tasks
+  // sync pauses until the peer upgrades.
+  // v5 = the `metadata.prompt` / `metadata.context` split (#4153): the full
+  // agent-facing payload now rides `prompt` and `context` reverts to the
+  // one-line human note. Same EXECUTION-semantics break as v3/v4 — `prompt`
+  // rides the permissive `metadata` map, so a ≤v4 receiver validates and stores
+  // the task fine and then MIS-RUNS it: its prompt builder only knows
+  // `metadata.context`, so the agent is handed a one-line description with the
+  // entire Phase 1–7 body (or `/do:*` claim prompt) missing, does the wrong
+  // work, and LWW-pushes that damaged state back onto the v5 peer. Readers on
+  // v5 fall back to `metadata.context`, so the reverse direction degrades
+  // gracefully — the gate exists for the forward one. Per-category gate → only
+  // cos-tasks sync pauses until the peer upgrades.
+  // v6 = `metadata.targetInstanceId`, the per-task pin to ONE federated instance
+  // (#4520). Same EXECUTION-semantics break as v3/v4/v5 — the pin rides the
+  // permissive `metadata` map, so a ≤v5 receiver validates and stores the task
+  // fine and then RUNS IT ANYWAY: its spawn guards only know the opportunistic
+  // claim/lease, so the laptop happily claims the task the user pinned to the
+  // GPU box, executes it with the wrong hardware/tooling, and LWW-pushes that
+  // run's state back onto the v6 peer — which by then had correctly passed over
+  // the task. Per-category gate → only cos-tasks sync pauses until the peer
+  // upgrades.
+  // v7 = plan-only issue-filing tasks (metadata.planOnly, the forced
+  // plan-task --yes invocation, and the task-description context
+  // bridge). A <=v6 peer accepts the permissive metadata map but does not
+  // understand the no-delivery execution contract, so it can claim the task
+  // and run the workflow without the description context needed to file the
+  // issue. Per-category gate -> only cos-tasks sync pauses until the peer
+  // upgrades.
+  // v8 = provider:<id> reviewers. Older peers drop these identities and could
+  // execute a task without its required review. Gate only task synchronization.
+  // v9 = strict large-input PR review fallback pins and complete linked issue
+  // evidence. Older peers may clip that evidence or substitute a smaller model.
+  cosTasks: 9,
+  // v1 = the Eidoverse foundation promote-candidate envelope (#7455, epic
+  // #7453) — authorized to cross the federation layer by the federated
+  // Eidoverse foundations ADR (docs/decisions/2026-09-18-federated-eidoverse-foundations.md).
+  // A sender advertises its promoted
+  // `baseline` foundations at GET /api/peer-sync/eidoverse-foundations; a
+  // receiver pulls, re-runs the full accept-side gate per envelope
+  // (`verifyFoundationCandidate`), and stores each acceptance under a
+  // `peer:<originInstanceId>:<foundationId>` ledger key.
+  //
+  // Receiver-pull like `mediaLibrary`/`cosHistory`/`cosTasks`, so it rides
+  // NON_RECORD_SCHEMA_CATEGORIES below and has no RECORD_KIND_SCHEMA_CATEGORIES
+  // entry: there is no push to gate. The receiver GENTLY SKIPS a sender ahead of
+  // its local version rather than 409-ing, because the envelope carries a body
+  // whose vocabulary is still being written (#7456) — a v1 receiver that applied
+  // a v2 envelope would store a foundation it cannot interpret, and the ledger
+  // has no re-fetch path that would later correct it.
+  //
+  // The envelope ALSO carries its own `candidateVersion` literal
+  // (EIDOVERSE_FOUNDATION_CANDIDATE_VERSION in lib/eidoverseFoundations.js),
+  // which the two prior slices added before any transport existed. The two are
+  // deliberately separate: `candidateVersion` pins ONE envelope's shape and is
+  // hashed into its content-addressed fingerprint, while this category gates the
+  // TRANSPORT payload (its wrapper, its caps, and which foundations an install
+  // offers). A change to either must bump its own number; a change to the
+  // envelope shape bumps both, because the wrapper's contents changed too.
+  //
+  // v2 (#7631): the envelope gained the `derived-from` edge, so both numbers
+  // moved together exactly as the note above requires. A v2 RECEIVER still
+  // accepts a v1 offering unchanged (the edge is absent by construction there),
+  // and a v1 receiver gently skips a v2 one rather than storing an envelope
+  // whose attribution it would read as plain local authorship.
+  //
+  // v3 (#7632): the WRAPPER gained `tombstones` — withdrawal, so a promoted
+  // foundation can be recalled from the installs that pulled it. `candidateVersion`
+  // does NOT move with it: a tombstone names a candidate by the fingerprint it
+  // already had, and no envelope field changed. A v2 sender simply omits the
+  // key and a v3 receiver reads that as "nothing to retract"; a v2 RECEIVER
+  // gently skips a v3 offering and therefore keeps a copy it should have
+  // dropped — the degradation is deliberate and documented in
+  // `docs/features/eidoverse.md`, because the alternative (a receiver acting on
+  // a wrapper it cannot fully read) is worse, and a retraction that reaches
+  // nobody is still better than one that corrupts.
+  eidoverseFoundations: 3,
+  // v1 = identified daily-log events (#8143). The meatspace snapshot's
+  // `daily-log.json` alcohol drinks and nicotine items now carry `id` +
+  // `createdAt`/`updatedAt`; a v1 receiver merges them by id (newest copy wins)
+  // so identical independently-logged events stay distinct and a replay stays
+  // idempotent. NOT a record kind — it gates the 60s meatspace snapshot in
+  // dataSync `applyRemote` (SNAPSHOT_CATEGORY_SCHEMA_KEYS), so it rides
+  // NON_RECORD_SCHEMA_CATEGORIES below.
+  //
+  // Mixed versions are deliberately NOT blocked, because neither direction can
+  // corrupt the other and pausing would strand drinks logged meanwhile:
+  //  - v0 → v1: a v0 payload is `behind` (never gated). Its rows without an `id`
+  //    keep the old content-keyed dedupe; copies of an id'd row that the v0 peer
+  //    bumped in place (it folds a same-product log into the existing row without
+  //    restamping) resolve to the larger `count` on equal stamps.
+  //  - v1 → v0: a v0 receiver scopes meatspace to no schema keys, so it cannot
+  //    gate; it unions the id'd rows by content and keeps them verbatim.
+  //    Its content union still keeps an edited row beside the unedited copy (it
+  //    cannot read `replaces`) — the same double row an edit between two v0
+  //    peers has always produced, cleared once that peer upgrades.
+  //
+  // Still v1 after #8154, which added deletes and date moves for id'd events:
+  // a top-level `eventTombstones: [{ id, deletedAt }]` list (unioned both ways)
+  // and a whole-log pass that keeps one copy per id, on whichever date the
+  // newest copy lives. That is additive, and a bump would make every older
+  // receiver refuse ALL daily-log data, new drinks included. With a pre-#8154
+  // peer in the federation:
+  //  - It keeps a deleted or moved-away copy (it cannot read tombstones and
+  //    merges ids per date) and sends it back each cycle. A current receiver
+  //    drops that copy again — it is not newer than the tombstone, and the
+  //    moved copy's newer stamp wins the id — so only the old peer
+  //    double-counts, until it upgrades.
+  //  - It cannot strip tombstones from a current peer: the list is unioned, and
+  //    the old peer's own writes keep unknown top-level fields. Its own copy of
+  //    the list only refreshes when its local file lacks the key, so it may
+  //    send a stale subset back, which a union ignores.
+  // Rows without an `id` (logged before #8143) are still add-only: deleting
+  // or moving one does not reach peers.
+  // The key exists so the NEXT incompatible daily-log change can bump to 2 and
+  // have v1 receivers reject it.
+  meatspace: 1,
+  // v1 = the paired-peer credential (#8356): `X-PortOS-Peer-Auth`, an HMAC of the
+  // pair `syncSecret` bound to the sender's instance id, replacing the instance
+  // password over HTTP Basic between paired peers. Not a record or snapshot
+  // category — it versions the authentication handshake. A receiver advertises it
+  // as `peerAuth.version` in GET /api/system/health/details together with
+  // `peerAuth.accepted` (whether THIS request's token verified). A sender drops
+  // the Basic header only after that confirmation (`peer.peerAuthAccepted`), so
+  // an older receiver, which never answers, keeps getting Basic.
+  peerAuth: 1,
+  // NOTE: `videoHistory` is intentionally NOT listed here. The version gate
+  // rejects the ENTIRE snapshot/push payload on ANY ahead-mismatch (the
+  // comparator walks the union of keys), so declaring a brand-new key would
+  // make every not-yet-upgraded peer reject ALL categories (universe,
+  // pipeline, …) — severing sync across a federation that upgrades on
+  // independent schedules. videoHistory is a flat append-only array merged by
+  // id with LWW-on-createdAt; the merge already tolerates unknown/extra rows,
+  // so it does not need whole-payload gating. An older peer that lacks the
+  // `videoHistory` route simply rejects that one category request and keeps
+  // syncing everything else.
+  //
+  // The gate is now PER-CATEGORY (see `scopeVersionDiff` below + its three
+  // call sites: dataSync `applyRemote`, peerSync push, sharing importer), so
+  // adding a new key here or bumping one category only gates transfers of
+  // THAT category — unrelated categories keep flowing. videoHistory stays
+  // unlisted because it has no versioned storage layout at all, not because
+  // of the old whole-payload footgun.
+});
+
+/**
+ * Map a federated record KIND (the unit a peer push or share manifest moves)
+ * to the `PORTOS_SCHEMA_VERSIONS` categories its storage layout touches. The
+ * per-category gate uses this to block a transfer ONLY when the sender is
+ * ahead on a category that record actually writes.
+ *
+ * Kinds absent from this map carry no versioned storage layout and are never
+ * gated — media-job records (flat re-render metadata), media-annotations,
+ * goals/character/digitalTwin/meatspace, videoHistory, etc. A `series` push
+ * that bundles issues, or a universe/series push that bundles a linked media
+ * collection, unions the additional kinds' categories at the call site.
+ */
+export const RECORD_KIND_SCHEMA_CATEGORIES = Object.freeze({
+  universe: Object.freeze(['universes']),
+  series: Object.freeze(['pipelineSeries']),
+  issue: Object.freeze(['pipelineIssues']),
+  mediaCollection: Object.freeze(['mediaCollections']),
+  author: Object.freeze(['authors']),
+  artist: Object.freeze(['artists']),
+  album: Object.freeze(['albums']),
+  track: Object.freeze(['tracks']),
+  'cat-ingredient': Object.freeze(['catalog']),
+  'cat-scrap': Object.freeze(['catalog']),
+  storyBuilder: Object.freeze(['storyBuilder']),
+  fableLoom: Object.freeze(['fableLoom']),
+  creativeDirectorProject: Object.freeze(['creativeDirectorProjects']),
+  moodBoard: Object.freeze(['moodBoards']),
+  writersRoomWork: Object.freeze(['writersRoomWorks']),
+  writersRoomFolder: Object.freeze(['writersRoomFolders']),
+  writersRoomExercise: Object.freeze(['writersRoomExercises']),
+  musicVideoProject: Object.freeze(['musicVideoProjects']),
+  commissionFeedback: Object.freeze(['commissionFeedback']),
+  creativeCommission: Object.freeze(['creativeCommissions']),
+  deck: Object.freeze(['decks']),
+});
+
+/**
+ * Schema-version categories that are versioned but NOT reachable from a record
+ * push — they ride their OWN transport with their OWN compatibility gate, not the
+ * per-record push gate that `RECORD_KIND_SCHEMA_CATEGORIES` drives. Listing one
+ * here is the explicit, reviewed way to say "this version is gated elsewhere, so
+ * the gate-map-completeness guard should not require a record-kind mapping."
+ *
+ * - `mediaLibrary` (#1566): the standalone media-library manifest a full-sync
+ *   peer advertises at GET /api/peer-sync/library-manifest. The RECEIVER pulls
+ *   it and GENTLY SKIPS a sender ahead of its local version (see
+ *   syncMediaLibraryFromPeer) — there is no push to gate, so it has no entry in
+ *   RECORD_KIND_SCHEMA_CATEGORIES by design.
+ * - `cosHistory` (#1650): the completed-agent CoS history archive manifest a
+ *   full-sync peer advertises at GET /api/peer-sync/cos-history-manifest. Same
+ *   receiver-pull shape as `mediaLibrary` (see syncCosHistoryFromPeer) — no push
+ *   to gate, so no RECORD_KIND_SCHEMA_CATEGORIES entry.
+ * - `cosTasks` (#1712): the live CoS task-list + claim-metadata payload a
+ *   full-sync peer advertises at GET /api/peer-sync/cos-tasks. Receiver-pull +
+ *   claim-aware per-task merge (see syncCosTasksFromPeer) — no push to gate, so
+ *   no RECORD_KIND_SCHEMA_CATEGORIES entry.
+ *
+ * - `eidoverseFoundations` (#7455): the promoted Eidoverse foundation candidates
+ *   an install advertises at GET /api/peer-sync/eidoverse-foundations. Same
+ *   receiver-pull shape as `cosTasks` (see syncEidoverseFoundationsFromPeer) —
+ *   no push to gate, so no RECORD_KIND_SCHEMA_CATEGORIES entry. A foundation is
+ *   not a peer-subscribable record kind and never rides the record pipeline.
+ *
+ * `appQuality`: numeric-only local evidence at GET /api/apps/quality-federation,
+ * validated against its exact wire version by collectAppQuality; never written or pushed.
+ * The repository file format is versioned separately (`appQualitySnapshotFormat.js`)
+ * and a file-schema change must not bump this wire version.
+ *
+ * `meatspace` (#8143): the daily-log snapshot category, gated by dataSync
+ * `applyRemote` through SNAPSHOT_CATEGORY_SCHEMA_KEYS; meatspace is never a
+ * per-record push.
+ *
+ * `peerAuth` (#8356): the peer credential handshake version, advertised by the
+ * receiver's health details; it gates which header a sender presents, never a
+ * record transfer.
+ *
+ * Do NOT add a real record-push category here to silence the guard — that would
+ * leave its push transfers ungated (silent cross-install corruption). Only
+ * genuinely non-push categories belong.
+ */
+export const NON_RECORD_SCHEMA_CATEGORIES = Object.freeze(new Set(['memoryHistory', 'mediaLibrary', 'cosHistory', 'cosTasks', 'appQuality', 'eidoverseFoundations', 'meatspace', 'peerAuth']));
+
+/**
+ * Lazy-read the current PortOS version from the ROOT package.json so a
+ * pull-and-restart picks it up without a process-relative cache.
+ *
+ * Tested-without-files fallback: when PATHS.root is mutated for a test to
+ * a directory without package.json, return '0.0.0' instead of throwing.
+ * Mirrors `getCurrentVersion` in `server/services/updateChecker.js`.
+ */
+export async function getPortosVersion() {
+  const pkgPath = join(PATHS.root, 'package.json');
+  const raw = await tryReadFile(pkgPath);
+  if (!raw) return '0.0.0';
+  const parsed = safeJSONParse(raw, null);
+  return typeof parsed?.version === 'string' && parsed.version ? parsed.version : '0.0.0';
+}
+
+/**
+ * Build the `portosMeta` envelope that every outbound sync payload carries
+ * at the top level. Receivers feed `meta.schemaVersions` into
+ * `compareSchemaVersions(sender, PORTOS_SCHEMA_VERSIONS)` to decide whether
+ * to apply the payload.
+ *
+ *   {
+ *     "portosMeta": {
+ *       "portosVersion": "2.7.0",
+ *       "schemaVersions": { "universes": 5 }
+ *     }
+ *   }
+ *
+ * `portosVersion` is informational — for UI surfacing only. The gate logic
+ * runs on `schemaVersions` because the on-disk shape is what matters; the
+ * PortOS version is just a friendly label users recognize.
+ */
+export async function buildPortosMeta(overrides = {}) {
+  const portosVersion = await getPortosVersion();
+  return {
+    portosVersion,
+    schemaVersions: { ...PORTOS_SCHEMA_VERSIONS, ...(overrides.schemaVersions || {}) },
+  };
+}
+
+/**
+ * Compare a peer's schemaVersions against the local code's expectations.
+ *
+ * Returns a structured diff so callers (push-rejection, UI surfacing) can
+ * tell users WHICH category is mismatched and in which direction.
+ *
+ *   ahead[]  — categories where the SENDER has a newer schema than the
+ *              RECEIVER. The receiver can't safely apply the payload; reject.
+ *   behind[] — categories where the SENDER is older than the receiver. The
+ *              sanitizer can usually backfill, but some forward-only
+ *              contracts may still require the sender to upgrade. Callers
+ *              decide whether to gate.
+ *
+ *   compatible — `true` only when neither list has entries.
+ *
+ * Absent or invalid entries are compared as zero. A legacy sender without
+ * `portosMeta` is behind every versioned receiver category; callers decide
+ * whether those behind gaps block the transfer.
+ */
+export function compareSchemaVersions(senderVersions = {}, receiverVersions = PORTOS_SCHEMA_VERSIONS) {
+  const sender = senderVersions && typeof senderVersions === 'object' ? senderVersions : {};
+  const receiver = receiverVersions && typeof receiverVersions === 'object' ? receiverVersions : {};
+  const ahead = [];
+  const behind = [];
+  // Walk the UNION of keys so we catch (a) sender has a category receiver
+  // doesn't know (sender ahead), AND (b) receiver requires a category the
+  // sender doesn't carry (sender behind on that category).
+  const keys = new Set([
+    ...Object.keys(sender),
+    ...Object.keys(receiver),
+  ]);
+  for (const cat of keys) {
+    const senderV = Number.isInteger(sender[cat]) ? sender[cat] : 0;
+    const receiverV = Number.isInteger(receiver[cat]) ? receiver[cat] : 0;
+    if (senderV === 0 && receiverV === 0) continue;          // no contract on either side
+    if (senderV === receiverV) continue;                      // exact match
+    if (senderV > receiverV) ahead.push({ category: cat, senderV, receiverV });
+    else behind.push({ category: cat, senderV, receiverV });
+  }
+  return { ahead, behind, compatible: ahead.length === 0 && behind.length === 0 };
+}
+
+/** Catalog row blocks share `deleted`, except user types use `deletedAt`.
+ * Unknown blocks and malformed rows conservatively count as live so a future
+ * payload cannot bypass the version gate. Envelope metadata is not a row block.
+ */
+export function catalogEnvelopeHasLiveRows(envelope) {
+  return Object.entries(envelope).some(([kind, block]) => Array.isArray(block) && block.some(
+    (row) => kind === 'catalogTypes' ? !row?.deletedAt : row?.deleted !== true,
+  ));
+}
+
+/**
+ * Restrict a comparator result to the categories actually being transferred.
+ *
+ * `compareSchemaVersions` walks the UNION of every known category so the full
+ * diff stays useful for diagnostics/UI. But the GATE decision must be
+ * per-category: a sender that bumped (or added) one category should only be
+ * blocked for transfers of THAT category — not for unrelated categories that
+ * happen to ride a federation upgrading on independent schedules. Pass the
+ * schema-version keys this transfer actually moves; categories outside the
+ * set are dropped from `ahead`/`behind` so they can't block (and the scoped
+ * `ahead` is what callers report, so a "pipeline" snapshot rejection never
+ * mis-attributes a `universes` gap).
+ *
+ * `categories` non-array (null/undefined) → returns the diff unchanged
+ * (whole-payload gate; the comparator's union result is used as-is). An empty
+ * array → nothing can block (the transfer touches no versioned category).
+ */
+export function scopeVersionDiff(diff = {}, categories) {
+  if (!Array.isArray(categories)) return diff;
+  const allow = new Set(categories);
+  const ahead = (Array.isArray(diff.ahead) ? diff.ahead : []).filter((g) => allow.has(g.category));
+  const behind = (Array.isArray(diff.behind) ? diff.behind : []).filter((g) => allow.has(g.category));
+  return { ahead, behind, compatible: ahead.length === 0 && behind.length === 0 };
+}
+
+/**
+ * Human-readable explanation of a comparator result. Used both for log lines
+ * and for the UI badge tooltip. Keeps the wording in one place so a peer-
+ * sync 409 message, the Instances UI, and the share-bucket panel all
+ * describe the gap identically.
+ *
+ *   formatVersionGap({ ahead: [{ category: 'universes', senderV: 5, receiverV: 4 }] })
+ *     → 'sender ahead of receiver on universes (v5 vs v4)'
+ */
+export function formatVersionGap({ ahead = [], behind = [] } = {}) {
+  const parts = [];
+  if (ahead.length) {
+    parts.push(`sender ahead of receiver on ${ahead.map((g) => `${g.category} (v${g.senderV} vs v${g.receiverV})`).join(', ')}`);
+  }
+  if (behind.length) {
+    parts.push(`sender behind receiver on ${behind.map((g) => `${g.category} (v${g.senderV} vs v${g.receiverV})`).join(', ')}`);
+  }
+  return parts.join('; ') || 'compatible';
+}

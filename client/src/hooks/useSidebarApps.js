@@ -1,0 +1,38 @@
+import { useState, useEffect } from 'react';
+import * as api from '../services/api';
+import socket from '../services/socket';
+
+// Sidebar apps list: load on mount and refresh whenever the server emits
+// `apps:changed`. Archived apps are filtered out and the rest sorted by name.
+// Unlike the series/universes lists this is socket-driven (not focus-debounced)
+// because app create/rename/archive events are pushed live.
+// The default is the cheap navigation projection. A detail-oriented consumer
+// can opt into the frozen full list with includeDetails without changing the
+// hook's socket refresh behavior.
+export function useSidebarApps({ includeDetails = false } = {}) {
+  const [apps, setApps] = useState([]);
+  useEffect(() => {
+    let cancelled = false;
+    const fetchApps = () => {
+      api.getApps({ silent: true, ...(includeDetails ? {} : { view: 'nav' }) })
+        .then((result) => {
+          if (cancelled) return;
+          setApps((result || [])
+            .filter((a) => !a.archived)
+            .sort((a, b) => (a.name || '').localeCompare(b.name || '')));
+        })
+        .catch((err) => {
+          console.warn(`⚠️ Layout: getApps refresh failed: ${err?.message || err}`);
+        });
+    };
+    fetchApps();
+    socket.on('apps:changed', fetchApps);
+    socket.on('connect', fetchApps);
+    return () => {
+      cancelled = true;
+      socket.off('apps:changed', fetchApps);
+      socket.off('connect', fetchApps);
+    };
+  }, [includeDetails]);
+  return apps;
+}

@@ -1,0 +1,141 @@
+/**
+ * Publish stage panel (#9281): the kit builds only from a final render, the
+ * copy draft carries the director's notes and valid links, an edited field
+ * saves on blur (tags as a list), and the thumbnail choice goes to the server.
+ */
+import { describe, it, expect, vi } from 'vitest';
+import { render, screen, fireEvent } from '@testing-library/react';
+
+vi.mock('../../hooks/useProviderModels.js', () => ({
+  default: () => ({ providers: [], selectedProviderId: '', selectedModel: '', availableModels: [], setSelectedProviderId: vi.fn(), setSelectedModel: vi.fn() }),
+}));
+vi.mock('../../lib/clipboard.js', () => ({ copyToClipboard: vi.fn() }));
+
+import PublishKitPanel from './PublishKitPanel.jsx';
+
+// Publish cards and platform rows fold when done; open everything so a test sees the whole page.
+const expandAll = () => { for (let b = screen.queryAllByRole('button', { expanded: false }); b.length; b = screen.queryAllByRole('button', { expanded: false })) b.forEach((x) => fireEvent.click(x)); };
+
+const hook = (over = {}) => ({
+  building: false, progress: 0, build: vi.fn(), drafting: false, saving: false,
+  draftCopy: vi.fn(async () => null), saveCopy: vi.fn(async () => null), selectThumbnail: vi.fn(async () => null),
+  composing: false, composeCover: vi.fn(async () => null), designing: false, designCover: vi.fn(async () => null), generateCover: vi.fn(async () => null), ...over,
+});
+const built = {
+  builtAt: '2026-01-01T00:00:00.000Z', master: { filename: 'master.mp4' },
+  exports: [{ kind: 'x-1080p', label: 'X / social 1080p (12 Mbps)', filename: 'x.mp4' }],
+  thumbnails: ['t1.jpg', 't2.jpg'], thumbnail: 't1.jpg', captionsFilename: 'c.srt',
+  chapters: [{ startSec: 0, label: 'Opening line' }, { startSec: 30, label: 'Chorus' }, { startSec: 72, label: 'Outro' }],
+  copy: { youtube: { title: 'A title', description: '', tags: ['music'] } }, copyDraftedAt: '2026-01-01T00:00:00.000Z',
+};
+
+describe('PublishKitPanel (#9281)', () => {
+  it('builds only once there is a final render', () => {
+    const k = hook();
+    const { rerender } = render(<PublishKitPanel project={{ id: 'mv-1' }} publishKit={k} />);
+    expandAll();
+    expect(screen.getByRole('button', { name: /Build publishing kit/ })).toBeDisabled();
+    rerender(<PublishKitPanel project={{ id: 'mv-1', renderHistoryId: 'rh-1' }} publishKit={k} />);
+    fireEvent.click(screen.getByRole('button', { name: /Build publishing kit/ }));
+    expect(k.build).toHaveBeenCalled();
+  });
+
+  it('drafts copy from the notes, only well-formed links and only what is ticked', () => {
+    const k = hook();
+    const project = { id: 'mv-1', name: 'Example Song', renderHistoryId: 'rh-1', lyricCues: [{ text: 'a line', startSec: 1 }, { text: 'untimed' }], productionRuns: [{ usage: { spentUsd: 4.5 } }] };
+    render(<PublishKitPanel project={project} publishKit={k} />);
+    expandAll();
+    fireEvent.change(screen.getByLabelText(/Making-of notes/), { target: { value: 'hummed it in the car' } });
+    fireEvent.change(screen.getByLabelText(/Full video URL/), { target: { value: 'https://example.com/v' } });
+    fireEvent.change(screen.getByLabelText(/Song URL/), { target: { value: 'not a url' } });
+    // By default only the song title goes in, kept to a sentence or two, with no hashtags.
+    expect(screen.getByLabelText(/Song title/)).toBeChecked();
+    expect(screen.getByLabelText(/Hashtags and YouTube tags/)).not.toBeChecked();
+    expect(screen.getByLabelText('A sentence or two')).toBeChecked();
+    expect(screen.getByText(/1 timed line$/)).toBeTruthy(); // the untimed cue never reaches the writer
+    fireEvent.click(screen.getByRole('button', { name: /Draft copy/ }));
+    const none = { title: true, lyrics: false, chapters: false, spend: false, hashtags: false };
+    expect(k.draftCopy).toHaveBeenLastCalledWith({ notes: 'hummed it in the car', links: { youtube: 'https://example.com/v' }, include: none, length: 'short' });
+
+    fireEvent.click(screen.getByLabelText(/Song title/));
+    fireEvent.click(screen.getByLabelText(/Lyrics/));
+    fireEvent.click(screen.getByLabelText(/Generation spend/));
+    fireEvent.click(screen.getByLabelText(/Hashtags and YouTube tags/));
+    fireEvent.click(screen.getByLabelText('Full making-of'));
+    fireEvent.click(screen.getByRole('button', { name: /Draft copy/ }));
+    expect(k.draftCopy).toHaveBeenLastCalledWith(expect.objectContaining({ include: { ...none, title: false, lyrics: true, spend: true, hashtags: true }, length: 'full' }));
+  });
+
+  it('asks before a draft replaces posts edited by hand', () => {
+    const k = hook();
+    const publishKit = { copy: { x: { hook: 'Mine.' } }, copyDraftedAt: '2026-01-01T00:00:00.000Z', copyEditedAt: '2026-01-02T00:00:00.000Z' };
+    render(<PublishKitPanel project={{ id: 'mv-1', name: 'Example Song', publishKit }} publishKit={k} enabledTargets={['x']} />);
+    expandAll();
+    fireEvent.click(screen.getByRole('button', { name: /Redraft copy/ }));
+    expect(k.draftCopy).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Keep mine' }));
+    expect(k.draftCopy).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: /Redraft copy/ }));
+    fireEvent.click(screen.getByRole('button', { name: 'Replace them' }));
+    expect(k.draftCopy).toHaveBeenCalledWith(expect.objectContaining({ replaceEdited: true }));
+  });
+
+  it('cannot tick lyrics or spend the project does not have, and lets you write a post without drafting', () => {
+    const k = hook();
+    render(<PublishKitPanel project={{ id: 'mv-1', name: 'Example Song', renderHistoryId: 'rh-1', lyricCues: [{ text: 'untimed' }] }} publishKit={k} enabledTargets={['x']} />);
+    expandAll();
+    expect(screen.getByLabelText(/Lyrics/)).toBeDisabled();
+    expect(screen.getByLabelText(/Generation spend/)).toBeDisabled();
+    const hook_ = screen.getByLabelText('Hook post (no links)');
+    fireEvent.change(hook_, { target: { value: 'One sentence of my own.' } });
+    fireEvent.blur(hook_);
+    expect(k.saveCopy).toHaveBeenCalledWith({ x: { hook: 'One sentence of my own.' } });
+  });
+
+  it('shows the built kit, saves an edited field on blur and picks a thumbnail', () => {
+    const k = hook();
+    render(<PublishKitPanel project={{ id: 'mv-1', renderHistoryId: 'rh-1', publishKit: built }} publishKit={k} />);
+    expandAll();
+    expect(screen.getByText('X / social 1080p (12 Mbps)')).toBeTruthy();
+    expect(screen.getByText(/0:00 Opening line/)).toBeTruthy();
+    const tags = screen.getByLabelText('Tags (comma-separated)');
+    fireEvent.change(tags, { target: { value: 'music, ai video ,claude' } });
+    fireEvent.blur(tags);
+    expect(k.saveCopy).toHaveBeenCalledWith({ youtube: { tags: ['music', 'ai video', 'claude'] } });
+    fireEvent.click(screen.getByRole('button', { name: 'Use thumbnail t2.jpg' }));
+    expect(k.selectThumbnail).toHaveBeenCalledWith('t2.jpg');
+  });
+
+  it('makes the cover art from a project image with the title, and asks Codex for a new one', () => {
+    const k = hook();
+    const project = { id: 'mv-1', name: 'Example Song', publishKit: built, castAndSets: { images: { character: { imageId: 'sheet.png' } } } };
+    const { rerender } = render(<PublishKitPanel project={project} publishKit={k} />);
+    expandAll();
+    expect(screen.getByText('No cover yet')).toBeTruthy();
+    fireEvent.change(screen.getByLabelText('Title on the cover'), { target: { value: 'Example Retitle' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Make the cover from Cast & Sets: character' }));
+    expect(k.composeCover).toHaveBeenCalledWith({ source: { kind: 'image', filename: 'sheet.png' }, title: 'Example Retitle', focusX: 0.5, lettering: true });
+    fireEvent.click(screen.getByRole('button', { name: 'Make the cover from Video frame 1' }));
+    expect(k.composeCover).toHaveBeenLastCalledWith(expect.objectContaining({ source: { kind: 'thumbnail', filename: 't1.jpg' } }));
+
+    fireEvent.change(screen.getByLabelText(/Style direction for this song/), { target: { value: 'grainy black and white' } });
+    fireEvent.click(screen.getByRole('button', { name: /Design the cover/ }));
+    expect(k.designCover).toHaveBeenCalledWith({ direction: 'grainy black and white' });
+    fireEvent.click(screen.getByRole('button', { name: /Make a new image/ }));
+    expect(k.generateCover).toHaveBeenCalledWith({ notes: 'grainy black and white' });
+
+    const art = { filename: 'cover-1.jpg', title: 'Example Song', tag: 'Example Artist', source: { kind: 'image', filename: 'sheet.png' }, pending: { mode: 'codex' }, design: { layout: 'top-center' }, rationale: 'Example reason.' };
+    rerender(<PublishKitPanel project={{ ...project, publishKit: { ...built, coverArt: art } }} publishKit={k} />);
+    expect(screen.getByAltText('Cover art for Example Song')).toBeTruthy();
+    expect(screen.getByText(/Making a cover image on codex/)).toBeTruthy();
+    expect(screen.getByText(/This song's look: Example reason/)).toBeTruthy();
+    // With a design in place the same box adjusts it, and can start from the current image.
+    fireEvent.change(screen.getByLabelText(/Adjust the style or the image/), { target: { value: 'warmer light' } });
+    fireEvent.click(screen.getByLabelText('Start from the current image'));
+    fireEvent.click(screen.getByRole('button', { name: /Make a new image/ }));
+    expect(k.generateCover).toHaveBeenLastCalledWith({ notes: 'warmer light', reference: { kind: 'image', filename: 'sheet.png' } });
+    // While a request is in flight (a first design can take a while) a second click cannot start another.
+    rerender(<PublishKitPanel project={{ ...project, publishKit: { ...built, coverArt: { ...art, design: null } } }} publishKit={{ ...k, requestingImage: true }} />);
+    expect(screen.getByRole('button', { name: /Designing, then queuing/ })).toBeDisabled();
+  });
+});

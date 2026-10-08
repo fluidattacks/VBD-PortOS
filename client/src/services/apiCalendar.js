@@ -1,0 +1,32 @@
+import { request } from './apiCore.js';
+
+// Calendar
+export const getCalendarAccounts = (options = {}) => request('/calendar/accounts', options);
+export const createCalendarAccount = (data, options = {}) => request('/calendar/accounts', { method: 'POST', body: JSON.stringify(data), ...options });
+export const updateCalendarAccount = (id, data, options = {}) => request(`/calendar/accounts/${id}`, { method: 'PUT', body: JSON.stringify(data), ...options });
+export const deleteCalendarAccount = (id) => request(`/calendar/accounts/${id}`, { method: 'DELETE' });
+export const syncCalendarAccount = (accountId, options = {}) => request(`/calendar/sync/${accountId}`, { method: 'POST', ...options });
+export const getCalendarEvents = (params = {}, options = {}) => {
+  const str = new URLSearchParams(Object.entries(params).filter(([, v]) => v != null)).toString();
+  return request(`/calendar/events${str ? `?${str}` : ''}`, options);
+};
+export const getCalendarAgenda = (options = {}) => request('/calendar/agenda', options);
+export const getCalendarTokenStatus = () => request('/calendar/debug/token-status');
+export const testCalendarToken = (provider) => request('/calendar/debug/test-token', { method: 'POST', body: JSON.stringify({ provider }) });
+export const clearCalendarToken = (provider) => request('/calendar/debug/clear-token', { method: 'POST', body: JSON.stringify({ provider }) });
+export const updateSubcalendars = (accountId, data, options = {}) => request(`/calendar/accounts/${accountId}/subcalendars`, { method: 'PUT', body: JSON.stringify(data), ...options });
+export const mcpSyncGoogleCalendar = (accountId, options = {}) => request(`/calendar/sync/${accountId}/google`, { method: 'POST', ...options });
+export const mcpDiscoverCalendars = (accountId) => request(`/calendar/sync/${accountId}/discover`, { method: 'POST' });
+export const getGoogleAuthStatus = () => request('/calendar/google/auth/status');
+export const saveGoogleAuthCredentials = (data, options = {}) => request('/calendar/google/auth/credentials', { method: 'POST', body: JSON.stringify(data), ...options });
+export const getGoogleAuthUrl = ({ returnTo, ...options } = {}) => {
+  const query = returnTo ? `?returnTo=${encodeURIComponent(returnTo)}` : '';
+  return request(`/calendar/google/auth/url${query}`, options);
+};
+export const clearGoogleAuth = () => request('/calendar/google/auth/clear', { method: 'POST' });
+export const apiSyncGoogleCalendar = (accountId, options = {}) => request(`/calendar/sync/${accountId}/api`, { method: 'POST', ...options });
+export const apiDiscoverCalendars = (accountId) => request(`/calendar/sync/${accountId}/discover-api`, { method: 'POST' });
+export const startGoogleAutoConfig = (options = {}) => request('/calendar/google/auto-configure/start', { method: 'POST', ...options });
+export const runGoogleAutoConfig = (email, options = {}) => request('/calendar/google/auto-configure/run', { method: 'POST', body: JSON.stringify({ email }), ...options });
+export const getDailyReview = (date) => request(`/calendar/review/${date}`);
+export const confirmDailyReviewEvent = (date, data, options = {}) => request(`/calendar/review/${date}/confirm`, { method: 'POST', body: JSON.stringify(data), ...options });

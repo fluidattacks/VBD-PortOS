@@ -1,0 +1,2413 @@
+import socket from '../services/socket';
+const socketEvent = event => { for (const [name, handler] of socket.on.mock.calls) if (name === event) handler({}); };
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { act, render, screen, fireEvent, waitFor, within } from '@testing-library/react';
+import { MemoryRouter, Route, Routes } from 'react-router';
+import { findEnabledByRole } from '../test/enabledBarrier.js';
+
+const api = vi.hoisted(() => ({
+  getProviders: vi.fn(),
+  getApps: vi.fn(),
+  getProviderStatuses: vi.fn(),
+  getProviderRuntimes: vi.fn(),
+  getProviderReadiness: vi.fn(),
+  // Kept pending by default so existing page tests that use a Codex fixture do
+  // not accidentally assert a subscription account state. Subscription-specific
+  // tests replace this with a bounded readiness response.
+  getCodexAccount: vi.fn(() => new Promise(() => {})),
+  getCodexModels: vi.fn(),
+  startCodexLogin: vi.fn(),
+  cancelCodexLogin: vi.fn(),
+  codexLogout: vi.fn(),
+  getInstances: vi.fn(),
+  getSampleProviders: vi.fn(),
+  createProvider: vi.fn(),
+  updateProvider: vi.fn(),
+  refreshProviderModels: vi.fn(),
+  // The retired-model-pin panel reads on mount. Resolved empty so a healthy
+  // install renders nothing extra — the panel has its own suite.
+  getModelPinWarnings: vi.fn().mockResolvedValue({ pins: [], providers: {} }),
+  clearModelPin: vi.fn(),
+  setActiveProvider: vi.fn().mockResolvedValue({}),
+  getOrchestrationProfiles: vi.fn().mockResolvedValue({ profiles: [] }),
+  createRun: vi.fn().mockResolvedValue({ runId: 'run-1' }),
+  stopRun: vi.fn().mockResolvedValue({}),
+  // The compatibility matrix reads the composition catalog (#7567). Empty by
+  // default so the preset list renders exactly as before; the matrix has its
+  // own cases below.
+  getProviderCatalog: vi.fn().mockResolvedValue({
+    harnesses: [], services: [], bootstraps: [], compatibility: {}, effortLevels: {}, effortLevelsByModel: {}, presets: [],
+  }),
+  getProviderBootstraps: vi.fn().mockResolvedValue({ bootstraps: {} }),
+  getHarnesses: vi.fn().mockResolvedValue({ harnesses: [] }),
+  createProviderPreset: vi.fn(),
+  // The Services view lists instances; empty by default.
+  getProviderServices: vi.fn().mockResolvedValue({ services: [] }),
+}));
+
+const localModels = vi.hoisted(() => ({ value: { ctxById: {}, installed: { ollama: null, lmstudio: null } } }));
+
+const toast = vi.hoisted(() => ({
+  success: vi.fn(),
+  error: vi.fn(),
+  info: vi.fn(),
+  warning: vi.fn(),
+}));
+
+vi.mock('../services/api', () => api);
+vi.mock('../services/apiProviders', () => ({
+  getFleetLlmHost: vi.fn(() => new Promise(() => {})),
+  getFleetPeerHosts: vi.fn(() => new Promise(() => {})),
+  revealFleetLlmHostKey: vi.fn(),
+  revealFleetPeerHostKey: vi.fn(),
+}));
+vi.mock('../components/ui/Toast', () => ({
+  default: toast,
+}));
+vi.mock('../services/socket', () => ({
+  default: {
+    on: vi.fn(),
+    off: vi.fn(),
+    emit: vi.fn(),
+  },
+}));
+vi.mock('../hooks/useLocalModels', () => ({
+  default: () => localModels.value,
+}));
+vi.mock('../components/models/ModelsTabsHeader', () => ({
+  default: ({ activeTab }) => <div data-testid="models-tabs-header" data-active-tab={activeTab} />,
+  ModelsSectionLayout: ({ children }) => <>{children}</>,
+}));
+vi.mock('../components/install/RuntimeInstallModal', () => ({
+  // `params` becomes the setup request's query string, so the test can assert
+  // WHICH setup step the clicked button asked for.
+  default: ({ open, runtime, streamMethod, flushMs, params }) => open
+    ? <div data-testid="runtime-install-modal" data-runtime={runtime} data-stream-method={streamMethod} data-flush-ms={flushMs} data-params={JSON.stringify(params || {})} />
+    : null,
+}));
+
+import AIProviders, { PRESET_STATE_ORDER } from './AIProviders';
+import { __resetProviderCatalogCache } from '../hooks/useProviderCatalog';
+import { CARD_STATE_STYLES } from '../components/providers/ProviderCard';
+import { PROVIDER_CARD_STATE } from '../utils/providers';
+
+// The editor is route-driven (/ai/presets/new · /ai/presets/:presetId over
+// the same page, plus the legacy /ai/edit/:providerId alias), so the tests
+// mount the real route table rather than a bare page — clicking Edit
+// navigates, and a deep link can be rendered directly. The three views are
+// route prefixes of the same page (#7567).
+const mountPage = (initialPath = '/ai/presets') => render(
+  <MemoryRouter initialEntries={[initialPath]}>
+    <Routes>
+      <Route path="/ai/presets" element={<AIProviders />} />
+      <Route path="/ai/presets/new" element={<AIProviders />} />
+      <Route path="/ai/presets/:presetId" element={<AIProviders />} />
+      <Route path="/ai/edit/:providerId" element={<AIProviders />} />
+      <Route path="/ai/fleet" element={<AIProviders />} />
+      <Route path="/ai/harnesses" element={<AIProviders />} />
+      <Route path="/ai/harnesses/:harnessId" element={<AIProviders />} />
+      <Route path="/ai/services" element={<AIProviders />} />
+      <Route path="/ai/services/new" element={<AIProviders />} />
+      <Route path="/ai/services/:serviceSlug" element={<AIProviders />} />
+    </Routes>
+  </MemoryRouter>
+);
+
+const renderPage = async (initialPath) => {
+  const result = mountPage(initialPath);
+  await act(async () => {});
+  return result;
+};
+
+// The editor opens on the Connection tab; every other field lives behind a tab
+// switch (the drawer renders only the active panel).
+const openEditorTab = async (label) => {
+  fireEvent.click(await screen.findByRole('tab', { name: label }));
+};
+
+// The rare page actions (Compare local models, Fleet setup, Load Samples) sit
+// behind the header's overflow menu since #5653, so the bar stays one row tall.
+const openHeaderMenu = async () => {
+  fireEvent.click(await screen.findByRole('button', { name: 'More provider actions' }));
+};
+
+const clickLoadSamples = async () => {
+  await openHeaderMenu();
+  fireEvent.click(await screen.findByRole('menuitem', { name: 'Load Samples' }));
+};
+
+// One entry of the `runtimes` map from GET /api/providers/runtimes.
+const missingRuntime = {
+  id: 'opencode',
+  label: 'OpenCode CLI',
+  command: 'opencode',
+  installed: false,
+  method: 'npm',
+  installable: true,
+  blockedReason: null,
+  docsUrl: 'https://opencode.ai/docs',
+};
+
+describe('AIProviders page load error handling', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    api.getApps.mockResolvedValue([]);
+    api.getProviderStatuses.mockResolvedValue({ providers: {} });
+    api.getProviderRuntimes.mockResolvedValue({ runtimes: {} });
+    api.getProviderReadiness.mockResolvedValue({ readiness: {} });
+    api.getCodexAccount.mockImplementation(() => new Promise(() => {}));
+    localModels.value = { ctxById: {}, installed: { ollama: null, lmstudio: null } };
+  });
+
+  it('renders one CLI/TUI card with one install check, explicit default modes and a TUI shell link', async () => {
+    const executionModes = [{ id: 'example', type: 'cli' }, { id: 'example-tui', type: 'tui' }];
+    api.getProviders.mockResolvedValue({ activeProvider: 'example', providers: [
+      { id: 'example', name: 'Example CLI', type: 'cli', command: 'opencode', enabled: true, models: ['model-a'], executionModes },
+      { id: 'example-tui', name: 'Example TUI', type: 'tui', command: 'opencode', enabled: true, models: ['model-a'], tuiCommandLine: 'opencode', executionModes },
+      { id: 'example-api', name: 'Example API', type: 'api', endpoint: 'http://192.0.2.10:11434', enabled: true, models: ['remote-model'] },
+    ] });
+    api.getProviderRuntimes.mockResolvedValue({ runtimes: { opencode: missingRuntime } });
+    await renderPage();
+    expect(await screen.findByRole('heading', { name: 'Example', exact: true })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Example API' })).toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: /Install OpenCode CLI/ })).toHaveLength(1);
+    expect(screen.getByRole('link', { name: 'Launch in Shell' })).toHaveAttribute('href', '/shell?provider=example-tui');
+    expect(screen.getByRole('button', { name: 'CLI default' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: 'Set TUI default' }));
+    await waitFor(() => expect(api.setActiveProvider).toHaveBeenCalledWith('example-tui'));
+    expect(await screen.findByRole('button', { name: 'TUI default' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: 'Set CLI default' }));
+    await waitFor(() => expect(api.setActiveProvider).toHaveBeenLastCalledWith('example'));
+  });
+
+  it('gates the CLI default on transport consent but leaves the TUI default selectable', async () => {
+    const executionModes = [{ id: 'codex', type: 'cli' }, { id: 'codex-tui', type: 'tui' }];
+    api.getCodexAccount.mockResolvedValue({ readiness: { status: 'ready' } });
+    api.getCodexModels.mockResolvedValue({ models: null });
+    api.getProviders.mockResolvedValue({ activeProvider: null, providers: [
+      { id: 'codex', name: 'Codex CLI', type: 'cli', command: 'codex', enabled: true, textTransportEnabled: true, executionModes },
+      { id: 'codex-tui', name: 'Codex TUI', type: 'tui', command: 'codex', enabled: true, textTransportEnabled: false, executionModes },
+    ] });
+    await renderPage();
+    await findEnabledByRole('button', { name: 'Set CLI default' });
+    expect(screen.getByRole('button', { name: 'Set TUI default' })).toBeEnabled();
+    fireEvent.click(screen.getByRole('button', { name: 'Set TUI default' }));
+    await waitFor(() => expect(api.setActiveProvider).toHaveBeenCalledWith('codex-tui'));
+  });
+
+  it('offers an install button on the card of a provider whose CLI is missing', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [{ id: 'opencode-ollama', name: 'OpenCode Ollama', type: 'cli', command: 'opencode', args: ['run'], enabled: true }],
+      activeProvider: null,
+    });
+    api.getProviderRuntimes.mockResolvedValue({ runtimes: { opencode: missingRuntime } });
+
+    await renderPage();
+
+    const install = await screen.findByRole('button', { name: /Install OpenCode CLI/ });
+    expect(install).toBeEnabled();
+    fireEvent.click(install);
+    const modal = screen.getByTestId('runtime-install-modal');
+    expect(modal).toHaveAttribute('data-runtime', 'opencode');
+    expect(modal).toHaveAttribute('data-stream-method', 'POST');
+    expect(modal).toHaveAttribute('data-flush-ms', '250');
+  });
+
+  it('opens the shared installer when a Harnesses card starts a CLI install', async () => {
+    __resetProviderCatalogCache();
+    api.getProviders.mockResolvedValue({ providers: [], activeProvider: null });
+    api.getProviderRuntimes.mockResolvedValue({
+      runtimes: {
+        pi: {
+          id: 'pi',
+          label: 'Pi Coding Agent CLI',
+          vendor: 'pi',
+          installed: false,
+          installable: true,
+          method: 'npm',
+        },
+      },
+    });
+    api.getProviderCatalog.mockResolvedValue({
+      harnesses: [{ id: 'pi', label: 'Pi', modes: ['cli', 'tui'], enabled: false, source: 'setting', detected: false }],
+      services: [],
+      bootstraps: [],
+      compatibility: {},
+      effortLevels: {},
+      effortLevelsByModel: {},
+      presets: [],
+    });
+
+    await renderPage('/ai/harnesses');
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Install Pi Coding Agent CLI' }));
+    const modal = await screen.findByTestId('runtime-install-modal');
+    expect(modal).toHaveAttribute('data-runtime', 'pi');
+    expect(modal).toHaveAttribute('data-stream-method', 'POST');
+    expect(modal).toHaveAttribute('data-flush-ms', '250');
+  });
+
+  // An absolute path in `command` is a legitimate config — the widget must
+  // still find its runtime rather than silently dropping the install button.
+  it('matches a runtime through a path-qualified command', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [{ id: 'codex-pinned', name: 'Codex (pinned)', type: 'cli', command: '/opt/bin/codex', args: [], enabled: true }],
+      activeProvider: null,
+    });
+    api.getProviderRuntimes.mockResolvedValue({
+      runtimes: { codex: { ...missingRuntime, id: 'codex', label: 'Codex CLI', command: 'codex' } },
+    });
+
+    await renderPage();
+
+    expect(await screen.findByRole('button', { name: /Install Codex CLI/ })).toBeEnabled();
+  });
+
+  it('reports an installed runtime instead of offering another install', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [{ id: 'opencode-ollama', name: 'OpenCode Ollama', type: 'cli', command: 'opencode', args: ['run'], enabled: true }],
+      activeProvider: null,
+    });
+    api.getProviderRuntimes.mockResolvedValue({ runtimes: { opencode: { ...missingRuntime, installed: true } } });
+
+    await renderPage();
+
+    expect(await screen.findByText(/installed/)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Install OpenCode CLI/ })).not.toBeInTheDocument();
+  });
+
+  it('does not recommend disabling Grok codebase upload on the card or editor', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [{
+        id: 'grok-tui',
+        name: 'Grok Build TUI',
+        type: 'tui',
+        command: 'grok',
+        args: [],
+        enabled: true,
+        models: ['grok-configured-default'],
+        defaultModel: 'grok-configured-default',
+      }],
+      activeProvider: 'grok-tui',
+    });
+
+    await renderPage();
+
+    expect(await screen.findByText('Grok Build TUI')).toBeInTheDocument();
+    expect(screen.queryByText(/uploads your entire working repo/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/disable_codebase_upload/i)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Edit' }));
+    expect(await screen.findByRole('heading', { name: 'Edit Provider' })).toBeInTheDocument();
+    expect(screen.queryByText(/uploads your entire working repo/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/disable_codebase_upload/i)).not.toBeInTheDocument();
+  });
+
+  it('explains why the install action is unavailable and links the vendor instructions', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [{ id: 'opencode-ollama', name: 'OpenCode Ollama', type: 'cli', command: 'opencode', args: ['run'], enabled: true }],
+      activeProvider: null,
+    });
+    api.getProviderRuntimes.mockResolvedValue({
+      runtimes: {
+        opencode: {
+          ...missingRuntime,
+          installable: false,
+          blockedReason: "npm is not available on PortOS's PATH, so this host cannot install OpenCode CLI from this page.",
+        },
+      },
+    });
+
+    await renderPage();
+
+    expect(await screen.findByText(/npm is not available on PortOS's PATH/)).toBeInTheDocument();
+    // No dead Install button — the vendor's own instructions are the way out.
+    expect(screen.queryByRole('button', { name: /Install OpenCode CLI/ })).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /Install instructions/ })).toHaveAttribute('href', 'https://opencode.ai/docs');
+  });
+
+  // Ollama / LM Studio keep their real installer on the Models → LLMs page, so the
+  // provider card links there instead of streaming an install of its own — and
+  // reads their state from the local-LLM status, which counts an installed app
+  // with no CLI shim on PATH.
+  it('links a locally-managed app to its own settings tab', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [{ id: 'lmstudio', name: 'LM Studio', type: 'api', endpoint: 'http://localhost:1234/v1', enabled: true }],
+      activeProvider: null,
+    });
+    localModels.value = { ctxById: {}, installed: { ollama: null, lmstudio: false } };
+
+    await renderPage();
+
+    expect(await screen.findByRole('link', { name: /Install LM Studio/ })).toHaveAttribute('href', '/models/llms');
+  });
+
+  // `null` means the local-LLM status has not answered yet — offering an
+  // install from that state would flash a wrong CTA on every page load.
+  it('offers nothing for a local app whose status has not been fetched', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [{ id: 'lmstudio', name: 'LM Studio', type: 'api', endpoint: 'http://localhost:1234/v1', enabled: true }],
+      activeProvider: null,
+    });
+
+    await renderPage();
+
+    expect(await screen.findByText('LM Studio')).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: /Install LM Studio/ })).not.toBeInTheDocument();
+  });
+
+  it('shows no install widget for a command PortOS has no installer for', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [{ id: 'custom', name: 'Custom CLI', type: 'cli', command: 'my-agent', args: [], enabled: true }],
+      activeProvider: null,
+    });
+    api.getProviderRuntimes.mockResolvedValue({ runtimes: { opencode: missingRuntime } });
+
+    await renderPage();
+
+    expect(await screen.findByText('Custom CLI')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^Install/ })).not.toBeInTheDocument();
+  });
+
+  it('renders provider list when api.getProviders succeeds with data', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [
+        { id: 'p1', name: 'OpenAI', type: 'api', enabled: true, endpoint: 'https://api.openai.com', models: ['gpt-4'] }
+      ],
+      activeProvider: 'p1',
+    });
+
+    await renderPage();
+
+    expect(await screen.findByText('OpenAI')).toBeInTheDocument();
+    expect(screen.queryByText('No presets configured')).not.toBeInTheDocument();
+    expect(screen.queryByText('Failed to load AI providers')).not.toBeInTheDocument();
+
+    // Demoted to the overflow menu, but still a real anchor so it can be
+    // opened in a new tab.
+    await openHeaderMenu();
+    expect(screen.getByRole('menuitem', { name: /Compare local models/ })).toHaveAttribute('href', '/models/performance');
+  });
+
+  it('uses the Models child navigation after Providers moves out of Settings', async () => {
+    api.getProviders.mockResolvedValue({ providers: [], activeProvider: null });
+
+    await renderPage();
+
+    expect(await screen.findByTestId('models-tabs-header')).toHaveAttribute('data-active-tab', 'providers');
+  });
+
+  // The page hosts ModelsTabsHeader; before #5653 it also hand-rolled a
+  // `Settings` title bar above it, so every render stacked two h1s and pushed
+  // the first provider card off a phone viewport.
+  it('renders exactly one h1, naming the page rather than the settings section', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [
+        { id: 'p1', name: 'OpenAI', type: 'api', enabled: true, endpoint: 'https://api.openai.com', models: ['gpt-4'] }
+      ],
+      activeProvider: 'p1',
+    });
+
+    await renderPage();
+
+    await screen.findByText('OpenAI');
+    const headings = screen.getAllByRole('heading', { level: 1 });
+    expect(headings).toHaveLength(1);
+    expect(headings[0]).toHaveAccessibleName('AI Providers');
+  });
+
+  it('shows a blank secret environment value as not set', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [{
+        id: 'bedrock',
+        name: 'Bedrock CLI',
+        type: 'cli',
+        command: 'claude',
+        enabled: true,
+        envVars: { AWS_BEARER_TOKEN_BEDROCK: '' },
+        secretEnvVars: ['AWS_BEARER_TOKEN_BEDROCK'],
+        missingPrerequisites: [],
+      }],
+      activeProvider: null,
+    });
+
+    await renderPage();
+
+    expect(await screen.findByText('AWS_BEARER_TOKEN_BEDROCK=(not set)')).toBeInTheDocument();
+    expect(screen.queryByText('AWS_BEARER_TOKEN_BEDROCK=***')).not.toBeInTheDocument();
+  });
+
+  it('renders EmptyState when api.getProviders succeeds with 0 items', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [],
+      activeProvider: null,
+    });
+
+    await renderPage();
+
+    expect(await screen.findByText('No presets configured')).toBeInTheDocument();
+    expect(screen.queryByText('Failed to load AI providers')).not.toBeInTheDocument();
+    // With nothing to group, no harness section renders either.
+    expect(screen.queryByRole('button', { name: new RegExp('^Claude Code') })).not.toBeInTheDocument();
+  });
+
+  it('renders Banner with Retry button when api.getProviders rejects and does not show EmptyState', async () => {
+    api.getProviders.mockRejectedValue(new Error('Network error'));
+
+    await renderPage();
+
+    expect(await screen.findByText('Failed to load AI providers')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument();
+    expect(screen.queryByText('No presets configured')).not.toBeInTheDocument();
+  });
+
+  it('re-fetches when Retry button is clicked and displays providers upon success', async () => {
+    api.getProviders
+      .mockRejectedValueOnce(new Error('Network error'))
+      .mockResolvedValueOnce({
+        providers: [
+          { id: 'p1', name: 'Claude', type: 'api', enabled: true, endpoint: 'https://api.anthropic.com', models: ['claude-3'] }
+        ],
+        activeProvider: 'p1',
+      });
+
+    await renderPage();
+
+    const retryBtn = await screen.findByRole('button', { name: 'Retry' });
+    fireEvent.click(retryBtn);
+
+    expect(await screen.findByText('Claude')).toBeInTheDocument();
+    expect(screen.queryByText('Failed to load AI providers')).not.toBeInTheDocument();
+    expect(screen.queryByText('No presets configured')).not.toBeInTheDocument();
+    expect(api.getProviders).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('local-daemon readiness on the provider card', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    api.getApps.mockResolvedValue([]);
+    api.getProviderStatuses.mockResolvedValue({ providers: {} });
+    api.getProviderRuntimes.mockResolvedValue({ runtimes: {} });
+    localModels.value = { ctxById: {}, installed: { ollama: null, lmstudio: null } };
+    api.getProviders.mockResolvedValue({
+      providers: [{ id: 'opencode-llama-tui', name: 'OpenCode llama TUI', type: 'tui', command: 'opencode', args: [], enabled: true, endpoint: 'http://127.0.0.1:5568/v1', llamaBacked: true }],
+      activeProvider: null,
+    });
+  });
+
+  it('surfaces the unmet requirements when the local daemon is not running', async () => {
+    api.getProviderReadiness.mockResolvedValue({
+      readiness: {
+        'opencode-llama-tui': {
+          kind: 'llama',
+          label: 'llama.cpp',
+          endpoint: 'http://127.0.0.1:5568/v1',
+          manageUrl: '/models/llms',
+          docsUrl: 'https://example.com/docs',
+          ready: false,
+          checks: [
+            { id: 'runtime', label: 'llama.cpp installed', ok: false, detail: 'not found', fixHint: 'Install llama.cpp from Models → Runtimes.' },
+            { id: 'server', label: 'llama.cpp server responding', ok: false, detail: 'nothing answered', fixHint: 'Install llama.cpp first, then start it.' },
+          ],
+        },
+      },
+    });
+
+    await renderPage();
+
+    expect(await screen.findByText(/llama\.cpp setup incomplete/)).toBeInTheDocument();
+    expect(screen.getByText(/Install llama\.cpp from Models/)).toBeInTheDocument();
+    expect(screen.queryByText(/setup docs/i)).not.toBeInTheDocument();
+  });
+
+  it('sends the weights-download action when the checklist offers it', async () => {
+    // MTPLX installed, nothing cached: the button is the download, and the
+    // action has to reach the setup request — sending the default would run a
+    // plain start, which is the failure this whole path exists to avoid.
+    api.getProviderReadiness.mockResolvedValue({
+      readiness: {
+        'opencode-llama-tui': {
+          kind: 'mtplx',
+          label: 'MTPLX',
+          endpoint: 'http://127.0.0.1:8000/v1',
+          manageUrl: null,
+          ready: false,
+          setup: { runtime: 'mtplx', label: 'MTPLX', action: 'pull-start', actionLabel: 'Download the default model & start MTPLX', blockedReason: null },
+          checks: [
+            { id: 'runtime', label: 'MTPLX installed', ok: true, detail: 'on PATH', fixHint: null },
+            { id: 'server', label: 'MTPLX server responding', ok: false, detail: 'MTPLX has no model weights cached, so its server exits before it binds a port.', fixHint: 'Use “Download the default model & start MTPLX” below — PortOS does this for you.' },
+          ],
+        },
+      },
+    });
+
+    await renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: /Download the default model & start MTPLX/ }));
+    const modal = await screen.findByTestId('runtime-install-modal');
+    expect(JSON.parse(modal.getAttribute('data-params'))).toEqual({ provider: 'opencode-llama-tui', action: 'pull-start' });
+    expect(modal.getAttribute('data-runtime')).toBe('mtplx');
+  });
+
+  it('lets the user match this provider to the model llama.cpp is actually serving', async () => {
+    api.updateProvider.mockResolvedValue({ id: 'opencode-llama-tui', defaultModel: 'dflash' });
+    api.getProviderReadiness.mockResolvedValue({
+      readiness: {
+        'opencode-llama-tui': {
+          kind: 'llama',
+          label: 'llama.cpp',
+          endpoint: 'http://127.0.0.1:5568/v1',
+          manageUrl: '/models/llms',
+          ready: false,
+          checks: [
+            { id: 'runtime', label: 'llama.cpp installed', ok: true, detail: 'on PATH', fixHint: null },
+            { id: 'server', label: 'llama.cpp server responding', ok: true, detail: 'answered', fixHint: null },
+            {
+              id: 'model',
+              label: 'Model `qwen3.8-27b-dflash2` available',
+              ok: false,
+              detail: 'llama.cpp is serving `dflash`.',
+              fixHint: 'This provider will send `qwen3.8-27b-dflash2`, but the running server only accepts `dflash`.',
+              servedModels: ['dflash'],
+            },
+          ],
+        },
+      },
+    });
+    api.getProviders.mockResolvedValue({
+      providers: [{
+        id: 'opencode-llama-tui',
+        name: 'OpenCode llama TUI',
+        type: 'tui',
+        command: 'opencode',
+        args: [],
+        enabled: true,
+        endpoint: 'http://127.0.0.1:5568/v1',
+        llamaBacked: true,
+        models: ['dflash', 'qwen3.8-27b-dflash2'],
+        defaultModel: 'qwen3.8-27b-dflash2',
+      }],
+      activeProvider: null,
+    });
+
+    await renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: /Use dflash as default/ }));
+    await waitFor(() => {
+      expect(api.updateProvider).toHaveBeenCalledWith('opencode-llama-tui', { defaultModel: 'dflash' });
+    });
+  });
+
+  it('renders no checklist for a provider the server reports nothing about', async () => {
+    api.getProviderReadiness.mockResolvedValue({ readiness: {} });
+
+    await renderPage();
+
+    expect(await screen.findByText('OpenCode llama TUI')).toBeInTheDocument();
+    expect(screen.queryByText(/setup incomplete/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/ready$/)).not.toBeInTheDocument();
+  });
+});
+
+describe('an API provider pointed at another machine', () => {
+  // `localBackendForProvider` matches by NAME and port, so a provider named
+  // "LM Studio <peer>" resolved to the `lmstudio` backend and collected THIS
+  // host's install state — a card badged READY carried "LM Studio not
+  // installed / Install LM Studio" for a server running on someone else's box.
+  beforeEach(() => {
+    vi.clearAllMocks();
+    api.getApps.mockResolvedValue([]);
+    api.getProviderStatuses.mockResolvedValue({ providers: {} });
+    api.getProviderRuntimes.mockResolvedValue({ runtimes: {} });
+    api.getProviderReadiness.mockResolvedValue({ readiness: {} });
+    // LM Studio is genuinely absent from THIS machine.
+    localModels.value = { ctxById: {}, installed: { ollama: false, lmstudio: false } };
+    api.getProviders.mockResolvedValue({
+      providers: [{
+        id: 'lmstudio-peer',
+        name: 'LM Studio peer',
+        type: 'api',
+        enabled: true,
+        endpoint: 'http://192.168.1.50:1234/v1',
+        models: ['qwen/qwen3.5-35b-a3b'],
+        defaultModel: 'qwen/qwen3.5-35b-a3b',
+      }],
+      activeProvider: null,
+    });
+  });
+
+  it('offers no local install for it, and does not demand an API key', async () => {
+    await renderPage();
+
+    expect(await screen.findByText('LM Studio peer')).toBeInTheDocument();
+    expect(screen.queryByText(/LM Studio not installed/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Install LM Studio/)).not.toBeInTheDocument();
+    // A keyless call to a private-network endpoint is a supported setup, so the
+    // card must not contradict the READY badge it is wearing.
+    expect(screen.getByText(/none \(private network endpoint\)/)).toBeInTheDocument();
+    expect(screen.queryByText(/not set — Edit this provider/)).not.toBeInTheDocument();
+  });
+
+  it('still offers the local install for the same backend on THIS machine', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [{
+        id: 'lmstudio',
+        name: 'LM Studio',
+        type: 'api',
+        enabled: true,
+        endpoint: 'http://localhost:1234/v1',
+        models: [],
+      }],
+      activeProvider: null,
+    });
+
+    await renderPage();
+
+    expect(await screen.findByText(/LM Studio not installed/)).toBeInTheDocument();
+  });
+});
+
+describe('fleet LLM setup walkthrough', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    api.getApps.mockResolvedValue([]);
+    api.getProviderStatuses.mockResolvedValue({ providers: {} });
+    api.getProviderRuntimes.mockResolvedValue({ runtimes: {} });
+    api.getProviderReadiness.mockResolvedValue({ readiness: {} });
+    api.getProviders.mockResolvedValue({ providers: [], activeProvider: null });
+    api.getInstances.mockResolvedValue({
+      peers: [{
+        id: 'peer-example',
+        name: 'Example GPU host',
+        host: 'gpu-host.example.ts.net',
+        address: '192.0.2.10',
+        status: 'online',
+        enabled: true,
+      }],
+    });
+    api.createProvider.mockImplementation(async (provider) => ({
+      id: 'fleet-gpu-opencode-tui',
+      ...provider,
+      hasApiKey: true,
+    }));
+  });
+
+  it('creates an OpenCode provider whose actual baseURL points at the selected peer', async () => {
+    await renderPage('/ai/fleet');
+
+    expect(await screen.findByRole('heading', { name: 'Model host setup' })).toBeInTheDocument();
+
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Connect client' }));
+    fireEvent.change(await screen.findByLabelText('Known PortOS peer'), { target: { value: 'peer-example' } });
+    fireEvent.change(screen.getByLabelText('vLLM API key'), { target: { value: 'example-secret' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Create fleet provider' }));
+
+    await waitFor(() => expect(api.createProvider).toHaveBeenCalledTimes(1));
+    const created = api.createProvider.mock.calls[0][0];
+    expect(created).toMatchObject({
+      type: 'tui',
+      command: 'opencode',
+      endpoint: 'http://gpu-host.example.ts.net:18022/v1',
+      apiKey: 'example-secret',
+      defaultModel: 'qwen3.8-27b',
+      vllmBacked: true,
+      thinking: false,
+      enabled: true,
+    });
+    expect(JSON.parse(created.envVars.OPENCODE_CONFIG_CONTENT).provider.vllm.options.baseURL)
+      .toBe('http://gpu-host.example.ts.net:18022/v1');
+    await waitFor(() => expect(screen.queryByRole('heading', { name: 'Model host setup' })).not.toBeInTheDocument());
+    expect(toast.success).toHaveBeenCalledWith('Fleet GPU · OpenCode TUI is connected to the fleet GPU host');
+  });
+
+  it('creates a direct API provider without an inert OpenCode config', async () => {
+    await renderPage('/ai/fleet?fleetStep=client');
+
+    fireEvent.change(await screen.findByLabelText('Known PortOS peer'), { target: { value: 'peer-example' } });
+    fireEvent.change(screen.getByLabelText('Harness'), { target: { value: 'api' } });
+    fireEvent.change(screen.getByLabelText('vLLM API key'), { target: { value: 'example-secret' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Create fleet provider' }));
+
+    await waitFor(() => expect(api.createProvider).toHaveBeenCalledTimes(1));
+    const created = api.createProvider.mock.calls[0][0];
+    expect(created).toMatchObject({
+      name: 'Fleet GPU · API',
+      type: 'api',
+      endpoint: 'http://gpu-host.example.ts.net:18022/v1',
+      vllmBacked: true,
+    });
+    expect(created).not.toHaveProperty('command');
+    expect(created).not.toHaveProperty('envVars');
+  });
+});
+
+describe('handleAddSample error handling', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    api.getApps.mockResolvedValue([]);
+    api.getProviderStatuses.mockResolvedValue({ providers: {} });
+    api.getProviderRuntimes.mockResolvedValue({ runtimes: {} });
+    api.getProviderReadiness.mockResolvedValue({ readiness: {} });
+    api.getProviders.mockResolvedValue({
+      providers: [],
+      activeProvider: null,
+    });
+    api.getSampleProviders.mockResolvedValue({
+      providers: [
+        { id: 'sample-1', name: 'Sample AI', type: 'api', enabled: true, endpoint: 'https://api.sample.com', models: ['model-1'] }
+      ]
+    });
+  });
+
+  it('resets addingSample state and re-enables button if api.createProvider rejects', async () => {
+    api.createProvider.mockRejectedValue(new Error('Failed to create provider'));
+
+    await renderPage();
+
+    await clickLoadSamples();
+
+    const addBtn = await screen.findByRole('button', { name: 'Add' });
+    fireEvent.click(addBtn);
+
+    expect(api.createProvider).toHaveBeenCalledWith(expect.objectContaining({ id: 'sample-1' }));
+
+    const reEnabledAddBtn = await screen.findByRole('button', { name: 'Add' });
+    expect(reEnabledAddBtn).not.toBeDisabled();
+    expect(toast.error).toHaveBeenCalledWith(expect.stringContaining('Failed to add provider: Failed to create provider'));
+  });
+
+  it('renders sample preset envVars using ProviderEnvVars with collapse affordance', async () => {
+    const longVal = 'y'.repeat(120);
+    api.getSampleProviders.mockResolvedValue({
+      providers: [
+        {
+          id: 'sample-long-env',
+          name: 'Sample Long Env',
+          type: 'cli',
+          command: 'opencode',
+          enabled: true,
+          models: ['model-1'],
+          envVars: {
+            OPENCODE_CONFIG_CONTENT: longVal,
+          },
+        },
+      ],
+    });
+
+    await renderPage();
+    await clickLoadSamples();
+
+    expect(await screen.findByText('Sample Long Env')).toBeInTheDocument();
+    expect(screen.getByText('Env:')).toBeInTheDocument();
+    const expandBtn = screen.getByRole('button', { name: /expand opencode_config_content value/i });
+    expect(expandBtn).toBeInTheDocument();
+    fireEvent.click(expandBtn);
+    expect(screen.getByRole('button', { name: /collapse opencode_config_content value/i })).toBeInTheDocument();
+  });
+});
+
+describe('handleAddAllSamples partial failure handling', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    api.getApps.mockResolvedValue([]);
+    api.getProviderStatuses.mockResolvedValue({ providers: {} });
+    api.getProviderRuntimes.mockResolvedValue({ runtimes: {} });
+    api.getProviderReadiness.mockResolvedValue({ readiness: {} });
+    api.getProviders.mockResolvedValue({
+      providers: [],
+      activeProvider: null,
+    });
+    api.getSampleProviders.mockResolvedValue({
+      providers: [
+        { id: 'sample-1', name: 'Sample AI 1', type: 'api', enabled: true, endpoint: 'https://api.sample1.com', models: ['model-1'] },
+        { id: 'sample-2', name: 'Sample AI 2', type: 'api', enabled: true, endpoint: 'https://api.sample2.com', models: ['model-2'] },
+        { id: 'sample-3', name: 'Sample AI 3', type: 'api', enabled: true, endpoint: 'https://api.sample3.com', models: ['model-3'] },
+      ]
+    });
+  });
+
+  it('handles partial failure when adding all samples', async () => {
+    api.createProvider
+      .mockResolvedValueOnce({ id: 'sample-1' })
+      .mockRejectedValueOnce(new Error('Creation failed'))
+      .mockResolvedValueOnce({ id: 'sample-3' });
+
+    await renderPage();
+
+    await clickLoadSamples();
+
+    const addAllBtn = await screen.findByRole('button', { name: 'Add All (3)' });
+    fireEvent.click(addAllBtn);
+
+    expect(await screen.findByText('Sample AI 2')).toBeInTheDocument();
+    expect(screen.queryByText('Sample AI 1')).not.toBeInTheDocument();
+    expect(screen.queryByText('Sample AI 3')).not.toBeInTheDocument();
+    expect(toast.warning).toHaveBeenCalledWith('Added 2 providers, 1 failed');
+    expect(api.getProviders).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('CoS Agent Runner allowlist warning', () => {
+  const cliProvider = (command) => ({
+    id: 'p1', name: 'Custom Agent', type: 'cli', enabled: true, command, args: [],
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    api.getApps.mockResolvedValue([]);
+    api.getProviderStatuses.mockResolvedValue({ providers: {} });
+    api.getProviderRuntimes.mockResolvedValue({ runtimes: {} });
+    api.getProviderReadiness.mockResolvedValue({ readiness: {} });
+  });
+
+  it('badges a provider whose command is off the published allowlist', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [cliProvider('my-custom-agent')],
+      activeProvider: 'p1',
+      runnerAllowedCommands: ['claude', 'codex'],
+    });
+
+    await renderPage();
+
+    expect(await screen.findByText('NO AGENT RUNNER')).toBeInTheDocument();
+  });
+
+  it('does not badge a provider whose command IS on the allowlist', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [cliProvider('/usr/local/bin/claude')],
+      activeProvider: 'p1',
+      runnerAllowedCommands: ['claude', 'codex'],
+    });
+
+    await renderPage();
+
+    expect(await screen.findByText('Custom Agent')).toBeInTheDocument();
+    expect(screen.queryByText('NO AGENT RUNNER')).not.toBeInTheDocument();
+  });
+
+  // A server that predates #4143 omits `runnerAllowedCommands`; an unfetchable
+  // list must read as "can't tell", never as "nothing is allowed".
+  it('stays silent when the server omits runnerAllowedCommands', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [cliProvider('my-custom-agent')],
+      activeProvider: 'p1',
+    });
+
+    await renderPage();
+
+    expect(await screen.findByText('Custom Agent')).toBeInTheDocument();
+    expect(screen.queryByText('NO AGENT RUNNER')).not.toBeInTheDocument();
+  });
+
+  it('warns inline in the editor as the command is typed, without blocking Save', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [cliProvider('claude')],
+      activeProvider: 'p1',
+      runnerAllowedCommands: ['claude', 'codex'],
+    });
+
+    await renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit' }));
+
+    const commandInput = await screen.findByDisplayValue('claude');
+    expect(screen.queryByText(/command allowlist/)).not.toBeInTheDocument();
+
+    fireEvent.change(commandInput, { target: { value: 'my-custom-agent' } });
+
+    expect(await screen.findByText(/command allowlist/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Save' })).not.toBeDisabled();
+  });
+});
+
+describe('provider reasoning defaults', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    api.getApps.mockResolvedValue([]);
+    api.getProviderStatuses.mockResolvedValue({ providers: {} });
+    api.getProviderRuntimes.mockResolvedValue({ runtimes: {} });
+    api.getProviderReadiness.mockResolvedValue({ readiness: {} });
+  });
+
+  it('shows the provider default-effort selector for an effort-capable provider', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [{
+        id: 'codex',
+        name: 'Codex',
+        type: 'cli',
+        command: 'codex',
+        enabled: true,
+        models: ['gpt-5'],
+        defaultModel: 'gpt-5',
+        effort: '',
+      }],
+      activeProvider: 'codex',
+    });
+
+    await renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit' }));
+    await openEditorTab('Models');
+
+    const effort = await screen.findByLabelText('Default Effort');
+    expect(effort).toHaveValue('');
+    fireEvent.change(effort, { target: { value: 'xhigh' } });
+    expect(effort).toHaveValue('xhigh');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(api.updateProvider).toHaveBeenCalledWith(
+      'codex',
+      expect.objectContaining({ effort: 'xhigh' }),
+    ));
+  });
+
+  // `ollamaBacked` identifies the OpenCode-Ollama ladder but is NOT a form
+  // field, so a capability shape built from formData alone dropped it — the
+  // effort select never rendered, and any stored level was wiped on save.
+  it('offers effort and thinking defaults on an Ollama-backed OpenCode provider', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [{
+        id: 'opencode-ollama',
+        name: 'OpenCode Ollama',
+        type: 'cli',
+        command: 'opencode',
+        args: ['run'],
+        enabled: true,
+        ollamaBacked: true,
+        models: ['qwen3:32b'],
+        defaultModel: 'qwen3:32b',
+        effort: '',
+        thinking: true,
+        envVars: {},
+      }],
+      activeProvider: 'opencode-ollama',
+    });
+
+    await renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit' }));
+    await openEditorTab('Models');
+
+    const effort = await screen.findByLabelText('Default Effort');
+    fireEvent.change(effort, { target: { value: 'high' } });
+
+    await openEditorTab('Generation');
+    const thinking = screen.getByLabelText('Thinking mode');
+    expect(thinking).toHaveValue('true');
+    fireEvent.change(thinking, { target: { value: 'false' } });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(api.updateProvider).toHaveBeenCalledWith(
+      'opencode-ollama',
+      expect.objectContaining({ effort: 'high', thinking: false }),
+    ));
+  });
+
+  // The OpenCode llama TUI is the headline case: `llamaBacked` is a record
+  // marker, not a form field, and the block used to be gated on the Ollama
+  // check alone — so the provider that most needs a temperature had none.
+  it('offers effort, temperature, top-p and thinking on a llama.cpp-backed OpenCode TUI', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [{
+        id: 'opencode-llama-tui',
+        name: 'OpenCode llama TUI',
+        type: 'tui',
+        command: 'opencode',
+        args: [],
+        enabled: true,
+        llamaBacked: true,
+        models: ['qwen3.8-27b'],
+        defaultModel: 'qwen3.8-27b',
+        effort: '',
+        thinking: true,
+        envVars: {},
+      }],
+      activeProvider: 'opencode-llama-tui',
+    });
+
+    await renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit' }));
+    await openEditorTab('Models');
+
+    fireEvent.change(await screen.findByLabelText('Default Effort'), { target: { value: 'high' } });
+    await openEditorTab('Generation');
+    fireEvent.change(screen.getByLabelText('Temperature'), { target: { value: '0.2' } });
+    fireEvent.change(screen.getByLabelText('Top-P'), { target: { value: '0.9' } });
+    expect(screen.getByLabelText('Thinking mode')).toHaveValue('true');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(api.updateProvider).toHaveBeenCalledWith(
+      'opencode-llama-tui',
+      expect.objectContaining({ effort: 'high', temperature: 0.2, topP: 0.9, thinking: true }),
+    ));
+  });
+
+  // The editor must be able to leave "unset" alone: seeding a default would let
+  // an unrelated Save pin a temperature/thinking mode the backend never had, and
+  // only Ollama has a documented server-side fallback to pin back to.
+  it('saves an untouched llama.cpp provider without pinning any generation default', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [{
+        id: 'opencode-llama-tui',
+        name: 'OpenCode llama TUI',
+        type: 'tui',
+        command: 'opencode',
+        args: [],
+        enabled: true,
+        llamaBacked: true,
+        models: ['qwen3.8-27b'],
+        defaultModel: 'qwen3.8-27b',
+        envVars: {},
+      }],
+      activeProvider: 'opencode-llama-tui',
+    });
+
+    await renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit' }));
+    await openEditorTab('Generation');
+
+    expect(await screen.findByLabelText('Temperature')).toHaveValue(null);
+    expect(screen.getByLabelText('Thinking mode')).toHaveValue('');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(api.updateProvider).toHaveBeenCalled());
+    expect(api.updateProvider.mock.calls[0][1]).toMatchObject({ temperature: null, topP: null, thinking: null });
+  });
+
+  // A Claude harness on Ollama is forwarded only MAX_THINKING_TOKENS
+  // (server/lib/cliChildEnv.js) — it owns its own sampling, so offering a
+  // temperature there would be a control that silently does nothing.
+  it('offers only the thinking control on a Claude/Ollama provider', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [{
+        id: 'claude-ollama-tui',
+        name: 'Claude Ollama TUI',
+        type: 'tui',
+        command: 'claude',
+        args: [],
+        enabled: true,
+        ollamaBacked: true,
+        models: ['qwen3:32b'],
+        defaultModel: 'qwen3:32b',
+        envVars: {},
+      }],
+      activeProvider: 'claude-ollama-tui',
+    });
+
+    await renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit' }));
+    await openEditorTab('Generation');
+
+    expect(await screen.findByLabelText('Thinking mode')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Temperature')).toBeNull();
+    expect(screen.queryByLabelText('Top-P')).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(api.updateProvider).toHaveBeenCalled());
+    const payload = api.updateProvider.mock.calls[0][1];
+    expect(payload).not.toHaveProperty('temperature');
+    expect(payload).not.toHaveProperty('topP');
+  });
+
+  // A stored default PortOS never forwards is a control that lies. The editor
+  // hides the block for cloud providers, and the payload must not carry the
+  // form's seeded values either (`topP: ''` isn't even a valid number).
+  it('sends no generation defaults for a cloud API provider', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [{
+        id: 'anthropic',
+        name: 'Anthropic',
+        type: 'api',
+        endpoint: 'https://api.anthropic.com/v1',
+        enabled: true,
+        models: ['claude-opus-5'],
+        defaultModel: 'claude-opus-5',
+        envVars: {},
+      }],
+      activeProvider: 'anthropic',
+    });
+
+    await renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit' }));
+    await openEditorTab('Generation');
+
+    expect(screen.queryByLabelText('Temperature')).toBeNull();
+    expect(screen.queryByLabelText('Thinking mode')).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(api.updateProvider).toHaveBeenCalled());
+    const payload = api.updateProvider.mock.calls[0][1];
+    expect(payload).not.toHaveProperty('temperature');
+    expect(payload).not.toHaveProperty('topP');
+    expect(payload).not.toHaveProperty('thinking');
+  });
+});
+
+describe('Codex subscription text read-risk gate', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    api.getApps.mockResolvedValue([]);
+    api.getProviderStatuses.mockResolvedValue({ providers: {} });
+    api.getProviderRuntimes.mockResolvedValue({ runtimes: {} });
+    api.getProviderReadiness.mockResolvedValue({ readiness: {} });
+    api.getProviders.mockResolvedValue({
+      providers: [{
+        id: 'codex',
+        name: 'Codex',
+        type: 'cli',
+        command: 'codex',
+        enabled: true,
+        textTransport: 'codex-app-server',
+      }],
+      activeProvider: 'codex',
+    });
+  });
+
+  it('requires the read-risk acknowledgement before enabling generic text calls', async () => {
+    await renderPage('/ai/presets/codex');
+
+    const acknowledgement = await screen.findByLabelText(/Codex may read local files/i);
+    const enable = screen.getByLabelText(/serve generic text calls/i);
+    expect(acknowledgement).not.toBeChecked();
+    expect(enable).toBeDisabled();
+
+    fireEvent.click(acknowledgement);
+    expect(enable).toBeEnabled();
+    fireEvent.click(enable);
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    await waitFor(() => expect(api.updateProvider).toHaveBeenCalledWith(
+      'codex',
+      expect.objectContaining({
+        textTransportEnabled: true,
+        textTransportReadRiskAcknowledged: true,
+      }),
+    ));
+  });
+
+  it('turns the transport back off when the acknowledgement is withdrawn', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [{
+        id: 'codex',
+        name: 'Codex',
+        type: 'cli',
+        command: 'codex',
+        enabled: true,
+        textTransport: 'codex-app-server',
+        textTransportEnabled: true,
+        textTransportReadRiskAcknowledged: true,
+      }],
+      activeProvider: 'codex',
+    });
+    await renderPage('/ai/presets/codex');
+
+    const acknowledgement = await screen.findByLabelText(/Codex may read local files/i);
+    const enable = screen.getByLabelText(/serve generic text calls/i);
+    expect(enable).toBeChecked();
+    fireEvent.click(acknowledgement);
+    expect(enable).not.toBeChecked();
+    expect(enable).toBeDisabled();
+  });
+});
+
+describe('provider editor deep links', () => {
+  const provider = {
+    id: 'codex',
+    name: 'Codex',
+    type: 'cli',
+    command: 'codex',
+    enabled: true,
+    models: ['gpt-5'],
+    defaultModel: 'gpt-5',
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    api.getApps.mockResolvedValue([]);
+    api.getProviderStatuses.mockResolvedValue({ providers: {} });
+    api.getProviderRuntimes.mockResolvedValue({ runtimes: {} });
+    api.getProviderReadiness.mockResolvedValue({ readiness: {} });
+    api.getProviders.mockResolvedValue({ providers: [provider], activeProvider: 'codex' });
+  });
+
+  it('opens the editor for the provider named in the URL', async () => {
+    await renderPage('/ai/presets/codex');
+
+    expect(await screen.findByRole('heading', { name: 'Edit Provider' })).toBeInTheDocument();
+    expect(screen.getByDisplayValue('Codex')).toBeInTheDocument();
+  });
+
+  it('opens the create form on /ai/new', async () => {
+    await renderPage('/ai/presets/new');
+
+    expect(await screen.findByRole('heading', { name: 'Add Provider' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Create' })).toBeInTheDocument();
+  });
+
+  // A deleted/hand-edited id must bounce back to the list rather than leaving a
+  // blank editor open over it.
+  it('sends an unknown provider id back to the list', async () => {
+    await renderPage('/ai/presets/does-not-exist');
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith('No provider with id "does-not-exist"'));
+    expect(screen.queryByRole('heading', { name: 'Edit Provider' })).toBeNull();
+  });
+
+  // The id comes off the URL, so a prototype key must not resolve to
+  // Object.prototype and open the editor on it.
+  it('does not open the editor for a prototype-chain id', async () => {
+    await renderPage('/ai/presets/__proto__');
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith('No provider with id "__proto__"'));
+    expect(screen.queryByRole('heading', { name: 'Edit Provider' })).toBeNull();
+  });
+
+  it('honors the ?providerTab deep link', async () => {
+    await renderPage('/ai/presets/codex?providerTab=models');
+
+    expect(await screen.findByLabelText('Default Model')).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: 'Models' })).toHaveAttribute('aria-selected', 'true');
+  });
+
+  // Only the active tab renders, so the browser can't run its own required-field
+  // check for a Save triggered from another tab.
+  it('sends the user back to the field a cross-tab Save left empty', async () => {
+    await renderPage('/ai/presets/codex');
+
+    fireEvent.change(await screen.findByDisplayValue('Codex'), { target: { value: '  ' } });
+    await openEditorTab('Models');
+    await screen.findByLabelText('Default Model');
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith('Name is required'));
+    expect(api.updateProvider).not.toHaveBeenCalled();
+    expect(screen.getByRole('tab', { name: 'Connection' })).toHaveAttribute('aria-selected', 'true');
+  });
+
+  // A provider whose display name slugifies to `new` must still be editable —
+  // the create route would shadow it if the edit id sat directly under /ai.
+  it('edits a provider whose id collides with the create route', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [{ ...provider, id: 'new', name: 'New' }],
+      activeProvider: 'new',
+    });
+
+    await renderPage('/ai/edit/new');
+
+    expect(await screen.findByRole('heading', { name: 'Edit Provider' })).toBeInTheDocument();
+    expect(screen.getByDisplayValue('New')).toBeInTheDocument();
+  });
+
+  // The inputs' own `min`/`max`/`type="url"` only run for the mounted tab, so
+  // the submit path restates them and points at the tab that owns the field.
+  it.each([
+    ['an unparseable endpoint', { type: 'api', endpoint: 'not-a-url', command: '' }, 'Endpoint must be a full URL, e.g. http://localhost:1234/v1', 'Connection'],
+    ['an out-of-range planning window', { contextWindow: 1 }, 'Planning Window must be between 512 and 2,097,152 tokens', 'Generation'],
+  ])('blocks a cross-tab Save with %s', async (_label, patch, message, tab) => {
+    api.getProviders.mockResolvedValue({
+      providers: [{ ...provider, ...patch }],
+      activeProvider: 'codex',
+    });
+
+    await renderPage('/ai/presets/codex?providerTab=models');
+
+    await screen.findByLabelText('Default Model');
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith(message));
+    expect(api.updateProvider).not.toHaveBeenCalled();
+    expect(screen.getByRole('tab', { name: tab })).toHaveAttribute('aria-selected', 'true');
+  });
+
+  it('closes back to the list', async () => {
+    await renderPage('/ai/presets/codex');
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Cancel' }));
+
+    await waitFor(() => expect(screen.queryByRole('heading', { name: 'Edit Provider' })).toBeNull());
+  });
+});
+
+describe('Local num_ctx field', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    api.getApps.mockResolvedValue([]);
+    api.getProviderStatuses.mockResolvedValue({ providers: {} });
+    api.getProviderRuntimes.mockResolvedValue({ runtimes: {} });
+    api.getProviderReadiness.mockResolvedValue({ readiness: {} });
+  });
+
+  const openEditorFor = async (provider) => {
+    api.getProviders.mockResolvedValue({ providers: [provider], activeProvider: provider.id });
+    await renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit' }));
+  };
+
+  // An Ollama-backed TUI reaches the daemon itself, so num_ctx is the ONLY way
+  // to lift it off Ollama's VRAM-based auto-pick. It used to be `api`-only.
+  it('offers num_ctx on an Ollama-backed TUI provider and saves it', async () => {
+    await openEditorFor({
+      id: 'claude-ollama-tui',
+      name: 'Claude Ollama TUI',
+      type: 'tui',
+      command: 'claude',
+      enabled: true,
+      ollamaBacked: true,
+      models: [],
+      envVars: {},
+    });
+
+    await openEditorTab('Generation');
+
+    const numCtx = await screen.findByLabelText('Local num_ctx');
+    fireEvent.change(numCtx, { target: { value: '131072' } });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(api.updateProvider).toHaveBeenCalledWith(
+      'claude-ollama-tui',
+      expect.objectContaining({ numCtx: 131072 }),
+    ));
+  });
+
+  it('hides num_ctx on a cloud CLI provider, which has no Ollama daemon to reload', async () => {
+    await openEditorFor({
+      id: 'codex',
+      name: 'Codex',
+      type: 'cli',
+      command: 'codex',
+      enabled: true,
+      models: ['gpt-5'],
+      defaultModel: 'gpt-5',
+    });
+
+    await openEditorTab('Generation');
+
+    await screen.findByLabelText('Planning Window');
+    expect(screen.queryByLabelText('Local num_ctx')).toBeNull();
+   });
+});
+
+describe('OpenCode OrcaRouter key hint', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    api.getApps.mockResolvedValue([]);
+    api.getProviderStatuses.mockResolvedValue({ providers: {} });
+    api.getProviderRuntimes.mockResolvedValue({ runtimes: {} });
+    api.getProviderReadiness.mockResolvedValue({ readiness: {} });
+   });
+
+  // The OpenCode wrapper carries no key of its own — the card must point the
+  // user at the sibling `orcarouter` API provider, not a key field that's absent.
+  it('points a keyless OpenCode wrapper at the sibling OrcaRouter API key', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [
+        {
+         id: 'opencode-orcarouter',
+         name: 'OpenCode OrcaRouter',
+         type: 'cli',
+         command: 'opencode',
+         enabled: true,
+         orcarouterBacked: true,
+         models: ['orcarouter/auto'],
+         defaultModel: 'orcarouter/auto',
+        },
+        { id: 'orcarouter', name: 'OrcaRouter', type: 'api', enabled: false, hasApiKey: false },
+       ],
+      activeProvider: 'opencode-orcarouter',
+     });
+
+    await renderPage();
+
+    const hint = await screen.findByText(/API key is inherited from/);
+    expect(hint).toBeInTheDocument();
+    expect(screen.getByText(/OrcaRouter key: not set/)).toBeInTheDocument();
+   });
+
+  it('opens the sibling API provider so the user can paste the OrcaRouter key', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [
+        {
+          id: 'opencode-orcarouter',
+          name: 'OpenCode OrcaRouter',
+          type: 'cli',
+          command: 'opencode',
+          enabled: true,
+          orcarouterBacked: true,
+          models: ['orcarouter/auto'],
+          defaultModel: 'orcarouter/auto',
+        },
+        { id: 'orcarouter', name: 'OrcaRouter', type: 'api', enabled: false, endpoint: 'https://api.orcarouter.ai/v1', hasApiKey: false },
+      ],
+      activeProvider: 'opencode-orcarouter',
+    });
+
+    await renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit OrcaRouter API provider' }));
+
+    expect(await screen.findByRole('heading', { name: 'Edit Provider' })).toBeInTheDocument();
+    expect(screen.getByLabelText('API Key')).toBeInTheDocument();
+    expect(screen.getByText(/ORCAROUTER_API_KEY/)).toBeInTheDocument();
+  });
+
+  it('collapses to a one-line confirmation when the sibling API provider has the key', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [
+        {
+         id: 'opencode-orcarouter-tui',
+         name: 'OpenCode OrcaRouter TUI',
+         type: 'tui',
+         command: 'opencode',
+         enabled: true,
+         orcarouterBacked: true,
+         models: ['orcarouter/auto'],
+         defaultModel: 'orcarouter/auto',
+        },
+        { id: 'orcarouter', name: 'OrcaRouter', type: 'api', enabled: false, hasApiKey: true },
+       ],
+      activeProvider: 'opencode-orcarouter-tui',
+     });
+
+    await renderPage();
+
+    // Configured providers state the fact and keep the link; the "where does
+    // the key go?" explanation is only shown while it is still unanswered.
+    expect(await screen.findByText('OrcaRouter API key configured')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Edit OrcaRouter API provider' })).toBeInTheDocument();
+    expect(screen.queryByText(/API key is inherited from/)).not.toBeInTheDocument();
+   });
+
+  // A non-orcarouter-backed provider must never see the inheritance hint.
+  it('does not show the hint for a non-orcarouter-backed provider', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [
+        { id: 'orca', name: 'My Orca', type: 'cli', command: 'claude', enabled: true, models: [] },
+       ],
+      activeProvider: 'orca',
+     });
+
+    await renderPage();
+
+    expect(await screen.findByText('My Orca')).toBeInTheDocument();
+    expect(screen.queryByText(/API key is inherited from/)).not.toBeInTheDocument();
+   });
+});
+
+describe('harness grouping', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    api.getApps.mockResolvedValue([]);
+    api.getProviderStatuses.mockResolvedValue({ providers: {} });
+    api.getProviderRuntimes.mockResolvedValue({ runtimes: {} });
+    localModels.value = { ctxById: {}, installed: { ollama: null, lmstudio: null } };
+  });
+
+  it('groups presets by harness and orders each group by readiness', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [
+        { id: 'ready', name: 'Ready CLI', type: 'cli', command: 'claude', enabled: true },
+        { id: 'off', name: 'Switched Off', type: 'cli', command: 'claude', enabled: false },
+        { id: 'keyless', name: 'Keyless Cloud', type: 'api', endpoint: 'https://api.example.com/v1', hasApiKey: false, enabled: true },
+      ],
+      activeProvider: 'ready',
+    });
+
+    await renderPage();
+
+    // Two Claude Code records share one group whatever their readiness; the
+    // API record lands under the Direct API harness.
+    const claude = await screen.findByRole('button', { name: new RegExp('^Claude Code') });
+    expect(claude).toHaveTextContent('2');
+    expect(claude).toHaveTextContent('1 of 2 can run');
+    expect(screen.getByRole('button', { name: new RegExp('^Direct API') })).toHaveTextContent('0 of 1 can run');
+    // Readiness is still on every card as its badge …
+    expect(screen.getByText('READY')).toBeInTheDocument();
+    expect(screen.getByText('DISABLED')).toBeInTheDocument();
+    expect(screen.getByText('NEEDS SETUP')).toBeInTheDocument();
+    // The blocker itself stays where its fix is — the card's API-key row.
+    expect(screen.getByText(/not set — Edit this provider to paste one/)).toBeInTheDocument();
+    // … and decides the order within the group: what can run reads first.
+    const ready = screen.getByText('Ready CLI');
+    const off = screen.getByText('Switched Off');
+    expect(ready.compareDocumentPosition(off) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(PRESET_STATE_ORDER.indexOf(PROVIDER_CARD_STATE.BLOCKED))
+      .toBeLessThan(PRESET_STATE_ORDER.indexOf(PROVIDER_CARD_STATE.DISABLED));
+  });
+
+  // A switched-off provider is optional — its badge says so and merely notes
+  // what enabling it would take, rather than reading as an outstanding task.
+  it('badges a switched-off provider with a missing CLI as Disabled, noting the setup', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [{ id: 'opencode-ollama', name: 'OpenCode Ollama', type: 'cli', command: 'opencode', enabled: false }],
+      activeProvider: null,
+    });
+    api.getProviderRuntimes.mockResolvedValue({ runtimes: { opencode: missingRuntime } });
+
+    await renderPage();
+
+    expect(await screen.findByRole('button', { name: new RegExp('^OpenCode') })).toBeInTheDocument();
+    expect(screen.getByText('DISABLED')).toBeInTheDocument();
+    expect(screen.getByText('SETUP TO ENABLE')).toBeInTheDocument();
+    // The missing CLI is still named — that IS the note about enabling it — but
+    // in the muted tone, not the amber that would read as a gap in the install.
+    const runtimePill = screen.getByText('OpenCode CLI not installed');
+    expect(runtimePill).toBeInTheDocument();
+    expect(runtimePill.className).not.toMatch(/port-warning/);
+    expect(screen.queryByText('NEEDS SETUP')).not.toBeInTheDocument();
+  });
+
+  // The provider list is authoritative: no sibling means the wrapper has no key
+  // to inherit at spawn time, which is a missing prerequisite, not "unknown".
+  it('badges an OrcaRouter wrapper whose sibling was deleted as Needs setup', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [{
+        id: 'opencode-orcarouter',
+        name: 'OpenCode OrcaRouter',
+        type: 'cli',
+        command: 'opencode',
+        enabled: true,
+        orcarouterBacked: true,
+      }],
+      activeProvider: null,
+    });
+
+    await renderPage();
+
+    expect(await screen.findByText('NEEDS SETUP')).toBeInTheDocument();
+  });
+
+  it('badges an enabled-but-benched provider with its reason', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [{ id: 'claude', name: 'Claude', type: 'cli', command: 'claude', enabled: true }],
+      activeProvider: 'claude',
+    });
+    api.getProviderStatuses.mockResolvedValue({
+      providers: { claude: { available: false, reason: 'usage-limit', message: 'Usage limit reached' } },
+    });
+
+    await renderPage();
+
+    expect(await screen.findByText('BENCHED · usage-limit')).toBeInTheDocument();
+    // A benched provider still counts as runnable — nothing is missing on it.
+    expect(screen.getByRole('button', { name: new RegExp('^Claude Code') })).toHaveTextContent('1 of 1 can run');
+    expect(screen.queryByText('NEEDS SETUP')).not.toBeInTheDocument();
+  });
+
+  it('badges a Codex provider whose ChatGPT quota is exhausted as Benched, still runnable', async () => {
+    api.getCodexAccount.mockResolvedValue({
+      readiness: {
+        status: 'quota-exhausted',
+        account: { planType: 'pro' },
+        rateLimits: { primary: { usedPercent: 100 } },
+      },
+    });
+    api.getProviders.mockResolvedValue({
+      providers: [{
+        id: 'codex',
+        name: 'Codex',
+        type: 'cli',
+        command: 'codex',
+        enabled: true,
+      }],
+      activeProvider: 'codex',
+    });
+
+    await renderPage();
+
+    expect(await screen.findByText('BENCHED · usage-limit')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: new RegExp('^Codex') })).toHaveTextContent('1 of 1 can run');
+    expect(screen.queryByText('NEEDS SETUP')).not.toBeInTheDocument();
+  });
+
+  it('folds a section away when its header is clicked', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [{ id: 'off', name: 'Switched Off', type: 'cli', command: 'claude', enabled: false }],
+      activeProvider: null,
+    });
+
+    await renderPage();
+
+    const header = await screen.findByRole('button', { name: /^Claude Code/ });
+    expect(screen.getByText('Switched Off')).toBeInTheDocument();
+
+    fireEvent.click(header);
+    expect(screen.queryByText('Switched Off')).not.toBeInTheDocument();
+    expect(header).toHaveAttribute('aria-expanded', 'false');
+
+    fireEvent.click(header);
+    expect(screen.getByText('Switched Off')).toBeInTheDocument();
+  });
+});
+
+describe('hardware-incompatible providers', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    api.getApps.mockResolvedValue([]);
+    api.getProviderStatuses.mockResolvedValue({ providers: {} });
+    api.getProviderRuntimes.mockResolvedValue({ runtimes: {} });
+    api.getProviderReadiness.mockResolvedValue({ readiness: {} });
+    api.getSampleProviders.mockResolvedValue({ providers: [] });
+  });
+
+  // A provider this machine cannot run is not a choice the user can act on, so
+  // it must not sit among the enabled cards adding a HARDWARE MISMATCH badge to
+  // a section that otherwise lists live providers.
+  it('parks an unrunnable provider in a collapsed section instead of its harness group', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [
+        { id: 'ok', name: 'Runs Here', type: 'cli', command: 'claude', enabled: true },
+        {
+          id: 'huge',
+          name: 'Needs More RAM',
+          type: 'api',
+          enabled: true,
+          endpoint: 'http://localhost:1234',
+          hardwareCompatibility: { state: 'unavailable', reasons: ['needs 128GB of RAM'] },
+        },
+      ],
+      activeProvider: 'ok',
+    });
+
+    await renderPage();
+
+    const claude = await screen.findByRole('button', { name: new RegExp('^Claude Code') });
+    expect(claude).toHaveTextContent('1');
+    expect(screen.getByText('Runs Here')).toBeInTheDocument();
+    // The unrunnable API record does not surface as a Direct API group.
+    expect(screen.queryByRole('button', { name: new RegExp('^Direct API') })).not.toBeInTheDocument();
+
+    // Collapsed by default: neither the card nor its badge is on screen.
+    const parked = screen.getByRole('button', { name: /Unavailable on this machine/ });
+    expect(parked).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByText('Needs More RAM')).not.toBeInTheDocument();
+    expect(screen.queryByText('HARDWARE MISMATCH')).not.toBeInTheDocument();
+
+    // Still one click from being edited or deleted.
+    fireEvent.click(parked);
+    expect(screen.getByText('Needs More RAM')).toBeInTheDocument();
+  });
+
+  it('omits the section entirely when every provider runs here', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [{ id: 'ok', name: 'Runs Here', type: 'cli', command: 'claude', enabled: true }],
+      activeProvider: 'ok',
+    });
+
+    await renderPage();
+
+    await screen.findByText('Runs Here');
+    expect(screen.queryByRole('button', { name: /Unavailable on this machine/ })).not.toBeInTheDocument();
+  });
+
+  it('leaves an unrunnable sample out of the sample list', async () => {
+    api.getProviders.mockResolvedValue({ providers: [], activeProvider: null });
+    api.getSampleProviders.mockResolvedValue({
+      providers: [
+        { id: 'sample-ok', name: 'Sample Runs Here', type: 'api', enabled: true, endpoint: 'https://api.example.com', models: ['m1'] },
+        {
+          id: 'sample-huge',
+          name: 'Sample Needs More RAM',
+          type: 'api',
+          enabled: true,
+          endpoint: 'https://api.example.com',
+          models: ['m2'],
+          hardwareCompatibility: { state: 'unavailable', reasons: ['needs 128GB of RAM'] },
+        },
+      ],
+    });
+
+    await renderPage();
+
+    await clickLoadSamples();
+
+    expect(await screen.findByText('Sample Runs Here')).toBeInTheDocument();
+    expect(screen.queryByText('Sample Needs More RAM')).not.toBeInTheDocument();
+    // One addable sample, so no Add All button and no dead 'Unavailable' action.
+    expect(screen.queryByRole('button', { name: /^Add All/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Unavailable' })).not.toBeInTheDocument();
+  });
+
+  it('says why the sample list is empty when nothing on offer runs here', async () => {
+    api.getProviders.mockResolvedValue({ providers: [], activeProvider: null });
+    api.getSampleProviders.mockResolvedValue({
+      providers: [{
+        id: 'sample-huge',
+        name: 'Sample Needs More RAM',
+        type: 'api',
+        enabled: true,
+        endpoint: 'https://api.example.com',
+        models: ['m2'],
+        hardwareCompatibility: { state: 'unavailable', reasons: ['needs 128GB of RAM'] },
+      }],
+    });
+
+    await renderPage();
+
+    await clickLoadSamples();
+
+    expect(await screen.findByText(/cannot run on this machine/)).toBeInTheDocument();
+  });
+});
+
+// Both tables are keyed off PROVIDER_CARD_STATE, and a state missing from either
+// fails quietly: no PRESET_STATE_ORDER rank sorts those cards to the front of
+// every group (indexOf = -1), no CARD_STATE_STYLES row and the card throws on
+// `style.border`.
+describe('readiness table coverage', () => {
+  it('gives every readiness state a card style and exactly one rank', () => {
+    for (const state of Object.values(PROVIDER_CARD_STATE)) {
+      expect(CARD_STATE_STYLES[state]).toBeDefined();
+      expect(PRESET_STATE_ORDER.filter((rank) => rank === state)).toHaveLength(1);
+    }
+  });
+});
+
+describe('Launch in Shell button on TUI provider cards', () => {
+  // The card hands the user a one-click way to drive a TUI provider by hand.
+  // The link carries only the provider ID — the server pairs the command with
+  // the provider's env (its backend/auth) when it spawns the PTY, and those
+  // values are secret, so the command line itself must NOT be what's sent.
+  // `tuiCommandLine` is the display half: it decides whether the button renders
+  // at all (an older server omits it) and shows what will run.
+  const baseMocks = () => {
+    vi.clearAllMocks();
+    api.getApps.mockResolvedValue([]);
+    api.getProviderStatuses.mockResolvedValue({ providers: {} });
+    api.getProviderRuntimes.mockResolvedValue({ runtimes: {} });
+    api.getProviderReadiness.mockResolvedValue({ readiness: {} });
+    localModels.value = { ctxById: {}, installed: { ollama: null, lmstudio: null } };
+  };
+
+  it('links to the Shell page with the server-built command line', async () => {
+    baseMocks();
+    api.getProviders.mockResolvedValue({
+      providers: [{
+        id: 'codex',
+        name: 'Codex TUI',
+        type: 'tui',
+        command: 'codex',
+        args: [],
+        enabled: true,
+        tuiCommandLine: 'codex --dangerously-bypass-approvals-and-sandbox --model gpt-5',
+      }],
+      activeProvider: null,
+    });
+
+    await renderPage();
+
+    const link = await screen.findByRole('link', { name: /Launch in Shell/ });
+    // By ID, never by command — sending the line would leave the provider's env
+    // behind and launch it against the wrong backend.
+    expect(link).toHaveAttribute('href', '/shell?provider=codex');
+    expect(link.getAttribute('href')).not.toContain('cmd=');
+    // The resolved line is still surfaced, so the user can see what will run.
+    expect(link).toHaveAttribute('title', expect.stringContaining('--model gpt-5'));
+  });
+
+  it('renders no button for a CLI provider, or when the server sent no command line', async () => {
+    baseMocks();
+    api.getProviders.mockResolvedValue({
+      providers: [
+        { id: 'claude-code', name: 'Claude Code', type: 'cli', command: 'claude', args: [], enabled: true },
+        { id: 'legacy-tui', name: 'Legacy TUI', type: 'tui', command: 'claude', args: [], enabled: true },
+      ],
+      activeProvider: null,
+    });
+
+    await renderPage();
+
+    expect(await screen.findByText('Legacy TUI')).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: /Launch in Shell/ })).not.toBeInTheDocument();
+  });
+});
+
+describe('provider card layout', () => {
+  // The card's details used to be the FIRST flex item of the same row that
+  // holds the action buttons. The button group never shrinks below its
+  // max-content width (seven buttons ≈ 660px), so on a real desktop card the
+  // details were squeezed into a ~275px column of hard-wrapped text beside an
+  // empty half-card. Keeping the details OUT of that row is what fixes it, so
+  // that is what this pins — a class assertion would just restate the JSX.
+  it('renders the details below the action row, not as a flex sibling of it', async () => {
+    vi.clearAllMocks();
+    api.getApps.mockResolvedValue([]);
+    api.getProviderStatuses.mockResolvedValue({ providers: {} });
+    api.getProviderRuntimes.mockResolvedValue({ runtimes: {} });
+    api.getProviderReadiness.mockResolvedValue({ readiness: {} });
+    localModels.value = { ctxById: {}, installed: { ollama: null, lmstudio: null } };
+    api.getProviders.mockResolvedValue({
+      providers: [{
+        id: 'opencode-llama',
+        name: 'OpenCode llama TUI',
+        type: 'tui',
+        command: 'opencode',
+        args: [],
+        enabled: true,
+        defaultModel: 'dflash',
+        tuiCommandLine: 'opencode',
+      }],
+      activeProvider: null,
+    });
+
+    await renderPage();
+
+    const deleteButton = await screen.findByRole('button', { name: 'Delete' });
+    // The row that lays identity out against the actions — one level above the
+    // button group the Delete button sits in.
+    const headerRow = deleteButton.closest('.flex-wrap').parentElement;
+    expect(headerRow.className).toContain('flex-row');
+    expect(headerRow.textContent).toContain('OpenCode llama TUI');
+    expect(headerRow.textContent).not.toContain('Command:');
+    expect(headerRow.textContent).not.toContain('Default:');
+  });
+});
+
+describe('vLLM-backed TUI provider', () => {
+  const vllmTui = (overrides = {}) => ({
+    id: 'opencode-vllm-tui',
+    name: 'OpenCode vLLM TUI (Qwen3.8-27B)',
+    type: 'tui',
+    command: 'opencode',
+    args: [],
+    enabled: true,
+    endpoint: 'http://127.0.0.1:18020/v1',
+    models: ['qwen3.8-27b'],
+    defaultModel: 'qwen3.8-27b',
+    vllmBacked: true,
+    ...overrides,
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    api.getApps.mockResolvedValue([]);
+    api.getProviderStatuses.mockResolvedValue({ providers: {} });
+    api.getProviderRuntimes.mockResolvedValue({ runtimes: {} });
+    api.getProviderReadiness.mockResolvedValue({ readiness: {} });
+    localModels.value = { ctxById: {}, installed: { ollama: null, lmstudio: null } };
+  });
+
+  it('badges the card so the GPU-exclusive backend is visible at a glance', async () => {
+    api.getProviders.mockResolvedValue({ providers: [vllmTui()], activeProvider: null });
+    await renderPage();
+    expect(await screen.findByText('vLLM / DFLASH2')).toBeInTheDocument();
+  });
+
+  it('offers an API Key field on a TUI provider — the container is key-gated', async () => {
+    api.getProviders.mockResolvedValue({ providers: [vllmTui()], activeProvider: null });
+    await renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit' }));
+    const key = await screen.findByLabelText('API Key');
+    fireEvent.change(key, { target: { value: 'vllm-key-example' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    await waitFor(() => expect(api.updateProvider).toHaveBeenCalledWith(
+      'opencode-vllm-tui',
+      expect.objectContaining({ apiKey: 'vllm-key-example' }),
+    ));
+  });
+
+  it('keeps the field off an unauthenticated local TUI backend', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [vllmTui({ id: 'opencode-mtplx-tui', name: 'OpenCode MTPLX TUI', vllmBacked: undefined, mtplxBacked: true })],
+      activeProvider: null,
+    });
+    await renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit' }));
+    await screen.findByDisplayValue('opencode');
+    expect(screen.queryByLabelText('API Key')).toBeNull();
+  });
+});
+
+describe('AIProviders orchestration profiles', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    api.getApps.mockResolvedValue([]);
+    api.getProviderStatuses.mockResolvedValue({ providers: {} });
+    api.getProviderRuntimes.mockResolvedValue({ runtimes: {} });
+    api.getProviderReadiness.mockResolvedValue({ readiness: {} });
+    api.getOrchestrationProfiles.mockResolvedValue({
+      profiles: [
+        {
+          id: 'deep-research',
+          name: 'Deep Research',
+          description: 'o3-mini planner + sonnet coder',
+          profile: {
+            architect: { provider: 'codex', model: 'o3-mini', effort: 'high' },
+            implementer: { provider: 'anthropic', model: 'claude-3-5-sonnet', effort: 'medium' },
+          },
+        },
+      ],
+    });
+    api.createRun.mockResolvedValue({ runId: 'run-123' });
+    localModels.value = { ctxById: {}, installed: { ollama: null, lmstudio: null } };
+  });
+
+  it('renders orchestration profiles link in the more actions menu', async () => {
+    api.getProviders.mockResolvedValue({ providers: [], activeProvider: null });
+    await renderPage();
+
+    await openHeaderMenu();
+    const link = await screen.findByRole('menuitem', { name: 'Orchestration profiles' });
+    expect(link).toHaveAttribute('href', '/settings/orchestration');
+  });
+
+  it('allows selecting an orchestration profile in the run panel and renders role chips', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [{ id: 'prov-1', name: 'Prov 1', type: 'api', enabled: true, hardwareUnavailable: false }],
+      activeProvider: 'prov-1',
+    });
+    await renderPage();
+
+    // Open runner panel
+    const runBtn = await screen.findByRole('button', { name: 'Run Prompt' });
+    fireEvent.click(runBtn);
+
+    // Profile selector should be available
+    const profileSelect = await screen.findByLabelText('Orchestration profile');
+    expect(profileSelect).toBeInTheDocument();
+    fireEvent.change(profileSelect, { target: { value: 'deep-research' } });
+
+    // Role chips should appear
+    expect(await screen.findByText('o3-mini planner + sonnet coder')).toBeInTheDocument();
+    expect(screen.getByText('architect:')).toBeInTheDocument();
+    expect(screen.getByText('o3-mini')).toBeInTheDocument();
+    expect(screen.getByText('(high)')).toBeInTheDocument();
+
+    // Fill prompt and execute
+    const promptInput = screen.getByLabelText('Prompt');
+    fireEvent.change(promptInput, { target: { value: 'Test run with orchestration' } });
+
+    const executeBtn = screen.getByRole('button', { name: 'Execute' });
+    fireEvent.click(executeBtn);
+
+    await waitFor(() => {
+      expect(api.createRun).toHaveBeenCalledWith(
+        expect.objectContaining({
+          providerId: 'prov-1',
+          prompt: 'Test run with orchestration',
+          orchestrationProfileId: 'deep-research',
+        }),
+        expect.anything()
+      );
+    });
+  });
+});
+
+// A refresh used to end in `loadData()`, which flips the page's `loading` flag
+// back on — the whole list is replaced by the skeleton and the browser lands at
+// the top, so the card the user clicked (often several screens down) scrolls out
+// from under them. The card has to update in place instead.
+describe('AIProviders model refresh', () => {
+  const executionModes = [{ id: 'opencode-mtplx', type: 'cli' }, { id: 'opencode-mtplx-tui', type: 'tui' }];
+
+  const mtplxProviders = () => ({
+    activeProvider: null,
+    providers: [
+      {
+        id: 'opencode-mtplx', name: 'OpenCode MTPLX', type: 'cli', command: 'opencode', enabled: true,
+        models: ['mtplx-served'], canRefreshModels: true, executionModes,
+      },
+      {
+        id: 'opencode-mtplx-tui', name: 'OpenCode MTPLX TUI', type: 'tui', command: 'opencode', enabled: true,
+        models: ['mtplx-served'], canRefreshModels: true, executionModes,
+      },
+    ],
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    api.getApps.mockResolvedValue([]);
+    api.getProviderStatuses.mockResolvedValue({ providers: {} });
+    api.getProviderRuntimes.mockResolvedValue({ runtimes: {} });
+    api.getProviderReadiness.mockResolvedValue({ readiness: {} });
+    api.getCodexAccount.mockImplementation(() => new Promise(() => {}));
+    api.getProviders.mockResolvedValue(mtplxProviders());
+    localModels.value = { ctxById: {}, installed: { ollama: null, lmstudio: null } };
+  });
+
+  it('applies the refreshed catalog to the clicked card without reloading the page', async () => {
+    api.refreshProviderModels.mockResolvedValue({
+      id: 'opencode-mtplx', name: 'OpenCode MTPLX', type: 'cli', command: 'opencode', enabled: true,
+      models: ['mtplx-served', 'wang-yang/Ornith-1.0-35B-MTPLX'], canRefreshModels: true,
+    });
+
+    await renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'Refresh Models' }));
+
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith('Models refreshed for OpenCode MTPLX'));
+    expect(await screen.findByText(/Models: mtplx-served, wang-yang\/Ornith-1\.0-35B-MTPLX/)).toBeInTheDocument();
+    // One load, from the initial mount — the refresh must not re-fetch the whole
+    // page, which is what unmounted the list and reset the scroll position.
+    expect(api.getProviders).toHaveBeenCalledTimes(1);
+    // The unified card keeps its grouping: replacing the entry wholesale with
+    // the bare record the refresh route returns would drop `executionModes` and
+    // split one card into two.
+    expect(screen.getAllByRole('button', { name: 'Refresh Models' })).toHaveLength(1);
+  });
+
+  it.each([
+    { mode: 'CLI', providerId: 'claude-code' },
+    { mode: 'TUI', providerId: 'claude-code-tui' },
+  ])('uses the refreshed full catalog when editing a paired $mode preset', async ({ mode, providerId }) => {
+    const catalogBeforeRefresh = ['example-claude-old', 'example-claude-retired'];
+    const catalogAfterRefresh = ['example-claude-current', 'example-claude-preview'];
+    const claudeExecutionModes = [{ id: 'claude-code', type: 'cli' }, { id: 'claude-code-tui', type: 'tui' }];
+    const claudeProviders = {
+      activeProvider: null,
+      providers: ['cli', 'tui'].map((type) => ({
+        id: `claude-code${type === 'tui' ? '-tui' : ''}`,
+        name: `Claude Code${type === 'tui' ? ' TUI' : ''}`,
+        type,
+        command: 'claude',
+        enabled: true,
+        models: [catalogBeforeRefresh[0]],
+        modelCatalog: catalogBeforeRefresh,
+        modelAccess: { mode: 'allow', patterns: ['example-claude-*'] },
+        canRefreshModels: true,
+        executionModes: claudeExecutionModes,
+      })),
+    };
+    api.getProviders.mockResolvedValue(claudeProviders);
+    api.refreshProviderModels.mockResolvedValue({
+      ...claudeProviders.providers[0],
+      models: [catalogAfterRefresh[0]],
+      modelCatalog: catalogAfterRefresh,
+      canRefreshModels: true,
+    });
+    api.updateProvider.mockResolvedValue({});
+
+    await renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'Refresh Models' }));
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith('Models refreshed for Claude Code'));
+
+    fireEvent.click(await screen.findByRole('button', { name: `Edit ${mode}` }));
+    await openEditorTab('Models');
+    const catalogField = screen.getByRole('textbox', { name: /Available Models/i });
+    expect(catalogField).toHaveValue(catalogAfterRefresh.join(', '));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(api.updateProvider).toHaveBeenCalled());
+    expect(api.updateProvider).toHaveBeenCalledWith(providerId, expect.objectContaining({ models: catalogAfterRefresh }));
+  });
+
+  it('keeps the stored catalog when the refresh is unsupported', async () => {
+    api.refreshProviderModels.mockResolvedValue(null);
+
+    await renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'Refresh Models' }));
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalled());
+    expect(screen.getByText(/Models: mtplx-served$/)).toBeInTheDocument();
+  });
+
+  // The root cause under the refresh button, which the other four reload paths
+  // on this page share: `loadData` flipped `loading` on unconditionally, so ANY
+  // reload after a click swapped the whole list for the page skeleton and
+  // returned the user to the top. The skeleton belongs to the first load only.
+  it('reloads after enabling a provider without swapping the list for the skeleton', async () => {
+    api.updateProvider.mockResolvedValue({});
+    // The reload is held OPEN so the assertions run while it is in flight — that
+    // window is the whole bug, and after it resolves the skeleton is gone again
+    // whether or not it ever appeared.
+    let releaseReload;
+    api.getProviders
+      .mockResolvedValueOnce(mtplxProviders())
+      .mockImplementationOnce(() => new Promise((resolve) => { releaseReload = resolve; }));
+
+    mountPage();
+    // The first load DOES show the skeleton — there is nothing else to show, and
+    // this is what keeps the assertion below from passing vacuously.
+    expect(screen.getByLabelText('Loading providers')).toBeInTheDocument();
+    // This find settles the initial mount after the pending-state assertion,
+    // including the retired-model-pin child that triggered #7801.
+    fireEvent.click(await screen.findByRole('button', { name: 'Disable' }));
+
+    await waitFor(() => expect(api.getProviders).toHaveBeenCalledTimes(2));
+    expect(screen.queryByLabelText('Loading providers')).toBeNull();
+    // ...and the card the user just clicked is still the thing on screen.
+    expect(screen.getByRole('heading', { name: 'OpenCode MTPLX' })).toBeInTheDocument();
+
+    await act(async () => {
+      releaseReload({
+        ...mtplxProviders(),
+        providers: mtplxProviders().providers.map(p => ({ ...p, enabled: false })),
+      });
+    });
+    expect(await screen.findByRole('button', { name: 'Enable' })).toBeInTheDocument();
+  });
+});
+
+// The compatibility matrix (#7567) is rendered from the composition catalog
+// every picker reads, so a cell can only disagree with what compose offers
+// by the catalog being stale — never by a second predicate in the browser.
+describe('compatibility matrix', () => {
+  const catalog = {
+    harnesses: [
+      { id: 'claude', label: 'Claude Code', modes: ['cli', 'tui'], enabled: true, detected: true },
+      { id: 'pi', label: 'Pi', modes: ['cli', 'tui'], enabled: false, detected: false },
+      { id: 'direct', label: 'Direct API', modes: ['api'], enabled: true, detected: true },
+    ],
+    services: [
+      { slug: 'ollama', label: 'Ollama', plan: 'local', enabled: true, readiness: 'ready', catalog: { models: ['qwen3:8b'] } },
+      { slug: 'nvidia-nim', label: 'NVIDIA NIM', plan: 'free', enabled: true, readiness: 'needs-credential', catalog: { models: [] } },
+    ],
+    bootstraps: [],
+    compatibility: { claude: ['ollama'], pi: ['ollama', 'nvidia-nim'], direct: ['ollama', 'nvidia-nim'] },
+    effortLevels: { claude: ['low', 'medium', 'high'], pi: [], direct: [] },
+    effortLevelsByModel: {},
+    presets: [],
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    __resetProviderCatalogCache();
+    api.getApps.mockResolvedValue([]);
+    api.getProviderStatuses.mockResolvedValue({ providers: {} });
+    api.getProviderRuntimes.mockResolvedValue({ runtimes: {} });
+    api.getProviderReadiness.mockResolvedValue({ readiness: {} });
+    api.getProviders.mockResolvedValue({ providers: [], activeProvider: null });
+    api.getProviderCatalog.mockResolvedValue(catalog);
+  });
+
+  it('renders the server verdict per cell: offered, blocked with its reason, or unreachable', async () => {
+    await renderPage();
+    const header = await screen.findByRole('button', { name: /Compatibility matrix/ });
+    await waitFor(() => expect(header).toHaveTextContent('2 combinations offered'));
+    fireEvent.click(header);
+    // Claude × Ollama: compatible, both on, ready → a click target.
+    expect(screen.getByRole('button', { name: 'New preset: Claude Code on Ollama' })).toBeInTheDocument();
+    // Claude × NVIDIA: not in the compatibility map → unreachable, not blocked.
+    expect(screen.getByRole('img', { name: 'Claude Code cannot reach NVIDIA NIM' })).toBeInTheDocument();
+    // Pi is switched off → blocked with that reason, even on a ready service.
+    expect(screen.getByRole('img', { name: 'Pi on Ollama: Pi is switched off' })).toBeInTheDocument();
+    // Direct × NVIDIA: compatible and on, but the service still needs a key.
+    expect(screen.getByRole('img', { name: 'Direct API on NVIDIA NIM: NVIDIA NIM needs a credential' })).toBeInTheDocument();
+  });
+
+  it('opens the compose flow on the clicked pair with only "Save as preset" as its exit, then lands on the new preset', async () => {
+    api.createProviderPreset.mockResolvedValue({ id: 'claude-cli-ollama', name: 'Claude Code · Ollama' });
+    await renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: /Compatibility matrix/ }));
+    fireEvent.click(screen.getByRole('button', { name: 'New preset: Claude Code on Ollama' }));
+
+    const dialog = await screen.findByRole('dialog', { name: 'Compose a new preset' });
+    expect(within(dialog).getByLabelText('Harness')).toHaveValue('claude');
+    expect(within(dialog).getByLabelText('Method')).toHaveValue('cli');
+    expect(within(dialog).getByLabelText('Service')).toHaveValue('ollama');
+    expect(within(dialog).queryByRole('button', { name: 'Use once' })).not.toBeInTheDocument();
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Save as preset…' }));
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm save' }));
+    await waitFor(() => expect(api.createProviderPreset).toHaveBeenCalledWith(expect.objectContaining({ compositeId: 'claude.cli@ollama' })));
+    // The page reloads its presets and opens the editor on the one just saved.
+    await waitFor(() => expect(api.getProviders).toHaveBeenCalledTimes(2));
+    expect(toast.success).toHaveBeenCalledWith('Claude Code · Ollama saved as a preset');
+  });
+
+  it('opens compose from Add Preset, saves a derived preset, and opens the editor on the service-owned fields', async () => {
+    const derived = {
+      id: 'claude-cli-ollama',
+      name: 'Claude Code · Ollama',
+      type: 'cli',
+      command: 'claude',
+      enabled: true,
+      presetKind: 'derived',
+      presetDerivable: false,
+      harnessId: 'claude',
+      method: 'cli',
+      serviceId: 'ollama',
+    };
+    const existing = { id: 'existing', name: 'Existing', type: 'cli', command: 'claude', enabled: true };
+    let providerLoads = 0;
+    api.getProviders.mockImplementation(() => {
+      providerLoads += 1;
+      const providers = providerLoads === 1 ? [existing] : [existing, derived];
+      return Promise.resolve({ providers, activeProvider: null });
+    });
+    api.createProviderPreset.mockResolvedValue(derived);
+    await renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Add Preset' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Compose a new preset' });
+    expect(within(dialog).getByLabelText('Harness')).toHaveValue('');
+    await waitFor(() => expect(within(dialog).getByLabelText('Harness')).not.toBeDisabled());
+    fireEvent.change(within(dialog).getByLabelText('Harness'), { target: { value: 'claude' } });
+    fireEvent.change(await within(dialog).findByLabelText('Method'), { target: { value: 'cli' } });
+    fireEvent.change(within(dialog).getByLabelText('Service'), { target: { value: 'ollama' } });
+    expect(api.refreshProviderModels).not.toHaveBeenCalled();
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Save as preset…' }));
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm save' }));
+    await waitFor(() => expect(api.createProviderPreset).toHaveBeenCalledWith(expect.objectContaining({ compositeId: 'claude.cli@ollama' })));
+    expect(await screen.findByText(/Derived from service/)).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'service settings for ollama' })).toHaveAttribute('href', '/ai/services/ollama');
+    expect(screen.queryByLabelText('Command *')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Name *')).toHaveValue('Claude Code · Ollama');
+    expect(screen.getByLabelText('Arguments (space-separated)')).toBeInTheDocument();
+  });
+
+  it('opens compose from a ready service card with that service selected after a compatible harness and method', async () => {
+    api.getProviderServices.mockResolvedValue({
+      services: [{
+        id: 'uuid-ollama', revision: 1, kind: 'ollama', label: 'Ollama', slug: 'ollama', definitionId: 'ollama',
+        plan: 'local', enabled: true, credentialVia: 'stored', hasCredentials: false, credentialSource: 'none', bindingCount: 0,
+        readiness: 'ready', transports: { openai: { baseUrl: 'http://127.0.0.1:11434/v1' } },
+        catalog: { state: 'known', models: ['qwen3:8b'] },
+        definition: { id: 'ollama', label: 'Ollama', family: 'local', plans: ['local'], catalogStrategy: 'daemon', harnessOnly: null, keyUrl: null, envVars: [] },
+      }],
+    });
+    await renderPage('/ai/services');
+    fireEvent.click(await screen.findByRole('button', { name: 'Create preset from Ollama' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Compose a new preset' });
+    expect(within(dialog).queryByLabelText('Service')).not.toBeInTheDocument();
+    await waitFor(() => expect(within(dialog).getByLabelText('Harness')).not.toBeDisabled());
+    fireEvent.change(within(dialog).getByLabelText('Harness'), { target: { value: 'claude' } });
+    fireEvent.change(await within(dialog).findByLabelText('Method'), { target: { value: 'cli' } });
+    expect(within(dialog).getByLabelText('Service')).toHaveValue('ollama');
+    expect(api.refreshProviderModels).not.toHaveBeenCalled();
+  });
+});
+
+describe('page views', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    __resetProviderCatalogCache();
+    api.getApps.mockResolvedValue([]);
+    api.getProviderStatuses.mockResolvedValue({ providers: {} });
+    api.getProviderRuntimes.mockResolvedValue({ runtimes: {} });
+    api.getProviderReadiness.mockResolvedValue({ readiness: {} });
+    api.getProviders.mockResolvedValue({ providers: [], activeProvider: null });
+  });
+
+  it('offers the three views as routed tabs and swaps the header action per view', async () => {
+    await renderPage('/ai/services');
+    expect(await screen.findByRole('button', { name: 'Add Service' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Run Prompt' })).not.toBeInTheDocument();
+    const tabs = screen.getByRole('tablist', { name: 'AI provider views' });
+    expect(within(tabs).getAllByRole('tab').map((tab) => tab.textContent)).toEqual(['Presets', 'Harnesses', 'Services']);
+    fireEvent.click(within(tabs).getByRole('tab', { name: 'Presets' }));
+    expect(await screen.findByRole('button', { name: 'Run Prompt' })).toBeInTheDocument();
+    // The header action plus the empty state's own — both create a preset.
+    expect(screen.getAllByRole('button', { name: 'Add Preset' }).length).toBeGreaterThan(0);
+    expect(screen.queryByRole('button', { name: 'Add Service' })).not.toBeInTheDocument();
+  });
+
+  it('keeps the blank legacy form behind Add standalone preset', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [{ id: 'codex', name: 'Codex', type: 'cli', command: 'codex', enabled: true }],
+      activeProvider: null,
+    });
+    await renderPage();
+    await openHeaderMenu();
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Add standalone preset' }));
+    expect(await screen.findByRole('heading', { name: 'Add Provider' })).toBeInTheDocument();
+    expect(screen.getByLabelText('Type *')).toBeInTheDocument();
+    expect(screen.getByLabelText('Command *')).toBeInTheDocument();
+  });
+});
+
+describe('default provider helper and card highlight', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    __resetProviderCatalogCache();
+    api.getApps.mockResolvedValue([]);
+    api.getProviderStatuses.mockResolvedValue({ providers: {} });
+    api.getProviderRuntimes.mockResolvedValue({ runtimes: {} });
+    api.getProviderReadiness.mockResolvedValue({ readiness: {} });
+  });
+
+  it('renders the helper at the top showing default provider, model, effort and highlights the card', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [
+        {
+          id: 'claude-tui',
+          name: 'Claude Code TUI',
+          type: 'tui',
+          command: 'claude',
+          defaultModel: 'claude-opus-4-7',
+          effort: 'high',
+          enabled: true,
+        },
+        {
+          id: 'opencode-tui',
+          name: 'OpenCode TUI',
+          type: 'tui',
+          command: 'opencode',
+          defaultModel: 'ox-alpha',
+          effort: 'medium',
+          enabled: true,
+        },
+      ],
+      activeProvider: 'claude-tui',
+    });
+
+    await renderPage();
+
+    const helper = await screen.findByTestId('default-provider-helper');
+    expect(helper).toBeInTheDocument();
+    expect(within(helper).getByTestId('default-helper-provider-name')).toHaveTextContent('Claude Code TUI');
+    expect(within(helper).getByTestId('default-helper-provider-name')).toHaveTextContent('(Claude Code)');
+    expect(within(helper).getByTestId('default-helper-model')).toHaveTextContent('claude-opus-4-7');
+    expect(within(helper).getByTestId('default-helper-effort')).toHaveTextContent('high');
+
+    // Default card has color-coded background and ring
+    const defaultCard = document.getElementById('provider-card-claude-tui');
+    expect(defaultCard).toHaveClass('bg-port-accent/10');
+    expect(defaultCard).not.toHaveClass('bg-port-card');
+    expect(defaultCard).toHaveClass('ring-1');
+
+    // Non-default card has standard background
+    const otherCard = document.getElementById('provider-card-opencode-tui');
+    expect(otherCard).toHaveClass('bg-port-card');
+    expect(otherCard).not.toHaveClass('bg-port-accent/10');
+
+    // Clicking Jump to card calls scrollIntoView
+    const scrollSpy = vi.fn();
+    defaultCard.scrollIntoView = scrollSpy;
+    fireEvent.click(within(helper).getByRole('button', { name: /Jump to card/ }));
+    expect(scrollSpy).toHaveBeenCalled();
+  });
+});
+
+
+it('shares readiness subscriptions and reconciles events, reconnect and tab show without polling', async () => {
+  vi.clearAllMocks();
+  api.getProviders.mockResolvedValue({ providers: [], activeProvider: null });
+  api.getApps.mockResolvedValue([]);
+  api.getProviderStatuses.mockResolvedValue({ providers: {} });
+  api.getProviderRuntimes.mockResolvedValue({ runtimes: {} });
+  api.getProviderReadiness.mockResolvedValue({ readiness: {} });
+
+  await renderPage();
+  vi.useFakeTimers();
+  const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
+  try {
+    const count = api.getProviderReadiness.mock.calls.length;
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    expect(api.getProviderReadiness).toHaveBeenCalledTimes(count);
+    api.getProviderReadiness.mockRejectedValueOnce(new Error('unavailable'));
+    await act(async () => { socketEvent('provider-readiness:changed'); });
+    expect(screen.getByText(/Provider readiness status unavailable/)).toBeInTheDocument();
+    expect(api.getProviderReadiness).toHaveBeenCalledTimes(count + 1);
+    await act(async () => { socketEvent('connect'); });
+    expect(api.getProviderReadiness).toHaveBeenCalledTimes(count + 2);
+    expect(screen.queryByText(/Provider readiness status unavailable/)).not.toBeInTheDocument();
+    visibility.mockReturnValue('hidden');
+    act(() => document.dispatchEvent(new Event('visibilitychange')));
+    visibility.mockReturnValue('visible');
+    await act(async () => document.dispatchEvent(new Event('visibilitychange')));
+    expect(api.getProviderReadiness).toHaveBeenCalledTimes(count + 3);
+    expect(socket.emit).toHaveBeenCalledWith('provider-readiness:subscribe');
+  } finally {
+    visibility.mockRestore();
+    vi.useRealTimers();
+  }
+});

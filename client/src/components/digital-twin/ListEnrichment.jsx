@@ -1,0 +1,431 @@
+import { useState, useEffect, useCallback, useRef } from 'react';
+import {ArrowLeft,
+  Plus,
+  X,
+  Sparkles,
+  Save,
+  Edit3,
+  Eye,
+  ChevronDown,
+  ChevronRight,
+  Check} from 'lucide-react';
+import * as api from '../../services/api';
+import toast from '../ui/Toast';
+import BrailleSpinner from '../BrailleSpinner';
+import { FormField } from '../ui/FormField';
+import TwinProviderPicker from './TwinProviderPicker.jsx';
+
+import { ENRICHMENT_CATEGORIES } from './constants';
+
+/**
+ * List-based enrichment component for books, movies, music
+ * Allows users to add items, analyze them with LLM, review/edit results
+ */
+export default function ListEnrichment({
+  categoryId,
+  onBack,
+  onRefresh,
+  providers,
+  selectedProvider,
+  setSelectedProvider
+}) {
+  const config = ENRICHMENT_CATEGORIES[categoryId];
+
+  // Stable key counter — items from the server have no id field, so we stamp
+  // a client-side _key on each item when it is loaded or created. This avoids
+  // the key={index} footgun when items are removed mid-list.
+  const nextKey = useRef(0);
+  const mkItem = (title = '', note = '') => ({ title, note, _key: nextKey.current++ });
+
+  // List items state
+  const [items, setItems] = useState(() => [mkItem()]);
+  const [loadingItems, setLoadingItems] = useState(true);
+
+  // Analysis state
+  const [analyzing, setAnalyzing] = useState(false);
+  const [analysis, setAnalysis] = useState(null);
+
+  // Document editing state
+  const [editingDocument, setEditingDocument] = useState(false);
+  const [documentContent, setDocumentContent] = useState('');
+  const [saving, setSaving] = useState(false);
+
+  // Expanded sections
+  const [showItemAnalysis, setShowItemAnalysis] = useState(false);
+  const [showPatterns, setShowPatterns] = useState(true);
+  const [showInsights, setShowInsights] = useState(true);
+
+  const loadExistingItems = useCallback(async () => {
+    setLoadingItems(true);
+    const existingItems = await api.getEnrichmentListItems(categoryId).catch(() => []);
+    if (existingItems && existingItems.length > 0) {
+      setItems(existingItems.map(({ title, note }) => mkItem(title, note)));
+    } else {
+      setItems([mkItem()]);
+    }
+    setLoadingItems(false);
+  }, [categoryId]);
+
+  useEffect(() => {
+    loadExistingItems();
+  }, [loadExistingItems]);
+
+  const addItem = () => {
+    setItems([...items, mkItem()]);
+  };
+
+  const updateItem = (index, field, value) => {
+    const updated = [...items];
+    updated[index] = { ...updated[index], [field]: value };
+    setItems(updated);
+  };
+
+  const removeItem = (index) => {
+    if (items.length > 1) {
+      setItems(items.filter((_, i) => i !== index));
+    }
+  };
+
+  // Strip the client-only _key before sending items to the API.
+  const getValidItems = () => items
+    .filter(item => item.title.trim().length > 0)
+    .map(({ title, note }) => ({ title, note }));
+
+  const analyzeList = async () => {
+    const validItems = getValidItems();
+    if (validItems.length === 0) {
+      toast.error(`Add at least one ${config.itemLabel.toLowerCase()}`);
+      return;
+    }
+    if (!selectedProvider) {
+      toast.error('Select a provider first');
+      return;
+    }
+
+    setAnalyzing(true);
+    setAnalysis(null);
+
+    const result = await api.analyzeEnrichmentList(
+      categoryId,
+      validItems,
+      selectedProvider.providerId,
+      selectedProvider.model,
+      { silent: true }
+    ).catch(e => ({ error: e.message }));
+
+    if (result.error) {
+      toast.error(result.error);
+    } else {
+      setAnalysis(result);
+      setDocumentContent(result.suggestedDocument || '');
+      toast.success('Analysis complete');
+    }
+    setAnalyzing(false);
+  };
+
+  const saveDocument = async () => {
+    if (!documentContent.trim()) {
+      toast.error('No document content to save');
+      return;
+    }
+
+    setSaving(true);
+    const result = await api.saveEnrichmentList(
+      categoryId,
+      documentContent,
+      getValidItems(),
+      { silent: true }
+    ).catch(e => ({ error: e.message }));
+
+    if (result.error) {
+      toast.error(result.error);
+    } else {
+      toast.success(`Saved to ${result.targetDoc}`);
+      onRefresh?.();
+    }
+    setSaving(false);
+  };
+
+  const Icon = config?.icon || Sparkles;
+
+  if (loadingItems) {
+    return (
+      <div className="flex items-center justify-center h-64">
+        <BrailleSpinner text="Loading" />
+      </div>
+    );
+  }
+
+  return (
+    <div className="max-w-3xl mx-auto px-1">
+      {/* Header */}
+      <div className="mb-6 sm:mb-8">
+        <button
+          onClick={onBack}
+          className="flex items-center gap-2 text-gray-400 hover:text-white mb-4 py-2 min-h-[44px]"
+        >
+          <ArrowLeft size={18} />
+          Back to categories
+        </button>
+
+        <div className="flex items-center gap-3 sm:gap-4">
+          <div className={`p-2.5 sm:p-3 rounded-lg bg-${config?.color || 'blue'}-500/20 shrink-0`}>
+            <Icon className={`w-5 h-5 sm:w-6 sm:h-6 text-${config?.color || 'blue'}-400`} />
+          </div>
+          <div className="min-w-0">
+            <h2 className="text-lg sm:text-xl font-bold text-white">{config?.label}</h2>
+            <p className="text-sm sm:text-base text-gray-400">{config?.description}</p>
+          </div>
+        </div>
+      </div>
+
+      {/* Items List */}
+      <div className="bg-port-card rounded-lg border border-port-border p-4 sm:p-6 mb-6">
+        <h3 className="font-medium text-white mb-4 flex items-center gap-2">
+          <Icon size={18} />
+          Your {config?.label}
+        </h3>
+
+        <div className="space-y-4">
+          {items.map((item, index) => (
+            <div
+              key={item._key}
+              className="bg-port-bg rounded-lg border border-port-border p-4 relative group"
+            >
+              {items.length > 1 && (
+                <button
+                  onClick={() => removeItem(index)}
+                  className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center absolute top-2 right-2 p-1.5 text-gray-500 hover:text-red-400 opacity-40 sm:opacity-0 sm:group-hover:opacity-100 focus-visible:opacity-100 transition-opacity"
+                  title="Remove" aria-label="Remove"
+                >
+                  <X size={16} />
+                </button>
+              )}
+
+              <div className="space-y-3">
+                <FormField
+                  label={<>{config?.itemLabel} {index + 1}</>}
+                  labelClassName="text-xs text-gray-500 uppercase tracking-wider mb-1 block"
+                >
+                  <input
+                    type="text"
+                    value={item.title}
+                    onChange={(e) => updateItem(index, 'title', e.target.value)}
+                    placeholder={config?.itemPlaceholder}
+                    className="w-full px-3 py-2.5 bg-port-card border border-port-border rounded-lg text-white focus:outline-hidden focus:border-port-accent"
+                  />
+                </FormField>
+
+                <FormField
+                  label="Notes (optional)"
+                  labelClassName="text-xs text-gray-500 uppercase tracking-wider mb-1 block"
+                >
+                  <textarea
+                    value={item.note}
+                    onChange={(e) => updateItem(index, 'note', e.target.value)}
+                    placeholder={config?.notePlaceholder}
+                    rows={2}
+                    className="w-full px-3 py-2.5 bg-port-card border border-port-border rounded-lg text-white resize-none focus:outline-hidden focus:border-port-accent"
+                  />
+                </FormField>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        <button
+          onClick={addItem}
+          className="mt-4 flex items-center gap-2 px-4 py-2.5 min-h-[44px] text-port-accent hover:text-white border border-port-accent/30 rounded-lg hover:border-port-accent transition-colors"
+        >
+          <Plus size={18} />
+          Add {config?.itemLabel}
+        </button>
+      </div>
+
+      {/* Provider Selection & Analyze Button */}
+      <div className="bg-port-card rounded-lg border border-port-border p-4 sm:p-6 mb-6">
+        <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-4">
+          <TwinProviderPicker
+            className="flex-1"
+            label="Analyze with"
+            providers={providers}
+            selected={selectedProvider}
+            onChange={setSelectedProvider}
+          />
+
+          <button
+            onClick={analyzeList}
+            disabled={analyzing || getValidItems().length === 0}
+            className="px-6 py-3 min-h-[48px] bg-port-accent text-white rounded-lg font-medium hover:bg-port-accent/80 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 sm:self-end"
+          >
+            {analyzing ? (
+              <>
+                <BrailleSpinner /> Analyzing...
+              </>
+            ) : (
+              <>
+                <Sparkles size={18} />
+                Analyze & Generate
+              </>
+            )}
+          </button>
+        </div>
+
+        <p className="text-xs text-gray-500 mt-3">
+          The AI will analyze your selections to identify patterns, themes, and personality insights.
+        </p>
+      </div>
+
+      {/* Analysis Results */}
+      {analysis && (
+        <div className="space-y-6">
+          {/* Item Analysis (collapsible) */}
+          {analysis.itemAnalysis?.length > 0 && (
+            <div className="bg-port-card rounded-lg border border-port-border overflow-hidden">
+              <button
+                type="button"
+                aria-expanded={showItemAnalysis}
+                aria-controls="item-analysis-panel"
+                onClick={() => setShowItemAnalysis(!showItemAnalysis)}
+                className="w-full p-4 flex items-center justify-between hover:bg-port-border/30 transition-colors"
+              >
+                <h3 className="font-medium text-white flex items-center gap-2">
+                  <Eye size={18} />
+                  Item-by-Item Analysis
+                </h3>
+                {showItemAnalysis ? <ChevronDown size={18} /> : <ChevronRight size={18} />}
+              </button>
+
+              {showItemAnalysis && (
+                <div id="item-analysis-panel" className="p-4 pt-0 space-y-3">
+                  {analysis.itemAnalysis.map((item, i) => (
+                    <div key={i} className="p-3 bg-port-bg rounded-lg">
+                      <div className="font-medium text-white mb-1">{item.title}</div>
+                      <div className="text-sm text-gray-400">{item.insights}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Patterns */}
+          {analysis.patterns?.length > 0 && (
+            <div className="bg-port-card rounded-lg border border-port-border overflow-hidden">
+              <button
+                type="button"
+                aria-expanded={showPatterns}
+                aria-controls="patterns-panel"
+                onClick={() => setShowPatterns(!showPatterns)}
+                className="w-full p-4 flex items-center justify-between hover:bg-port-border/30 transition-colors"
+              >
+                <h3 className="font-medium text-white flex items-center gap-2">
+                  <Sparkles size={18} />
+                  Patterns Detected
+                </h3>
+                {showPatterns ? <ChevronDown size={18} /> : <ChevronRight size={18} />}
+              </button>
+
+              {showPatterns && (
+                <div id="patterns-panel" className="p-4 pt-0">
+                  <ul className="space-y-2">
+                    {analysis.patterns.map((pattern, i) => (
+                      <li key={i} className="flex items-start gap-2 text-gray-300">
+                        <Check size={16} className="text-port-success mt-0.5 shrink-0" />
+                        {pattern}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Personality Insights */}
+          {analysis.personalityInsights && (
+            <div className="bg-port-card rounded-lg border border-port-border overflow-hidden">
+              <button
+                type="button"
+                aria-expanded={showInsights}
+                aria-controls="insights-panel"
+                onClick={() => setShowInsights(!showInsights)}
+                className="w-full p-4 flex items-center justify-between hover:bg-port-border/30 transition-colors"
+              >
+                <h3 className="font-medium text-white flex items-center gap-2">
+                  <Sparkles size={18} />
+                  Personality Insights
+                </h3>
+                {showInsights ? <ChevronDown size={18} /> : <ChevronRight size={18} />}
+              </button>
+
+              {showInsights && (
+                <div id="insights-panel" className="p-4 pt-0 space-y-3">
+                  {Object.entries(analysis.personalityInsights).map(([key, value]) => (
+                    <div key={key} className="p-3 bg-port-bg rounded-lg">
+                      <div className="text-xs text-gray-500 uppercase tracking-wider mb-1">
+                        {key.replace(/([A-Z])/g, ' $1').trim()}
+                      </div>
+                      <div className="text-sm text-gray-300">{value}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Generated Document */}
+          <div className="bg-port-card rounded-lg border border-port-border p-4 sm:p-6">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="font-medium text-white flex items-center gap-2">
+                Generated Document: {analysis.targetDoc}
+              </h3>
+              <button
+                onClick={() => setEditingDocument(!editingDocument)}
+                className="flex items-center gap-1 text-sm text-port-accent hover:text-white"
+              >
+                <Edit3 size={14} />
+                {editingDocument ? 'Preview' : 'Edit'}
+              </button>
+            </div>
+
+            {editingDocument ? (
+              <textarea
+                aria-label="Document content"
+                value={documentContent}
+                onChange={(e) => setDocumentContent(e.target.value)}
+                rows={15}
+                className="w-full px-4 py-3 bg-port-bg border border-port-border rounded-lg text-white font-mono text-sm resize-y focus:outline-hidden focus:border-port-accent"
+              />
+            ) : (
+              <pre className="p-4 bg-port-bg rounded-lg text-sm text-gray-300 whitespace-pre-wrap break-words overflow-auto max-h-96">
+                {documentContent}
+              </pre>
+            )}
+
+            <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 mt-4 pt-4 border-t border-port-border">
+              <p className="text-xs text-gray-500">
+                Review and edit the generated content before saving.
+              </p>
+              <button
+                onClick={saveDocument}
+                disabled={saving || !documentContent.trim()}
+                className="px-6 py-3 min-h-[44px] bg-port-success text-white rounded-lg font-medium hover:bg-port-success/80 disabled:opacity-50 flex items-center justify-center gap-2"
+              >
+                {saving ? (
+                  <>
+                    <BrailleSpinner /> Saving...
+                  </>
+                ) : (
+                  <>
+                    <Save size={18} />
+                    Save to Digital Twin
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

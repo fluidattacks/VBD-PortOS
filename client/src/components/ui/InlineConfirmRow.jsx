@@ -1,0 +1,88 @@
+import { useEffect, useRef } from 'react';
+
+// Inline "question + confirm + cancel" row for destructive actions — the
+// inline-confirmation pattern PortOS prefers over a two-click-arm button or a
+// window.confirm() modal. Shaped for confirm/cancel prompts, which is why these
+// don't reuse <Banner> (that's "icon + content + actions" alerts).
+//
+// Tones pre-compose full Tailwind class names — the JIT scans for complete
+// tokens, so `bg-port-${tone}/10` would NOT generate the utility. Spell it out.
+// `error` for destructive confirms; `warning` for expensive-but-safe confirms
+// (e.g. a long-running re-embed) where the action isn't destructive.
+const TONES = {
+  error: {
+    wrapper: 'bg-port-error/10 border-port-error/30',
+    confirm: 'bg-port-error text-white hover:bg-port-error/80',
+  },
+  warning: {
+    wrapper: 'bg-port-warning/10 border-port-warning/30',
+    confirm: 'bg-port-warning text-black hover:bg-port-warning/80',
+  },
+};
+
+// Layout variants share the same tone + button styling and differ only in the
+// frame: `box` is a standalone rounded card (inline, text-xs); `separator` is a
+// full-width strip with a bottom border (text-sm), used as an attached header/
+// footer band above panel content. Button styling is identical across variants.
+const VARIANTS = {
+  box: { frame: 'p-2 border rounded', question: 'text-xs' },
+  separator: { frame: 'px-4 py-2 border-b', question: 'text-sm' },
+};
+
+export default function InlineConfirmRow({
+  question,
+  confirmText = 'Delete',
+  cancelText = 'Cancel',
+  confirmTitle,
+  cancelTitle,
+  onConfirm,
+  onCancel,
+  tone = 'error',
+  variant = 'box',
+  className = '',
+  autoFocus = false,
+  ...rest
+}) {
+  const t = TONES[tone] || TONES.error;
+  const v = VARIANTS[variant] || VARIANTS.box;
+  const rowRef = useRef(null);
+
+  // `autoFocus` moves focus to the row itself (not to the destructive button —
+  // a stray Enter must not delete anything). Callers that reveal this row from
+  // another control (a "…" menu item, a toolbar button) should set it so
+  // keyboard/screen-reader users land on, and hear, the question instead of
+  // being left on a trigger whose menu just vanished. Pair it with an
+  // `aria-label` naming the record so the focus move announces something.
+  useEffect(() => {
+    if (autoFocus) rowRef.current?.focus();
+  }, [autoFocus]);
+
+  return (
+    <div
+      ref={rowRef}
+      tabIndex={autoFocus ? -1 : undefined}
+      className={`flex flex-col items-stretch gap-2 sm:flex-row sm:items-center ${v.frame} ${t.wrapper} focus:outline-hidden focus:ring-2 focus:ring-port-accent ${className}`.trim()}
+      {...rest}
+    >
+      <span className={`${v.question} text-white flex-1 min-w-0`}>{question}</span>
+      <div className="grid grid-cols-2 gap-2 sm:flex sm:shrink-0">
+        <button
+          type="button"
+          onClick={onConfirm}
+          title={confirmTitle}
+          className={`min-w-0 min-h-9 px-2 py-1 text-xs rounded transition-colors ${t.confirm}`}
+        >
+          {confirmText}
+        </button>
+        <button
+          type="button"
+          onClick={onCancel}
+          title={cancelTitle}
+          className="min-w-0 min-h-9 px-2 py-1 text-xs text-gray-400 hover:text-white transition-colors"
+        >
+          {cancelText}
+        </button>
+      </div>
+    </div>
+  );
+}

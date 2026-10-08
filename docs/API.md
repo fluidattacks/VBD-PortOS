@@ -1,0 +1,1065 @@
+# API Reference
+
+PortOS exposes a REST API on port 5555 and WebSocket events via Socket.IO.
+
+## Base URL
+
+```
+http://localhost:5555/api
+```
+
+When a TLS cert is provisioned (`npm run setup:cert`), `:5555` serves HTTPS instead and a loopback-only HTTP mirror runs on `http://127.0.0.1:5553` for local scripts. See [PORTS.md](./PORTS.md).
+
+This document covers the most commonly used endpoints plus a [route-domain index](#route-domain-index). The in-app **API Explorer** at `/api-reference/catalog` is the exhaustive, generated reference:
+
+For the bridge between these HTTP/event inventories and model-facing tools,
+see [API and MCP Unified Tool Contract](./API_TOOL_CONTRACT.md). It records
+the shipped semantic registry, MCP context/action schemas, authority matrix,
+and the current-vs-proposed boundary.
+
+- `GET /api/api-docs/catalog.json` — searchable metadata for every mounted HTTP operation.
+- `GET /api/api-docs/internal/openapi.json` — OpenAPI 3.0.3 for the complete internal HTTP surface.
+- `GET /api/api-docs/openapi.json` — OpenAPI 3.0.3 for only the external APIs currently exposed in Settings.
+- `GET /api/api-docs/events.json` — searchable Socket.IO event inventory.
+- `GET /api/api-docs/asyncapi.json` — AsyncAPI 3 for the Socket.IO transport.
+- `GET /api/api-docs/tools.min.json` — the minimized semantic tool resource: only the operations annotated `x-portos-tool`, flattened to provider-neutral tool records with an HTTP binding. Sized for an agent to read whole, unlike the full internal document.
+
+Inferred entries are explicitly marked `generated` until a runtime-backed payload contract exists; detailed entries are marked `modeled`. Both inventories are derived from source on first use and cached for the server process — HTTP routes by `server/lib/apiRouteGraph.js`, Socket.IO events by `server/lib/socketEventInventory.js` — so neither route nor event declarations have a checked-in manifest or a regeneration step.
+
+When adding an HTTP route, keep its request Zod schema in a reusable server library and register the detailed documentation in `server/lib/apiOperationContracts.js`; the route and OpenAPI should consume the same schema object. Add an `x-portos-tool` annotation to that contract entry to also publish the operation as an agent-callable tool in `tools.min.json`, and declare the codes its error responses really throw in `x-portos-error-codes` — the HTTP status alone does not identify the code, since `errorHandler` prefers an explicit `err.code` over the status map. Socket payload schemas follow the same pattern in `server/lib/socketEventContracts.js`. The live HTTP and Socket.IO source inventories guarantee coverage, while these small registries make richer contracts incremental without maintaining a second handwritten list of paths or events.
+
+Building a native companion client? See [COMPANION_APP_API.md](./COMPANION_APP_API.md) — the stable, pre-auth-discoverable contract (discovery/identity, HTTP Basic auth vs. operator sessions, instance management, palette actions, daily-log, POST progress, and the iCloud-sync precedent) that the PortDeck app consumes. Basic auth alone does not grant peer management or host control — those need an operator session obtained via `POST /api/auth/login`, same as this section's [Security Model](#security-model) describes for host control below.
+
+## Security Model
+
+PortOS can execute host commands and access private files. It must remain on the user's private network; a reachable LAN or tailnet peer is not automatically trustworthy. It implements the following security measures:
+
+- **Network isolation**: By default, access should be restricted to trusted networks (e.g., Tailscale VPN, localhost)
+- **Command policies**: Execution follows each surface's operator/unattended policy and agent execution profile (see `server/lib/commandSecurity.js`); these controls do not sandbox the entire application
+- **Input validation**: All API inputs are validated using Zod schemas
+- **Opt-in authentication**: Off by default (trusting private network/Tailscale), PortOS supports opt-in instance password authentication (enforced by `server/services/authGate.js`) gating `/api/*`, `/data/*`, and `/sdapi/*` via session cookies, Bearer tokens, or HTTP Basic credentials
+- **Host-control authority**: routes that execute on the host — `/api/commands/*` plus the audited `HOST_CONTROL_ROUTES` list in `server/lib/hostControlRoutes.js` (app create/start/restart, CoS agent queueing, git, scaffold, standardize, feature agents, loops, GSD, local code review, provider execution config and runtime installs, autopilot start) — the execution-policy slices of `PUT /api/settings` and `PUT /api/cos/config`, and the matching Socket.IO events need an operator session, or a local connection when no password is set. A remote LAN/tailnet caller on a password-free install, and any peer or Basic credential, gets `403 HOST_CONTROL_FORBIDDEN`
+
+Never publish PortOS administration, APIs, sockets, sidecars, or host controls through public tunnels, reverse proxies, or forwarding. A password or TLS does not make public deployment supported. For private deployments, consider:
+- Binding to `127.0.0.1` instead of `0.0.0.0`
+- Enabling instance password authentication in Settings → Security
+- Using Tailscale or similar VPN for remote access
+
+Password-free installs warn the operator until they set a password or explicitly accept the risk. See the [host-control security model](../PRD.md#host-control-security-model) for the full contract.
+
+## REST Endpoints
+
+### System
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/system/capabilities` | Host-local platform, architecture, Apple Silicon, memory, CPU, and cached CUDA capability snapshot used to filter model/provider selections. Probe failures remain `unknown`; this payload is intentionally not included in federation health records. |
+
+### Federated peer-probe contract
+
+PortOS peers running independently upgraded installs use the following existing
+endpoints during the periodic reachability probe in
+`server/services/instances.js`. They are a **frozen compatibility contract**:
+keep their paths, request semantics, and listed response fields compatible.
+Additive response fields are allowed. A breaking change needs a new, explicitly
+versioned endpoint and a staged migration of the probe; `schemaVersions.js`
+gates synchronized records, not these request/response contracts.
+
+All three requests authenticate with the peer credential described in
+[PEER_PUSH_AUTH.md](./PEER_PUSH_AUTH.md#peer-credentials-are-not-operator-authority):
+the paired peer token, plus the configured HTTP Basic credential until the
+remote confirms the token. They are not a general
+cross-install data channel: probe results are stored only as the local peer's
+health, app, and sync snapshots. Do not add personal records, peer lists,
+credentials, local paths, or build identity to these responses.
+
+| Method | Endpoint | Stable request and response contract |
+|--------|----------|--------------------------------------|
+| GET | `/system/health/details` | Returns an object containing `instanceId` and `version` (each may be `null`) for peer identity and compatibility display. Newer installs add `peerAuth: { version, accepted }`; `accepted` is true only when this request authenticated with the prober's pair token. A missing field means the prober keeps sending Basic. The health summary remains an object so an older prober can retain it as its last-known health snapshot. |
+| GET | `/apps?view=probe` | The periodic probe requests `view=probe`; returns either the legacy app array or `{ apps: [...] }`. Each app entry used by peers retains `id`, `name`, `icon`, `overallStatus`, `uiPort`, `apiPort`, and `type`; fields may be absent or `null` when unknown. Older peers may ignore the query and return the legacy enriched list, which remains compatible with the same field mapping. |
+| GET | `/instances/sync-status?forPeer=<instance-id>` | `forPeer` is optional and remains lenient: an unknown or legacy identifier, blank value, or omitted value must degrade to the unscoped status response rather than fail the probe. A recognized peer receives its `cursorForYou` alongside the normal sync status — with this install's own `lastSyncError` / `lastSyncSucceeded` stripped, since those carry local diagnostics and the endpoint is reachable by any tailnet machine. |
+
+The separate `/federation/media/v1` surface is already versioned and has its
+own wire contract in [FEDERATED_MEDIA_PROVIDERS.md](./FEDERATED_MEDIA_PROVIDERS.md).
+
+### Apps
+
+The app list keeps the legacy PM2-enriched response when no `view` is given.
+Use `view=nav` for name/icon/archive/type pickers that do not need runtime
+status or repository details; it reads the registry without PM2 or repository
+enrichment. Use `view=probe` for the PM2-backed seven-field projection used by
+federated peer probes. `includeQuality=true` remains an explicit opt-in on the
+legacy list for local Apps/Dashboard views.
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/apps` | List all registered apps |
+| POST | `/apps` | Register a new app |
+| GET | `/apps/:id` | Get app details |
+| PUT | `/apps/:id` | Update app |
+| DELETE | `/apps/:id` | Unregister app |
+| POST | `/apps/:id/start` | Start app via PM2 |
+| POST | `/apps/:id/stop` | Stop app via PM2 |
+| POST | `/apps/:id/restart` | Restart app via PM2 |
+| GET | `/apps/:id/status` | Get PM2 status |
+| GET | `/apps/:id/logs` | Get recent logs |
+| POST | `/apps/:id/refresh-config` | Re-parse ecosystem config |
+| POST | `/apps/:id/quality-snapshot` | Rebuild the app's numeric quality snapshot and land canonical schema v2 `.quality.json` through an immediately-merged pull request on `portos/quality-snapshot` (scoped to that one path; the live checkout is not committed). The file is not the peer wire payload (`PORTOS_SCHEMA_VERSIONS.appQuality` stays 1). A v1 file is rewritten when current evidence exists. Answers `{ success, published, path }` plus the commit `hash`, `prUrl`, and `prNumber`, or a `reason` of `no-repo-path` / `not-a-repo` / `no-evidence` / `no-changes` / `no-remote` / `no-default-branch` / `pr-failed` / `unsupported-format` / `invalid-evidence` when nothing was written. `unsupported-format` means a future, unrecognized, malformed, or oversize file was left in place. Not gated on the app's `publishQualitySnapshot` toggle — that toggle only automates the same publish after each audit. Any app's committed `.quality.json` (or a historical `quality-snapshot.json` when `.quality.json` is absent) is read back as a "Release snapshot" quality source, PortOS's own checkout included (`npm run quality:snapshot` is the same publish, run from the release step; `npm run quality:snapshot -- --migrate` converts an old file without reading the database). |
+| GET | `/apps/:id/quality-schedule` | The Quality tab's weekly-schedule form: every audit check with its applicability verdict and reason, the repository shapes that verdict came from, the cron expressions already occupied on this app, and the plan the shipped defaults produce. Read-only — no LLM call, no write. |
+| POST | `/apps/:id/quality-schedule/preview` | Re-plan for an edited form (selection, per-check delivery mode, checks per day, hour window, claim-drain task and offset). Still read-only; a POST only because the option bag carries a per-check map. |
+| POST | `/apps/:id/quality-schedule/apply` | Persist the plan as ordinary per-app task-type overrides: the selected checks enabled with their weekly cron and `fileIssues` mode, the audit types left out disabled with their interval cleared, and — when at least one selected check files issues — one daily cron for the issue-claim drain (one an earlier plan planted is retired when it is switched off or replaced). Other task types are untouched. |
+
+### Processes & Logs
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/logs/processes` | List all PM2 processes |
+| GET | `/logs/:name` | Get logs for process |
+| GET | `/ports/scan` | Scan for active ports |
+
+### AI Providers
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/providers` | List all AI providers. Also returns `runnerAllowedCommands` — the CoS Agent Runner's exec allowlist, read-only, so the editor can warn that a custom `command` won't spawn via `/spawn` / `/spawn-tui`. |
+| POST | `/providers` | Add new provider. A body carrying `modes` (`{ cli: {…}, tui: {…} }`) instead creates BOTH execution modes of one harness in one write — a program that runs headlessly and interactively is one program on one backend, but a record stores one `type`, so configuring both otherwise means adding the same command twice and hoping the two records satisfy the pairing rule. The pair is minted as `<id>` / `<id>-tui` with every grouped field (command, endpoint, credentials, env) shared, and answers `{ providers: [cli, tui] }`; a single-mode create still answers the bare provider object. A mode declares only `args` / `headlessArgs` / `tuiPromptDelayMs` for itself, and `cli: {}` is normal — the body's own fields already describe the CLI record, so the key is there to declare the pair. A per-mode MAP rather than the mode-name ARRAY `POST /providers/bindings` takes, because a binding mints argv from the harness's shipped recipe while a provider added here has none and the user types each mode's arguments. Create-only: `PUT /providers/:id` drops the key. |
+| PUT | `/providers/:id` | Update provider |
+| DELETE | `/providers/:id` | Delete provider |
+| POST | `/providers/:id/modes/tui` | Give an EXISTING CLI provider the TUI half of its harness, minted from the record already on disk — the other end of the dual-mode create above, for an install that already has a lone `claude` or `opencode` CLI record. A new endpoint rather than a flag on `PUT /providers/:id`, because `modes` is create-only: a PATCH against one record cannot mean "make me two". No request body: the command, endpoint, credentials and env come from `:id` (retyping them is both friction and a fresh chance for a grouped field to differ and leave two unrelated routes), and the argv defaults from the harness recipe’s proven interactive line, or stays empty for a binary PortOS has no row for. Answers the created record; `GET /providers` flags eligible records with `canAddTuiMode` so a card only ever offers what this accepts. Refuses a non-CLI record, a record storing no command, and a known harness declaring no TUI mode (400); a taken `<id>-tui` answers 409 and writes nothing — the CLI id is already fixed, so something else is standing there. |
+| POST | `/providers/:id/test` | Test provider connectivity |
+| PUT | `/providers/active` | Set active provider |
+| GET | `/providers/service-definitions` | Every `SERVICE_DEFINITIONS` row an "Add service" flow may instantiate (#7567): id, label, family, plans, catalog strategy, transports with their default base URLs, and where a key is obtained (`keyUrl`, conventional `envVars`). Code-only data — no instance, no credential. The instance surface is `/providers/services*` (`docs/PROVIDER_COMPOSITION.md`). |
+| GET | `/providers/runtimes` | Per-runtime install status (`claude`, `codex`, `opencode`, `kilo`, `openchamber`, `grok`, `kimi`, `agy`, `cursor-agent`): is the binary runnable here, and can PortOS install it? Booleans and labels only — never resolved filesystem paths. 60s TTL cache. Ollama / LM Studio are absent on purpose — Models → LLMs owns their install. |
+| POST | `/providers/runtimes/install?runtime=<id>` | Install one runtime from the installer's fixed table, streaming installer output as SSE. Rejects any id not in the table. |
+| GET | `/providers/readiness` | Requirements checklist per provider backed by a LOCAL daemon (llama.cpp / Ollama / LM Studio / MTPLX), keyed by provider id: is the daemon installed, is it answering at the endpoint THIS provider points at, and is it serving the provider's default model. Each entry also carries `setup` — what the one-click fix below can do about the unmet checks (`null` when nothing is auto-fixable here). Each entry also carries `contextWindows` — what the daemon is SERVING right now, keyed by every spelling the provider could dispatch under, or `null` when it is down or silent about them; the provider card budgets its meter with it so the number matches what the pre-dispatch gate enforces, and it is never written back to the stored provider record. Providers with no local dependency are absent from the map. Complements `/providers/runtimes` (which answers "can PortOS run this CLI?"). Booleans, labels, and the provider's own endpoint only — never a resolved binary path. Skips disabled providers; 15s endpoint-probe cache (one probe per distinct endpoint), 60s binary-PATH cache, both dropped by the llama-server start/stop/install routes. |
+| POST | `/providers/readiness/setup?provider=<id>` | Install and/or start the LOCAL DAEMON that provider points at (llama.cpp / Ollama / LM Studio / MTPLX), streaming progress as SSE — the "do it for me" half of `/providers/readiness`, so an unmet requirement is fixed from the card instead of from a vendor setup doc. The request names a PROVIDER only: the runtime kind and endpoint are re-derived server-side from the stored record, so no query value reaches a spawn argument (an optional `runtime=` is cross-checked and 409s on a mismatch). Every command comes from a fixed per-runtime table. Never downloads model weights, never starts llama-server (it needs a checkpoint you choose), and never runs MTPLX's privileged fan-control helper. Single-flight. |
+| POST | `/providers/readiness/serve-model?provider=<id>` | Relaunch the local daemon so it answers under the model id THIS provider sends — the other half of the readiness model mismatch. `llama-server` serves one model per process under the `--alias` on its launch line, so the fix keeps the loaded weights and changes only the name; the whole launch line is carried forward and the previous one restored if the relaunch is rejected or never answers. The model id is re-derived server-side from the stored record. 400s for a runtime that has no such label (Ollama / LM Studio / MTPLX name a model after its weights), 409s when PortOS did not start the daemon. |
+| GET | `/providers/model-pins` | Stored model pins naming a model their provider no longer lists. A vendor retires an id, the install's catalog refresh picks that up, and every pin still naming it rots silently until a render or a scheduled run dies with a raw vendor error. Answers `{ pins, providers }` — each pin carries where it lives and a deep link, and `providers` carries only the catalogs a stale pin actually names. Covers the Image Gen and render-default settings pins, global and per-app scheduled-task pins, per-record render pins, the Code Review Defaults reviewer pins (the `<reviewer>Model` scalars, the `provider:<id>` entries in `providerModels`, and `goalFidelity.model`), and user-saved CoS task-template pins. A reviewer pin names a BINARY that several provider records front, so it carries `providerIds` and is reported only when EVERY one of them stops listing the model — judging it against one record would call a tier retired that the other still serves. Derived on read, never persisted, so a pin cleared a moment ago is already gone from the answer and one that rotted before this shipped is reported on the first read. Every UNKNOWN case (no pin, empty catalog, unresolved provider) reads as "still listed" — a false "your pin is gone" tells the user to change a setting that works. |
+| POST | `/providers/model-pins/clear` | Clear ONE stale pin back to "inherit", named by the `pinId` the endpoint above reported. PortOS re-points only the shipped default it owns; a pin the USER chose is surfaced and never rewritten, because substituting it would render under the chosen model's name and bury the vendor's own "unknown model" error. Clears the model field only, never the sibling mode/provider/enabled choices. An id naming a pin that is already gone answers `{ cleared: false }` rather than 404ing, and an id matching no collected pin reaches no writer. |
+| GET | `/providers/codex/account?fresh=1` | Is a ChatGPT subscription signed in, and usable right now? Answers `{ readiness }` with a `status` of `runtime-missing` / `unknown` / `signed-out` / `login-pending` / `ready` / `quota-exhausted` / `reauth-required`, plus the plan name and quota percentages. Read from the Codex app-server's own `account/read` — PortOS never opens Codex's credential file and the payload carries no token, account id, or credential path. This is the ONLY call that may spawn `codex app-server`, and it runs from an explicit page fetch: nothing on the boot path calls it, and `GET /providers` decorates its Codex cards from the cached snapshot only. `fresh=1` skips the 15s TTL for the poll after a sign-in. |
+| POST | `/providers/codex/account/login` | Start an explicit ChatGPT sign-in. Returns `{ login }` — a bounded `loginId` plus `authUrl` (browser flow) or `verificationUrl` + `userCode` (device-code flow, via `{ "deviceCode": true }`). A POST because it begins an OAuth flow; never a side effect of a read. 409s while another sign-in is already pending. |
+| POST | `/providers/codex/account/login/cancel` | Abandon the pending sign-in named by `{ loginId }`, then re-read. 409s for an id that is not the pending login, so a stale tab cannot cancel a flow the user started afterwards. |
+| POST | `/providers/codex/account/logout` | Sign out of ChatGPT and re-read. Codex drops its own credentials; PortOS holds none to clear. |
+| GET | `/providers/codex/models?fresh=1` | Which models this ChatGPT subscription may run, from the app-server's own `model/list` rather than a hard-coded table. Answers `{ models, fetchedAt, error }`. The sentinels are load-bearing: `models: null` = NEVER FETCHED, `[]` = fetched and the plan genuinely has none, and a failed read returns the LAST-KNOWN-GOOD list alongside `error` — so one timeout can never empty the picker. Lazy like `/codex/account`; `fresh=1` skips the 10m TTL after a plan change or a sign-in. |
+| GET | `/providers/opencode/installation` | **Legacy alias**, kept so a stale client bundle still renders: `{ installed, npmAvailable }` for the `opencode` runtime. New code uses `/providers/runtimes`. |
+| POST | `/providers/opencode/install` | **Legacy alias** for `/providers/runtimes/install?runtime=opencode`. |
+
+### Harnesses
+
+The coding-agent CLIs/TUIs PortOS drives (`opencode`, `kilo`, `openchamber`, `claude`, `codex`, `agy`, `grok`, `kimi`, `cursor-agent`), managed as things in their own right rather than as a footnote on a provider card. Backs **Models → Harnesses**. Every response carries booleans, versions, and labels — never a resolved filesystem path, which would disclose the host account name.
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/harnesses?fresh=1` | Every harness with its installed version, the latest published version (npm-backed rows only), whether an update is available, which lifecycle actions it supports, and the provider records riding on it. `version`/`latestVersion` are `null` for NOT KNOWN, never `0.0.0` — `updateAvailable` is set only on a definite "installed < latest", so an offline host shows no false staleness badge. `fresh=1` bypasses both the 60s runtime-status TTL and the 6h registry cache. |
+| POST | `/harnesses/action?runtime=<id>&action=install\|update\|uninstall` | Run one lifecycle action, streaming the child's output as SSE. `action` defaults to `install`. Update prefers the vendor's OWN updater (`opencode upgrade`, `claude update`) — the only path that refreshes the copy actually on PATH when the user installed it from Homebrew or a vendor script. Remove is offered only for npm-installed rows, and reports an error rather than success if the binary is still runnable afterwards. One action at a time process-wide (npm's global prefix is one directory); closing the stream cancels the child. Both values are table keys — nothing from the request reaches a shell word. |
+| POST | `/harnesses/models/refresh?runtime=<id>` | Re-read a harness's own model catalog (`opencode models`, `kilo models`, `agy models`, `grok models`) and write it to every provider that draws from that catalog — i.e. a wrapper with no local-runtime marker and no `gatewayBacked`, since a gateway- or Ollama-backed wrapper serves ids the harness never lists. Answers `{ ok, models, updated }`. A probe that runs but parses to nothing is a **409**, not an empty write: a signed-out CLI must not blank every picker. |
+
+### AI Runs
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/runs` | List run history |
+| POST | `/runs` | Execute new AI run |
+| GET | `/runs/:id` | Get run details |
+| GET | `/runs/:id/output` | Get run output |
+| POST | `/runs/:id/stop` | Stop active run |
+| DELETE | `/runs/:id` | Delete run |
+
+### AI Agents
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/agents` | List running AI agent processes |
+| GET | `/agents/:pid` | Get agent process details |
+| DELETE | `/agents/:pid` | Kill agent process |
+
+### Agent Tools (MCP)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/agent-context/manifest` | Inspect the local context profile, scopes, semantic-action grants, schemas, exclusions, and limits; available while MCP is disabled |
+| POST | `/agent-context/mcp` | Loopback-only, opt-in MCP Streamable HTTP endpoint for bounded context plus explicitly granted semantic PortOS tools |
+
+Context tools remain read-only. Semantic reads and writes are independent, default-off grants; MCP advertises only granted actions and never accepts a raw route, URL, shell command, or SQL query. See [Agent Tools (MCP)](./features/agent-context.md) for setup, transport headers, privacy profiles, grants, and tool schemas.
+
+### Command Execution
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/commands/execute` | Execute shell command |
+| POST | `/commands/:id/stop` | Stop running command |
+| GET | `/commands/allowed` | List allowed commands |
+| GET | `/commands/processes` | List PM2 processes |
+
+### History
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/history` | List action history |
+| GET | `/history/stats` | Get history statistics |
+| DELETE | `/history` | Clear history |
+
+### Detection & Import
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/detect/port` | Detect process on port |
+| POST | `/detect/repo` | Validate repo path |
+| POST | `/detect/pm2` | Detect PM2 processes for a repo |
+| POST | `/detect/ai` | AI-powered app detection |
+
+### Scaffold (App Templates)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/scaffold/directories` | List candidate parent directories |
+| GET | `/scaffold/templates` | List available templates |
+| POST | `/scaffold/templates/create` | Create app from template |
+| POST | `/scaffold` | Scaffold a new app |
+
+### Prompts
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/prompts` | List all prompt stages |
+| GET | `/prompts/:stage` | Get stage template |
+| PUT | `/prompts/:stage` | Update stage/template |
+| POST | `/prompts/:stage/preview` | Preview compiled prompt |
+| GET | `/prompts/variables` | List all variables |
+| PUT | `/prompts/variables/:key` | Update variable |
+| POST | `/prompts/variables` | Create variable |
+| DELETE | `/prompts/variables/:key` | Delete variable |
+
+### Chief of Staff
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/cos` | Get CoS status |
+| POST | `/cos/start` | Start daemon |
+| POST | `/cos/stop` | Stop daemon |
+| GET | `/cos/config` | Get configuration |
+| GET | `/cos/tools` | Provider-neutral semantic tool catalog; `scope=agent|mind|ui|voice`, with PortOS/OpenAI/Anthropic/MCP output formats |
+| POST | `/cos/tools/call` | Execute one schema-validated semantic tool with server-derived authority and idempotency |
+| GET | `/cos/tools/calls/:requestId` | Read a retained normalized tool result |
+| PUT | `/cos/config` | Update configuration |
+| GET | `/cos/tasks` | Bounded task list: all non-completed tasks plus the first 25 completed (`completedCount`, `completedNextCursor`); `view=queue`, `view=completed` (paged), `view=full` (raw unbounded store) |
+| POST | `/cos/evaluate` | Force task evaluation |
+| GET | `/cos/health` | Get health status |
+| POST | `/cos/health/check` | Run health check |
+| GET | `/cos/agents` | List active agents |
+| POST | `/cos/agents/:id/terminate` | Terminate agent |
+| GET | `/cos/reports` | List reports |
+
+### CoS Task Learning
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/cos/learning` | Get learning insights and recommendations |
+| GET | `/cos/learning/durations` | Get task duration estimates by type |
+| POST | `/cos/learning/backfill` | Backfill learning data from history |
+| POST | `/cos/learning/recalculate-durations` | Manual repair: rebuild the success-only duration ETAs (and the execution-scoped buckets) from the agent archive. No UI or scheduled caller — run it by hand after a bulk edit or purge of the archive |
+
+### CoS Jobs (Autonomous Jobs)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/cos/jobs` | List all jobs |
+| GET | `/cos/jobs/due` | List jobs due to run |
+| GET | `/cos/jobs/intervals` | Get available interval options |
+| GET | `/cos/jobs/allowed-commands` | Get allowed commands for shell jobs |
+| GET | `/cos/jobs/gates` | Get job gate status |
+| GET | `/cos/jobs/:id` | Get a specific job |
+| POST | `/cos/jobs` | Create a new job |
+| PUT | `/cos/jobs/:id` | Update a job |
+| DELETE | `/cos/jobs/:id` | Delete a job |
+| POST | `/cos/jobs/:id/toggle` | Toggle job on/off |
+| POST | `/cos/jobs/:id/trigger` | Run a job immediately |
+| POST | `/cos/jobs/:id/gate-check` | Evaluate a job's gates |
+
+### CoS Task Schedule & Timeline
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/cos/schedule` | Get full task schedule status |
+| GET | `/cos/upcoming` | Get upcoming scheduled tasks preview |
+| GET | `/cos/schedule/interval-types` | Get the two cadence types (`on-demand`, `cron`) and their descriptions, plus the `perpetual` flag description |
+| GET | `/cos/schedule/due` | List all tasks due to run |
+| GET | `/cos/schedule/due/:appId` | List tasks due for specific app |
+| GET | `/cos/schedule/task/:taskType` | Get interval and schedule settings for a task type |
+| PUT | `/cos/schedule/task/:taskType` | Update schedule settings for a task type (`type`: `on-demand` \| `cron`; `cronExpression`: 5-field or null; `perpetual`: boolean drain flag, orthogonal to `type`; `autoStart`: set false for manual-only on-demand drains, omitted preserves legacy automatic starts/rechecks) |
+| POST | `/cos/schedule/trigger` | Trigger an on-demand task run |
+| GET | `/cos/schedule/maintenance-runs` | List manual maintenance runs (the Schedule tab's "Run maintenance now"; running first, then recent history) |
+| POST | `/cos/schedule/maintenance-runs` | Start a manual maintenance run for one app (`appId`, `providerId`, `model`, optional `effort`); returns the run and its first dispatch or hold reason. Independent of Quota Burn |
+| POST | `/cos/schedule/maintenance-runs/:id/stop` | Stop a run from dispatching further steps (a task already queued or running is not recalled) |
+| POST | `/cos/schedule/maintenance-runs/:id/resume` | Resume a stopped run from its completion ledger |
+| GET | `/cos/schedule/on-demand` | List pending on-demand task requests |
+| DELETE | `/cos/schedule/on-demand/:requestId` | Clear a pending on-demand request |
+| POST | `/cos/schedule/reset` | Reset execution history for a task type |
+| GET | `/cos/schedule/templates` | List all template tasks |
+| POST | `/cos/schedule/templates` | Add a template task |
+| DELETE | `/cos/schedule/templates/:templateId` | Delete a template task |
+
+(`GET /cos/scripts` still exists but now lists generated scripts only; scheduling lives in `/cos/jobs` and `/cos/schedule`.)
+
+### CoS Weekly Digest
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/cos/digest` | Get current week's digest |
+| GET | `/cos/digest/list` | List all available weekly digests |
+| GET | `/cos/digest/progress` | Get current week's live progress |
+| GET | `/cos/digest/text` | Get text summary for notifications |
+| GET | `/cos/digest/:weekId` | Get digest for specific week |
+| POST | `/cos/digest/generate` | Force generate digest for a week |
+| GET | `/cos/digest/compare` | Compare two weeks |
+
+### Memory System
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/memory` | List memories with filters |
+| GET | `/memory/:id` | Get current memory, or local historical text with `?version=N` |
+| GET | `/memory/:id/versions` | List local history metadata; `limit` (default 20, max 100) and `offset` |
+| POST | `/memory` | Create memory |
+| PUT | `/memory/:id` | Update memory; optional `expectedVersion` rejects stale edits with 409, `changeReason` and `changedBy` annotate history |
+| DELETE | `/memory/:id` | Archive; optional `reason` and `supersededBy` query fields retain retirement context; `hard=true` purges history too |
+| POST | `/memory/search` | Semantic search |
+| GET | `/memory/categories` | List categories |
+| GET | `/memory/tags` | List tags |
+| GET | `/memory/timeline` | Timeline view data |
+| GET | `/memory/graph` | Graph visualization data |
+| GET | `/memory/stats` | Memory statistics |
+| POST | `/memory/link` | Link two memories |
+| POST | `/memory/consolidate` | Merge similar memories |
+| POST | `/memory/decay` | Apply importance decay (`decayRate` in (0, 0.02], default 0.01; else 400) |
+| DELETE | `/memory/expired` | Clear expired memories |
+| GET | `/memory/embeddings/status` | LM Studio connection status |
+
+### PM2 Standardization
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/standardize/analyze` | Analyze app for standardization |
+| POST | `/standardize/apply` | Apply standardization changes |
+| GET | `/standardize/template` | Get PM2 template reference |
+| POST | `/standardize/backup` | Create git backup |
+
+### Usage Metrics
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/usage` | Get usage statistics |
+| GET | `/usage/hourly` | Get hourly activity |
+
+### Eidoverse Worlds
+
+The PortOS-owned Eidoverse adapter is private and install-local. It stores its
+identity and projection recipe under `data/eidoverse/`, joins the separately
+installed Eidoverse runtime through its WebSocket protocol, and does not
+federate world records.
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/eidoverse/world/status` | Private world identity, CoS presence, projection recipe, setup, and storage boundary |
+| PUT | `/eidoverse/world/config` | Persist the world identity and deterministic resource projection recipe |
+| POST | `/eidoverse/world/presence` | Establish the install's persistent CoS agent presence |
+| POST | `/eidoverse/world/project` | Project current PortOS resources into the world using the saved recipe |
+| POST | `/eidoverse/world/augment` | Apply bounded, allowlisted world construction/role operations |
+| POST | `/eidoverse/world/say` | Send a bounded message as the PortOS CoS presence |
+| GET | `/eidoverse/world/foundations` | Local foundation ledger: ownership layer, provenance, derived lineage, any inheritance edge, and packaged promote candidates |
+| POST | `/eidoverse/world/foundations` | Record (or re-author) a local vernacular foundation — the layer is never caller-supplied; a body copied from an inherited foundation is refused with 409 unless it carries a `derivedFrom: { originInstanceId, foundationId }` edge naming it |
+| GET | `/eidoverse/world/foundations/:id` | One foundation record, with its derived provenance lineage |
+| POST | `/eidoverse/world/foundations/:id/candidate` | Run the agent-free resilience assay and package a promote candidate; a refusal returns 200 with its reasons |
+| POST | `/eidoverse/world/foundations/:id/promote` | Re-package and publish a foundation into this install's shared baseline population; a refusal returns 200 with its reasons and moves nothing |
+| POST | `/eidoverse/world/foundations/:id/withdraw` | Retract a promoted foundation: de-promotes it and tombstones the published fingerprint so peers that inherited it drop their copy on the next sweep; a refusal returns 200 with its reasons |
+| DELETE | `/eidoverse/world/foundations/:id` | Delete a record — `?originInstanceId=` addresses an inherited copy, a bare id this install's own work. A promoted local record is withdrawn first, so no peer's copy is orphaned |
+
+### Legacy OpenWorld / CyberCity
+
+Retired with the OpenWorld surface (#5890): there is no `/api/openworld` or
+`/api/city` HTTP API any more, so a client still calling the old snapshot or
+introspection endpoints gets a 404. Only the UI routes survive, as redirects to
+Eidoverse — see [OpenWorld](./features/openworld.md).
+
+### Brain (Second Brain)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/brain/capture` | Capture and classify thought (a text that is only a URL is filed straight to `/brain/links` — no classifier call — and returns the `link` alongside the inbox entry) |
+| GET | `/brain/inbox` | List inbox log with filters |
+| POST | `/brain/review/resolve` | Resolve needs_review item |
+| POST | `/brain/fix` | Correct misclassified item |
+| GET | `/brain/people` | List people |
+| POST | `/brain/people` | Create person |
+| GET | `/brain/people/:id` | Get person |
+| PUT | `/brain/people/:id` | Update person |
+| DELETE | `/brain/people/:id` | Delete person |
+| GET | `/brain/projects` | List projects |
+| POST | `/brain/projects` | Create project |
+| GET | `/brain/projects/:id` | Get project |
+| PUT | `/brain/projects/:id` | Update project |
+| DELETE | `/brain/projects/:id` | Delete project |
+| GET | `/brain/ideas` | List ideas |
+| POST | `/brain/ideas` | Create idea |
+| GET | `/brain/ideas/:id` | Get idea |
+| PUT | `/brain/ideas/:id` | Update idea |
+| DELETE | `/brain/ideas/:id` | Delete idea |
+| GET/PUT | `/brain/ideas/idealoom/settings` | Get or update local IdeaLoom integration settings (disabled by default) |
+| GET/POST | `/brain/ideas/idealoom/lists` | List or create machine-local IdeaLoom lists |
+| GET/PUT/DELETE | `/brain/ideas/idealoom/lists/:id` | Read, update, or delete a machine-local IdeaLoom list |
+| POST | `/brain/ideas/idealoom/import` | Explicitly import valid IdeaLoom Markdown from the configured Obsidian vault |
+| POST | `/brain/ideas/idealoom/sync` | Explicitly export all lists, or one list (`listId`), to the configured Obsidian vault. `recreateMissing: true` is the only way to rewrite a note deleted in the vault — automatic sync never sets it |
+| GET | `/brain/admin` | List admin tasks |
+| POST | `/brain/admin` | Create admin task |
+| GET | `/brain/admin/:id` | Get admin task |
+| PUT | `/brain/admin/:id` | Update admin task |
+| DELETE | `/brain/admin/:id` | Delete admin task |
+| GET | `/brain/digest/latest` | Get latest daily digest |
+| GET | `/brain/review/latest` | Get latest weekly review |
+| POST | `/brain/digest/run` | Trigger daily digest |
+| POST | `/brain/review/run` | Trigger weekly review |
+| GET | `/brain/settings` | Get Brain settings |
+| PUT | `/brain/settings` | Update Brain settings |
+| GET | `/brain/summary` | Get brain statistics summary |
+| GET | `/brain/reconcile/manifest` | Per-record parity manifest (`{ id, updatedAt, deleted }` per entity type) a peer audits against — ids and clocks only, no record bodies |
+| GET | `/brain/reconcile/parity` | Last stored parity report per peer (local read, no peer I/O) |
+| POST | `/brain/reconcile/parity` | Run the record-level parity audit — body `{ peerId? }`, omitted sweeps every federating peer |
+
+### Brain Thread Ingestion
+
+A Brain thread is a tracked topic, distinct from a message thread.
+
+`POST /api/brain/threads/sync` accepts `{ "appId": "example-app", "pinned": false }`.
+It explicitly discovers issues assigned to the saved managed app's GitHub account
+and creates threads for observed open issues. The optional `pinned` value applies
+only to new records. Use the install's normal API authentication.
+
+The response contains `observed`, `created`, `updated`, `skipped`, and
+`possiblyTruncated`. The query reads at most 200 assigned open/closed issues;
+`possiblyTruncated: true` means this is not a complete inventory. Missing issues
+never imply closure or unassignment. Only an observed closed issue updates its
+existing thread's `externalState`; the human's status, title, notes, next action,
+priority and detached links remain untouched. Deleted threads stay deleted.
+A failed or malformed tracker response returns 502 without changing threads.
+
+Managed app GitHub Issues tabs expose this action as **Track my assigned issues in Brain**,
+with a link to the Threads list. This endpoint does not enable background polling. GitLab/JIRA sources, scheduling,
+settings controls and source-closed UI prompts are tracked separately in #7664.
+
+### Brain Links
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/brain/links` | List saved links |
+| GET | `/brain/links/:id` | Get link details |
+| POST | `/brain/links` | Save a new link |
+| PUT | `/brain/links/:id` | Update link |
+| DELETE | `/brain/links/:id` | Delete link |
+| POST | `/brain/links/:id/clone` | Clone repository (github.com / gitlab.com) |
+| POST | `/brain/links/:id/pull` | Pull updates for cloned repo |
+| POST | `/brain/links/:id/open-folder` | Open cloned repo in file manager |
+| POST | `/brain/links/:id/scan` | Queue a read-only malware/risk scan of the clone |
+| POST | `/brain/links/:id/study` | Refresh the clone and queue a repo study with a caller-supplied brief |
+
+### File Uploads
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/uploads` | List all uploaded files |
+| POST | `/uploads` | Upload file (base64) |
+| GET | `/uploads/:filename` | Download/serve file |
+| DELETE | `/uploads/:filename` | Delete file |
+| DELETE | `/uploads?confirm=true` | Delete all files |
+
+### Task Attachments
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/attachments` | List all attachments |
+| POST | `/attachments` | Upload task attachment |
+| GET | `/attachments/:filename` | Download attachment |
+| DELETE | `/attachments/:filename` | Delete attachment |
+
+### Digital Twin
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/digital-twin/documents` | List all documents |
+| GET | `/digital-twin/documents/:id` | Get document content |
+| POST | `/digital-twin/documents` | Create document |
+| PUT | `/digital-twin/documents/:id` | Update document |
+| DELETE | `/digital-twin/documents/:id` | Delete document |
+| GET | `/digital-twin/export/formats` | List available export formats |
+| POST | `/digital-twin/feedback/recalculate` | Manual refresh: recompute the suggested per-document weight adjustments from feedback history (also described in [the twin feature doc](features/digital-twin.md)) |
+| POST | `/digital-twin/export` | Export the twin in the requested format |
+| GET | `/digital-twin/tests` | Get the behavioral test suite |
+| POST | `/digital-twin/tests/run` | Run behavioral tests against one provider/model |
+| GET | `/digital-twin/tests/history` | Get test run history |
+| GET | `/digital-twin/enrich/categories` | List enrichment categories |
+| POST | `/digital-twin/enrich/question` | Get the next enrichment question for a category |
+| POST | `/digital-twin/enrich/answer` | Submit an answer and update the twin documents |
+| GET | `/digital-twin/traits` | Get extracted personality traits |
+| POST | `/digital-twin/traits/analyze` | Analyze traits from documents |
+| GET | `/digital-twin/confidence` | Get confidence scores |
+| POST | `/digital-twin/confidence/calculate` | Calculate confidence |
+| GET | `/digital-twin/gaps` | Get enrichment recommendations |
+| GET | `/digital-twin/validate/completeness` | Get completeness validation |
+| POST | `/digital-twin/validate/contradictions` | Detect contradictions |
+| POST | `/digital-twin/import/spotify/browser/open` | Open Spotify privacy page in the managed browser |
+| POST | `/digital-twin/import/spotify/browser/import` | Request/read the Spotify browser export and analyze it |
+| POST | `/digital-twin/import/analyze` | Analyze external data import |
+| POST | `/digital-twin/import/save` | Save analyzed import as document |
+
+### Agent Personalities
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/agents/personalities` | List all agent personalities |
+| GET | `/agents/personalities/:id` | Get personality details |
+| POST | `/agents/personalities` | Create personality |
+| PUT | `/agents/personalities/:id` | Update personality |
+| DELETE | `/agents/personalities/:id` | Delete personality |
+| POST | `/agents/personalities/generate` | AI-generate personality |
+| POST | `/agents/personalities/:id/toggle` | Toggle personality active state |
+
+### Platform Accounts
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/agents/accounts` | List linked platform accounts |
+| GET | `/agents/accounts/:id` | Get account details |
+| POST | `/agents/accounts` | Link new account |
+| DELETE | `/agents/accounts/:id` | Unlink account |
+| POST | `/agents/accounts/:id/test` | Test account connection |
+| POST | `/agents/accounts/:id/claim` | Claim account for an agent |
+
+### Automation Schedules
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/agents/schedules` | List all schedules |
+| GET | `/agents/schedules/stats` | Get schedule statistics |
+| GET | `/agents/schedules/:id` | Get schedule details |
+| POST | `/agents/schedules` | Create schedule |
+| PUT | `/agents/schedules/:id` | Update schedule |
+| DELETE | `/agents/schedules/:id` | Delete schedule |
+| POST | `/agents/schedules/:id/toggle` | Toggle schedule on/off |
+| POST | `/agents/schedules/:id/run` | Run schedule immediately |
+
+### Agent Activity
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/agents/activity` | List activity logs |
+| GET | `/agents/activity/timeline` | Get activity timeline |
+| GET | `/agents/activity/agent/:agentId` | Get agent's activity |
+| GET | `/agents/activity/agent/:agentId/stats` | Get agent statistics |
+| POST | `/agents/activity/cleanup` | Clean up old activity logs |
+| GET | `/agents/activity/run-events` | Read the append-only CoS run lifecycle ledger (filters: `runId`, `agentId`, `taskId`, `kind`, `since`, `limit`) |
+| GET | `/agents/activity/run-events/stats` | Ledger generation sizes and the count + age retention bounds |
+| GET | `/agents/activity/run-events/projections` | Current run status derived by replaying the ledger |
+| GET | `/agents/activity/run-events/run/:id` | One run's projection plus the events behind it |
+| GET | `/agents/activity/run-events/reconcile` | Where the ledger and the durable run records disagree (filters: `runId`, `limit`) — read-only |
+| POST | `/agents/activity/run-events/reconcile` | Close the run records the ledger proves are finished; reports what it closed |
+
+### Human Actions
+
+Steps only the person can take (press Post, answer replies, upload a file), scheduled for a time.
+Each step becomes a Brain thread tagged `human-action` and `plan:<planKey>`, so it appears in
+Review Hub › Actions on its day, and an `action_due` notification fires at its due time on the
+machine that created it. Planning the same `planKey` again archives that plan's open steps and
+leaves finished ones alone. Agents outside PortOS call these with `node scripts/portos-api.js`.
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/human-actions` | List open steps, soonest first (`?planKey=`, `?includeDone=true`) |
+| POST | `/human-actions/plans` | Schedule `{ planKey, title, steps: [{ title, dueAt, instructions[], content[{label,text}], links[{label,url}], priority }] }` (`dueAt` needs a UTC offset) |
+| GET | `/music-video/:id/publish/promotion-plan` | A music video's open promotion steps |
+| POST | `/music-video/:id/publish/promotion-plan` | Plan its promotion with one provider call `{ goal?, audience?, days?, providerId?, model? }` and schedule the steps |
+
+### Notifications
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/notifications` | List notifications |
+| GET | `/notifications/count` | Get unread count |
+| GET | `/notifications/counts` | Get counts by type |
+| POST | `/notifications/:id/read` | Mark as read |
+| POST | `/notifications/read-all` | Mark all as read |
+| DELETE | `/notifications/:id` | Delete notification |
+| DELETE | `/notifications` | Clear all notifications |
+
+`GET /notifications` returns a bare JSON array of notification objects, newest
+first. It accepts the optional query parameters `type`, `unreadOnly=true`, and
+`limit`; the filters are applied before the result is returned. It does not
+return an `{ items, total }` envelope.
+
+```json
+[
+  {
+    "id": "notification-id",
+    "type": "agent_warning",
+    "title": "Example notification",
+    "description": "Example description",
+    "priority": "medium",
+    "timestamp": "2025-01-01T00:00:00.000Z",
+    "link": "/example",
+    "read": false,
+    "metadata": {}
+  }
+]
+```
+
+### Media (Audio/Video Capture)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/media/devices` | List available media devices |
+| GET | `/media/status` | Get capture status |
+| POST | `/media/start` | Start capture |
+| POST | `/media/stop` | Stop capture |
+| GET | `/media/video` | Get video stream |
+| GET | `/media/audio` | Get audio stream |
+
+### Browser Management
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/browser` | Get browser status |
+| GET | `/browser/config` | Get browser configuration |
+| PUT | `/browser/config` | Update browser configuration |
+| POST | `/browser/launch` | Launch browser instance |
+| POST | `/browser/stop` | Stop browser instance |
+| POST | `/browser/restart` | Restart browser instance |
+| POST | `/browser/navigate` | Navigate browser to URL |
+| GET | `/browser/health` | Get browser health status |
+| GET | `/browser/process` | Get browser process info |
+| GET | `/browser/pages` | Get open browser pages |
+| GET | `/browser/version` | Get browser version info |
+| GET | `/browser/logs` | Get browser logs |
+
+### Meatspace Genome
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/meatspace/genome` | Get genome summary |
+| POST | `/meatspace/genome/upload` | Upload 23andMe genome file |
+| POST | `/meatspace/genome/scan` | Scan curated SNP markers |
+| POST | `/meatspace/genome/search` | Search SNP by rsid |
+| POST | `/meatspace/genome/markers` | Save a marker (saved markers come back in the summary) |
+| PUT | `/meatspace/genome/markers/:id/notes` | Update marker notes |
+| DELETE | `/meatspace/genome/markers/:id` | Remove saved marker |
+| DELETE | `/meatspace/genome` | Delete all genome data |
+| GET | `/meatspace/genome/clinvar/status` | ClinVar sync status |
+| POST | `/meatspace/genome/clinvar/sync` | Download and index the ClinVar database |
+| POST | `/meatspace/genome/clinvar/scan` | Scan the genome against ClinVar |
+| DELETE | `/meatspace/genome/clinvar` | Delete ClinVar data |
+| GET | `/meatspace/genome/epigenetic` | Get epigenetic interventions |
+| GET | `/meatspace/genome/epigenetic/recommendations` | Get curated intervention recommendations |
+| GET | `/meatspace/genome/epigenetic/compliance` | Get compliance summary |
+| POST | `/meatspace/genome/epigenetic` | Add epigenetic intervention |
+| PUT | `/meatspace/genome/epigenetic/:id` | Update intervention |
+| DELETE | `/meatspace/genome/epigenetic/:id` | Delete intervention |
+| POST | `/meatspace/genome/epigenetic/:id/log` | Log intervention entry |
+
+### Moltworld Agent Tools
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/agents/tools/moltworld/join` | Join/move agent in world |
+| POST | `/agents/tools/moltworld/explore` | Get nearby entities |
+| POST | `/agents/tools/moltworld/build` | Place/remove blocks |
+| POST | `/agents/tools/moltworld/think` | Display thinking bubble |
+| POST | `/agents/tools/moltworld/say` | Send chat message |
+| GET | `/agents/tools/moltworld/status` | Get world status |
+
+### Decks
+
+Playing-card / tarot deck designer (Create → Decks). Decks are db-primary and federate to peers as record kind `deck` under the **Decks** sync category (off by default, per peer) — the deck ships with its full card roster, while the image/LLM pins and each card's in-flight render job stay machine-local. Card images live in the shared gallery, are referenced by filename, and ride the push asset manifest.
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/decks` | List decks with render completion |
+| POST | `/decks` | Create a deck (`name`, `kind` = `playing` \| `tarot`, optional `universeId`, `seedStyleFromUniverse`); mints the full card roster |
+| GET | `/decks/:id` | Deck + cards + completion |
+| PATCH | `/decks/:id` | Style guide (`styleNotes`, `influences`, `layoutPrompt`), universe link, render pin (`imageMode`/`imageModelId`), LLM pins |
+| DELETE | `/decks/:id` | Tombstone the deck so the deletion reaches subscribed peers; it disappears from reads immediately and the rows are hard-removed by the tombstone GC sweep (gallery images are kept) |
+| PATCH | `/decks/:id/cards/:cardId` | Edit a card (`prompt`, `negativePrompt`, `primaryImageRef`, `imageRefs`, `canonRef`) |
+| POST | `/decks/:id/analyze-sample` | Stateless vision analysis of a gallery image → proposed style guide + diff |
+| POST | `/decks/:id/samples` | Persist a reviewed sample; `adopt` applies the proposal in the same write |
+| DELETE | `/decks/:id/samples/:sampleId` | Remove a sample |
+| POST | `/decks/:id/generate-prompts` | Cast a linked universe onto the cards, then write subject prompts (`cardIds`, `overwrite`, `cast`, provider/model/effort) |
+| GET | `/decks/:id/generate-prompts/progress` | SSE stream of the prompt run (`start` → per-chunk `written`/`requested` → `complete`/`error`); subscribe before the POST, no-op when nobody listens |
+| POST | `/decks/:id/render` | Queue card renders through the media queue (`cardIds`, `onlyMissing`, `mode`, `model`, `seed`) |
+| POST | `/decks/:id/cards/:cardId/render` | Queue one card |
+
+## Route Domain Index
+
+Every mounted API prefix (see `server/index.js` for the authoritative list). Domains documented in detail above are omitted. Each prefix corresponds to a router in `server/routes/`.
+
+| Prefix | Domain |
+|--------|--------|
+| `/api/auth` | Optional password gate |
+| `/api/alerts` | System alerts |
+| `/api/avatar` | Avatar rendering/config |
+| `/api/system` | System health metrics |
+| `/api/system/capabilities` | Local hardware capabilities for model/provider selection |
+| `/api/system-resources` | System storage report, the tracked downloaded-model manifest, and AI-assisted cleanup triage |
+| `/api/remote-desktop`, `/remote-desktop` | PortDeck remote desktop session broker and viewer |
+| `/api/capabilities` | Feature capability flags |
+| `/api/agent-context` | Opt-in, loopback-only MCP context plus separately granted semantic PortOS actions |
+| `/api/workspace-contexts` | Workspace context management |
+| `/api/apps/:appId/reference-repos` | Per-app reference repos |
+| `/api/managed-visitor-admin` | Owner-only provisioning and revocation of scoped managed-app visitor credentials; [contract](features/managed-visitors.md) |
+| `/api/managed-visitors/v1` | Loopback managed visitor admission, observation, bounded actions and confirmed cleanup; requires a separate scoped app credential even when the instance password is off; [contract](features/managed-visitors.md) |
+| `/api/network-exposure` | Network exposure checks |
+| `/api/history` | User/system action history log |
+| `/api/commands` | Allowlisted command execution |
+| `/api/git` | Git operations for managed apps |
+| `/api/screenshots` | Screenshot capture |
+| `/api/search` | Global search |
+| `/api/rapid-reader` | Rapid reader library and Accelerando source cache |
+| `/api/palette` | ⌘K command palette manifest + actions |
+| `/api/dashboard/layouts` | Dashboard widget layouts |
+| `/api/dashboard/daily-actions` | Dashboard daily action tracking |
+| `/api/media/collections`, `/api/media/annotations`, `/api/media/sketches` | Media library collections/annotations/sketches |
+| `/api/client-errors` | Client-side error reporting |
+| `/api/backup` | Backup snapshots + restore |
+| `/api/legacy-export` | Legacy data export |
+| `/api/database` | Postgres introspection |
+| `/api/image-clean` | Image metadata cleaning |
+| `/api/eidoverse/world` | Private Eidoverse identity, projection, presence, augmentation, and chat adapter |
+| `/api/eidoverse/travel` | Eidoverse travel: destinations, departing to a peer world, and the federation visit/chat/leave hops (`/guest` is the one public endpoint) |
+| `/api/cos/gsd` | CoS GSD workflow |
+| `/api/feature-agents` | Feature agent runs |
+| `/api/feeds` | RSS/content feeds |
+| `/api/catalog` | Creative ingredients catalog |
+| `/api/tribe` | Tribe relationship graph |
+| `/api/user-actions` | Operator-action ledger — read-only log of what the user did (machine-local) |
+| `/api/notes` | Notes |
+| `/api/calendar` | Calendar integration |
+| `/api/messages` | Messages (email) integration |
+| `/api/digital-twin/social-accounts`, `/api/digital-twin/identity`, `/api/digital-twin/autobiography` | Digital-twin sub-domains |
+| `/api/meatspace` | MeatSpace (health, POST, genome) |
+| `/api/lmstudio`, `/api/local-llm` | Local LLM backends and the local runtime servers PortOS can start/stop (Ollama, LM Studio, `llama-server`, MTPLX, Slotstream — the last three as PM2 processes; `POST /api/local-llm/save-startup` is `pm2 save`), plus MTPLX's checkpoint catalog — `GET /api/local-llm/mtplx/models/search`, `POST .../models/pull` (byte progress on the `mtplx:download` socket event), `POST .../models/remove`. Slotstream lifecycle is `GET /api/local-llm/slotstream/status` (which also carries the curated checkpoint catalog), `POST .../start` (never downloads weights), `POST .../stop`, `POST .../install`, and `POST /api/local-llm/slotstream/models/download` — the separate, explicit action that fetches a checkpoint, with byte progress on the `slotstream:download` socket event. |
+| `/api/code-review` | Code review runs |
+| `/api/voice`, `/api/voice/public` | Voice assistant |
+| `/api/api-docs` | Generated HTTP/event catalogs, OpenAPI 3.0.3 documents, AsyncAPI 3 document, and the minimized semantic tool resource |
+| `/api/data` | Data manager/sync |
+| `/api/datadog`, `/api/jira`, `/api/github`, `/api/telegram` | External integrations |
+| `/api/health` | Apple Health metrics, ingest, and XML import |
+| `/api/human-actions` | Scheduled steps only the human can take, as Brain threads with reminders ([Human Actions](#human-actions)) |
+| `/api/insights` | Cross-domain insights |
+| `/api/instances`, `/api/sync`, `/api/peer-sync`, `/api/sharing` | Federation / peer sync (see [COMPANION_APP_API.md](./COMPANION_APP_API.md)) |
+| `/api/federation/media/v1` | Authenticated queued peer audio provider (see [FEDERATED_MEDIA_PROVIDERS.md](./FEDERATED_MEDIA_PROVIDERS.md)) |
+| `/api/federation/admin/v1` | Paired-peer administration preflights and temporary signed plans; execution remains unsupported (see [peer administration planning](./features/peer-administration.md)) |
+| `/api/peer-administration` | Operator-only per-peer/action planning grants and outbound previews (see [peer administration planning](./features/peer-administration.md)) |
+| `/api/mortalloom` | MortalLoom (iCloud-JSON sync precedent) |
+| `/api/review` | Review queue |
+| `/api/settings` | App settings |
+| `/api/update` | Self-update flow |
+| `/api/loops` | Loops |
+| `/api/character` | Character management |
+| `/api/tools` | Agent tool registry |
+| `/api/image-gen`, `/api/video-gen`, `/api/image-video/models` | Image/video generation |
+| `/api/devtools/video-download` | Video download |
+| `/api/video-timeline` | Video timeline editor |
+| `/api/html-composition` | Offline seekable HTML-to-MP4 rendering; [contract and job endpoints](./HTML_COMPOSITIONS.md) |
+| `/api/continuous-video` | Continuous-video episodes (script + bible → chained multi-clip generation) |
+| `/api/media-jobs` | Async media job queue |
+| `/api/creative-director` | Creative Director projects |
+| `/api/fableloom` | FableLoom interactive story generation |
+| `/api/music-video` | Music video projects; [one-prompt autonomous runs](./features/music-video-autonomous.md) at `/api/music-video/autonomous` |
+| `/api/music-video/character-styles` | Built-in character styles a project loads via `concept.characterStyleId`: list with each style's sheet prompt and this install's sheet (`GET /`), full style (`GET /:id`), set or clear the install's character sheet (`PUT /:id/reference` `{ imageId }`) |
+| `/api/mood-boards` | Mood boards |
+| `/api/decks` | Decks (playing-card / tarot designer) |
+| `/api/writers-room` | Writers Room |
+| `/api/universe-builder` | Universe Builder |
+| `/api/authors`, `/api/artists`, `/api/albums`, `/api/tracks`, `/api/music` | Music/creator catalogs |
+| `/api/music/supercollider` | Contained SuperCollider runtime status, setup and offline renders ([SUPERCOLLIDER.md](./SUPERCOLLIDER.md)) |
+| `/api/pipeline` | Series/comic pipeline |
+| `/api/conflict-journal` | Sync conflict journal |
+| `/api/importer` | Story importer |
+| `/api/story-builder` | Story Builder |
+| `/api/loras`, `/api/lora-datasets`, `/api/lora-training` | LoRA management/training |
+| `/sdapi/v1` | AUTOMATIC1111-compatible image generation surface (gated by `settings.imageGen.expose.a1111`) |
+| `/api/openclaw` | OpenClaw operator chat |
+| `/api/rounds` | Rounds (music + Morse training) |
+| `/api/ask` | Ask (LLM Q&A) |
+| `/api/quota-burn` | Quota-burn plan (ordered scheduled-task references + per-invocation overrides), its live status, the app/provider catalog its pickers read, manual runs, and re-arm. The referenced work itself is read from — and only ever edited through — `/api/cos/schedule` and `/api/cos/jobs`. |
+| `/api/timeline` | Human-activity timeline (day + events) |
+| `/api/games` | Game projects |
+| `/api/sprites` | Sprite catalog / export |
+| `/api/threejs-models` | Procedural Three.js models |
+| `/api/film-styles` | Read-only film style grammar catalog: picker list (`GET /`), full grammar record (`GET /:id`) and rendered prompt-section preview (`GET /:id/prompt?parts=motion,camera`) |
+| `/api/code-animation` | Code Animation: LLM-written briefs, prompt building, persistent jobs gallery, generated HTML retrieval, frame-exact MP4 export (`POST /:id/export` → HTML-composition media job), the vendored three.js modules the `three` renderer's preview inlines (`GET /vendor/three`; the export stages the same files, hashed, beside the page), portable source download (`GET /:id/package`), and data-only package validation (`POST /packages/validate`; [contract](CODE_ANIMATION_PACKAGES.md)) |
+| `/api/code-animation/execution` | Code Animation contained production execution: platform sandbox and lane readiness (`GET /`), operator-owned tool paths (`PUT /tools`, host control) and the on-demand adversarial containment check (`POST /probe`, host control) ([contract](CODE_ANIMATION_PACKAGES.md#contained-production-execution)) |
+| `/api/image-to-3d` | Image-to-3D conversion |
+| `/api/rigging` | Auto-skin rigging and animation retargeting for image-to-3D models |
+| `/api/privacy` | PII vault / trusted-org / broker opt-out |
+| `/api/shell` | Browser PTY shells |
+| `/api/iterm` | iTerm2 view capability status (`GET /status` → `{ state, detail }`); sessions themselves travel over the `iterm:*` socket events ([ITERM.md](./ITERM.md)) |
+| `/api/ports` | Port scan / allocation |
+| `/api/logs` | PM2 process logs |
+| `/api/detect` | App-repo detection |
+| `/api/scaffold` | App scaffolding |
+| `/api/usage` | Provider usage / quota |
+| `/api/daily-driver` | Daily-driver snapshot |
+| `/api/attachments` | Task / CoS file attachments |
+| `/api/autofix` | Autofixer metrics |
+| `/api/uploads` | Generic uploads |
+| `/api/agents` | Agent process management (personalities, accounts, schedules, activity, tools) |
+| `/api/agents/tools/moltworld`, `/api/agents/tools/moltworld/ws` | MoltWorld agent tools and WebSocket |
+| `/api/cos` | Chief of Staff |
+| `/api/memory` | Memory CRUD / search |
+| `/api/brain`, `/api/brain/import` | Brain (second brain) and document import |
+| `/api/media` | Media library |
+| `/api/imessage`, `/api/contacts`, `/api/signal`, `/api/beeper`, `/api/spotify`, `/api/youtube` | Personal-data ingest |
+| `/api/notifications` | Notification stream |
+| `/api/standardize` | App PM2 standardizer |
+| `/api/stacker-news`, `/api/x` | Social integrations |
+| `/api/model-personality` | LLM personality tests |
+| `/api/providers/comparison` | Selectable model inventory, sourced PortOS composite, and public evidence; POST `/import` merges researched observations (see [MODEL-COMPARISON.md](./MODEL-COMPARISON.md)) |
+| `/api/models/performance/task-benchmark` | Machine-local PortOS task benchmark history and configured-provider inventory; `POST /discover` and `POST /run` perform explicit user-requested actions |
+| `/api/browser` | Managed Chromium |
+| `/api/creative-commission` | Creative commissions |
+| `/api/midi-runtime` | MIDI runtime |
+| `/api/harnesses` | Coding-agent CLI/TUI harness lifecycle |
+
+## WebSocket Events
+
+Connect to Socket.IO at `http://localhost:5555`.
+
+The complete source-derived event list is visible in **API Explorer → Event API** and available at `GET /api/api-docs/asyncapi.json` as AsyncAPI 3. The examples below highlight common flows rather than serving as the exhaustive inventory.
+
+### Log Streaming
+
+```javascript
+// Subscribe to process logs
+socket.emit('logs:subscribe', { processName: 'portos-server', lines: 100 });
+
+// Receive log lines
+socket.on('logs:line', ({ processName, line }) => {
+  console.log(`[${processName}] ${line}`);
+});
+
+// Unsubscribe
+socket.emit('logs:unsubscribe', { processName: 'portos-server' });
+```
+
+### Error Notifications
+
+Server errors are broadcast to all connected sockets — no subscription handshake is needed.
+
+```javascript
+// Receive error events
+socket.on('error:occurred', (error) => {
+  console.error('Server error:', error.message, error.code);
+});
+```
+
+### Chief of Staff Events
+
+```javascript
+// Join the CoS room to receive agent lifecycle events
+socket.emit('cos:subscribe');
+
+socket.on('cos:agent:spawned', (agent) => {
+  console.log('Agent spawned:', agent.id, agent.task);
+});
+
+socket.on('cos:agent:updated', (agent) => {
+  console.log('Agent updated:', agent.id, agent.status);
+});
+
+socket.on('cos:agent:completed', (agent) => {
+  console.log('Agent completed:', agent.id, agent.success);
+});
+
+socket.on('cos:agent:output', ({ agentId, lines }) => {
+  console.log('Agent output:', agentId, lines);
+});
+```
+
+### Memory Events
+
+```javascript
+socket.on('memory:created', (memory) => {
+  console.log('Memory created:', memory.id);
+});
+
+socket.on('memory:updated', (memory) => {
+  console.log('Memory updated:', memory.id);
+});
+
+socket.on('memory:deleted', ({ id }) => {
+  console.log('Memory deleted:', id);
+});
+```
+
+### App Detection (Streaming)
+
+```javascript
+// Start streaming detection
+socket.emit('detect:start', { path: '/path/to/repo' });
+
+// Receive discovery steps
+socket.on('detect:step', (step) => {
+  console.log('Discovered:', step.field, step.value);
+});
+
+// Detection complete
+socket.on('detect:complete', (appData) => {
+  console.log('Detection complete:', appData);
+});
+```
+
+### Shell Terminal
+
+> **Security**: The shell WebSocket API provides full terminal access as the PortOS process user. It relies on PortOS's network-level access control (see [Security Model](#security-model)) — do not expose the PortOS server to untrusted networks.
+
+```javascript
+// Start a shell session — the server assigns the id and replies with shell:started
+socket.emit('shell:start', {});
+socket.on('shell:started', ({ sessionId }) => console.log('session', sessionId));
+
+// Send input to shell. Submit with `\r` (the byte Enter sends), never `\n` — cmd.exe
+// under Windows ConPTY ignores LF and the line is typed but never executed.
+socket.emit('shell:input', { sessionId, data: 'ls -la\r' });
+
+// Receive shell output
+socket.on('shell:output', ({ sessionId, data }) => {
+  console.log(data); // Terminal output
+});
+
+// Change directory — send the PATH, not a command. The server renders the `cd` for
+// the shell this session runs (`cd /d "…"` on cmd.exe, Set-Location on PowerShell).
+socket.emit('shell:cd', { sessionId, path: '/path/to/app' });
+
+// Resize terminal
+socket.emit('shell:resize', { sessionId, cols: 120, rows: 40 });
+
+// Stop shell session
+socket.emit('shell:stop', { sessionId });
+```
+
+### iTerm2 Sessions
+
+The Shell page's iTerm2 view uses its own `iterm:*` events, never the `shell:*` ones — see [ITERM.md](./ITERM.md). There is no start, stop or resize: iTerm2 owns its sessions' lifecycle and size.
+
+`iterm:input` types exact bytes into a live host terminal and can run commands with the host user's privileges. Treat access to the PortOS socket as host-command access; the iTerm2 view adds no command allowlist. PortOS authentication and HTTPS are optional and off by default, so keep the instance on its private network and use a strong, unique instance password.
+
+```javascript
+socket.emit('iterm:list'); // subscribe; replies (and re-broadcasts) iterm:sessions
+socket.on('iterm:sessions', ({ status, sessions }) => {}); // status.state, [{ id: 'iterm-<uuid>', windowIndex, tabIndex, paneIndex, label, cwd, cols, rows, … }]
+socket.emit('iterm:attach', { id }); // → iterm:attached { id, cols, rows, bufferedOutput } | iterm:error
+socket.on('iterm:output', ({ id, data }) => {}); // one full-screen ANSI repaint per frame
+socket.emit('iterm:input', { id, data: 'ls\r' }); // exact bytes, delivered in order
+socket.on('iterm:exit', ({ id }) => {}); // session closed or iTerm2 went away
+socket.emit('iterm:detach', { id });
+socket.emit('iterm:unlist');
+```
+
+### Provider Status
+
+```javascript
+// Provider availability changed
+socket.on('provider:status:changed', ({ providerId, status, reason }) => {
+  console.log(`Provider ${providerId}: ${status}`, reason);
+});
+```
+
+## Request Examples
+
+### Register an App
+
+```bash
+curl -X POST http://localhost:5555/api/apps \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "My App",
+    "repoPath": "/path/to/repo",
+    "uiPort": 3000,
+    "apiPort": 3001,
+    "pm2ProcessNames": ["myapp-server", "myapp-client"]
+  }'
+```
+
+### Execute AI Run
+
+```bash
+curl -X POST http://localhost:5555/api/runs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "providerId": "claude-code",
+    "prompt": "List all files in the current directory",
+    "workspacePath": "/path/to/workspace"
+  }'
+```
+
+### Get PM2 Process Logs
+
+```bash
+curl http://localhost:5555/api/logs/portos-server?lines=50
+```
+
+## Error Responses
+
+All errors return JSON with consistent structure:
+
+```json
+{
+  "error": "Error message",
+  "code": "ERROR_CODE",
+  "timestamp": 1704067200000,
+  "context": {}
+}
+```
+
+When a route throws without naming a `code`, it is derived from the HTTP status
+(`ERROR_CODES_BY_STATUS` in `server/lib/errorHandler.js`, the same table the
+agent-tool resource advertises):
+
+| Status | Code | Meaning |
+|--------|------|---------|
+| 400 | `BAD_REQUEST` | Malformed request |
+| 401 | `UNAUTHORIZED` | Authentication missing or rejected |
+| 403 | `FORBIDDEN` | Refused, including a shell command outside the allowlist |
+| 404 | `NOT_FOUND` | Resource not found |
+| 409 | `CONFLICT` | State conflict (duplicate, stale, or already running) |
+| 422 | `VALIDATION_ERROR` | Request understood but invalid |
+| 500 | `INTERNAL_ERROR` | Server error (also the fallback for any unlisted status) |
+| 502 | `BAD_GATEWAY` | An upstream service failed |
+| 503 | `SERVICE_UNAVAILABLE` | A dependency is not available |
+
+Zod request validation (`validateRequest`) answers `400` with
+`VALIDATION_ERROR` and the field errors in `context.details`. Domain routes may
+also set their own code (for example `MERGE_METHOD_NOT_ALLOWED`) on top of the
+status — branch on the status first, and treat an unfamiliar `code` as a
+refinement of it.
+
+
+### Catalog scrap graph commits
+
+An optional UUID `operationKey` makes a reviewed submission retry-safe. Reuse it for retries with the same accepted content, relationships, scrap, universe and role: the server returns the original ingredient response without creating another batch, including after restart or concurrent requests. Reusing it with different input returns HTTP 409. Embedding output is excluded from request identity. Mint a new key for an intentional new submission; callers omitting it keep legacy behavior. Receipts remain local to the accepting instance and persist with its database.
+
+`POST /api/catalog/scraps/:id/commit` accepts up to 200 `accepted` entries and an optional `relationships` array (at most 1,000 edges). Each explicit edge has `fromDraftId`, `toDraftId`, `kind`, and nonempty `evidence` (at most 400 characters). When the array is present, every accepted entry needs a unique nonempty `draftId` (at most 120 characters); both endpoints must be accepted IDs and self-edges are rejected. Draft IDs stay outside persisted payloads. Renaming or reordering entries does not change endpoint identity. An optional `creativeNoteIds` array (at most 200 Brain inbox note GUIDs) names the creative notes the scrap was built from; the commit stamps them consumed in the same request — including when `operationKey` replays an earlier commit — so a reload between the commit and any follow-up call cannot leave them re-sendable.
+
+The server validates the graph before embedding or writing. Duplicate directed tuples create one edge, retaining every distinct evidence passage in the source ingredient's existing `payload.evidence` field with the kind and target name. Bible entries keep their evidence arrays (20 passages, 500 characters each including the contextual prefix); light entries keep string evidence, or arrays when supplied. Overflow is rejected explicitly, never truncated. The existing 200KB payload limit still applies after evidence enrichment.
+
+`relationships: []` means no edges. Omitting `relationships` preserves legacy all-pairs `related-to` links for batches of 2–25 entries. Explicit graphs work above that legacy batch limit. Supported kinds include `owned-by` (inverse: Owns) and `used-by` (inverse: Uses); using an object does not establish ownership. The caller must supply only grounded, accepted facts.
+
+Ingredients, source links, optional `universeRef` bindings, and edges commit in one transaction. No existing records are backfilled. The relation wire shape and existing evidence fields are unchanged; unknown relation kinds continue to round-trip through peer sync. Structured extraction and relationship review are tracked separately under #7895.
+
+### Canon description repair
+
+`POST /api/universe-builder/:id/canon/backfill-descriptions` repairs legacy canon
+entries using their existing image prompts. It accepts no body and returns
+`{ universe, report }`, where `report` includes `filled`, `byKind`
+(`character`, `place`, `object`), `alreadyDescribed`, `missingPrompt`, and
+`skippedLocked`. It fills blank character `physicalDescription` or place/object
+`description` fields, trims and bounds prompt text, and preserves authored
+(including legacy character) descriptions and locked entries. No AI provider is
+called. The normal instance authentication gate applies; missing universes return
+404. Migration 422 applies this repair once across live universes on upgrade;
+this endpoint remains available for explicit agent or operator repairs afterward.

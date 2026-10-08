@@ -1,0 +1,293 @@
+import { describe, expect, it } from 'vitest';
+import { createDefaultPersistentMindState, normalizePersistentMindState } from './persistentMind.js';
+import { publicPersistentMindState } from './persistentMindPublic.js';
+import { PROVIDER_USAGE_LIMIT_PAUSE_REASON } from './persistentMindUsageLimit.js';
+import { contextBudgetPauseReasonFrom } from './persistentMindContextBudget.js';
+
+const selection = {
+  id: 'deep-think',
+  label: 'Deep think',
+  providerId: 'example-provider',
+  model: 'example-model',
+  effort: 'high',
+};
+
+const stateWithActiveTemporaryTurn = (overrides = {}) => normalizePersistentMindState({
+  ...createDefaultPersistentMindState(),
+  enabled: true,
+  started: true,
+  status: 'thinking',
+  activeTurn: {
+    id: 'turn-9',
+    startedAt: '2026-09-01T00:00:00.000Z',
+    heartbeatAt: '2026-09-01T00:00:05.000Z',
+    providerId: 'example-provider',
+    model: 'example-model',
+    effort: 'high',
+    wake: {
+      kind: 'message',
+      message: {
+        id: 'message-9',
+        text: 'Think harder about this one.',
+        thinkingPresetId: 'deep-think',
+        thinkingPreset: selection,
+        createdAt: '2026-09-01T00:00:00.000Z',
+      },
+    },
+  },
+  ...overrides,
+});
+
+describe('public persistent mind state', () => {
+  it('projects the scheduled wake without exposing queued message content', () => {
+    const nextWakeAt = new Date(Date.now() + 15 * 60_000).toISOString();
+    const projected = publicPersistentMindState({
+      ...createDefaultPersistentMindState(),
+      enabled: true,
+      started: true,
+      status: 'waiting',
+      queuedMessages: [],
+      selfWake: {
+        id: 'wake-1',
+        kind: 'self',
+        reason: 'scheduled reflection',
+        sourceTurnId: 'turn-1',
+        createdAt: new Date().toISOString(),
+        notBefore: nextWakeAt,
+      },
+    });
+
+    expect(projected.nextWakeAt).toBe(nextWakeAt);
+    expect(projected).not.toHaveProperty('selfWake');
+    expect(projected).not.toHaveProperty('queuedMessages');
+  });
+
+  it('reports the route a temporary session is actually running on, not the home profile', () => {
+    const projected = publicPersistentMindState(stateWithActiveTemporaryTurn());
+
+    expect(projected.activeRoute).toEqual({
+      providerId: 'example-provider',
+      model: 'example-model',
+      effort: 'high',
+    });
+    expect(projected.activeThinkingSession).toEqual({
+      presetId: 'deep-think',
+      label: 'Deep think',
+      providerId: 'example-provider',
+      model: 'example-model',
+      effort: 'high',
+      resolvable: true,
+    });
+    // The message body itself must never ride the status payload.
+    expect(JSON.stringify(projected)).not.toContain('Think harder');
+  });
+
+  it('marks a session whose stored selection no longer validates as unresolvable', () => {
+    // `sanitizeMessage` keeps a selected-but-unvalidatable message as a durable
+    // record with a null selection, which is exactly the revoked-mid-flight case
+    // the resolver refuses. The page must say so instead of rendering a route.
+    const state = normalizePersistentMindState({
+      ...createDefaultPersistentMindState(),
+      enabled: true,
+      started: true,
+      status: 'thinking',
+      activeTurn: {
+        id: 'turn-10',
+        startedAt: '2026-09-01T00:00:00.000Z',
+        heartbeatAt: '2026-09-01T00:00:05.000Z',
+        providerId: 'example-provider',
+        model: 'example-model',
+        effort: 'high',
+        wake: {
+          kind: 'message',
+          message: {
+            id: 'message-10',
+            text: 'Selection was revoked.',
+            thinkingPresetId: 'deep-think',
+            thinkingPreset: { ...selection, effort: 'not-a-level' },
+            createdAt: '2026-09-01T00:00:00.000Z',
+          },
+        },
+      },
+    });
+
+    const projected = publicPersistentMindState(state);
+
+    expect(projected.activeThinkingSession).toMatchObject({
+      presetId: 'deep-think',
+      resolvable: false,
+      providerId: null,
+      model: null,
+    });
+  });
+
+  it('leaves the temporary-session fields null for an ordinary wake', () => {
+    const projected = publicPersistentMindState({
+      ...createDefaultPersistentMindState(),
+      enabled: true,
+      started: true,
+      status: 'waiting',
+    });
+
+    expect(projected.activeRoute).toBeNull();
+    expect(projected.activeThinkingSession).toBeNull();
+    expect(projected.queuedTemporaryMessageCount).toBe(0);
+  });
+
+  it('counts only the queued messages that carry a borrowed route', () => {
+    const state = normalizePersistentMindState({
+      ...createDefaultPersistentMindState(),
+      enabled: true,
+      started: true,
+      status: 'waiting',
+      queuedMessages: [
+        { id: 'ordinary', text: 'no preset', createdAt: '2026-09-01T00:00:00.000Z' },
+        {
+          id: 'borrowed',
+          text: 'with preset',
+          thinkingPresetId: 'deep-think',
+          thinkingPreset: selection,
+          createdAt: '2026-09-01T00:00:01.000Z',
+        },
+      ],
+    });
+
+    const projected = publicPersistentMindState(state);
+
+    expect(projected.queuedMessageCount).toBe(2);
+    expect(projected.queuedTemporaryMessageCount).toBe(1);
+  });
+
+  it('distinguishes a quota autopause from a pause the user asked for', () => {
+    const quota = publicPersistentMindState(normalizePersistentMindState({
+      ...createDefaultPersistentMindState(),
+      enabled: true,
+      started: true,
+      status: 'paused',
+      pauseReason: PROVIDER_USAGE_LIMIT_PAUSE_REASON,
+      nextEligibleWakeAt: '2026-09-01T00:30:00.000Z',
+    }));
+    const byUser = publicPersistentMindState(normalizePersistentMindState({
+      ...createDefaultPersistentMindState(),
+      enabled: true,
+      started: true,
+      status: 'paused',
+      pauseReason: 'Paused from the Mind page',
+    }));
+
+    expect(quota.usageLimited).toBe(true);
+    expect(quota.pauseReason).toBe('Provider usage limit reached');
+    expect(quota.nextEligibleWakeAt).toBe('2026-09-01T00:30:00.000Z');
+    expect(byUser.usageLimited).toBe(false);
+    expect(byUser.pauseReason).toBe('Paused by user');
+    expect(publicPersistentMindState(createDefaultPersistentMindState()).usageLimited).toBe(false);
+  });
+
+  it('still reveals no raw pause text for a quota autopause', () => {
+    const projected = publicPersistentMindState(normalizePersistentMindState({
+      ...createDefaultPersistentMindState(),
+      status: 'paused',
+      pauseReason: PROVIDER_USAGE_LIMIT_PAUSE_REASON,
+      lastError: 'provider said: key sk-EXAMPLE exceeded your current quota',
+    }));
+
+    expect(projected.lastError).toBe('The last wake did not complete; local diagnostics have details');
+    expect(JSON.stringify(projected)).not.toContain('sk-EXAMPLE');
+  });
+
+  it('surfaces an actionable context-budget pauseReason with token counts instead of the vague provider copy', () => {
+    const raw = 'Ollama (qwen3:8b): known 12288-token context is below the 15104-token request budget';
+    const projected = publicPersistentMindState(normalizePersistentMindState({
+      ...createDefaultPersistentMindState(),
+      enabled: true,
+      started: true,
+      status: 'interrupted',
+      pauseReason: raw,
+      lastError: raw,
+      failureCount: 3,
+    }));
+
+    expect(projected.contextBudgetBlocked).toBe(true);
+    expect(projected.pauseReason).toMatch(/12288/);
+    expect(projected.pauseReason).toMatch(/15104/);
+    expect(projected.pauseReason).toMatch(/numCtx/i);
+    expect(projected.pauseReason).not.toBe('Provider unavailable or wake failed');
+    expect(projected.lastError).toBe(projected.pauseReason);
+    expect(projected.usageLimited).toBe(false);
+    expect(JSON.stringify(projected)).not.toContain('sk-');
+  });
+
+  it('does not blame the user when a context-budget failure was stored as a pause', () => {
+    const reason = contextBudgetPauseReasonFrom('known 8192-token context is below the 20000-token request budget');
+    const projected = publicPersistentMindState(normalizePersistentMindState({
+      ...createDefaultPersistentMindState(),
+      status: 'paused',
+      pauseReason: reason,
+      lastError: reason,
+    }));
+
+    expect(projected.contextBudgetBlocked).toBe(true);
+    expect(projected.pauseReason).toBe(reason);
+    expect(projected.pauseReason).not.toBe('Paused by user');
+  });
+
+  it('passes through a non-user pause reason instead of blaming the user', () => {
+    const projected = publicPersistentMindState(normalizePersistentMindState({
+      ...createDefaultPersistentMindState(), enabled: true, started: true,
+      status: 'paused',
+      pauseReason: 'Agent API pause: OOM safety',
+    }));
+    expect(projected.pauseReason).toBe('Agent API pause: OOM safety');
+    expect(projected.lastError).toBeNull();
+  });
+
+  it('labels the Mind page and default pauses as user pauses', () => {
+    for (const pauseReason of ['Paused by user', 'Paused from Mind page', 'Paused from the Mind page']) {
+      const projected = publicPersistentMindState(normalizePersistentMindState({
+        ...createDefaultPersistentMindState(), enabled: true, started: true, status: 'paused', pauseReason,
+      }));
+      expect(projected.pauseReason).toBe('Paused by user');
+    }
+  });
+
+  it('scrubs credential-looking text from a passed-through pause reason', () => {
+    const projected = publicPersistentMindState(normalizePersistentMindState({
+      ...createDefaultPersistentMindState(), enabled: true, started: true,
+      status: 'paused',
+      pauseReason: 'Held refusal: key=sk-EXAMPLE1234 rejected',
+    }));
+    expect(projected.pauseReason).toContain('Held refusal');
+    expect(JSON.stringify(projected)).not.toContain('sk-EXAMPLE');
+  });
+
+  it('shows both the pause reason and a coarse last-wake failure', () => {
+    const killed = publicPersistentMindState(normalizePersistentMindState({
+      ...createDefaultPersistentMindState(), enabled: true, started: true,
+      status: 'paused',
+      pauseReason: 'Agent API pause: OOM safety',
+      lastError: 'codex exited with SIGKILL; token=abc123',
+    }));
+    expect(killed.pauseReason).toBe('Agent API pause: OOM safety');
+    expect(killed.lastError).toMatch(/killed \(possibly out of memory\)/);
+    expect(JSON.stringify(killed)).not.toContain('abc123');
+
+    const canceled = publicPersistentMindState(normalizePersistentMindState({
+      ...createDefaultPersistentMindState(), enabled: true, started: true,
+      status: 'paused',
+      pauseReason: 'Paused from Mind page',
+      lastError: 'API run canceled',
+    }));
+    expect(canceled.pauseReason).toBe('Paused by user');
+    expect(canceled.lastError).toBe('The last wake was canceled before it completed');
+  });
+
+  it('does not render a legacy pause copied into lastError as a wake failure', () => {
+    const projected = publicPersistentMindState(normalizePersistentMindState({
+      ...createDefaultPersistentMindState(), enabled: true, started: true,
+      status: 'paused',
+      pauseReason: 'Paused from Mind page',
+      lastError: 'Paused from Mind page',
+    }));
+    expect(projected.lastError).toBeNull();
+  });
+});

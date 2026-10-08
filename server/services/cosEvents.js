@@ -1,0 +1,40 @@
+/**
+ * CoS Events Module
+ *
+ * Centralized event emitter for Chief of Staff services.
+ * Separated to avoid circular dependencies between cos.js and other modules.
+ */
+
+import { EventEmitter } from 'events';
+
+// Event emitter for CoS events
+export const cosEvents = new EventEmitter();
+cosEvents.setMaxListeners(60);
+
+/**
+ * Emit a log event for UI display
+ * @param {string} level - Log level: 'info', 'warn', 'error', 'success', 'debug'
+ * @param {string} message - Log message
+ * @param {Object} data - Additional data to include in log entry. A `stack`
+ *   string is also appended to the console line (#7549), so a caller reporting
+ *   a caught error doesn't need a second console.error call to keep it.
+ * @param {string} prefix - Optional prefix for console output (e.g., 'SelfImprovement')
+ */
+export function emitLog(level, message, data = {}, prefix = '') {
+  const logEntry = {
+    timestamp: new Date().toISOString(),
+    level,
+    message,
+    ...data
+  };
+  // Debug messages go to socket only (UI), not console — set COS_LOG_LEVEL=debug to include them
+  if (level !== 'debug' || process.env.COS_LOG_LEVEL === 'debug') {
+    const emoji = level === 'error' ? '❌' : level === 'warn' ? '⚠️' : level === 'success' ? '✅' : level === 'debug' ? '🔍' : 'ℹ️';
+    const prefixStr = prefix ? ` ${prefix}` : '';
+    const logFn = level === 'error' ? console.error : level === 'warn' ? console.warn : console.log;
+    const consoleArgs = [`${emoji}${prefixStr} ${message}`];
+    if (data?.stack) consoleArgs.push(data.stack);
+    logFn(...consoleArgs);
+  }
+  cosEvents.emit('log', logEntry);
+}

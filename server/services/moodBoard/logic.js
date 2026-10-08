@@ -1,0 +1,571 @@
+/**
+ * Mood Board — pure record transforms (issue #911).
+ *
+ * Storage-agnostic mutation semantics, mirroring the creativeDirector
+ * projectsLogic split: each function takes a plain board record and returns the
+ * next record (or throws a ServerError on a validation failure), leaving the
+ * load/persist to the db module. A board holds a small bounded `items[]` inline
+ * — image refs (media-key or external URL) or text notes — that feed the Create
+ * suite. No file backend exists (mood boards are db-primary, local-only), so
+ * this module has a single consumer (db.js); it stays a separate pure module so
+ * the transforms are unit-testable without a live database.
+ */
+
+import { randomUUID } from 'crypto';
+import { ServerError } from '../../lib/errorHandler.js';
+import { compareNewerWins } from '../../lib/lwwTimestamp.js';
+import { sanitizeSoftDeleteFields } from '../../lib/syncWire.js';
+import { localImageFilename, assetBasename } from '../../lib/localImageFilename.js';
+import { isVideoItemMediaKey } from '../../lib/moodBoardValidation.js';
+import { isStr } from '../../lib/textUtils.js';
+
+// Bound the inline items[] so a single board row's JSONB can't grow without
+// limit (a board is loaded/serialized whole on every read/write). Far above any
+// realistic hand-curated board. Enforced in addItem (the add route surfaces the
+// BOARD_FULL error); the item schema validates a single item, not the count.
+export const MAX_ITEMS_PER_BOARD = 500;
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+// Build a fresh board record from a validated create input. `id`/`now` are
+// injected by the caller (db.js) so this stays pure and testable.
+export function buildBoardRecord(input, { id, now = nowIso() } = {}) {
+  return {
+    id,
+    name: input.name,
+    description: input.description ?? '',
+    items: [],
+    createdAt: now,
+    updatedAt: now,
+    // Soft-delete / LWW tombstone trio (#1564) — boards federate across peers
+    // via the per-record push pipeline (record kind `moodBoard`, sync category
+    // `moodBoards`), so a delete is a tombstone the merge keeps an out-of-date
+    // peer from resurrecting. Mirrors the creativeDirector project record.
+    deleted: false,
+    deletedAt: null,
+  };
+}
+
+/**
+ * Normalize a raw board record into the canonical stored shape for a sync
+ * round-trip. Returns null for a non-object or a record without a usable id
+ * (mirrors `sanitizeProjectForSync`'s "drop on the floor" contract so a
+ * malformed peer payload can't land). The board body (name/description/items)
+ * passes through verbatim — it is all app-authored data — while the LWW key
+ * (`updatedAt`) and the soft-delete trio are normalized so the wire/hash shape
+ * is stable regardless of on-disk key position.
+ */
+export function sanitizeBoardForSync(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  if (!isStr(raw.id) || !raw.id) return null;
+  const createdAt = isStr(raw.createdAt) ? raw.createdAt : new Date().toISOString();
+  const updatedAt = isStr(raw.updatedAt) ? raw.updatedAt : createdAt;
+  const { deleted, deletedAt } = sanitizeSoftDeleteFields(raw);
+  return { ...raw, createdAt, updatedAt, deleted, deletedAt };
+}
+
+/**
+ * LWW merge decision for one incoming board record against the local copy —
+ * mirrors `mergeProjectRecord` (creativeDirector/projectsLogic.js):
+ *   - remote sanitized here (drop-on-floor on a malformed payload → `next: null`).
+ *   - No local counterpart → insert the remote verbatim (`inserted: true`).
+ *   - Both present → newer `updatedAt` wins (`compareNewerWins`: epoch-ms,
+ *     unparseable-loses, tie → local). Tombstones ride the same path.
+ * Returns `{ next, inserted, remoteWins, changed }`; `changed` is false when the
+ * winner is byte-identical to local. The whole record is LWW-overwritten (no
+ * field-union), so it is hashed in full by `contentHashForRecord`.
+ */
+export function mergeBoardRecord(local, remoteRaw) {
+  const remote = sanitizeBoardForSync(remoteRaw);
+  if (!remote) return { next: null, inserted: false, remoteWins: false, changed: false };
+  if (!local) return { next: remote, inserted: true, remoteWins: true, changed: true };
+  const remoteWins = compareNewerWins(remote.updatedAt, local.updatedAt);
+  const next = remoteWins ? remote : local;
+  const changed = JSON.stringify(next) !== JSON.stringify(local);
+  return { next, inserted: false, remoteWins, changed };
+}
+
+// Served-asset dir prefix → peer-sync asset-manifest `kind`. A board item's
+// `imageUrl` can point at any same-origin app-path image the media UI surfaces:
+// gallery renders (`/data/images/`) AND character/canon reference sheets
+// (`/data/image-refs/`) — synthetic sources like `canon-sheet:`/`noun:` aren't
+// valid media-keys, so PinToMoodBoardMenu pins them as an `imageUrl` only (their
+// `previewUrl` is the `/data/image-refs/...` served path). Both dirs are
+// federated asset kinds (see directoryForAssetKind in peerSync.js), so both must
+// be advertised in the manifest or the receiver stores a board item pointing at
+// a missing local file. Mirrors the prefix vocabulary of directoryForAssetKind.
+const APP_IMAGE_URL_PREFIXES = Object.freeze([
+  ['/data/images/', 'image'],
+  ['/data/image-refs/', 'image-ref'],
+]);
+
+/**
+ * Resolve a board item's app-path `imageUrl` to `{ kind, filename }` so the
+ * peer-sync asset pipeline can hash + transfer the bytes via the right dir.
+ * Returns null for an empty/non-string value, an external URL (`http(s)://…`,
+ * `data:`, `blob:`), or any absolute path outside the served-asset dirs above —
+ * the receiver resolves those itself. A bare/relative ref (no leading `/`) is
+ * treated as a gallery image filename (legacy shape). A media-key reference
+ * (`image:<ref>`) is handled separately by the manifest builder (it carries the
+ * bare ref directly); this covers only the `imageUrl` pointer.
+ */
+export function imageUrlToAppAsset(imageUrl) {
+  // Gallery images (the `/data/images/` mount or a bare/relative legacy ref) and
+  // every rejection — empty/non-string, external URL (`http(s)://…`/`data:`/
+  // `blob:`), and any other absolute path — are exactly the shared resolver's
+  // contract, so delegate to it instead of re-deriving them here.
+  const galleryFilename = localImageFilename(imageUrl);
+  if (galleryFilename) return { kind: 'image', filename: galleryFilename };
+  // localImageFilename returned null: external/empty (nothing to ship) or a
+  // non-gallery absolute path. The only served-asset dir it doesn't cover is
+  // image-refs — resolve that here, sharing the basename primitive.
+  if (!isStr(imageUrl)) return null;
+  const url = imageUrl.trim();
+  for (const [prefix, kind] of APP_IMAGE_URL_PREFIXES) {
+    if (kind === 'image') continue; // gallery is handled by localImageFilename above
+    if (url.startsWith(prefix)) {
+      const filename = assetBasename(url.slice(prefix.length));
+      return filename ? { kind, filename } : null;
+    }
+  }
+  return null; // some other absolute path → not a served gallery asset
+}
+
+/**
+ * An image item's LOCAL asset as `{ kind: 'image'|'image-ref', filename }` —
+ * from its `image:<file>` media key or an app-path `imageUrl` — or null for
+ * text/video items and external pins. The one rule for "which file on this
+ * install is this pin", for callers that hand board images to a model.
+ */
+export function boardItemLocalImage(item) {
+  if (item?.type !== 'image') return null;
+  if (isStr(item.mediaKey) && item.mediaKey.startsWith('image:')) {
+    const filename = assetBasename(item.mediaKey.slice('image:'.length));
+    return filename ? { kind: 'image', filename } : null;
+  }
+  return imageUrlToAppAsset(item.imageUrl);
+}
+
+// Stored shape of the board's composite style prompt. Absent optionals become
+// explicit nulls; `composedAt` is stamped when the writer didn't send one.
+// `null` clears the style (the poster render has nothing to pin to).
+function normalizeBoardStyle(style, now = nowIso()) {
+  if (!style) return null;
+  return {
+    prompt: style.prompt,
+    negativePrompt: style.negativePrompt ?? null,
+    rationale: style.rationale ?? null,
+    analyzedItemCount: Number.isInteger(style.analyzedItemCount) ? style.analyzedItemCount : 0,
+    providerId: style.providerId ?? null,
+    model: style.model ?? null,
+    composedAt: style.composedAt ?? now,
+  };
+}
+
+// Apply a PATCH to board-level fields (name/description/style/poster). Absent
+// keys preserve the original; a present empty string clears description, and
+// `null` clears style or the poster filename. `items` is managed only through
+// the dedicated item ops below, never a bulk board PATCH.
+export function applyBoardPatch(board, patch) {
+  const next = { ...board };
+  if (patch.name !== undefined) next.name = patch.name;
+  if (patch.description !== undefined) next.description = patch.description;
+  if (patch.style !== undefined) next.style = normalizeBoardStyle(patch.style);
+  if (patch.posterImageRef !== undefined) next.posterImageRef = patch.posterImageRef ?? null;
+  if (patch.collageImageRef !== undefined) next.collageImageRef = patch.collageImageRef ?? null;
+  next.updatedAt = nowIso();
+  return next;
+}
+
+// Normalize a validated item input into the stored item shape. An image item
+// carries a `mediaKey` (an indexed `<kind>:<ref>` asset) OR an `imageUrl`
+// (external/pinned), never required to have both; a video item (#4188)
+// carries a `video:<filename>` mediaKey plus an optional poster-thumbnail
+// `imageUrl`; a text item carries `text`. `caption`/`source` are optional on
+// all. The route schema guarantees the type-appropriate field is present, so
+// this only fills the shared shape.
+function normalizeItem(input, { id, now = nowIso() } = {}) {
+  const hasMedia = input.type === 'image' || input.type === 'video';
+  return {
+    id,
+    type: input.type,
+    mediaKey: hasMedia ? (input.mediaKey ?? null) : null,
+    imageUrl: hasMedia ? (input.imageUrl ?? null) : null,
+    text: input.type === 'text' ? input.text : null,
+    prompt: hasMedia ? (input.prompt ?? null) : null,
+    caption: input.caption ?? null,
+    source: input.source ?? null,
+    createdAt: now,
+  };
+}
+
+export function addItem(board, itemInput) {
+  const items = Array.isArray(board.items) ? board.items : [];
+  if (items.length >= MAX_ITEMS_PER_BOARD) {
+    throw new ServerError(`Board is full (max ${MAX_ITEMS_PER_BOARD} items)`, {
+      status: 400,
+      code: 'BOARD_FULL',
+    });
+  }
+  const item = normalizeItem(itemInput, { id: `mbi-${randomUUID()}` });
+  const next = { ...board, items: [...items, item], updatedAt: nowIso() };
+  return { board: next, item };
+}
+
+// Normalize a validated prompt-from-media analysis patch (#4188 Phase 3) into
+// the stored shape: absent optional fields become explicit nulls and
+// `analyzedAt` is stamped server-side when the client didn't send one, so
+// every stored analysis carries a wall clock for the "analyzed N ago"
+// affordance. `null` clears a stored analysis.
+function normalizeItemAnalysis(analysis, now = nowIso()) {
+  if (!analysis) return null;
+  return {
+    prompt: analysis.prompt,
+    negativePrompt: analysis.negativePrompt ?? null,
+    rationale: analysis.rationale ?? null,
+    providerId: analysis.providerId ?? null,
+    model: analysis.model ?? null,
+    analyzedAt: analysis.analyzedAt ?? now,
+  };
+}
+
+// PATCH a single item's editable fields. caption/source apply to any item;
+// the body fields are gated to the item's FIXED type (an item's kind can't
+// change after creation) so a patch can't make a text item carry an imageUrl
+// or an image item carry text — the schema permits every key, the invariant is
+// enforced here where the item's type is known. Absent keys preserve; throws
+// NOT_FOUND when the item id isn't on the board.
+export function updateItem(board, itemId, patch) {
+  const items = Array.isArray(board.items) ? board.items : [];
+  const idx = items.findIndex((it) => it && it.id === itemId);
+  if (idx === -1) {
+    throw new ServerError('Item not found', { status: 404, code: 'NOT_FOUND' });
+  }
+  const current = items[idx];
+  const updated = { ...current };
+  const isMediaItem = current.type === 'image' || current.type === 'video';
+  const editableKeys = isMediaItem
+    ? ['caption', 'source', 'imageUrl', 'mediaKey', 'prompt']
+    : ['caption', 'source', 'text'];
+  for (const key of editableKeys) {
+    if (patch[key] !== undefined) updated[key] = patch[key];
+  }
+  // Analysis (#4188 Phase 3) comes from the item's media, so it only applies
+  // to media items — a patch carrying it for a text item is silently ignored,
+  // matching how the other type-gated keys behave. Stored normalized (explicit
+  // nulls + stamped analyzedAt); `null` clears.
+  if (isMediaItem && patch.analysis !== undefined) {
+    updated.analysis = normalizeItemAnalysis(patch.analysis);
+  }
+  // Reject a patch that would strip the item's required content (the schema
+  // permits nulls so a partial edit can clear one of two image sources, but the
+  // MERGED result must stay valid): an image keeps at least one of
+  // mediaKey/imageUrl; a text item keeps non-empty text.
+  if (updated.type === 'image' && !updated.mediaKey && !updated.imageUrl) {
+    throw new ServerError('An image item must keep a mediaKey or imageUrl', { status: 400, code: 'INVALID_ITEM' });
+  }
+  if (updated.type === 'video' && !isVideoItemMediaKey(updated.mediaKey)) {
+    throw new ServerError('A video item must keep a video:<filename> mediaKey', { status: 400, code: 'INVALID_ITEM' });
+  }
+  if (updated.type === 'text' && (typeof updated.text !== 'string' || !updated.text.trim())) {
+    throw new ServerError('A text item must keep non-empty text', { status: 400, code: 'INVALID_ITEM' });
+  }
+  const nextItems = [...items];
+  nextItems[idx] = updated;
+  const next = { ...board, items: nextItems, updatedAt: nowIso() };
+  return { board: next, item: updated };
+}
+
+// ─── Text note → image render (#10531) ───────────────────────────────────────
+// A text note can be rendered into an image. While the job runs the note carries
+// `render: { status, jobId, error, queuedAt }`; when it completes the note turns
+// into an image item in place (same id and position) — the one sanctioned type
+// change, since the render IS the note's visual form.
+
+function findItemIndex(board, itemId) {
+  const items = Array.isArray(board.items) ? board.items : [];
+  const idx = items.findIndex((it) => it && it.id === itemId);
+  if (idx === -1) throw new ServerError('Item not found', { status: 404, code: 'NOT_FOUND' });
+  return { items, idx };
+}
+
+function replaceItem(board, items, idx, item) {
+  const nextItems = [...items];
+  nextItems[idx] = item;
+  return { ...board, items: nextItems, updatedAt: nowIso() };
+}
+
+// Mark a text note queued before its job is enqueued, so a second click (or an
+// autopilot retry) can't queue a duplicate. `isLive(jobId)` says whether an
+// earlier render's job is still queued/running; a dead one may be replaced. A
+// claim that never got its job id (the process died mid-enqueue) expires.
+const RENDER_CLAIM_TTL_MS = 10 * 60 * 1000;
+
+export function claimItemRender(board, itemId, { isLive = () => false, now = nowIso() } = {}) {
+  const { items, idx } = findItemIndex(board, itemId);
+  const current = items[idx];
+  if (current.type !== 'text') {
+    throw new ServerError('Only a text note can be rendered', { status: 409, code: 'MOOD_BOARD_ITEM_NOT_TEXT' });
+  }
+  const render = current.render;
+  const pending = render?.status === 'queued' && (render.jobId
+    ? isLive(render.jobId)
+    : Date.parse(now) - Date.parse(render.queuedAt) < RENDER_CLAIM_TTL_MS);
+  if (pending) {
+    throw new ServerError('This note is already rendering', { status: 409, code: 'MOOD_BOARD_RENDER_BUSY' });
+  }
+  const item = { ...current, render: { status: 'queued', jobId: null, error: null, queuedAt: now } };
+  return { board: replaceItem(board, items, idx, item), item };
+}
+
+// Record the queued job id, or a failure. Applies only while the note is still
+// the text item this render claimed: a job that already finished (the note is
+// now an image) or a newer claim (a different jobId) leaves the board untouched.
+export function settleItemRender(board, itemId, { jobId, status, error = null }) {
+  const { items, idx } = findItemIndex(board, itemId);
+  const current = items[idx];
+  const render = current.render;
+  if (current.type !== 'text' || !render || (render.jobId && render.jobId !== jobId)) {
+    return { board, item: current, changed: false };
+  }
+  const item = { ...current, render: { ...render, jobId: jobId ?? render.jobId, status, error } };
+  return { board: replaceItem(board, items, idx, item), item, changed: true };
+}
+
+// Turn the rendered note into an image item. The note text becomes the caption
+// (the schema's caption bound) and the submitted prompt the item prompt, so the
+// board's analyze step skips it. Skips a stale job, as settleItemRender does.
+export function applyRenderedItem(board, itemId, { jobId, filename, prompt }) {
+  const { items, idx } = findItemIndex(board, itemId);
+  const current = items[idx];
+  const render = current.render;
+  if (current.type !== 'text' || !render || (render.jobId && render.jobId !== jobId)) {
+    return { board, item: current, changed: false };
+  }
+  const item = {
+    id: current.id,
+    type: 'image',
+    mediaKey: `image:${filename}`,
+    imageUrl: null,
+    text: null,
+    prompt: isStr(prompt) && prompt.trim() ? prompt.trim().slice(0, 8000) : null,
+    caption: current.text.slice(0, 2000),
+    source: current.source ?? null,
+    createdAt: current.createdAt,
+    renderedAt: nowIso(),
+  };
+  return { board: replaceItem(board, items, idx, item), item, changed: true };
+}
+
+// Remove an item by id. Returns `removed: false` (no write) when the id is
+// absent so the db layer can skip a wasted row rewrite.
+export function removeItem(board, itemId) {
+  const items = Array.isArray(board.items) ? board.items : [];
+  const nextItems = items.filter((it) => !(it && it.id === itemId));
+  if (nextItems.length === items.length) {
+    return { board, removed: false };
+  }
+  const next = { ...board, items: nextItems, updatedAt: nowIso() };
+  return { board: next, removed: true };
+}
+
+// Faithful conflict-restore of the restorable board fields (RESTORABLE_FIELDS.
+// moodBoard = name/description/items/style/posterImageRef). Unlike applyBoardPatch
+// — the route PATCH path, which does not touch items because they are managed
+// through the dedicated item ops — a "restore my whole version" must bring back
+// the board's items[], and the composite style + poster when the journaled
+// version had them. The conflict resolver narrows `patch` to the allowed fields
+// (via `pick`), so this just spreads the present ones and bumps updatedAt so the
+// restore wins LWW and re-propagates. Mirrors creativeDirector's
+// applyProjectPatch wholesale-spread restore path.
+export function applyBoardRestore(board, patch) {
+  const next = { ...board };
+  if (patch.name !== undefined) next.name = patch.name;
+  if (patch.description !== undefined) next.description = patch.description;
+  if (Array.isArray(patch.items)) next.items = patch.items;
+  if (patch.style !== undefined) next.style = normalizeBoardStyle(patch.style);
+  if (patch.posterImageRef !== undefined) next.posterImageRef = patch.posterImageRef ?? null;
+  if (patch.collageImageRef !== undefined) next.collageImageRef = patch.collageImageRef ?? null;
+  next.updatedAt = nowIso();
+  return next;
+}
+
+// ─── Pinterest board link (mood-board importer) ──────────────────────────────
+// A board can be linked to a public Pinterest board's RSS feed. The link is an
+// additive `pinterest` sub-object on the board record — it rides through
+// sanitizeBoardForSync's `...raw` spread, so it federates with the board (no
+// schema-version bump: full-record LWW, and an older peer preserves the unknown
+// key). `lastSyncedAt` tracks the most recent manual "Sync now".
+
+// Set (or replace) the Pinterest link. Preserve the prior sync timestamp only
+// when re-linking the SAME feed; pointing the board at a DIFFERENT Pinterest
+// board clears lastSyncedAt, otherwise the UI would claim the new board was
+// "last synced" at the old board's time before any sync has run.
+export function applyPinterestLink(board, { feedUrl, boardUrl }) {
+  const prior = board.pinterest || {};
+  const sameFeed = prior.feedUrl === feedUrl;
+  return {
+    ...board,
+    pinterest: {
+      feedUrl,
+      boardUrl: boardUrl ?? null,
+      lastSyncedAt: sameFeed ? (prior.lastSyncedAt ?? null) : null,
+    },
+    updatedAt: nowIso(),
+  };
+}
+
+// Self-heal a stale Pinterest feed (e.g. a section URL saved before section
+// detection, whose `/user/board/section.rss` feed Pinterest serves as HTML) to a
+// corrected `feedUrl`, but ONLY when the board's currently-persisted feed still
+// matches `fromFeedUrl` — the feed read at sync start. This guards the same
+// single-user re-entrancy race as appendPinterestPins: the sync's getBoard()
+// runs before this locked write, so the user can unlink or repoint the board in
+// between. Without the guard, applyPinterestLink would unconditionally rewrite
+// the link and resurrect/clobber the user's newer state. Returns changed:false
+// (no write) when the board was unlinked/repointed concurrently or is already
+// on the corrected feed. Returns { board, changed }.
+export function healPinterestFeedRecord(board, { fromFeedUrl, feedUrl, boardUrl }) {
+  if (board.pinterest?.feedUrl !== fromFeedUrl || fromFeedUrl === feedUrl) {
+    return { board, changed: false };
+  }
+  return { board: applyPinterestLink(board, { feedUrl, boardUrl }), changed: true };
+}
+
+// Remove the Pinterest link. Returns changed:false (no write) when the board
+// wasn't linked, so the db layer can skip a wasted row rewrite + peer push.
+export function clearPinterestLinkRecord(board) {
+  if (!board.pinterest) return { board, changed: false };
+  const next = { ...board };
+  delete next.pinterest;
+  next.updatedAt = nowIso();
+  return { board: next, changed: true };
+}
+
+/**
+ * Shared dedupe-by-`source` + MAX_ITEMS_PER_BOARD-capacity core for every
+ * "append already-downloaded media as board items" flow (the persisted
+ * Pinterest sync below and the one-shot X post importer) — one place owning
+ * the truncate-rather-than-throw contract so it can't drift between the two
+ * callers. `buildItem(imp)` turns one `imported` entry into a normalized item;
+ * the caller decides the rest (what to stamp on the board afterward).
+ */
+function buildFreshItems(existingItems, imported, buildItem) {
+  const seen = new Set(existingItems.map((it) => it && it.source).filter(Boolean));
+  const capacity = Math.max(0, MAX_ITEMS_PER_BOARD - existingItems.length);
+  const fresh = [];
+  for (const imp of Array.isArray(imported) ? imported : []) {
+    if (fresh.length >= capacity) break;
+    if (imp.source && seen.has(imp.source)) continue;
+    if (imp.source) seen.add(imp.source);
+    fresh.push(buildItem(imp));
+  }
+  return fresh;
+}
+
+/**
+ * Append already-downloaded Pinterest pins as image items, then stamp the sync
+ * timestamp. Each `imported` entry is `{ imageUrl, caption, source }` where
+ * `source` is the pin permalink — the dedupe key (see buildFreshItems). Always
+ * re-stamps `pinterest.lastSyncedAt` (even on zero new) so the UI reflects the
+ * check. Returns `{ board, added, aborted }`.
+ *
+ * `expectedFeedUrl` guards a single-user re-entrancy race: the feed fetch +
+ * image downloads run OUTSIDE the row lock, so the user can unlink or re-link
+ * the board mid-sync. When the persisted feed no longer matches the one this
+ * sync fetched, abort — append no pins and DON'T stamp lastSyncedAt — so stale
+ * pins never land on a board that was unlinked/repointed.
+ */
+export function appendPinterestPins(board, imported, { syncedAt = nowIso(), expectedFeedUrl = null } = {}) {
+  if (expectedFeedUrl && board.pinterest?.feedUrl !== expectedFeedUrl) {
+    return { board, added: 0, aborted: true };
+  }
+  const items = Array.isArray(board.items) ? board.items : [];
+  const fresh = buildFreshItems(items, imported, (imp) => normalizeItem(
+    { type: 'image', imageUrl: imp.imageUrl, caption: imp.caption ?? null, source: imp.source ?? null },
+    { id: `mbi-${randomUUID()}`, now: syncedAt },
+  ));
+  const next = {
+    ...board,
+    items: [...items, ...fresh],
+    pinterest: { ...(board.pinterest || {}), lastSyncedAt: syncedAt },
+    updatedAt: nowIso(),
+  };
+  return { board: next, added: fresh.length, aborted: false };
+}
+
+// ─── One-shot media imports (X post importer) ────────────────────────────────
+
+/**
+ * Append already-downloaded media items in ONE locked write — same
+ * dedupe/capacity core as appendPinterestPins (buildFreshItems), generalized
+ * for a one-shot import (X post) that has no persisted link/lastSyncedAt to
+ * stamp. Each `imported` entry is `{ type, imageUrl, mediaKey, caption,
+ * source }`; `source` is the dedupe key, re-checked here as an in-lock safety
+ * net (the service pre-dedupes before downloading, but two concurrent imports
+ * of the same post could race between that check and this write). Returns
+ * `{ board, added }`.
+ */
+export function appendImportedItems(board, imported) {
+  const items = Array.isArray(board.items) ? board.items : [];
+  const fresh = buildFreshItems(items, imported, (imp) => normalizeItem(
+    { type: imp.type, imageUrl: imp.imageUrl ?? null, mediaKey: imp.mediaKey ?? null, caption: imp.caption ?? null, source: imp.source ?? null },
+    { id: `mbi-${randomUUID()}` },
+  ));
+  const next = { ...board, items: [...items, ...fresh], updatedAt: nowIso() };
+  return { board: next, added: fresh.length };
+}
+
+// ─── Re-hosting external media ───────────────────────────────────────────────
+
+/** True for an http(s) URL — the only `imageUrl` shape that isn't a local asset. */
+export function isExternalImageUrl(url) {
+  return isStr(url) && /^https?:\/\//i.test(url.trim());
+}
+
+/** Media items whose displayed image still points at a remote host. */
+export function externalImageItems(board) {
+  const items = Array.isArray(board?.items) ? board.items : [];
+  return items.filter((it) => it && (it.type === 'image' || it.type === 'video') && isExternalImageUrl(it.imageUrl));
+}
+
+/**
+ * Swap re-hosted images in. Each replacement is `{ id, from, to }`; it only
+ * applies while the item still carries the `from` URL the download was started
+ * for (the fetch runs outside the row lock, so the user may have edited the item
+ * meanwhile). Returns `{ board, changed }`.
+ */
+export function applyLocalizedImageUrls(board, replacements) {
+  const items = Array.isArray(board.items) ? board.items : [];
+  const byId = new Map((replacements || []).map((r) => [r.id, r]));
+  let changed = 0;
+  const nextItems = items.map((it) => {
+    const r = it && byId.get(it.id);
+    if (!r || it.imageUrl !== r.from) return it;
+    changed += 1;
+    return { ...it, imageUrl: r.to };
+  });
+  if (!changed) return { board, changed: 0 };
+  return { board: { ...board, items: nextItems, updatedAt: nowIso() }, changed };
+}
+
+// ─── Collage geometry ────────────────────────────────────────────────────────
+
+/**
+ * Grid dimensions that keep the composite as square as possible: the smallest
+ * column count whose square covers `count`, then only as many rows as needed
+ * (e.g. 5 → 3×2, 10 → 4×3, 16 → 4×4). Cells are square, so the image aspect
+ * follows the grid aspect.
+ */
+export function squareGridDims(count) {
+  const n = Math.max(1, Math.floor(count) || 1);
+  const cols = Math.ceil(Math.sqrt(n));
+  return { cols, rows: Math.ceil(n / cols) };
+}
+
+/** Evenly spaced sample times — the midpoint of each of `count` equal segments. */
+export function frameSampleTimes(durationSec, count) {
+  return Array.from({ length: count }, (_, i) => ((i + 0.5) * durationSec) / count);
+}

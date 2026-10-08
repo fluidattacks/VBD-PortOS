@@ -1,0 +1,795 @@
+/**
+ * TracksManager — manage music tracks (singles or album members).
+ *
+ * Master-detail: a list of tracks on the left, an editor on the right. A track
+ * carries a title, an artist (via ArtistPicker), lyrics + a generation prompt,
+ * and an audio file. Audio is stored in the shared music library; the editor
+ * uploads a file or attaches an existing library track, and plays it inline.
+ *
+ * The editor hosts on-device audio generation, LLM-composed chiptunes, and —
+ * for a track that carries one — the Music Designer's LLM-drawn wave sketch.
+ * It can also save the open form and hand the same persisted track to the
+ * stepped MusicDesigner workflow. Mirrors the Authors/Artists master-detail
+ * pattern.
+ */
+
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { Link, useNavigate, useParams } from 'react-router';
+import { Plus, Loader2, Trash2, Save, Upload, Music2, Library, Sparkles, FileMusic } from 'lucide-react';
+import BrailleSpinner from '../BrailleSpinner';
+import toast from '../ui/Toast';
+import FilePickerButton from '../ui/FilePickerButton';
+import ConfirmButtonPair from '../ui/ConfirmButtonPair';
+import Field from '../ui/FormField';
+import { useConfirmDelete } from '../../hooks/useConfirmDelete';
+import { formatBytes, formatTimecode } from '../../utils/formatters';
+import { withUnlistedOption } from '../../lib/withUnlistedOption';
+import ArtistPicker from './ArtistPicker';
+import MusicGenPanel from './MusicGenPanel';
+import ChiptunePanel from './ChiptunePanel';
+import TrackWaveformHost from './TrackWaveformHost';
+import TrackRenderCard from './TrackRenderCard';
+import TrackRenderModal from './TrackRenderModal';
+import MidiVisualization from '../songs/MidiVisualization.jsx';
+import { listMusicVideoMidiSources } from '../../services/apiMusicVideo.js';
+import { trackAudioUrl } from '../../services/apiTracks.js';
+import {
+  listTracks, createTrack, updateTrack, deleteTrack,
+  uploadTrackAudio, attachTrackAudio, listMusicLibrary, listAlbums,
+  selectTrackRender, deleteTrackRender,
+  TRACK_TITLE_MAX, TRACK_LYRICS_MAX, TRACK_PROMPT_MAX,
+} from '../../services/api';
+
+// Cap audio uploads to match the server's MUSIC_UPLOAD_MAX_BYTES (50MB).
+const AUDIO_MAX_BYTES = 50 * 1024 * 1024;
+
+const emptyForm = () => ({
+  title: '', albumId: '', artistId: '', artist: '', lyrics: '', prompt: '', audioFilename: '',
+});
+
+const formFromTrack = (t) => ({
+  title: t.title || '',
+  albumId: t.albumId || '',
+  artistId: t.artistId || '',
+  artist: t.artist || '',
+  lyrics: t.lyrics || '',
+  prompt: t.prompt || '',
+  audioFilename: t.audioFilename || '',
+});
+
+// The generator a freshly selected track opens on: its drawing when the active
+// take was drawn from it, else its chiptune score, else the audio models.
+const initialGenMode = (track) => {
+  if (track.engine === 'waveform' && track.waveSketch) return 'drawn';
+  return track.chiptuneScore ? 'chiptune' : 'audio';
+};
+
+export default function TracksManager() {
+  const navigate = useNavigate();
+  // Selection lives in the URL (`/music/tracks/:id`, `/music/tracks/new`) so it's
+  // deep-linkable and reload-safe. `id === 'new'` = create; a real id = edit.
+  const { id } = useParams();
+  const [tracks, setTracks] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [form, setForm] = useState(emptyForm);
+  const [saving, setSaving] = useState(false);
+  const [openingDesigner, setOpeningDesigner] = useState(false);
+  const { isConfirming: isConfirmingDelete, requestDelete, cancelDelete, confirmDelete } = useConfirmDelete();
+  const [uploading, setUploading] = useState(false);
+  const [libraryOpen, setLibraryOpen] = useState(false);
+  const [library, setLibrary] = useState([]);
+  const [albums, setAlbums] = useState([]);
+  // The render shown in the detail/remix modal, and the seed passed to the gen
+  // panel when remixing (nonce bumps per click so re-remixing the same take
+  // re-applies). See remixRender below.
+  const [modalRender, setModalRender] = useState(null);
+  const [remix, setRemix] = useState(null);
+  const [chiptuneRemix, setChiptuneRemix] = useState(null);
+  // Music Video projects, for the MIDI read-through: MuScriptor transcriptions
+  // are stored on the MV project that links a track, not on the track itself.
+  const [mvProjects, setMvProjects] = useState([]);
+  // Which generator the editor shows: the on-device audio models, the
+  // LLM-composed chiptune score (#2911), or the LLM-drawn wave sketch (#8376,
+  // offered only for a track that already carries one). Seeded per selection
+  // below — a track whose active take is drawn opens on its drawing, and one
+  // that carries a score opens on the chiptune panel.
+  const [genMode, setGenMode] = useState('audio');
+  const remixNonceRef = useRef(0);
+  // Mirrors `selectedId` so async audio handlers can detect a selection change
+  // that happened while their server round-trip was in flight (the server write
+  // still targets the original track id; only the open form must not be clobbered
+  // with another track's result).
+  const selectedIdRef = useRef(null);
+
+  useEffect(() => {
+    Promise.all([
+      listTracks({ silent: true }).catch((err) => { toast.error(err.message || 'Failed to load tracks'); return []; }),
+      listAlbums({ silent: true }).catch(() => []),
+      listMusicVideoMidiSources({ silent: true }).catch(() => []),
+    ])
+      .then(([trackList, albumList, mvList]) => {
+        setTracks(Array.isArray(trackList) ? trackList : []);
+        setAlbums(Array.isArray(albumList) ? albumList : []);
+        setMvProjects(Array.isArray(mvList) ? mvList : []);
+      })
+      .finally(() => setLoading(false));
+  }, []);
+
+  const isCreate = id === 'new';
+  const selected = useMemo(
+    () => (isCreate || !id ? null : tracks.find((t) => t.id === id) || null),
+    [tracks, id, isCreate],
+  );
+  const notFound = !isCreate && !!id && !loading && !selected;
+  // The persisted track (for gen metadata + the audio player, which need a saved id).
+  const persisted = selected;
+
+  // Reset per-track view state on any selection change. The render modal + remix
+  // seed belong to the previously-selected track; without clearing them, a modal
+  // left open across a track switch would drive its Use/Delete/Remix against the
+  // NEWLY selected track (the action handlers read persisted?.id), sending the
+  // old render's id to the wrong track.
+  const resetTrackViewState = () => {
+    cancelDelete();
+    setLibraryOpen(false);
+    setModalRender(null);
+    setRemix(null);
+    setChiptuneRemix(null);
+  };
+
+  const selectTrack = (t) => navigate(`/music/tracks/${encodeURIComponent(t.id)}`);
+  const startCreate = () => navigate('/music/tracks/new');
+
+  // Hydrate the editor form from the URL-selected track. Keyed on the id so a
+  // list refresh (audio upload, generate, upsertLocal) doesn't clobber the open
+  // form; `selectedIdRef` is kept in sync so async handlers can still detect a
+  // selection change that happened mid-round-trip. Per-track view state is reset
+  // for every selection change (incl. idle / not-found) so a modal/remix left
+  // open can't drive the previous track (see Authors.jsx for the base pattern).
+  const hydratedRef = useRef(null);
+  // Set by `persistForm` to the id it just created. The create flow navigates
+  // /music/tracks/new → /music/tracks/<id>, which re-runs this effect; without
+  // the marker the derivation below would snap a "Chiptune score" chosen BEFORE
+  // saving back to "Audio model" the moment the track came into existence
+  // (#3264). Consumed once — a later re-selection of the same track hydrates
+  // from `chiptuneScore` normally.
+  const justCreatedIdRef = useRef(null);
+  const selectionKey = id ?? null;
+  useEffect(() => {
+    if (loading) return;
+    if (hydratedRef.current === selectionKey) return;
+    hydratedRef.current = selectionKey;
+    selectedIdRef.current = selectionKey;
+    resetTrackViewState();
+    if (isCreate) {
+      setForm(emptyForm());
+      // Deliberately no `setGenMode` here. A new track has no score to derive
+      // from, so the derivation could only ever force 'audio' — and the create
+      // editor renders while `listTracks` is still in flight, so it would also
+      // clobber a mode the user picked during that window.
+    } else if (selected) {
+      setForm(formFromTrack(selected));
+      // Skip the derivation exactly once for the track `handleSave` just made,
+      // so the pre-save choice survives the create → navigate hydration.
+      if (justCreatedIdRef.current === selectionKey) justCreatedIdRef.current = null;
+      else setGenMode(initialGenMode(selected));
+    }
+  }, [selectionKey, isCreate, selected, loading]);
+
+  const upsertLocal = (track) => {
+    setTracks((prev) => {
+      const exists = prev.some((t) => t.id === track.id);
+      return exists ? prev.map((t) => (t.id === track.id ? track : t)) : [...prev, track];
+    });
+  };
+
+  // A chiptune/drawn generator updated the persisted track (score, drawing, or
+  // a new take): refresh the list and mirror the active audio pointer onto the
+  // open form without touching the user's unsaved edits.
+  const applyGeneratorUpdate = (updated) => {
+    upsertLocal(updated); // list update is id-keyed → always safe
+    if (selectedIdRef.current === updated.id) {
+      setForm((f) => ({ ...f, audioFilename: updated.audioFilename || f.audioFilename }));
+    }
+  };
+
+  const genModes = [
+    ['audio', 'Audio model'],
+    ['chiptune', 'Chiptune score'],
+    ...(persisted?.waveSketch ? [['drawn', 'Drawn waveform']] : []),
+  ];
+
+  const persistForm = async () => {
+    const title = form.title.trim();
+    if (!title) { toast.error('Track title is required'); return null; }
+    setSaving(true);
+    if (isCreate) {
+      const created = await createTrack({ ...form, title }, { silent: true }).catch((err) => { toast.error(err.message || 'Failed to create track'); return null; });
+      setSaving(false);
+      if (!created) return null;
+      upsertLocal(created);
+      // Point the async-handler ref at the new id immediately (the hydration
+      // effect also sets it, but not until after navigation re-renders).
+      selectedIdRef.current = created.id;
+      // Carry the pre-save generator choice through the create → navigate
+      // hydration instead of re-deriving it from the (score-less) new track.
+      justCreatedIdRef.current = created.id;
+      return created;
+    } else {
+      // Drop `albumId` from a metadata-only update unless the user actually
+      // changed the album here — otherwise a stale form would re-send the old
+      // albumId and the server's reconcile would move the track back (a track
+      // reassigned in another tab/API would get clobbered). The album editor
+      // remains the primary place to (re)order an album's tracks.
+      const payload = { ...form, title };
+      if ((selected?.albumId || '') === form.albumId) delete payload.albumId;
+      const updated = await updateTrack(id, payload, { silent: true }).catch((err) => { toast.error(err.message || 'Failed to save track'); return null; });
+      setSaving(false);
+      if (!updated) return null;
+      upsertLocal(updated);
+      return updated;
+    }
+  };
+
+  const handleSave = async () => {
+    const saved = await persistForm();
+    if (!saved) return;
+    if (isCreate) {
+      navigate(`/music/tracks/${encodeURIComponent(saved.id)}`);
+      toast.success(`Created "${saved.title}"`);
+    } else {
+      toast.success('Saved');
+    }
+  };
+
+  // The stepped designer already knows how to hydrate and update a saved track
+  // by `trackId`. Persist the open form first so moving into the Concept →
+  // Description → Lyrics → Render flow never drops unsaved metadata or text.
+  const openDesigner = async () => {
+    setOpeningDesigner(true);
+    const saved = await persistForm();
+    setOpeningDesigner(false);
+    if (!saved) return;
+    navigate(`/music/generate/concept?trackId=${encodeURIComponent(saved.id)}`);
+  };
+
+  const handleDelete = async () => {
+    if (!selected) return;
+    const prior = tracks;
+    setTracks((prev) => prev.filter((t) => t.id !== selected.id));
+    resetTrackViewState();
+    navigate('/music/tracks');
+    await deleteTrack(selected.id, { silent: true }).catch((err) => { toast.error(err.message || 'Delete failed'); setTracks(prior); });
+  };
+
+  // Audio actions operate on the SAVED track (the server attaches the filename
+  // and returns the updated record). A brand-new unsaved track must be saved first.
+  const requireSaved = () => {
+    if (!persisted) { toast.error('Save the track first, then add audio'); return false; }
+    return true;
+  };
+
+  // `fields` are the multipart provenance fields (#8967): a Suno export sends
+  // `source: 'suno'` plus the style prompt and lyrics it was made from.
+  const uploadAudio = async (file, fields = {}) => {
+    if (!file || !requireSaved()) return;
+    if (file.size > AUDIO_MAX_BYTES) { toast.error(`Audio exceeds ${formatBytes(AUDIO_MAX_BYTES, 0)}`); return; }
+    const targetId = persisted.id; // server write targets THIS track
+    setUploading(true);
+    const fd = new FormData();
+    Object.entries(fields).forEach(([k, v]) => fd.append(k, v));
+    fd.append('track', file, file.name);
+    const res = await uploadTrackAudio(targetId, fd, { silent: true }).catch((err) => { toast.error(err.message || 'Upload failed'); return null; });
+    setUploading(false);
+    if (res?.track) {
+      upsertLocal(res.track); // list update is id-keyed → always safe
+      // Only touch the open form if THIS track is still selected (the user may
+      // have switched tracks during the upload round-trip).
+      if (selectedIdRef.current === targetId) setForm((f) => ({ ...f, audioFilename: res.track.audioFilename }));
+      toast.success(fields.source === 'suno' ? 'Suno export imported' : 'Audio uploaded');
+    }
+  };
+
+  const handleAudioFile = (e) => uploadAudio(e.target.files?.[0]);
+
+  // Import a song exported from Suno (a manual import — no Suno API is called).
+  // Save the open form first so the style prompt + lyrics typed above persist on
+  // the track AND ride onto the imported take as its provenance.
+  const handleSunoExport = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file || !requireSaved()) return;
+    const saved = await persistForm();
+    if (!saved) return;
+    await uploadAudio(file, { source: 'suno', prompt: saved.prompt || '', lyrics: saved.lyrics || '' });
+  };
+
+  const openLibrary = async () => {
+    if (!requireSaved()) return;
+    const targetId = persisted.id;
+    const res = await listMusicLibrary({ silent: true }).catch(() => null);
+    // The user may have switched tracks (or to a new unsaved one) while the
+    // library list loaded — don't pop the picker open for a stale selection.
+    if (selectedIdRef.current !== targetId) return;
+    setLibrary(Array.isArray(res?.tracks) ? res.tracks : []);
+    setLibraryOpen(true);
+  };
+
+  const attachFromLibrary = async (filename) => {
+    setLibraryOpen(false);
+    // Re-resolve the target from the live selection rather than a possibly-stale
+    // `persisted` — and bail if there's no saved track to attach to.
+    const targetId = selectedIdRef.current;
+    if (!targetId || targetId === 'new') { toast.error('Save the track first, then add audio'); return; }
+    const res = await attachTrackAudio(targetId, filename, { silent: true }).catch((err) => { toast.error(err.message || 'Attach failed'); return null; });
+    if (res?.track) {
+      upsertLocal(res.track);
+      if (selectedIdRef.current === targetId) setForm((f) => ({ ...f, audioFilename: res.track.audioFilename }));
+      toast.success('Audio attached');
+    }
+  };
+
+  // MIDI read-through: the newest transcription among Music Video projects
+  // linked to this track. Transcriptions are made (and stored) on the MV
+  // project, but the piano-roll is just as useful when inspecting the track.
+  const midiSource = useMemo(() => {
+    if (!persisted?.id) return null;
+    return mvProjects.find((p) => p.trackId === persisted.id) || null;
+  }, [mvProjects, persisted]);
+
+  // Render history — newest first. The active take (the top-level audioFilename
+  // pointer) is highlighted in the grid.
+  const renders = useMemo(() => {
+    const list = Array.isArray(persisted?.renders) ? [...persisted.renders] : [];
+    return list.sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+  }, [persisted]);
+  const activeFilename = persisted?.audioFilename || '';
+
+  // After a server-confirmed render mutation, sync the list + mirror the active
+  // pointer into the open form (only when THIS track is still selected — the
+  // user may have switched tracks during the round-trip).
+  const applyRenderResult = (res, targetId) => {
+    if (!res?.track) return;
+    upsertLocal(res.track);
+    if (selectedIdRef.current === targetId) setForm((f) => ({ ...f, audioFilename: res.track.audioFilename || '' }));
+  };
+
+  const selectRender = async (render) => {
+    const targetId = persisted?.id;
+    if (!targetId) return;
+    const res = await selectTrackRender(targetId, render.id, { silent: true })
+      .catch((err) => { toast.error(err.message || 'Failed to select render'); return null; });
+    applyRenderResult(res, targetId);
+  };
+
+  const sendRenderToVideo = (render) => {
+    if (!render?.audioFilename) return;
+    navigate(`/media/video?mode=a2v&audioFilename=${encodeURIComponent(render.audioFilename)}`);
+  };
+
+  const deleteRender = async (render) => {
+    const targetId = persisted?.id;
+    if (!targetId) return;
+    setModalRender((m) => (m?.id === render.id ? null : m));
+    const res = await deleteTrackRender(targetId, render.id, { silent: true })
+      .catch((err) => { toast.error(err.message || 'Failed to delete render'); return null; });
+    applyRenderResult(res, targetId);
+  };
+
+  // Remix: prefill the editable prompt/lyrics from the take (guard empties so an
+  // uploaded take can't wipe the user's text), seed the gen panel's engine/
+  // model/duration, and close the modal so the panel is in view.
+  const remixRender = (render) => {
+    setModalRender(null);
+    remixNonceRef.current += 1;
+    // A chiptune take remixes in the chiptune panel: seed ITS prompt (not the
+    // audio-model form's prompt — that field belongs to the diffusion engines).
+    if (render.engine === 'chiptune') {
+      setGenMode('chiptune');
+      setChiptuneRemix({ prompt: render.prompt || '', nonce: remixNonceRef.current });
+      return;
+    }
+    // A drawn-waveform take remixes in the editor's drawn mode, on the track's
+    // stored sketch, seeded with the description the take was rendered from.
+    if (render.engine === 'waveform' && persisted?.waveSketch) {
+      setGenMode('drawn');
+      if (render.prompt) setForm((f) => ({ ...f, prompt: render.prompt }));
+      return;
+    }
+    // A drawn take from before the sketch was stored on the track (#8376) has
+    // nothing to reopen here — send it to the Music Designer's drawn engine.
+    if (render.engine === 'waveform' && persisted) {
+      navigate(`/music/generate/render?trackId=${encodeURIComponent(persisted.id)}&engine=drawn`);
+      return;
+    }
+    // Same for a code take: its Strudel code lives in the designer's code engine.
+    if (render.engine === 'code' && persisted) {
+      navigate(`/music/generate/render?trackId=${encodeURIComponent(persisted.id)}&engine=code`);
+      return;
+    }
+    setGenMode('audio');
+    setForm((f) => ({
+      ...f,
+      ...((render.authoredPrompt || render.prompt) ? { prompt: render.authoredPrompt || render.prompt } : {}),
+      ...(render.lyrics ? { lyrics: render.lyrics } : {}),
+    }));
+    setRemix({
+      engineId: render.engine,
+      modelId: render.modelId,
+      durationSec: render.durationSec,
+      // Only new renders carry an explicit vocal-mode decision. Legacy empty
+      // lyric snapshots are ambiguous and must not be reclassified as no-vocals.
+      ...(typeof render.instrumentalOnly === 'boolean' ? { instrumentalOnly: render.instrumentalOnly } : {}),
+      nonce: remixNonceRef.current,
+    });
+  };
+
+  // A linked albumId the fetched list no longer carries (deleted album)
+  // shouldn't silently snap the select to "no album" — surface it so the
+  // link isn't lost.
+  const albumOptions = withUnlistedOption(
+    albums,
+    form.albumId,
+    (albumId) => ({ id: albumId, title: 'Linked album (unavailable)' }),
+  );
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
+        <p className="text-sm text-gray-400 max-w-2xl">
+          Tracks are singles or album members. Design a prompt and lyrics with AI, edit them directly, then
+          render on-device, upload an audio file, or attach one from your music library.
+        </p>
+        <button
+          type="button"
+          onClick={startCreate}
+          className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-port-accent hover:bg-port-accent/90 text-white text-sm font-medium shrink-0"
+        >
+          <Plus size={16} aria-hidden="true" /> New Track
+        </button>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-[260px_1fr] gap-4">
+        <div className="bg-port-card border border-port-border rounded-lg p-2">
+          {loading ? (
+            <div className="text-sm p-2"><BrailleSpinner text="Loading…" /></div>
+          ) : tracks.length === 0 ? (
+            <div className="text-gray-500 text-sm p-2">
+              No tracks yet.{' '}
+              <button type="button" onClick={startCreate} className="text-port-accent hover:underline">New Track</button>
+            </div>
+          ) : (
+            <ul className="space-y-1">
+              {tracks.map((t) => (
+                <li key={t.id}>
+                  <button
+                    type="button"
+                    onClick={() => selectTrack(t)}
+                    className={`w-full text-left px-3 py-2 rounded text-sm truncate flex items-center gap-2 ${
+                      t.id === id ? 'bg-port-accent/20 text-white' : 'text-gray-300 hover:bg-port-bg'
+                    }`}
+                  >
+                    <Music2 size={13} className={t.audioFilename ? 'text-port-success shrink-0' : 'text-gray-600 shrink-0'} aria-hidden="true" />
+                    <span className="flex-1 min-w-0 truncate">{t.title}</span>
+                    {t.durationSec ? <span className="text-[11px] text-gray-500 shrink-0">{formatTimecode(t.durationSec)}</span> : null}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+
+        <div className="bg-port-card border border-port-border rounded-lg p-4">
+          {notFound ? (
+            <div className="text-gray-500 text-sm">
+              That track could not be found — it may have been deleted.{' '}
+              <button type="button" onClick={() => navigate('/music/tracks')} className="text-port-accent hover:underline">
+                Back to tracks
+              </button>
+            </div>
+          ) : !isCreate && !selected ? (
+            <div className="text-gray-500 text-sm">
+              <p>Select a track to edit, or create a new one.</p>
+              <button type="button" onClick={startCreate} className="mt-3 inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-port-accent hover:bg-port-accent/90 text-white text-sm font-medium">
+                <Plus size={16} aria-hidden="true" /> New Track
+              </button>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              <div className="flex flex-col gap-3 rounded-lg border border-port-accent/30 bg-port-accent/5 p-3 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <p className="text-sm font-medium text-white">Generative workflow</p>
+                  <p className="text-xs text-gray-400">
+                    Take this track through the same Concept → Description → Lyrics → Render steps as the Generate wizard.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={openDesigner}
+                  disabled={saving || !form.title.trim()}
+                  className="inline-flex min-h-[40px] shrink-0 items-center justify-center gap-2 rounded-lg border border-port-accent px-3 py-2 text-sm font-medium text-port-accent transition-colors hover:bg-port-accent/10 disabled:opacity-50"
+                >
+                  {openingDesigner ? <Loader2 size={15} className="animate-spin" /> : <Sparkles size={15} />}
+                  {openingDesigner ? 'Opening designer…' : (isCreate ? 'Save & design with AI' : 'Design with AI')}
+                </button>
+              </div>
+              <Field compact label="Title">
+                <input
+                  value={form.title}
+                  onChange={(e) => setForm((f) => ({ ...f, title: e.target.value }))}
+                  placeholder="Track title"
+                  maxLength={TRACK_TITLE_MAX}
+                  className="w-full px-3 py-2 bg-port-bg border border-port-border rounded text-white"
+                  autoFocus
+                />
+              </Field>
+              <Field compact label="Artist">
+                <ArtistPicker
+                  id="track-artist"
+                  value={form.artistId}
+                  name={form.artist}
+                  onChange={(artistId, artist) => setForm((f) => ({ ...f, artistId, artist }))}
+                />
+              </Field>
+              <Field compact label="Album" hint="Optional — none means a standalone single. Saving syncs the album's tracklist.">
+                <select
+                  id="track-album"
+                  value={form.albumId}
+                  onChange={(e) => setForm((f) => ({ ...f, albumId: e.target.value }))}
+                  className="w-full px-3 py-2 bg-port-bg border border-port-border rounded text-white text-sm"
+                >
+                  <option value="">— Single (no album) —</option>
+                  {albumOptions.map((a) => (
+                    <option key={a.id} value={a.id}>{a.title}</option>
+                  ))}
+                </select>
+              </Field>
+              <Field compact label="Prompt" hint="Text/style prompt used by the on-device generators.">
+                <textarea
+                  value={form.prompt}
+                  onChange={(e) => setForm((f) => ({ ...f, prompt: e.target.value }))}
+                  rows={2}
+                  maxLength={TRACK_PROMPT_MAX}
+                  placeholder="Warm fingerpicked folk, breathy vocals, tape hiss, 90 BPM."
+                  className="w-full px-3 py-2 bg-port-bg border border-port-border rounded text-white text-sm"
+                />
+              </Field>
+              <Field compact label="Lyrics" hint="Full lyrics — also the conditioning text for lyric-aware generators (Ace-Step).">
+                <textarea
+                  value={form.lyrics}
+                  onChange={(e) => setForm((f) => ({ ...f, lyrics: e.target.value }))}
+                  rows={6}
+                  maxLength={TRACK_LYRICS_MAX}
+                  placeholder={'[verse]\n…\n[chorus]\n…'}
+                  className="w-full px-3 py-2 bg-port-bg border border-port-border rounded text-white text-sm font-mono"
+                />
+              </Field>
+
+              {/* Generation — the on-device audio models (MusicGen/AudioLDM2/
+                  ACE-Step), the LLM-composed looping chiptune score (#2911),
+                  and, for a track drawn in the Music Designer, its stored wave
+                  sketch (#8376) to revise and re-render.
+
+                  Audio-model generation can create a standalone track directly;
+                  chiptune composition still needs a persisted score record. */}
+              <div className="space-y-2">
+                <div className="inline-flex rounded-lg border border-port-border overflow-hidden text-sm" role="group" aria-label="Generation mode">
+                  {genModes.map(([mode, label]) => (
+                    <button
+                      key={mode}
+                      type="button"
+                      onClick={() => setGenMode(mode)}
+                      aria-pressed={genMode === mode}
+                      className={`px-3 py-1.5 ${genMode === mode ? 'bg-port-accent/20 text-white' : 'bg-port-bg text-gray-400 hover:text-white'}`}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                {!persisted && genMode === 'chiptune' ? (
+                  <p className="text-xs text-gray-500">
+                    Save the track first, then generate a chiptune score.
+                  </p>
+                ) : genMode === 'drawn' && persisted?.waveSketch ? (
+                  <TrackWaveformHost
+                    track={persisted}
+                    description={form.prompt}
+                    lyrics={form.lyrics}
+                    title={form.title}
+                    onTrackUpdate={applyGeneratorUpdate}
+                  />
+                ) : genMode === 'chiptune' ? (
+                  <ChiptunePanel
+                    track={persisted}
+                    sourcePrompt={form.prompt}
+                    sourceLyrics={form.lyrics}
+                    remix={chiptuneRemix}
+                    onTrackUpdate={applyGeneratorUpdate}
+                  />
+                ) : (
+                  <MusicGenPanel
+                    track={persisted}
+                    title={form.title}
+                    artistId={form.artistId}
+                    artist={form.artist}
+                    albumId={form.albumId}
+                    prompt={form.prompt}
+                    lyrics={form.lyrics}
+                    remix={remix}
+                    onGenerated={(updated) => {
+                      upsertLocal(updated); // list update is id-keyed → always safe
+                      if (!persisted) {
+                        justCreatedIdRef.current = updated.id;
+                        setForm((f) => ({ ...f, audioFilename: updated.audioFilename || '' }));
+                        navigate(`/music/tracks/${encodeURIComponent(updated.id)}`);
+                        return;
+                      }
+                      // Merge ONLY the server-set generation fields into the open
+                      // form (the active audio pointer mirrors onto the form) so any
+                      // UNSAVED edits the user made to title/artist/album/prompt/
+                      // lyrics before clicking Generate survive.
+                      if (selectedIdRef.current === updated.id) {
+                        setForm((f) => ({ ...f, audioFilename: updated.audioFilename || '' }));
+                      }
+                    }}
+                  />
+                )}
+              </div>
+
+              {/* Render history — every generated/uploaded take as a card. The
+                  active take is highlighted; each card opens a detail/remix modal,
+                  can be made active, remixed, downloaded, or deleted. */}
+              {persisted ? (
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between gap-2 flex-wrap">
+                    <span className="block text-xs uppercase tracking-wider text-gray-500">
+                      Renders{renders.length ? ` (${renders.length})` : ''}
+                    </span>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      {/* `handleAudioFile` re-checks `requireSaved()` itself, so the
+                          picker needs no gate of its own. */}
+                      <FilePickerButton
+                        accept="audio/*,.mp3,.wav,.m4a,.ogg,.flac"
+                        onChange={handleAudioFile}
+                        disabled={uploading}
+                        ariaLabel="Upload track audio"
+                        className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg bg-port-bg border border-port-border text-white text-sm hover:border-port-accent"
+                      >
+                        {uploading ? <Loader2 size={14} className="animate-spin" /> : <Upload size={14} />} Upload
+                      </FilePickerButton>
+                      <FilePickerButton
+                        accept="audio/*,.mp3,.wav,.m4a,.ogg,.flac"
+                        onChange={handleSunoExport}
+                        disabled={uploading || saving}
+                        ariaLabel="Import Suno export audio"
+                        title="Import audio you exported from Suno. The prompt (style) and lyrics above are saved with the take."
+                        className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg bg-port-bg border border-port-border text-white text-sm hover:border-port-accent"
+                      >
+                        <FileMusic size={14} /> Suno export
+                      </FilePickerButton>
+                      <button
+                        type="button"
+                        onClick={openLibrary}
+                        className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg bg-port-bg border border-port-border text-white text-sm hover:border-port-accent"
+                      >
+                        <Library size={14} /> From library
+                      </button>
+                    </div>
+                  </div>
+
+                  {renders.length === 0 ? (
+                    <div className="text-xs text-gray-500 border border-dashed border-port-border rounded-lg p-4 text-center">
+                      No renders yet. Generate above, upload a file, or attach one from your library.
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                      {renders.map((r) => (
+                        <TrackRenderCard
+                          key={r.id}
+                          render={r}
+                          active={r.audioFilename === activeFilename}
+                          onOpen={(rr) => setModalRender(rr)}
+                          onSelect={selectRender}
+                          onRemix={remixRender}
+                          onDelete={deleteRender}
+                          onSendToVideo={sendRenderToVideo}
+                        />
+                      ))}
+                    </div>
+                  )}
+
+                  {libraryOpen ? (
+                    <div className="mt-1 border border-port-border rounded-lg bg-port-bg max-h-48 overflow-y-auto">
+                      {library.length === 0 ? (
+                        <div className="text-xs text-gray-500 p-3">The music library is empty — upload a track first.</div>
+                      ) : (
+                        <ul className="divide-y divide-port-border">
+                          {library.map((item) => (
+                            <li key={item.filename}>
+                              <button
+                                type="button"
+                                onClick={() => attachFromLibrary(item.filename)}
+                                className="w-full text-left px-3 py-2 text-sm text-gray-300 hover:bg-port-card flex items-center gap-2"
+                              >
+                                <Music2 size={13} className="text-gray-500 shrink-0" />
+                                <span className="flex-1 min-w-0 truncate">{item.label || item.filename}</span>
+                              </button>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  ) : null}
+                </div>
+              ) : (
+                /* Generation has its own hint under the mode toggle above
+                   (#3264), so this covers only what the renders block offers. */
+                <p className="text-xs text-gray-500">Save the track first to upload or attach audio.</p>
+              )}
+
+              {/* MIDI piano-roll (#2477) — read through from the linked Music
+                  Video project that ran the MuScriptor transcription. */}
+              {midiSource ? (
+                <div className="space-y-1">
+                  <div className="flex items-center justify-between gap-2 flex-wrap">
+                    <span className="block text-xs uppercase tracking-wider text-gray-500">MIDI transcription</span>
+                    <Link
+                      to={`/music-video/${encodeURIComponent(midiSource.id)}`}
+                      className="text-[11px] text-port-accent hover:underline"
+                    >
+                      from Music Video “{midiSource.name}” →
+                    </Link>
+                  </div>
+                  <MidiVisualization
+                    url={trackAudioUrl(midiSource.midiTranscription.filename)}
+                    filename={midiSource.midiTranscription.filename}
+                    model={midiSource.midiTranscription.model}
+                  />
+                </div>
+              ) : null}
+
+              <div className="flex items-center gap-2 pt-1 flex-wrap">
+                <button
+                  type="button"
+                  onClick={handleSave}
+                  disabled={saving || !form.title.trim()}
+                  className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-port-accent text-white text-sm font-medium disabled:opacity-50"
+                >
+                  {saving ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
+                  {isCreate ? 'Create' : 'Save'}
+                </button>
+                {!isCreate && selected ? (
+                  isConfirmingDelete(selected.id) ? (
+                    <ConfirmButtonPair
+                      prompt="Delete this track?"
+                      confirmText="Yes, delete"
+                      ariaLabel="Confirm delete track"
+                      tone="error"
+                      onConfirm={() => confirmDelete(handleDelete)}
+                      onCancel={cancelDelete}
+                    />
+                  ) : (
+                    <button type="button" onClick={() => requestDelete(selected.id)} className="inline-flex items-center gap-2 px-3 py-2 rounded-lg text-gray-400 hover:text-port-error text-sm">
+                      <Trash2 size={14} /> Delete
+                    </button>
+                  )
+                ) : null}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {modalRender ? (
+        <TrackRenderModal
+          render={modalRender}
+          active={modalRender.audioFilename === activeFilename}
+          onClose={() => setModalRender(null)}
+          onSelect={selectRender}
+          onRemix={remixRender}
+          onDelete={deleteRender}
+          onSendToVideo={sendRenderToVideo}
+        />
+      ) : null}
+    </div>
+  );
+}

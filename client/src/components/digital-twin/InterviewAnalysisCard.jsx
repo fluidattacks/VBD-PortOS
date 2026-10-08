@@ -1,0 +1,154 @@
+import { FileText, TrendingUp, Layers, BarChart3 } from 'lucide-react';
+import CollapsibleSection from '../ui/CollapsibleSection';
+
+// Local wrapper so the four call sites below keep the card's rounded-border
+// chrome and `title`-named prop while the toggle behaviour (and aria-expanded)
+// comes from the shared primitive.
+function AnalysisSection({ title, icon, children, defaultOpen = false }) {
+  return (
+    <CollapsibleSection
+      size="lg"
+      icon={icon}
+      label={title}
+      defaultOpen={defaultOpen}
+      className="border border-port-border rounded-lg overflow-hidden"
+      buttonClassName="px-3 py-2"
+      bodyClassName="px-3 pb-3 text-sm"
+    >
+      {children}
+    </CollapsibleSection>
+  );
+}
+
+export default function InterviewAnalysisCard({ analysisResult }) {
+  if (!analysisResult) return null;
+
+  const { traitsUpdated, documentsCreated, documentsUpdated, newDimensions, confidenceDelta, rawAnalysis } = analysisResult;
+
+  const traitCount = Object.keys(traitsUpdated || {}).length;
+  const docsCreatedCount = (documentsCreated || []).length;
+  const docsUpdatedCount = (documentsUpdated || []).length;
+  const dimensionCount = (newDimensions || []).length;
+
+  return (
+    <div className="mt-2 space-y-2">
+      {/* Summary badges */}
+      <div className="flex flex-wrap gap-2">
+        {traitCount > 0 && (
+          <span className="px-2 py-1 text-xs rounded-full bg-port-accent/20 text-port-accent border border-port-accent/30">
+            {traitCount} trait categories updated
+          </span>
+        )}
+        {docsCreatedCount > 0 && (
+          <span className="px-2 py-1 text-xs rounded-full bg-port-success/20 text-port-success border border-port-success/30">
+            {docsCreatedCount} docs created
+          </span>
+        )}
+        {docsUpdatedCount > 0 && (
+          <span className="px-2 py-1 text-xs rounded-full bg-port-warning/20 text-port-warning border border-port-warning/30">
+            {docsUpdatedCount} docs updated
+          </span>
+        )}
+        {dimensionCount > 0 && (
+          <span className="px-2 py-1 text-xs rounded-full bg-port-accent-2/20 text-port-accent-2 border border-port-accent-2/30">
+            {dimensionCount} new dimensions
+          </span>
+        )}
+        {confidenceDelta && confidenceDelta.after !== confidenceDelta.before && (
+          <span className="px-2 py-1 text-xs rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">
+            Confidence: {Math.round(confidenceDelta.before * 100)}% → {Math.round(confidenceDelta.after * 100)}%
+          </span>
+        )}
+      </div>
+
+      {/* Collapsible sections */}
+      <div className="space-y-1">
+        {traitCount > 0 && (
+          <AnalysisSection title="Trait Updates" icon={BarChart3}>
+            <div className="space-y-2">
+              {traitsUpdated.bigFive && (
+                <div>
+                  <p className="text-gray-400 mb-1">Big Five:</p>
+                  <div className="grid grid-cols-5 gap-1 sm:gap-2">
+                    {Object.entries(traitsUpdated.bigFive).filter(([k]) => k !== 'notes').map(([k, v]) => (
+                      <div key={k} className="text-center">
+                        <div className="text-[10px] sm:text-xs text-gray-500">{k}</div>
+                        <div className="text-white font-medium">{typeof v === 'number' ? v.toFixed(2) : v}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {traitsUpdated.valuesHierarchy && (
+                <div>
+                  <p className="text-gray-400 mb-1">Values:</p>
+                  <div className="flex flex-wrap gap-1">
+                    {traitsUpdated.valuesHierarchy.map((v, i) => (
+                      <span key={i} className="px-2 py-0.5 text-xs bg-port-bg rounded text-gray-300">
+                        {v.value} ({v.priority})
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {traitsUpdated.communicationProfile && (
+                <div>
+                  <p className="text-gray-400 mb-1">Communication:</p>
+                  <div className="text-xs text-gray-300 space-y-0.5">
+                    {traitsUpdated.communicationProfile.formality !== undefined && (
+                      <div>Formality: {traitsUpdated.communicationProfile.formality}/10</div>
+                    )}
+                    {traitsUpdated.communicationProfile.verbosity !== undefined && (
+                      <div>Verbosity: {traitsUpdated.communicationProfile.verbosity}/10</div>
+                    )}
+                    {traitsUpdated.communicationProfile.preferredTone && (
+                      <div>Tone: {traitsUpdated.communicationProfile.preferredTone}</div>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          </AnalysisSection>
+        )}
+
+        {dimensionCount > 0 && (
+          <AnalysisSection title="New Dimensions" icon={Layers}>
+            <div className="space-y-2">
+              {newDimensions.map((dim, i) => (
+                <div key={i} className="bg-port-bg rounded p-2">
+                  <div className="font-medium text-port-accent-2 text-xs mb-1">{dim.name}</div>
+                  <div className="space-y-1">
+                    {dim.traits.map((t, j) => (
+                      <div key={j} className="text-xs text-gray-300">
+                        <span className="text-white">{t.trait}:</span> {t.expression}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </AnalysisSection>
+        )}
+
+        {(docsCreatedCount > 0 || docsUpdatedCount > 0) && (
+          <AnalysisSection title="Document Changes" icon={FileText}>
+            <div className="space-y-1">
+              {(documentsCreated || []).map((f, i) => (
+                <div key={`c-${i}`} className="text-xs text-port-success">+ {f}</div>
+              ))}
+              {(documentsUpdated || []).map((f, i) => (
+                <div key={`u-${i}`} className="text-xs text-port-warning">~ {f}</div>
+              ))}
+            </div>
+          </AnalysisSection>
+        )}
+
+        {rawAnalysis && (
+          <AnalysisSection title="Analysis Summary" icon={TrendingUp} defaultOpen>
+            <p className="text-xs text-gray-300 whitespace-pre-wrap">{rawAnalysis}</p>
+          </AnalysisSection>
+        )}
+      </div>
+    </div>
+  );
+}

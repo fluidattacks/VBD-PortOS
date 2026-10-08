@@ -1,0 +1,220 @@
+import { useEffect, useRef, useState } from 'react';
+import socket from '../services/socket';
+import { getMediaJob } from '../services/apiMediaJobs';
+import { usePreviousSync } from './usePrevious.js';
+import useMounted from './useMounted';
+import { subscribeVisibility } from './useVisibilityEvent';
+
+/**
+ * Subscribe to live progress for a single mediaJobQueue job. `kind`
+ * selects the socket namespace: 'image' (default) → image-gen, 'video' →
+ * video-gen, 'audio' → audio-gen (first-pass music-bed, #1933). Filters
+ * socket events by jobId so multiple instances of this hook coexist (one
+ * per comic panel / storyboard scene) without cross-talk.
+ *
+ * Returns:
+ *   {
+ *     status: 'unknown' | 'queued' | 'running' | 'completed' | 'failed' | 'canceled',
+ *     progress, statusMsg, step, totalSteps, currentImage,
+ *     filename, path, error, etaMs,
+ *   }
+ *
+ * `etaMs` is the server's history-calibrated wall-clock estimate for the whole
+ * render (#3801) — video gen only, and only once that install has measured a
+ * comparable render. It stays `null` when the server sent no estimate, which
+ * consumers must render as "unknown" rather than as a finished countdown.
+ *
+ * Initial state is hydrated from GET /api/media-jobs/:id so navigating
+ * back to a page mid-render picks up the in-flight job's snapshot
+ * instead of showing an empty preview until the next event lands.
+ */
+const INITIAL_STATE = Object.freeze({
+  status: 'unknown',
+  progress: 0,
+  statusMsg: null,
+  step: 0,
+  totalSteps: null,
+  currentImage: null,
+  etaMs: null,
+  filename: null,
+  path: null,
+  error: null,
+  startedAt: null,
+  trackId: null,
+});
+
+export default function useMediaJobProgress(jobId, { kind = 'image' } = {}) {
+  const [state, setState] = useState(INITIAL_STATE);
+  // SYNCHRONOUS reset when `jobId` changes — React's "adjusting state on
+  // prop change" pattern. `usePreviousSync` advances its snapshot during
+  // render (not in an effect), so React's re-run after the setState
+  // already sees `prevJobId === jobId` and doesn't fire a second setState.
+  // Without this synchronous semantics, the first observable render would
+  // still carry the prior job's `status` / `filename` and `onJobCompleted`
+  // consumers would mis-attribute it to the new jobId.
+  const prevJobId = usePreviousSync(jobId, jobId);
+  if (prevJobId !== jobId) setState(INITIAL_STATE);
+  // Track mount so the initial fetch's setState doesn't fire after unmount
+  // (the panel could be removed while the GET is in flight).
+  const mountedRef = useMounted();
+  // Latest status for the reconnect re-hydrate below, read outside a setState
+  // updater so the fetch isn't a side effect inside one (#8426).
+  const statusRef = useRef(state.status);
+  statusRef.current = state.status;
+
+  useEffect(() => {
+    if (!jobId) return undefined;
+
+    // Hydrate from the server. The job may already be completed (the user
+    // reloaded after the render finished) — without this fetch the UI
+    // would never reflect that. Re-run on every socket reconnect (#8426): a
+    // terminal event emitted while the socket was down is never replayed, so
+    // without it a render that finished during a blip stays "running".
+    let canceled = false;
+    let pendingHydrate = null;
+    let revision = 0;
+    const hydrate = () => {
+      if (pendingHydrate) return pendingHydrate;
+      const startedRevision = revision;
+      pendingHydrate = getMediaJob(jobId).then((job) => {
+        if (canceled || !mountedRef.current || startedRevision !== revision) return;
+        setState((prev) => ({
+          ...prev,
+          status: job.status || 'unknown',
+          progress: typeof job.progress === 'number' ? job.progress : prev.progress,
+          statusMsg: job.statusMsg || prev.statusMsg,
+          // Reload mid-render: the queue retained the estimate, so the ETA comes
+          // back immediately instead of after the next (minutes-away) step.
+          // Same absent-vs-explicit rule as the socket frames: a key the
+          // snapshot doesn't carry leaves the current value alone, an explicit
+          // null clears it.
+          etaMs: job.etaMs !== undefined ? job.etaMs : prev.etaMs,
+          filename: job.result?.filename || prev.filename,
+          path: job.result?.path || prev.path,
+          error: job.error || prev.error,
+          startedAt: job.startedAt || prev.startedAt,
+          trackId: job.result?.trackId || prev.trackId,
+        }));
+      }).catch(() => {
+        // 404 (job past 24h archive TTL) and any other failure stay silent;
+        // MediaJobThumb's `fallbackFilename` path bypasses this fetch entirely
+        // when the parent already has the completed render's filename.
+      }).finally(() => { pendingHydrate = null; });
+      return pendingHydrate;
+    };
+    hydrate();
+    // A terminal job can't change, so a reconnect only re-fetches live ones.
+    const onReconnect = () => {
+      if (!['completed', 'failed', 'canceled'].includes(statusRef.current)) hydrate();
+    };
+
+    const evtPrefix = kind === 'video' ? 'video-gen' : kind === 'audio' ? 'audio-gen' : 'image-gen';
+    const onStarted = (data) => {
+      if (data.generationId !== jobId) return;
+      revision += 1;
+      setState((prev) => {
+        const totalSteps = data.totalSteps ?? prev.totalSteps;
+        // `etaMs: null` on the wire is the server saying "no estimate for this
+        // shape" — an intentional value, not an absent key, so it must clear a
+        // stale estimate rather than fall through to `prev`.
+        const etaMs = data.etaMs !== undefined ? data.etaMs : prev.etaMs;
+        if (prev.status === 'running' && totalSteps === prev.totalSteps && etaMs === prev.etaMs) return prev;
+        return { ...prev, status: 'running', totalSteps, etaMs };
+      });
+    };
+    // Diffusion runners throttle `currentImage` but still emit identical
+    // step/progress between frames. Return prev unchanged on a no-op tick so
+    // each panel doesn't re-render unnecessarily — N panels × every tick
+    // adds up across a comic page.
+    const onProgress = (data) => {
+      if (data.generationId !== jobId) return;
+      revision += 1;
+      setState((prev) => {
+        const next = {
+          ...prev,
+          status: 'running',
+          progress: data.progress ?? prev.progress,
+          statusMsg: data.message ?? prev.statusMsg,
+          step: data.step ?? prev.step,
+          totalSteps: data.totalSteps ?? prev.totalSteps,
+          currentImage: data.currentImage ?? prev.currentImage,
+          etaMs: data.etaMs !== undefined ? data.etaMs : prev.etaMs,
+        };
+        if (
+          next.status === prev.status
+          && next.progress === prev.progress
+          && next.statusMsg === prev.statusMsg
+          && next.step === prev.step
+          && next.totalSteps === prev.totalSteps
+          && next.currentImage === prev.currentImage
+          && next.etaMs === prev.etaMs
+        ) return prev;
+        return next;
+      });
+    };
+    const onCompleted = (data) => {
+      if (data.generationId !== jobId) return;
+      revision += 1;
+      setState((prev) => ({
+        ...prev,
+        status: 'completed',
+        progress: 1,
+        statusMsg: 'Completed',
+        filename: data.filename ?? prev.filename,
+        path: data.path ?? prev.path,
+        trackId: data.trackId ?? prev.trackId,
+      }));
+    };
+    const onFailed = (data) => {
+      if (data.generationId !== jobId) return;
+      revision += 1;
+      // The mediaJobQueue collapses a RUNNING job's cancellation into a *:failed
+      // socket event (SIGTERM looks like a failure to the underlying gen
+      // module) while the persisted job.status is actually 'canceled'.
+      // Re-fetch the authoritative state so MediaJobThumb's canceled UI
+      // is reachable in live sessions, not just on reload.
+      setState((prev) => ({ ...prev, status: 'failed', error: data.error || 'failed' }));
+      getMediaJob(jobId).then((job) => {
+        if (canceled || !mountedRef.current) return;
+        if (job?.status === 'canceled') {
+          setState((prev) => ({ ...prev, status: 'canceled', error: job.error || prev.error }));
+        }
+      }).catch(() => {});
+    };
+    // A job canceled while still QUEUED never starts a gen run, so it emits no
+    // *:failed — only `*-gen:canceled` (bridged from mediaJobEvents, #1791).
+    // Settle straight to 'canceled' so the spinner clears live without the
+    // re-fetch the *:failed path needs. Also fires (harmlessly, idempotently)
+    // alongside *:failed when a running job is canceled.
+    const onCanceled = (data) => {
+      if (data.generationId !== jobId) return;
+      revision += 1;
+      setState((prev) => (prev.status === 'canceled' ? prev : { ...prev, status: 'canceled' }));
+    };
+
+    socket.on(`${evtPrefix}:started`, onStarted);
+    socket.on(`${evtPrefix}:progress`, onProgress);
+    socket.on(`${evtPrefix}:completed`, onCompleted);
+    socket.on(`${evtPrefix}:failed`, onFailed);
+    socket.on(`${evtPrefix}:canceled`, onCanceled);
+    socket.on('connect', onReconnect);
+    let lastVisibility = document.visibilityState;
+    const unsubscribeVisibility = subscribeVisibility((visibility) => {
+      const changed = visibility !== lastVisibility;
+      lastVisibility = visibility;
+      if (changed && visibility === 'visible') onReconnect();
+    });
+    return () => {
+      canceled = true;
+      unsubscribeVisibility();
+      socket.off(`${evtPrefix}:started`, onStarted);
+      socket.off(`${evtPrefix}:progress`, onProgress);
+      socket.off(`${evtPrefix}:completed`, onCompleted);
+      socket.off(`${evtPrefix}:failed`, onFailed);
+      socket.off(`${evtPrefix}:canceled`, onCanceled);
+      socket.off('connect', onReconnect);
+    };
+  }, [jobId, kind]);
+
+  return state;
+}

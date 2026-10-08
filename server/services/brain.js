@@ -1,0 +1,1134 @@
+/**
+ * Brain Service
+ *
+ * Core business logic for the Brain feature:
+ * - Capture and classify thoughts
+ * - Route to appropriate databases
+ * - Generate daily digests and weekly reviews
+ * - Handle corrections and fixes
+ */
+
+import * as storage from './brainStorage.js';
+import { brainEvents } from './brainStorage.js';
+import { getInstanceId, ensureInstanceId, UNKNOWN_INSTANCE_ID } from './instanceIdentity.js';
+import { getActiveProvider, getProviderById } from './providers.js';
+import { buildPrompt } from './promptService.js';
+import { validate } from '../lib/validation.js';
+import { extractJson } from '../lib/jsonExtract.js';
+import { runPromptThroughProvider } from './promptRunner.js';
+import { getDomainAutonomyMode } from './cosState.js';
+import { getDomainBudgetStatus, recordDomainUsage } from './domainUsage.js';
+import { deleteMemoryAssets } from './chatgptImport.js';
+import { withBackupAssetPublication } from '../lib/backupSnapshotBoundary.js';
+import * as repoCloner from './repoCloner.js';
+import { deriveRepoLinkFields } from '../lib/repoLinkFields.js';
+import { parseBareUrl } from '../lib/bareUrl.js';
+import { normalizeRepoIntake } from '../lib/repoIntakeActions.js';
+import {
+  classifierOutputSchema,
+  digestOutputSchema,
+  reviewOutputSchema,
+  extractedPeopleSchema,
+  extractedProjectSchema,
+  extractedIdeaSchema,
+  extractedAdminSchema,
+  extractedMemorySchema
+} from '../lib/brainValidation.js';
+
+// Extracted field validators by destination
+const EXTRACTED_VALIDATORS = {
+  people: extractedPeopleSchema,
+  projects: extractedProjectSchema,
+  ideas: extractedIdeaSchema,
+  admin: extractedAdminSchema,
+  memories: extractedMemorySchema
+};
+
+/**
+ * Call AI provider with a prompt
+ */
+async function callAI(promptStageName, variables, providerOverride, modelOverride) {
+  const provider = providerOverride
+    ? await getProviderById(providerOverride)
+    : await getActiveProvider();
+
+  if (!provider || !provider.enabled) {
+    throw new Error('No AI provider available');
+  }
+
+  const prompt = await buildPrompt(promptStageName, variables);
+  let model = modelOverride || provider.defaultModel;
+
+  // gemini-cli default is a thinking model (3.1-pro); prefer the provider's configured
+  // light tier (populated from data.reference/providers.json on new installs) and only fall
+  // back to the hard-coded flash if nothing is configured at all.
+  if (provider.id === 'gemini-cli' && !model) {
+    model = provider.lightModel || 'gemini-2.5-flash';
+  }
+
+  console.log(`🧠 Calling AI: ${provider.id} / ${model} / ${promptStageName}`);
+
+  // brain runs are headless classification — append the provider's
+  // headlessArgs (e.g. claude-code's --no-session-persistence) so the
+  // user's session list doesn't fill up with classifier transcripts.
+  // The clone leaves the saved provider config untouched.
+  const providerForCall = provider.headlessArgs?.length
+    ? { ...provider, args: [...(provider.args || []), ...provider.headlessArgs] }
+    : provider;
+
+  const { text, model: effectiveModel } = await runPromptThroughProvider({
+    provider: providerForCall, prompt, source: `brain-${promptStageName}`, model,
+  });
+  return { content: text, model: effectiveModel || model, providerId: provider.id, prompt };
+}
+
+/**
+ * Parse JSON from AI response (handles markdown code blocks)
+ */
+function parseJsonResponse(content, responseSchema = null, promptToStrip = '') {
+  if (!content || typeof content !== 'string') {
+    throw new Error('Empty or invalid AI response');
+  }
+
+  const shapePredicate = responseSchema
+    ? (value) => responseSchema.safeParse(value).success
+    : undefined;
+  const source = promptToStrip && content.includes(promptToStrip)
+    ? content.replace(promptToStrip, '')
+    : content;
+  const { value, lastError } = extractJson(source, {
+    // Brain prompts include fenced JSON examples. Walk all candidates so an
+    // echoed example cannot win before the actual answer.
+    skipInnerFence: true,
+    shapePredicate,
+  });
+  if (value === undefined) {
+    throw new Error(`Failed to parse AI JSON response: ${lastError?.message || 'No JSON found'}`);
+  }
+  return value;
+}
+
+/**
+ * Safe version of parseJsonResponse that returns null instead of throwing.
+ * Used in background classification where errors can't bubble to middleware.
+ *
+ * The schema is the single validation authority: it picks the matching JSON
+ * candidate AND supplies the returned data. extractJson falls back to the first
+ * raw JSON value when no candidate matches; that fallback is discarded here
+ * (null) rather than re-validated by the caller.
+ */
+function safeParseJsonResponse(content, responseSchema, promptToStrip = '') {
+  if (!content || typeof content !== 'string') return null;
+  const source = promptToStrip && content.includes(promptToStrip)
+    ? content.replace(promptToStrip, '')
+    : content;
+  let matched = null;
+  const shapePredicate = (value) => {
+    const result = responseSchema.safeParse(value);
+    if (result.success) matched = { value, data: result.data };
+    return result.success;
+  };
+  const { value } = extractJson(source, { skipInnerFence: true, shapePredicate });
+  return matched && matched.value === value ? matched.data : null;
+}
+
+/**
+ * Capture a thought and classify it
+ * Returns immediately after creating the inbox entry.
+ * AI classification runs in the background and emits a socket event on completion.
+ */
+export async function captureThought(text, providerOverride, modelOverride, { creative = false, repoIntake = null, note } = {}) {
+  // A capture that is nothing but a URL is a bookmark, not a thought: file it
+  // straight to Links exactly as the Links tab would, and skip the classifier
+  // LLM call entirely. This outranks the creative flag — a bare URL carries no
+  // prose for the Catalog to work from — so both capture boxes disable the
+  // Creative toggle for a URL rather than the two rules disagreeing.
+  const bareUrl = parseBareUrl(text);
+  if (bareUrl) {
+    return captureUrlAsLink(bareUrl, text, { repoIntake, note });
+  }
+
+  const meta = await storage.loadMeta();
+  const provider = providerOverride || meta.defaultProvider;
+  const model = modelOverride || meta.defaultModel;
+
+  // Per-domain autonomy gate: `off` captures the thought but skips auto-classify
+  // entirely (it lands in the inbox for manual review); `dry-run` classifies and
+  // surfaces the suggestion but doesn't auto-file it.
+  const autonomyMode = await getDomainAutonomyMode('brain');
+
+  // Daily brain budget (#711): when today's auto-classify actions/minutes reach
+  // the cap, fall back to `off` for the rest of the day — the thought is still
+  // captured for manual review, just not auto-classified. A manual retry
+  // (retryClassification) is user-initiated and never gated or counted.
+  const withinBudget = autonomyMode === 'off' || (await getDomainBudgetStatus('brain')).withinBudget;
+  const classify = autonomyMode !== 'off' && withinBudget;
+  const budgetPaused = autonomyMode !== 'off' && !withinBudget;
+
+  // Create initial inbox log entry. When auto-classify is off the entry goes
+  // straight to needs_review rather than the transient classifying state — and
+  // carries no `ai` metadata, since no provider/model was ever invoked.
+  const inboxEntry = await storage.createInboxLog({
+    capturedText: text,
+    source: 'brain_ui',
+    ...(creative ? { creative: true } : {}),
+    ...(!classify
+      ? {}
+      : { ai: { providerId: provider, modelId: model, promptTemplateId: 'brain-classifier' } }),
+    status: !classify ? 'needs_review' : 'classifying'
+  });
+
+  if (!classify) {
+    console.log(`🧠 Thought captured, ${budgetPaused ? 'auto-classify daily budget reached' : 'auto-classify is OFF'} — left for manual review: ${inboxEntry.id}`);
+    return {
+      inboxLog: inboxEntry,
+      message: budgetPaused
+        ? 'Thought captured! Auto-classify daily budget reached — review it in the inbox.'
+        : 'Thought captured! Auto-classify is off — review it in the inbox.'
+    };
+  }
+
+  console.log(`🧠 Thought captured, classifying in background${autonomyMode === 'dry-run' ? ' (dry-run, no auto-file)' : ''}: ${inboxEntry.id}`);
+
+  // Run AI classification in background (don't await)
+  // Pass resolved provider/model so callAI uses brain's configured provider, not the system active one
+  classifyInBackground({
+    entryId: inboxEntry.id,
+    text,
+    meta,
+    provider,
+    model,
+    autoFile: autonomyMode !== 'dry-run',
+    countsTowardBudget: true
+  })
+    .catch(err => console.error(`❌ Background classification failed for ${inboxEntry.id}: ${err.message}`));
+
+  return {
+    inboxLog: inboxEntry,
+    message: autonomyMode === 'dry-run'
+      ? 'Thought captured! AI is suggesting a classification (dry-run — confirm to file).'
+      : 'Thought captured! AI is classifying...'
+  };
+}
+
+/**
+ * File a bare-URL capture to the links collection and log it as an already-filed
+ * inbox entry (so the capture is still auditable from the inbox, showing where
+ * it went). Re-pasting a URL that's already saved reuses that link instead of
+ * failing the capture — the inbox entry then points at the existing bookmark.
+ *
+ * `repoIntake` carries the capture box's opt-in post-clone agent actions
+ * (malware scan / repo study). It applies only to a NEW GitHub link: re-pasting
+ * an already-saved URL performs no clone, so there is no fresh clone for the
+ * agents to read and re-queueing them silently would be a surprise.
+ */
+async function captureUrlAsLink(url, capturedText, { repoIntake = null, note } = {}) {
+  const existing = await storage.getLinkByUrl(url);
+  const link = existing || await createLinkFromUrl(url, { repoIntake, note });
+
+  // No `classification` block: nothing classified this — the destination was
+  // decided by shape, not by a model, so there is no confidence or extraction to
+  // record. That also keeps the entry safe on a federated peer running older
+  // code (inbox records sync): its inbox renders `classification.destination`
+  // through a fixed destination map, so an absent classification degrades to the
+  // existing "Unknown" badge instead of an unmapped value it can't render.
+  const inboxEntry = await storage.createInboxLog({
+    capturedText,
+    source: 'brain_ui',
+    status: 'filed',
+    filed: { destination: 'links', destinationId: link.id }
+  });
+
+  console.log(`🔗 Captured URL filed to links: ${link.id}${existing ? ' (existing)' : ''} via ${inboxEntry.id}`);
+
+  return {
+    inboxLog: inboxEntry,
+    link,
+    message: existing
+      ? 'Already saved in Links.'
+      : (link.isRepo ? repoCaptureMessage(link.repoIntake) : 'Saved to Links!')
+  };
+}
+
+/**
+ * What a freshly-captured repo link tells the user will happen next. The
+ * clone is always implied; the agent runs only when they ticked the boxes, and
+ * they only start once the clone lands.
+ */
+function repoCaptureMessage(repoIntake) {
+  const queued = [
+    repoIntake?.malwareScan && 'malware scan',
+    repoIntake?.learn && 'repo study',
+  ].filter(Boolean);
+  return queued.length
+    ? `Repo saved — cloning, then queueing ${queued.join(' + ')}.`
+    : 'Repo saved to Links — cloning now.';
+}
+
+/**
+ * Background AI classification for a captured thought.
+ * Updates the inbox entry and emits a brain:classified event when done.
+ */
+async function classifyInBackground({ entryId, text, meta, provider, model, autoFile = true, countsTowardBudget = false }) {
+  let classification = null;
+  let aiError = null;
+
+  const startTime = Date.now();
+  const aiResult = await callAI(
+    'brain-classifier',
+    { capturedText: text, now: new Date().toISOString() },
+    provider,
+    model
+  ).catch(err => {
+    aiError = err;
+    return null;
+  });
+
+  const durationMs = Date.now() - startTime;
+  const elapsed = (durationMs / 1000).toFixed(1);
+
+  // Daily brain budget accounting (#711): an auto-classify consumed compute
+  // whether or not it parsed, so count the attempt + its time. Only the auto
+  // path (captureThought) passes countsTowardBudget — a manual retry doesn't count.
+  if (countsTowardBudget) {
+    await recordDomainUsage('brain', { actions: 1, ms: durationMs })
+      .catch(err => console.error(`❌ Failed to record brain budget usage for ${entryId}: ${err.message}`));
+  }
+  const aiResponse = aiResult?.content;
+  // Patch ai metadata so the inbox entry reflects the model actually invoked
+  // (captureThought/retryClassification stored the pre-resolved value, which may
+  // have been null when gemini-cli fell back internally).
+  const aiMeta = aiResult
+    ? { providerId: aiResult.providerId, modelId: aiResult.model, promptTemplateId: 'brain-classifier' }
+    : null;
+
+  if (aiResponse) {
+    console.log(`🧠 AI responded in ${elapsed}s for ${entryId}`);
+    classification = safeParseJsonResponse(aiResponse, classifierOutputSchema, aiResult.prompt);
+    if (!classification) aiError = new Error('Could not parse a valid classification from AI response');
+  } else {
+    console.log(`🧠 AI failed after ${elapsed}s for ${entryId}`);
+  }
+
+  // If AI failed, mark as needs_review
+  if (!classification) {
+    const errorMessage = aiError?.message || 'AI classification failed';
+    await storage.updateInboxLog(entryId, {
+      ...(aiMeta ? { ai: aiMeta } : {}),
+      classification: {
+        destination: 'unknown',
+        confidence: 0,
+        title: 'Classification failed',
+        extracted: {},
+        reasons: [errorMessage]
+      },
+      status: 'needs_review',
+      error: { message: errorMessage }
+    });
+
+    console.log(`🧠 Classification failed for ${entryId}: ${errorMessage}`);
+    brainEvents.emit('classified', { entryId, status: 'needs_review', error: errorMessage });
+    return;
+  }
+
+  // Check confidence threshold
+  if (classification.confidence < meta.confidenceThreshold || classification.destination === 'unknown') {
+    await storage.updateInboxLog(entryId, {
+      ai: aiMeta,
+      classification,
+      status: 'needs_review'
+    });
+
+    console.log(`🧠 Low confidence (${classification.confidence}) for ${entryId}`);
+    brainEvents.emit('classified', { entryId, status: 'needs_review', confidence: classification.confidence });
+    return;
+  }
+
+  // Dry-run: a confident classification was produced, but the auto-file side
+  // effect is withheld. Surface the suggestion as needs_review so the user can
+  // confirm filing it from the inbox.
+  if (!autoFile) {
+    await storage.updateInboxLog(entryId, {
+      ai: aiMeta,
+      classification,
+      status: 'needs_review'
+    });
+    console.log(`🧠 [dry-run] Classified ${entryId} → ${classification.destination} (not filed; awaiting confirmation)`);
+    brainEvents.emit('classified', {
+      entryId,
+      status: 'needs_review',
+      destination: classification.destination,
+      title: classification.title,
+      dryRun: true
+    });
+    return;
+  }
+
+  // File to appropriate destination
+  const filedRecord = await fileToDestination(classification.destination, classification.extracted, classification.title);
+
+  await storage.updateInboxLog(entryId, {
+    ai: aiMeta,
+    classification,
+    status: 'filed',
+    filed: {
+      destination: classification.destination,
+      destinationId: filedRecord.id
+    }
+  });
+
+  console.log(`🧠 Classified and filed to ${classification.destination}: ${filedRecord.id}`);
+  brainEvents.emit('classified', {
+    entryId,
+    status: 'filed',
+    destination: classification.destination,
+    title: classification.title
+  });
+}
+
+/**
+ * File extracted data to destination database
+ */
+async function fileToDestination(destination, extracted, title) {
+  const validator = EXTRACTED_VALIDATORS[destination];
+  if (!validator) {
+    throw new Error(`Unknown destination: ${destination}`);
+  }
+
+  // Validate and set defaults
+  const validationResult = validator.safeParse(extracted);
+  const data = validationResult.success ? validationResult.data : extracted;
+
+  switch (destination) {
+    case 'people':
+      return storage.createPerson({
+        name: data.name || title,
+        context: data.context || '',
+        followUps: data.followUps || [],
+        lastTouched: data.lastTouched || null,
+        tags: data.tags || []
+      });
+
+    case 'projects':
+      return storage.createProject({
+        name: data.name || title,
+        status: data.status || 'active',
+        nextAction: data.nextAction || 'Define next action',
+        notes: data.notes || '',
+        tags: data.tags || []
+      });
+
+    case 'ideas':
+      return storage.createIdea({
+        title: data.title || title,
+        oneLiner: data.oneLiner || title,
+        notes: data.notes || '',
+        tags: data.tags || []
+      });
+
+    case 'admin':
+      return storage.createAdminItem({
+        title: data.title || title,
+        status: data.status || 'open',
+        dueDate: data.dueDate || null,
+        nextAction: data.nextAction || null,
+        notes: data.notes || ''
+      });
+
+    case 'memories':
+      return storage.createMemoryEntry({
+        title: data.title || title,
+        content: data.content || '',
+        mood: data.mood || null,
+        tags: data.tags || []
+      });
+
+    default:
+      throw new Error(`Cannot file to destination: ${destination}`);
+  }
+}
+
+/**
+ * Title to file an inbox entry under. Not every entry carries a classification —
+ * a URL filed to Links skipped the classifier, and so does every capture taken
+ * while auto-classify is off — so fall back to the captured text (bounded to the
+ * 200-char record-title limit) before the last-resort placeholder.
+ */
+function entryTitle(inboxLog) {
+  return inboxLog.classification?.title
+    || inboxLog.capturedText?.trim().slice(0, 200)
+    || 'Untitled';
+}
+
+/**
+ * Resolve a needs_review inbox item
+ */
+export async function resolveReview(inboxLogId, destination, editedExtracted) {
+  const inboxLog = await storage.getInboxLogById(inboxLogId);
+  if (!inboxLog) {
+    throw new Error('Inbox log entry not found');
+  }
+
+  if (inboxLog.status !== 'needs_review') {
+    throw new Error('Inbox entry is not in needs_review status');
+  }
+
+  // Merge extracted data with edits
+  const extracted = { ...inboxLog.classification?.extracted, ...editedExtracted };
+  const title = entryTitle(inboxLog);
+
+  // File to destination
+  const filedRecord = await fileToDestination(destination, extracted, title);
+
+  // Update inbox log
+  await storage.updateInboxLog(inboxLogId, {
+    classification: {
+      ...inboxLog.classification,
+      destination,
+      extracted,
+      confidence: 1.0,
+      reasons: [...(inboxLog.classification?.reasons || []), 'Manually resolved']
+    },
+    status: 'filed',
+    filed: {
+      destination,
+      destinationId: filedRecord.id
+    }
+  });
+
+  console.log(`🧠 Resolved review to ${destination}: ${filedRecord.id}`);
+  return {
+    inboxLog: await storage.getInboxLogById(inboxLogId),
+    filedRecord
+  };
+}
+
+/**
+ * Fix/correct a filed inbox item
+ */
+export async function fixClassification(inboxLogId, newDestination, updatedFields, note) {
+  const inboxLog = await storage.getInboxLogById(inboxLogId);
+  if (!inboxLog) {
+    throw new Error('Inbox log entry not found');
+  }
+
+  if (inboxLog.status !== 'filed' && inboxLog.status !== 'corrected') {
+    throw new Error('Can only fix filed or previously corrected entries');
+  }
+
+  const previousDestination = inboxLog.filed?.destination || inboxLog.classification?.destination;
+  const previousId = inboxLog.filed?.destinationId;
+
+  // Create new record in new destination
+  const extracted = { ...inboxLog.classification?.extracted, ...updatedFields };
+  const title = entryTitle(inboxLog);
+  const newRecord = await fileToDestination(newDestination, extracted, title);
+
+  // Mark old record as archived (soft delete by adding archived flag)
+  if (previousId && previousDestination) {
+    await archiveRecord(previousDestination, previousId);
+  }
+
+  // Update inbox log with correction info
+  await storage.updateInboxLog(inboxLogId, {
+    status: 'corrected',
+    filed: {
+      destination: newDestination,
+      destinationId: newRecord.id
+    },
+    correction: {
+      correctedAt: new Date().toISOString(),
+      previousDestination: previousDestination || 'unknown',
+      newDestination,
+      note
+    }
+  });
+
+  console.log(`🧠 Fixed classification from ${previousDestination} to ${newDestination}`);
+  return {
+    inboxLog: await storage.getInboxLogById(inboxLogId),
+    newRecord
+  };
+}
+
+/**
+ * Archive a record (soft delete)
+ */
+async function archiveRecord(destination, id) {
+  // A bookmark has no archived state — the Links tab renders every record — so
+  // correcting a bare-URL capture into a real destination removes the link it
+  // auto-created, rather than leaving it behind in Links.
+  if (destination === 'links') {
+    await storage.deleteLink(id);
+    return;
+  }
+
+  const updateFn = {
+    people: storage.updatePerson,
+    projects: storage.updateProject,
+    ideas: storage.updateIdea,
+    admin: storage.updateAdminItem,
+    memories: storage.updateMemoryEntry
+  }[destination];
+
+  if (updateFn) {
+    await updateFn(id, { archived: true });
+  }
+}
+
+/**
+ * Run daily digest
+ */
+export async function runDailyDigest(providerOverride, modelOverride) {
+  const meta = await storage.loadMeta();
+
+  // Gather data for digest
+  const [activeProjects, openAdmin, allPeople, needsReviewLogs] = await Promise.all([
+    storage.getProjects({ status: 'active' }),
+    storage.getAdminItems({ status: 'open' }),
+    storage.getPeople(),
+    storage.getInboxLog({ status: 'needs_review' })
+  ]);
+
+  // Filter people with follow-ups
+  const peopleWithFollowUps = allPeople.filter(p => p.followUps && p.followUps.length > 0);
+
+  // Skip AI call when brain has no data (fresh instance)
+  if (!activeProjects.length && !openAdmin.length && !peopleWithFollowUps.length && !needsReviewLogs.length) {
+    console.log('🧠 Skipping daily digest: no brain data yet');
+    await storage.updateMeta({ lastDailyDigest: new Date().toISOString() });
+    return null;
+  }
+
+  const aiResult = await callAI(
+    'brain-daily-digest',
+    {
+      activeProjects: JSON.stringify(activeProjects),
+      openAdmin: JSON.stringify(openAdmin),
+      peopleFollowUps: JSON.stringify(peopleWithFollowUps),
+      needsReview: JSON.stringify(needsReviewLogs),
+      now: new Date().toISOString()
+    },
+    providerOverride || meta.defaultProvider,
+    modelOverride || meta.defaultModel
+  );
+
+  const parsed = parseJsonResponse(aiResult.content, digestOutputSchema, aiResult.prompt);
+  const validationResult = digestOutputSchema.safeParse(parsed);
+
+  if (!validationResult.success) {
+    throw new Error(`Invalid digest output: ${JSON.stringify(validationResult.error.issues)}`);
+  }
+
+  const digestData = validationResult.data;
+
+  // Enforce word limit
+  const wordCount = digestData.digestText.split(/\s+/).length;
+  if (wordCount > 150) {
+    digestData.digestText = digestData.digestText.split(/\s+/).slice(0, 150).join(' ') + '...';
+  }
+
+  // Store digest — ai.modelId reflects the resolved model so attribution stays
+  // accurate even when callAI falls back (e.g., gemini-cli → gemini-2.5-flash).
+  const digest = await storage.createDigest({
+    ...digestData,
+    ai: {
+      providerId: aiResult.providerId,
+      modelId: aiResult.model,
+      promptTemplateId: 'brain-daily-digest'
+    }
+  });
+
+  console.log(`🧠 Generated daily digest: ${digest.id}`);
+  return digest;
+}
+
+/**
+ * Run weekly review
+ */
+export async function runWeeklyReview(providerOverride, modelOverride) {
+  const meta = await storage.loadMeta();
+
+  // Get inbox log from last 7 days
+  const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+  const allInboxLogs = await storage.getInboxLog({ limit: 500 });
+  const recentInboxLogs = allInboxLogs.filter(log => log.capturedAt >= sevenDaysAgo);
+
+  // Get active projects
+  const activeProjects = await storage.getProjects({ status: 'active' });
+
+  // Skip AI call when brain has no data (fresh instance)
+  if (!recentInboxLogs.length && !activeProjects.length) {
+    console.log('🧠 Skipping weekly review: no brain data yet');
+    await storage.updateMeta({ lastWeeklyReview: new Date().toISOString() });
+    return null;
+  }
+
+  const aiResult = await callAI(
+    'brain-weekly-review',
+    {
+      inboxLogLast7Days: JSON.stringify(recentInboxLogs),
+      activeProjects: JSON.stringify(activeProjects),
+      now: new Date().toISOString()
+    },
+    providerOverride || meta.defaultProvider,
+    modelOverride || meta.defaultModel
+  );
+
+  const parsed = parseJsonResponse(aiResult.content, reviewOutputSchema, aiResult.prompt);
+  const validationResult = reviewOutputSchema.safeParse(parsed);
+
+  if (!validationResult.success) {
+    throw new Error(`Invalid review output: ${JSON.stringify(validationResult.error.issues)}`);
+  }
+
+  const reviewData = validationResult.data;
+
+  // Enforce word limit
+  const wordCount = reviewData.reviewText.split(/\s+/).length;
+  if (wordCount > 250) {
+    reviewData.reviewText = reviewData.reviewText.split(/\s+/).slice(0, 250).join(' ') + '...';
+  }
+
+  // Store review — ai.modelId reflects the resolved model so attribution stays
+  // accurate even when callAI falls back (e.g., gemini-cli → gemini-2.5-flash).
+  const review = await storage.createReview({
+    ...reviewData,
+    ai: {
+      providerId: aiResult.providerId,
+      modelId: aiResult.model,
+      promptTemplateId: 'brain-weekly-review'
+    }
+  });
+
+  console.log(`🧠 Generated weekly review: ${review.id}`);
+  return review;
+}
+
+/**
+ * Retry classification for a needs_review item.
+ * Returns immediately after setting status to 'classifying'.
+ * AI classification runs in the background and emits a socket event on completion.
+ */
+export async function retryClassification(inboxLogId, providerOverride, modelOverride) {
+  const inboxLog = await storage.getInboxLogById(inboxLogId);
+  if (!inboxLog) {
+    throw new Error('Inbox log entry not found');
+  }
+
+  const meta = await storage.loadMeta();
+  const provider = providerOverride || meta.defaultProvider;
+  const model = modelOverride || meta.defaultModel;
+
+  // Set status to classifying so UI shows spinner
+  await storage.updateInboxLog(inboxLogId, {
+    ai: {
+      providerId: provider,
+      modelId: model,
+      promptTemplateId: 'brain-classifier'
+    },
+    status: 'classifying',
+    error: null
+  });
+
+  console.log(`🧠 Retrying classification in background: ${inboxLogId}`);
+
+  // Run AI classification in background (don't await)
+  // A manual retry is a user decision to file: it skips the autonomy gate and isn't budget-counted.
+  classifyInBackground({
+    entryId: inboxLogId,
+    text: inboxLog.capturedText,
+    meta,
+    provider,
+    model,
+    autoFile: true,
+    countsTowardBudget: false
+  })
+    .catch(err => console.error(`❌ Background retry failed for ${inboxLogId}: ${err.message}`));
+
+  return {
+    inboxLog: await storage.getInboxLogById(inboxLogId),
+    message: 'Retrying classification...'
+  };
+}
+
+/**
+ * Mark inbox entry as done
+ */
+export async function markInboxDone(inboxLogId) {
+  const inboxLog = await storage.getInboxLogById(inboxLogId);
+  if (!inboxLog) {
+    return null;
+  }
+
+  const updated = await storage.updateInboxLog(inboxLogId, {
+    status: 'done',
+    doneAt: new Date().toISOString()
+  });
+
+  console.log(`🧠 Marked inbox entry done: ${inboxLogId}`);
+  return updated;
+}
+
+/**
+ * Mark a batch of creative inbox notes as consumed by a catalog ingest that just
+ * committed — stamps `sentToCatalogAt` so they drop out of the inbox's "ready to
+ * become ingredients" banner and can't be accidentally re-sent. Idempotent and
+ * forgiving: ids that no longer exist (deleted/tombstoned) are skipped silently
+ * so a partially-stale list still stamps the rest. Returns the updated entries.
+ */
+export async function markInboxSentToCatalog(ids) {
+  const sentToCatalogAt = new Date().toISOString();
+  // Single batched write (one store rewrite + one sync-log pass) — updateMany
+  // already skips unknown/tombstoned ids, preserving the "stamp the rest" contract.
+  const updated = await storage.updateMany('inbox', ids.map(id => ({ id, sentToCatalogAt })));
+  console.log(`🧠 Marked ${updated.length} creative note(s) sent to catalog`);
+  return updated;
+}
+
+/**
+ * Update inbox entry (edit captured text)
+ */
+export async function updateInboxEntry(inboxLogId, updates) {
+  const updated = await storage.updateInboxLog(inboxLogId, updates);
+  if (!updated) {
+    return null;
+  }
+
+  console.log(`🧠 Updated inbox entry text: ${inboxLogId}`);
+  return updated;
+}
+
+/**
+ * Delete inbox entry
+ */
+export async function deleteInboxEntry(inboxLogId) {
+  const deleted = await storage.deleteInboxLog(inboxLogId);
+  if (!deleted) {
+    return false;
+  }
+
+  console.log(`🧠 Deleted inbox entry: ${inboxLogId}`);
+  return true;
+}
+
+/**
+ * Recover inbox entries stuck in 'classifying' status from a previous server restart.
+ * Resets them to 'needs_review' so the user can retry.
+ *
+ * Only touches entries THIS instance originated. Now that inbox rows are synced
+ * brain records, a peer's entry can be legitimately mid-classification (status
+ * 'classifying') on ITS machine while we hold a synced copy. Flipping that to
+ * 'needs_review' here would stamp a fresh updatedAt and, as the LWW winner,
+ * clobber the origin's real classification on the next sync. Classification only
+ * ever runs on the capturing (origin) machine, so a stuck 'classifying' entry is
+ * only ours to recover when we created it. (Pre-091 records with no
+ * originInstanceId are treated as local — backfillOriginInstanceId stamps them
+ * with our id at boot anyway, so they ARE ours.)
+ */
+export async function recoverStuckClassifications() {
+  const instanceId = await getInstanceId();
+  const entries = await storage.getInboxLog({ status: 'classifying', limit: 100 });
+  let recovered = 0;
+  for (const entry of entries) {
+    if (entry.originInstanceId && entry.originInstanceId !== instanceId) continue;
+    await storage.updateInboxLog(entry.id, { status: 'needs_review' });
+    recovered++;
+    console.log(`🧠 Recovered stuck classification: ${entry.id}`);
+  }
+  if (recovered > 0) {
+    console.log(`🧠 Recovered ${recovered} stuck classification(s)`);
+  }
+}
+
+// Matches the client's clone stall window (#5442). Past it, a `cloning` record
+// this install cannot attribute to itself is treated as orphaned rather than
+// left in place — see `shouldRecoverInterruptedClone`.
+const CLONE_STALE_MS = 10 * 60 * 1000;
+
+/**
+ * Whether THIS install should reset `link` out of `cloning` at boot.
+ *
+ * Ours, or unattributed (pre-#5463 records carry no `cloneInstanceId`) — always,
+ * because no in-process clone survives a restart. A clone another instance owns
+ * is left alone while it could still be running, but ages out of that
+ * protection: a peer that crashed mid-clone and never comes back must not
+ * strand the link at `cloning` forever, which is the whole bug (#5463).
+ */
+const shouldRecoverInterruptedClone = (link, instanceId) => {
+  const owner = link.cloneInstanceId ?? link.originInstanceId ?? null;
+  if (!owner || owner === instanceId) return true;
+  const updatedAt = Date.parse(link.updatedAt);
+  return Number.isFinite(updatedAt) && Date.now() - updatedAt >= CLONE_STALE_MS;
+};
+
+/**
+ * Recover repository clones interrupted by a previous server shutdown.
+ * Clone work is published only after git exits successfully; an orphaned child
+ * can keep writing its private staging directory without racing a retry.
+ */
+export async function recoverInterruptedRepoClones() {
+  // `ensureInstanceId`, not `getInstanceId`: this comparison decides a durable
+  // record mutation, and the sentinel would match every other uninitialized
+  // install's records while missing our own.
+  const instanceId = await ensureInstanceId();
+  const links = await storage.getLinks({ cloneStatus: 'cloning' });
+  let recovered = 0;
+  for (const link of links) {
+    // Keep the state guard even though storage applies the filter so a future
+    // storage implementation cannot broaden this boot-time mutation by accident.
+    if (link.cloneStatus !== 'cloning') continue;
+    if (!shouldRecoverInterruptedClone(link, instanceId)) continue;
+    await storage.updateLink(link.id, {
+      cloneStatus: 'failed',
+      cloneError: 'Clone interrupted by a server restart. Retry to clone the repository again.',
+      cloneInstanceId: null,
+      cloneInterrupted: true
+    });
+    recovered++;
+  }
+  if (recovered > 0) {
+    console.log(`🧠 Recovered ${recovered} interrupted repository clone(s)`);
+  }
+  // Detached on purpose: boot AWAITS this function so the first links request
+  // can't see an orphaned `cloning` badge, and a recursive scan plus `rm -rf` of
+  // abandoned partial checkouts must not sit in front of `startListening()`.
+  repoCloner.reapStaleCloneStaging()
+    .catch(err => console.error(`❌ Clone staging recovery failed: ${err.message}`));
+}
+
+// Re-export storage functions for convenience
+export const loadMeta = storage.loadMeta;
+export const updateMeta = storage.updateMeta;
+export const getSummary = storage.getSummary;
+export const getInboxLog = storage.getInboxLog;
+export const getInboxPage = storage.getInboxPage;
+export const getInboxLogById = storage.getInboxLogById;
+export const getInboxLogCounts = storage.getInboxLogCounts;
+export const getEntityPage = storage.getEntityPage;
+export const toMemoryListItem = storage.toMemoryListItem;
+export const getPeople = storage.getPeople;
+export const getPersonById = storage.getPersonById;
+export const createPerson = storage.createPerson;
+export const updatePerson = storage.updatePerson;
+export const deletePerson = storage.deletePerson;
+export const getProjects = storage.getProjects;
+export const getProjectById = storage.getProjectById;
+export const createProject = storage.createProject;
+export const updateProject = storage.updateProject;
+export const deleteProject = storage.deleteProject;
+export const getIdeas = storage.getIdeas;
+export const getIdeaById = storage.getIdeaById;
+export const createIdea = storage.createIdea;
+export const updateIdea = storage.updateIdea;
+export const deleteIdea = storage.deleteIdea;
+export const getAdminItems = storage.getAdminItems;
+export const getAdminById = storage.getAdminById;
+export const createAdminItem = storage.createAdminItem;
+export const updateAdminItem = storage.updateAdminItem;
+export const deleteAdminItem = storage.deleteAdminItem;
+export const getDigests = storage.getDigests;
+export const getLatestDigest = storage.getLatestDigest;
+export const getReviews = storage.getReviews;
+export const getLatestReview = storage.getLatestReview;
+export const getMemoryEntries = storage.getMemoryEntries;
+export const getMemoryEntryById = storage.getMemoryEntryById;
+export const createMemoryEntry = storage.createMemoryEntry;
+export const updateMemoryEntry = storage.updateMemoryEntry;
+
+/**
+ * Delete a memory entry AND clean up its on-disk assets.
+ *
+ * A `chatgpt-import` memory references an archived transcript (`sourceRef`) and
+ * any number of served asset files (images/audio/PDFs) embedded in its markdown
+ * `content`. The storage-level delete only tombstones the JSON record — without
+ * this wrapper those files orphan forever under `data/brain/imports/`. We load
+ * the record first (to know what it referenced) and the surviving import
+ * memories (so a shared transcript/asset still in use — e.g. the same export
+ * imported twice — isn't pulled out from under them).
+ */
+export const deleteMemoryEntry = (id) => withBackupAssetPublication(() => deleteMemoryEntryLeased(id));
+
+// The record drop and the asset/transcript unlinks are one backup workflow (#9982).
+async function deleteMemoryEntryLeased(id) {
+  const record = await storage.getMemoryEntryById(id);
+  const deleted = await storage.deleteMemoryEntry(id);
+  if (deleted && record?.source === 'chatgpt-import') {
+    const survivors = (await storage.getMemoryEntries())
+      .filter((m) => m.id !== id && m.source === 'chatgpt-import');
+    await deleteMemoryAssets(record, survivors);
+  }
+  return deleted;
+}
+
+export const getLinks = storage.getLinks;
+// Paginated read path — filters/sorts/counts off the cached link summary index
+// and loads only the requested page's bodies (issue #3509).
+export const getLinksPage = storage.getLinksPage;
+export const listLinkIds = storage.listLinkIds;
+export const getLinkById = storage.getLinkById;
+export const getLinkByUrl = storage.getLinkByUrl;
+export const updateLink = storage.updateLink;
+export const reorderLinks = storage.reorderLinks;
+export const deleteLink = storage.deleteLink;
+
+export const getBuckets = storage.getBuckets;
+export const getBucketById = storage.getBucketById;
+export const createBucket = storage.createBucket;
+export const updateBucket = storage.updateBucket;
+export const reorderBuckets = storage.reorderBuckets;
+export const deleteBucket = storage.deleteBucket;
+
+/**
+ * Create a bucket appended after all existing ones (next-order logic).
+ * Folds the next-order computation into the service so the route stays thin.
+ */
+export async function createBucketAppended({ name, color, icon }) {
+  const existing = await storage.getBuckets();
+  const nextOrder = existing.reduce((max, b) => Math.max(max, b.order ?? 0), -1) + 1;
+  return storage.createBucket({ name, color: color || 'accent', icon: icon || '', order: nextOrder });
+}
+
+/**
+ * Delete a bucket and unassign (bucketId → null) all links that belonged to it.
+ * Links survive; they fall back to the ungrouped list rather than being orphaned.
+ */
+export async function deleteBucketAndUnlinkChildren(id) {
+  const links = await storage.getLinks();
+  let unassigned = 0;
+  for (const link of links) {
+    if (link.bucketId === id) {
+      await storage.updateLink(link.id, { bucketId: null });
+      unassigned++;
+    }
+  }
+  await storage.deleteBucket(id);
+  return { deleted: true, unassigned };
+}
+
+/**
+ * Extract a clean hostname from a URL (strip a leading www.), or null if unparseable.
+ */
+function hostnameFromUrl(url) {
+  return URL.parse(url)?.hostname.replace(/^www\./, '') ?? null;
+}
+
+/**
+ * Clone a repo in the background, tracking progress on the link record.
+ * Runs outside the request lifecycle, so every failure is caught and recorded
+ * on the link rather than left to bubble.
+ *
+ * The opt-in agent actions the user ticked at capture time are read off the
+ * link's own `repoIntake` field, not passed in — so EVERY path that reaches a
+ * successful clone honors them, including the Links tab's Clone/Retry button
+ * after a first clone failed. They dispatch only after the clone SUCCEEDS:
+ * there is nothing on disk to read before that, and a failed clone must not
+ * queue an agent against a path that doesn't exist.
+ */
+export async function cloneRepoInBackground(linkId, url) {
+  const previous = await storage.getLinkById(linkId);
+  // `ensureInstanceId`, and null rather than the sentinel: `cloneInstanceId`
+  // lands on a durable, federated record, and a stamped 'unknown' would read as
+  // "some other install owns this" at boot on every machine — re-stranding the
+  // exact record this recovery exists to free.
+  const resolvedInstanceId = await ensureInstanceId();
+  const cloneInstanceId = resolvedInstanceId === UNKNOWN_INSTANCE_ID ? null : resolvedInstanceId;
+  await storage.updateLink(linkId, {
+    cloneStatus: 'cloning',
+    // The Links tab renders `cloneError` whenever it is set, independent of
+    // status — leaving the previous attempt's message would show the failure
+    // text beside the new attempt's spinner.
+    cloneError: null,
+    cloneInstanceId,
+    cloneInterrupted: false
+  });
+
+  repoCloner.cloneRepo(url, { replaceIncomplete: previous?.cloneInterrupted === true })
+    .then(async (result) => {
+      const link = await storage.updateLink(linkId, {
+        localPath: result.localPath,
+        cloneStatus: 'cloned',
+        cloneError: null,
+        cloneInstanceId: null,
+        cloneInterrupted: false
+      });
+      console.log(`✅ Background clone complete: ${linkId}`);
+      // `link` is null when the user deleted the bookmark mid-clone — nothing
+      // left to scan or study. The whole intake is chained off its OWN catch, so
+      // a queueing failure can't rewrite a clone that genuinely succeeded as
+      // `failed` via the outer handler below.
+      if (!link?.repoIntake) return;
+      // Dynamic on purpose, and NOT for boot cost — routes/brainLinks.js already
+      // imports repoIntake.js statically, so the CoS task graph is loaded either
+      // way. It keeps that graph out of *brain.js's own module graph*, which the
+      // heavily-mocked brain.test.js suite instantiates; a static edge drags
+      // cos.js → taskSchedule.js in and the suite dies on an incomplete mock.
+      // Same reason malwareScanReports.js imports brain.js this way.
+      await import('./repoIntake.js')
+        .then(({ runRepoIntake }) => runRepoIntake(link, link.repoIntake))
+        .then(patch => (Object.keys(patch).length ? storage.updateLink(linkId, patch) : null))
+        .catch(err => console.error(`❌ Post-clone intake failed for ${linkId}: ${err.message}`));
+    })
+    .catch(async (err) => {
+      await storage.updateLink(linkId, {
+        cloneStatus: 'failed',
+        cloneError: err.message,
+        cloneInstanceId: null,
+        cloneInterrupted: false
+      });
+      console.error(`❌ Background clone failed: ${linkId} - ${err.message}`);
+    });
+}
+
+/**
+ * Create a link from a URL: derives the repository metadata + a readable default
+ * title and kicks off the background clone for a repo. Shared by the Links
+ * route's quick-add and the bare-URL capture short-circuit so a URL pasted into
+ * the Brain inbox lands exactly as it would from the Links tab.
+ *
+ * Callers own duplicate handling (the route 409s; capture reuses the existing
+ * link) — this always creates.
+ */
+export async function createLinkFromUrl(url, {
+  title, description, note, linkType, tags, bucketId, bucketOrder, autoClone, repoIntake
+} = {}) {
+  const repoFields = deriveRepoLinkFields(url);
+  const shouldClone = repoFields.isRepo && autoClone !== false;
+  // Opt-in post-clone agent actions. Only meaningful when a clone will actually
+  // happen, and persisted on the link so the record says what was asked for even
+  // if the clone is still running.
+  const intake = shouldClone ? normalizeRepoIntake(repoIntake) : null;
+
+  // Derive a readable default title: repo slug for a repository, hostname for
+  // plain URLs (so quick-added bucket chips read "example.com" instead of the
+  // full URL).
+  const defaultTitle = repoFields.isRepo
+    ? `${repoFields.repoOwner}/${repoFields.repoName}`
+    : (hostnameFromUrl(url) || url);
+  const cleanNote = typeof note === 'string' ? note.trim() : '';
+
+  const link = await storage.createLink({
+    url,
+    title: title || defaultTitle,
+    description: description || '',
+    note: cleanNote,
+    linkType: linkType || (repoFields.isRepo ? 'repo' : 'other'),
+    tags: tags || [],
+    ...repoFields,
+    localPath: null,
+    cloneStatus: shouldClone ? 'pending' : 'none',
+    cloneError: null,
+    ...(intake ? { repoIntake: intake } : {}),
+    ...(bucketId !== undefined ? { bucketId } : {}),
+    ...(bucketOrder !== undefined ? { bucketOrder } : {})
+  });
+  console.log(`🔗 Created link: ${link.id} (${repoFields.isRepo ? `${repoFields.repoHost} repo` : 'regular URL'})`);
+
+  if (shouldClone) {
+    cloneRepoInBackground(link.id, url).catch(err => {
+      console.error(`❌ Background clone setup failed for ${link.id}: ${err.message}`);
+    });
+  }
+
+  return link;
+}

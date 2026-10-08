@@ -1,0 +1,195 @@
+import { Router } from 'express';
+import { z } from 'zod';
+import { asyncHandler, ServerError } from '../lib/errorHandler.js';
+import { validateRequest } from '../lib/validation.js';
+import { UPSTREAM_FULL_NAME } from '../lib/gitRemote.js';
+import * as updateChecker from '../services/updateChecker.js';
+import { startPortosSelfUpdate } from '../services/portosSelfUpdate.js';
+import {
+  AUTO_UPDATE_MIN_INTERVAL_HOURS_MAX,
+  AUTO_UPDATE_MIN_INTERVAL_HOURS_MIN,
+  storableAutoUpdateConfig,
+} from '../lib/sharedSchemas.js';
+import {
+  countActiveCosAgents,
+  getPersistentMindImageWorkGuard,
+} from '../services/updatePreflight.js';
+
+const router = Router();
+
+const ignoreSchema = z.object({
+  version: z.string().min(1, 'version is required')
+});
+
+const syncForkSchema = z.object({
+  branch: z.string().min(1).max(255).regex(/^[A-Za-z0-9._/-]+$/, 'branch contains invalid characters').optional()
+});
+
+const executeSchema = z.object({
+  acknowledgeFork: z.boolean().optional(),
+  acknowledgePersistentMindImageBackup: z.boolean().optional(),
+  // Reconcile a half-updated install (issue #1779): run update.sh to pull +
+  // install + build + restart even when there's no NEWER GitHub release — the
+  // user did a bare `git pull` and just needs the rest of the update steps.
+  reconcile: z.boolean().optional()
+});
+
+// GET /api/update/status — returns update state (also clears stale locks).
+// `activeCosAgents` counts live CoS agent processes (direct + runner spawns) so
+// the UI can suppress the reconcile/update actions while an agent is in flight —
+// updating restarts PortOS and would sever those live processes (issue: don't
+// restart out from under a running agent).
+router.get('/status', asyncHandler(async (req, res) => {
+  await updateChecker.clearStaleUpdateInProgress();
+  const [status, persistentMindImages, activeCosAgents] = await Promise.all([
+    updateChecker.getUpdateStatus(),
+    getPersistentMindImageWorkGuard(),
+    countActiveCosAgents(),
+  ]);
+  res.json({ ...status, activeCosAgents, persistentMindImages });
+}));
+
+// GET /api/update/auto — everything the Update tab needs to explain what the
+// unattended updater is doing: the effective config, its own runtime record,
+// whether the checkout is in a state it may run against, and the live idle
+// verdict (the SAME `activity` object the dashboard's Live activity widget
+// renders, from lib/systemIdle.js).
+//
+// Its OWN route rather than a block on /status, and the three service imports
+// are deferred: activity invalidations of /status must not drag a git status
+// walk into the cheaper update status read,
+// and a static import of the activity/readiness graph would pull the whole CoS
+// + git subtree into every suite that mounts this router (see "Import scoping"
+// in server/AGENTS.md). `sharedSchemas` is already in this module's static
+// closure through validation.js, so it stays a plain import.
+router.get('/auto', asyncHandler(async (req, res) => {
+  const [{ getSettings }, { checkUpdateRepoReadiness }, { getSystemActivity }] = await Promise.all([
+    import('../services/settings.js'),
+    import('../services/updateRepoReadiness.js'),
+    import('../services/activeProcessing.js'),
+  ]);
+  const [settings, runtime] = await Promise.all([
+    getSettings().catch(() => null),
+    updateChecker.getAutoUpdateRuntime(),
+  ]);
+  const config = storableAutoUpdateConfig(settings?.autoUpdate);
+  // The two expensive halves answer "what is the scheduler waiting for", which
+  // is not a question while the scheduler is off (the shipped default).
+  // No fetch either way: refreshing origin refs is the scheduler's own tick,
+  // not a network hop every viewer of this tab pays for.
+  const [repo, processing] = config.enabled
+    ? await Promise.all([
+      checkUpdateRepoReadiness({ fetch: false }).catch(() => null),
+      getSystemActivity().catch(() => null),
+    ])
+    : [null, null];
+  res.json({
+    // Storable keys only — the panel hands this straight back on the next save,
+    // and the settings schema is strict.
+    config,
+    // Server-authoritative bounds so the form's clamp can't drift from what the
+    // schema enforces (the `parallelLimitBounds` pattern in routes/settings.js).
+    bounds: { minIntervalHours: { min: AUTO_UPDATE_MIN_INTERVAL_HOURS_MIN, max: AUTO_UPDATE_MIN_INTERVAL_HOURS_MAX } },
+    runtime,
+    repo,
+    activity: processing?.activity ?? null,
+  });
+}));
+
+// POST /api/update/check — triggers manual check. `manual: true` bypasses the
+// unattended scheduler's gh backoff — a user who explicitly asked for a check
+// must get a real attempt, not a silent rejection from a cooldown the
+// background poller armed on its own.
+router.post('/check', asyncHandler(async (req, res) => {
+  const result = await updateChecker.checkForUpdate({ manual: true });
+  res.json(result);
+}));
+
+// POST /api/update/ignore — adds version to ignored list
+router.post('/ignore', asyncHandler(async (req, res) => {
+  const { version } = validateRequest(ignoreSchema, req.body);
+  await updateChecker.ignoreVersion(version.replace(/^v/, ''));
+  const status = await updateChecker.getUpdateStatus();
+  res.json(status);
+}));
+
+// DELETE /api/update/ignore — clears all ignored versions
+router.delete('/ignore', asyncHandler(async (req, res) => {
+  await updateChecker.clearIgnored();
+  const status = await updateChecker.getUpdateStatus();
+  res.json(status);
+}));
+
+// POST /api/update/sync-fork — fast-forward the user's GitHub fork from upstream
+// via `gh repo sync`. Non-destructive: gh refuses to overwrite divergent fork
+// history without --force, so a 409 FORK_DIVERGED here means the fork's main has
+// commits not on upstream (user customizations). Other failures (gh missing,
+// network, etc.) bubble as 502 FORK_SYNC_FAILED.
+router.post('/sync-fork', asyncHandler(async (req, res) => {
+  const { branch } = validateRequest(syncForkSchema, req.body || {});
+  // Surface git-binary/spawn failures as a structured 502 instead of an
+  // unclassified 500 — the UI banner relies on err.message for guidance.
+  const info = await updateChecker.getRemoteInfo().catch(err => {
+    throw new ServerError(`Could not inspect git origin remote: ${err.message}`,
+      { status: 502, code: 'GIT_UNAVAILABLE' });
+  });
+  if (!info?.hasOrigin) {
+    throw new ServerError('No git origin remote found — fork sync requires a GitHub remote.',
+      { status: 400, code: 'NO_ORIGIN' });
+  }
+  if (!info.isGithub) {
+    throw new ServerError('Origin remote is not on GitHub — fork sync is GitHub-only.',
+      { status: 400, code: 'NOT_GITHUB' });
+  }
+  if (info.isUpstream) {
+    throw new ServerError(`Origin is already the upstream ${UPSTREAM_FULL_NAME} — nothing to sync.`,
+      { status: 400, code: 'ALREADY_UPSTREAM' });
+  }
+  if (!info.isFork) {
+    throw new ServerError(
+      `Origin ${info.fullName} is not a fork of ${UPSTREAM_FULL_NAME} (repo name differs). ` +
+      `Fork sync requires the origin to be a GitHub fork.`,
+      { status: 400, code: 'NOT_A_FORK' }
+    );
+  }
+
+  // Default mirrors syncFork()'s internal default so error messaging matches
+  // the actual branch the gh call targeted.
+  const targetBranch = branch || 'main';
+  const result = await updateChecker.syncFork({ branch, remoteInfo: info }).catch(err => {
+    const msg = err.message || 'Fork sync failed';
+    // gh's "would not be a fast forward" / "diverged" error → 409 so client
+    // can show the "you have local customizations" guidance
+    if (/fast forward|diverge|non-fast/i.test(msg)) {
+      throw new ServerError(
+        `Fork sync would overwrite commits on ${info.fullName}'s ${targetBranch} branch (GitHub): ${msg}. ` +
+        `Move customizations to a feature branch, PR them upstream, or run ` +
+        `\`gh repo sync ${info.fullName} --branch ${targetBranch} --force\` from a terminal if you want to discard them.`,
+        { status: 409, code: 'FORK_DIVERGED' }
+      );
+    }
+    throw new ServerError(msg, { status: 502, code: 'FORK_SYNC_FAILED' });
+  });
+
+  res.json(result);
+}));
+
+// POST /api/update/execute — kicks off update
+router.post('/execute', asyncHandler(async (req, res) => {
+  const { acknowledgeFork, acknowledgePersistentMindImageBackup, reconcile } = validateRequest(executeSchema, req.body || {});
+
+  // Every refusal, the update lock, and the fire-and-forget launch live in
+  // `portosSelfUpdate` — shared with App Management's Git tab so both entry
+  // points into update.sh behave identically (#5984, and the Git tab hang the
+  // shared launcher was extracted to fix).
+  const { started, tag } = await startPortosSelfUpdate({
+    io: req.app.get('io'),
+    acknowledgeFork,
+    acknowledgePersistentMindImageBackup,
+    mode: reconcile ? 'reconcile' : 'release',
+  });
+
+  res.json({ started, tag });
+}));
+
+export default router;

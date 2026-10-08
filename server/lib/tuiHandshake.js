@@ -1,0 +1,1762 @@
+/**
+ * Shared TUI invocation + paste-handshake constants.
+ *
+ * Two execution paths need these: `server/lib/tuiPromptRunner.js` (one-shot
+ * prompts from the central handler) and `server/services/agentTuiSpawning.js`
+ * (long-running CoS agents). Both shell into the same set of TUI binaries
+ * (Claude Code, Codex, Antigravity) and use identical PTY-paste choreography to
+ * deliver the prompt — banner repaint wait, bracketed-paste, Enter handshake.
+ * Without this shared module they had verbatim copies that would silently
+ * drift the first time anyone tweaked one side's paste timing.
+ *
+ * No cycle risk: this module imports nothing from either consumer.
+ */
+
+// inferTuiCommand / applyCommandDefaults are RE-EXPORTED below (not defined
+// here) — the per-vendor dispatch they used to hand-roll now lives in the
+// PROVIDER_VENDORS registry (#3618), consumed by every dispatch site that
+// used to duplicate its own vendor if-chain.
+import { inferTuiCommand, applyCommandDefaults, injectTuiModelAndEffort } from './providerVendors.js';
+import { detectTuiRetryBanner, describeTuiRetryStall } from './aiToolkit/errorDetection.js';
+
+// ─── Paste handshake constants ────────────────────────────────────────────
+
+// PTY readiness — wait for the TUI banner to finish repainting (output-idle
+// for READY_IDLE_THRESHOLD_MS) before pasting. A fixed delay loses to slow
+// banners and burns time on fast ones; idle-detect adapts.
+export const READY_POLL_INTERVAL_MS = 300;
+export const READY_IDLE_THRESHOLD_MS = 1200;
+export const PASTE_DEADLINE_MS = 10000;
+// Give Claude Code time to switch into /low-priority mode before retrying a
+// prompt rejected by its session limit. Shared by both TUI execution paths.
+export const CLAUDE_LOW_PRIORITY_RESUBMIT_DELAY_MS = 1500;
+// How long to wait for claude's POSITIVE input-ready footer (createInputReadyTracker)
+// before giving up and surfacing a startup failure. Generous because a cold
+// claude start can spend many seconds on banner + MCP-server + model init
+// (well within the normal startup budget). Used only on the input-ready-gated
+// path; the non-claude providers use PASTE_DEADLINE_MS.
+export const TUI_INPUT_READY_DEADLINE_MS = 45000;
+
+// Claude Code emits `[Pasted text #N +M lines]`, Codex emits
+// `[Pasted Content N chars]`, OpenCode emits `[Pasted ~N lines]`, Pi emits
+// `[paste #N +M lines]` (note: "paste", not "Pasted" — hence the optional `d`),
+// and Grok Build emits `[Pasted: 31 KB]` after
+// committing a paste. Watch for any of these markers (or fall back after
+// PASTE_TO_ENTER_FALLBACK_MS) before sending `\r` so Enter doesn't get
+// swallowed mid-paste-commit.
+//
+// CRITICAL: the marker must be matched against ANSI-STRIPPED output, never the
+// raw PTY stream. Claude Code renders the marker by positioning each token with
+// absolute-column cursor moves instead of literal spaces — the raw bytes look
+// like `[Pasted\x1b[11Gtext\x1b[16G#1\x1b[19G+35\x1b[23Glines]`, so the literal
+// substring "Pasted text #1" never exists contiguously and a space-requiring
+// regex never matches. Once ANSI is stripped the cursor moves vanish and the
+// glyphs collapse adjacent → `[Pastedtext#1+35lines]`. So the pattern tolerates
+// arbitrary (including zero) whitespace between tokens and is case-insensitive,
+// and `detectPasteMarker()` below is the only sanctioned way to test it. This
+// was the root cause of issue #1229: across a month of real transcripts the
+// marker "never appeared" only because the matcher ran against the raw stream;
+// the fast path was effectively dead and every run fell back to the blind timer.
+//
+// Pi's marker is ALSO the only evidence a pi paste landed: like Claude Code, pi
+// COLLAPSES a multi-line bracketed paste into the chip and hides the body, so
+// the verifyPasteRendered text fallback can never see the prompt. Before pi's
+// `[paste #N +M lines]` form was in the alternation above, every pi-TUI CoS
+// agent burned all 3 paste attempts and died `paste-not-rendered` with three
+// chips (`[paste #1][paste #2][paste #3]`) sitting unsent in the composer and
+// Enter never sent — the prompt was delivered perfectly all three times.
+export const PASTE_MARKER_POLL_MS = 150;
+
+// Paste verification: after paste-commit (marker or fallback), verify the prompt
+// text actually rendered in the buffer before submitting. If verification fails,
+// retry the paste with backoff. This catches TUIs that were still initializing
+// when the paste was sent and silently swallowed it (issue #2192).
+export const PASTE_VERIFY_POLL_MS = 200;
+export const PASTE_VERIFY_WINDOW_MS = 2000; // max time to wait for verification after paste-commit
+export const PASTE_RETRY_MAX_ATTEMPTS = 3;
+export const PASTE_RETRY_BASE_DELAY_MS = 800;
+// Minimum prefix length for verification (shorter prompts verify whole-text)
+const MIN_VERIFIABLE_PREFIX_LEN = 15;
+export const PASTE_MARKER_PATTERN = /\[Pasted?\s*(?:text\s*#\d+[^\]]*|content\s*\d+\s*chars|~\s*\d+\s*lines?|#\d+\s*\+\d+\s*lines?|:\s*\d+(?:\.\d+)?\s*(?:B|KB|MB))\]/i;
+export const PASTE_TO_ENTER_MIN_DELAY_MS = 200;
+export const PASTE_TO_ENTER_FALLBACK_MS = 3500;
+
+// Codex QUEUES a bracketed paste that arrives before its composer has finished
+// initializing and commits it once the composer is live — it is not lost. On a
+// cold Windows start (`cmd.exe /c codex.cmd` -> node -> the native binary) that
+// commit was measured at ~11s for a paste written at 3.7s, far past the 3.5s
+// marker wait + 2s verify window above. The first attempt was therefore
+// declared swallowed and the retry ladder wrote a SECOND 29KB bracketed paste
+// on top of the queued one; codex then committed NEITHER, all three attempts
+// "failed", and the agent was killed `paste-not-rendered` with a healthy TUI
+// sitting at its composer (2026-09-20: six codex-tui agents each dead in ~24s
+// with an empty "Ask Codex to do anything" box in the transcript). Re-pasting
+// is the destructive half — a single early paste, left alone, lands on its own.
+//
+// So codex's FIRST attempt waits this long for the commit instead of retrying.
+// It costs nothing in the healthy case: the wait exits the instant the paste is
+// confirmed (the `[Pasted Content N chars]` chip, or the prompt text rendering
+// for a paste too small to chip), which on a ready codex is ~200ms. Only
+// attempt 1 is patient: 45s is the WHOLE queued-commit window (4x the measured
+// 11s), so a paste still uncommitted after it is genuinely gone and attempts 2
+// and 3 revert to the short #2192 swallow-recovery ladder — a run with no live
+// TUI at all still fails in ~60s.
+//
+// It does NOT apply while codex is booting MCP servers. There it renders its
+// input box early and SWALLOWS pastes outright (see createMcpBootTracker
+// below), so nothing is queued to wait for and patience would only delay the
+// re-paste cadence that IS the recovery. The spawner reads the boot tracker
+// live for that reason — the banner can latch after the paste went out.
+//
+// The one-shot runner (tuiPromptRunner.js) keeps the flat fallback: it never
+// re-pastes, so it has nothing for patience to protect, and it tracks no
+// verifiable prompt prefix, so a short codex prompt renders no chip there and
+// would simply wait the full window for nothing.
+export const PASTE_COMMIT_PATIENCE_MS = 45000;
+
+// Codex's composer placeholder — the ONLY positive evidence its input box is
+// live and will accept a paste. Codex is not on the requireInputReady path
+// (that would fail a run hard the first time a wording change outran us), so
+// this is a SOFT gate: the idle heuristic waits for it, and PASTE_DEADLINE_MS
+// still backstops delivery if it never paints.
+//
+// It is what the idle heuristic was missing. On a cold Windows start
+// (`cmd.exe /c codex.cmd` -> node -> the native binary) codex paints its
+// header, then goes quiet for seconds while the binary boots — output-idle
+// alone reads that lull as "ready" and pastes into a composer that does not
+// exist yet, which swallows the paste (2026-09-20: six codex-tui agents dead
+// in ~24s, each with an empty composer in the transcript). Waiting for the
+// placeholder orders the two correctly; PASTE_COMMIT_PATIENCE_MS above stays
+// as the rescue for a paste that still goes out early.
+//
+// Matched against ANSI-STRIPPED output, and deliberately shorter than the full
+// "Ask Codex to do anything" sentence: the stripped stream collapses the
+// cursor-positioned gaps between glyphs, so the pattern tolerates arbitrary
+// (including zero) whitespace and matches only the stable leading words.
+export const CODEX_COMPOSER_READY_PATTERN = /Ask\s*Codex/i;
+
+/**
+ * Extract a verifiable prefix from a prompt for paste verification. The prefix
+ * is a unique-enough substring from the prompt's first "content" line (skipping
+ * leading whitespace/common prefixes) that's unlikely to appear in TUI chrome.
+ * Used to verify the paste actually rendered rather than being silently swallowed.
+ *
+ * @param {string} prompt — the full prompt text being pasted.
+ * @returns {string|null} a verifiable prefix, or null if the prompt is too short.
+ */
+export function extractVerifiablePromptPrefix(prompt) {
+  if (typeof prompt !== 'string' || !prompt.trim()) return null;
+  // Collapse whitespace and take the first content chunk. Skip leading boilerplate
+  // that might match TUI chrome (e.g., "You are a..." is generic).
+  const normalized = prompt.replace(/\s+/g, ' ').trim();
+  if (normalized.length < MIN_VERIFIABLE_PREFIX_LEN) {
+    // Very short prompt: use the whole thing
+    return normalized.length >= 5 ? normalized : null;
+  }
+  // For longer prompts, take a prefix from the middle portion to avoid common
+  // prefixes like "You are" or "Please" that might appear elsewhere
+  const startOffset = Math.min(10, Math.floor(normalized.length * 0.1));
+  const prefixLen = Math.min(40, normalized.length - startOffset);
+  return normalized.slice(startOffset, startOffset + prefixLen);
+}
+
+/**
+ * True when the verifiable prompt prefix appears in the post-paste buffer.
+ * ANSI-stripped input; internal whitespace differences are ignored (see below).
+ * A null/empty prefix always returns true (no verification possible).
+ *
+ * Whitespace is stripped ENTIRELY (not just collapsed to a single space) before
+ * comparing, on both sides. Claude Code (and potentially other TUIs) can
+ * redraw/reflow a pasted multi-word line using cursor-positioning escapes
+ * instead of literal space bytes between words — the same "inter-glyph cursor
+ * moves" quirk already documented above (BRACKETED_PASTE_MODE_PATTERN) as the
+ * reason createInputReadyTracker avoids literal footer-text matching. ANSI
+ * stripping drops those inter-word spaces entirely, so a genuinely-rendered
+ * paste can still fail a single-space-normalized substring match (real
+ * incident: every claude-code-tui CoS agent failed immediately with
+ * "paste-not-rendered" after 3 retries — see tuiHandshake.test.js's "real
+ * incident" regression test for the captured transcript). Comparing with all
+ * whitespace removed makes the match robust to however a given TUI reflows a
+ * line, at the cost of a (very low, given the ~40-char prefix) chance of a
+ * spurious match spanning a word boundary that only lines up once spaces are
+ * gone.
+ *
+ * @param {string} strippedBuffer — ANSI-stripped post-paste output.
+ * @param {string|null} prefix — the prefix from extractVerifiablePromptPrefix.
+ * @returns {boolean}
+ */
+export function verifyPasteRendered(strippedBuffer, prefix) {
+  if (!prefix) return true; // no verification possible
+  if (typeof strippedBuffer !== 'string') return false;
+  const collapseWhitespace = (s) => s.replace(/\s+/g, '');
+  return collapseWhitespace(strippedBuffer).includes(collapseWhitespace(prefix));
+}
+
+const PASTE_MARKER_PATTERN_GLOBAL = new RegExp(PASTE_MARKER_PATTERN.source, 'gi');
+
+/**
+ * Count paste-commit markers from Claude Code, Codex, OpenCode, or Grok in
+ * `strippedText`.
+ * Callers MUST pass ANSI-STRIPPED output (see PASTE_MARKER_PATTERN above for why
+ * the raw stream never matches). Shared by both TUI consumers so the
+ * strip-then-match contract can't drift between them.
+ *
+ * Why count rather than just detect-presence: when the pasted PROMPT itself
+ * contains a paste-marker (a transcript-analysis task — plausible here, since
+ * #1229 is about TUI transcripts), the echoed prompt carries that marker into
+ * the post-paste stream BEFORE the TUI emits its own commit marker. A bare
+ * presence check would then fire the submit-Enters ~200ms in, while the paste is
+ * still reflowing, reintroducing the unsent-prompt bug (issue #1229 review). So
+ * callers gate on the count EXCEEDING the count already present in the prompt —
+ * the TUI's genuine (N+1)th marker. A normal prompt has 0, so the common case is
+ * unchanged. When Claude Code COLLAPSES a self-marker-containing multi-line
+ * prompt to its own single chip, this count-only comparison false-negatives
+ * (`1 > 1` is false) even though the paste landed — `isCollapsedPasteChip` below
+ * is what rescues that case in isPasteConfirmed (issue #2228). It is NOT safe to
+ * "simply fall back to the timer" there: the collapse HIDES the body, so the
+ * verifyPasteRendered text fallback also fails and the agent dies
+ * `paste-not-rendered`.
+ *
+ * @param {string} strippedText — ANSI-stripped text (prompt or post-paste output).
+ * @returns {number}
+ */
+export function countPasteMarkers(strippedText) {
+  if (typeof strippedText !== 'string' || !strippedText) return 0;
+  // `match` with a /g regex ignores and resets lastIndex, so one shared
+  // instance is safe and saves recompiling it on every poll tick.
+  const m = strippedText.match(PASTE_MARKER_PATTERN_GLOBAL);
+  return m ? m.length : 0;
+}
+
+/**
+ * True when `strippedText` contains at least one paste-commit marker. Thin
+ * presence wrapper over `countPasteMarkers`. Callers that must ignore markers
+ * echoed from the prompt should compare `countPasteMarkers(output)` against
+ * `countPasteMarkers(prompt)` instead of using this.
+ *
+ * @param {string} strippedText — ANSI-stripped post-paste output accumulator.
+ * @returns {boolean}
+ */
+export function detectPasteMarker(strippedText) {
+  return countPasteMarkers(strippedText) > 0;
+}
+
+// Claude Code's "this chip is a collapsed multi-line paste, click to see the
+// body" affordance, rendered right next to the `[Pasted text #N]` chip whenever
+// it folds a multi-line paste and HIDES the body. Matched against ANSI-stripped
+// output; whitespace-tolerant for the same inter-glyph-cursor-move reason as
+// PASTE_MARKER_PATTERN. This chrome is emitted by the TUI ITSELF — it never
+// appears in a raw prompt's own echoed `[Pasted text #N]` literal — so it's the
+// discriminator that separates issue #2228's genuine collapse (confirm) from the
+// echoed-marker false-positive the promptMarkerCount subtraction guards (reject).
+export const COLLAPSED_PASTE_CHIP_PATTERN = /paste\s*again\s*to\s*expand/i;
+
+/**
+ * True when `strippedText` shows Claude Code's COLLAPSED-paste chip shape: a
+ * paste-commit marker present alongside the "paste again to expand" affordance
+ * the TUI renders when it folds a multi-line paste and hides the body. A
+ * collapsed chip is the TUI's own commit by construction, so its mere presence
+ * proves delivery even when the marker count doesn't exceed promptMarkerCount
+ * (the self-marker-containing multi-line prompt case, issue #2228). Callers MUST
+ * pass an ANSI-STRIPPED buffer.
+ *
+ * @param {string} strippedText — ANSI-stripped post-paste output accumulator.
+ * @returns {boolean}
+ */
+export function isCollapsedPasteChip(strippedText) {
+  if (typeof strippedText !== 'string' || !strippedText) return false;
+  return countPasteMarkers(strippedText) >= 1 && COLLAPSED_PASTE_CHIP_PATTERN.test(strippedText);
+}
+
+/**
+ * True when a post-paste buffer proves the TUI actually RECEIVED the prompt
+ * paste — the gate before sending the submit Enter(s). Two independent signals,
+ * checked in priority order:
+ *
+ *   1. The TUI's own paste-commit marker count exceeds the count the prompt
+ *      itself carried (promptMarkerCount). This is AUTHORITATIVE and is checked
+ *      FIRST because Claude Code collapses a multi-line bracketed paste into a
+ *      chip and HIDES the pasted body text from the buffer — so on every
+ *      multi-line prompt the literal text is genuinely absent even though the
+ *      paste landed perfectly. Real incident (2026-07-05): every
+ *      claude-code-tui CoS agent failed `paste-not-rendered` after 3 retries
+ *      because #2192's text-only check never saw the collapsed body — while the
+ *      marker was sitting right there. (agent-656efa6e et al.)
+ *   1b. The COLLAPSED-CHIP shape (`isCollapsedPasteChip`) — a marker present
+ *      alongside Claude's "paste again to expand" affordance. This rescues the
+ *      subtraction's blind spot: when the prompt ITSELF embeds `[Pasted text #N]`
+ *      literals AND is multi-line, Claude folds it into its own single chip and
+ *      hides the body, so `count (1) > promptMarkerCount (1)` is false — yet the
+ *      collapse chrome proves the visible marker is the TUI's own commit. The
+ *      chrome never rides in on an echoed prompt literal, so this can't
+ *      re-introduce the echoed-marker false-positive the subtraction guards
+ *      (issue #2228; the inline/uncollapsed echo path has no such chrome and keeps
+ *      subtracting).
+ *   2. Fallback for the MARKERLESS path — a paste too small to render the marker,
+ *      or one genuinely SWALLOWED by a still-initializing TUI (the #2192 case,
+ *      which renders no marker at all): fall back to confirming the prompt text
+ *      literally rendered. A null/empty verifiablePrefix means no verification is
+ *      possible, so this returns true (nothing to disconfirm).
+ *
+ * Callers MUST pass an ANSI-STRIPPED buffer (both signals require it — see
+ * countPasteMarkers / verifyPasteRendered). Signals 1/1b/2 live in
+ * isPasteCommitted below; this wrapper adds only the "nothing to verify" pass.
+ *
+ * @param {string} strippedBuffer — ANSI-stripped post-paste output accumulator.
+ * @param {{ verifiablePrefix?: string|null, promptMarkerCount?: number }} [opts]
+ * @returns {boolean}
+ */
+export function isPasteConfirmed(strippedBuffer, options = {}) {
+  if (isPasteCommitted(strippedBuffer, options)) return true;
+  return !options.verifiablePrefix; // nothing to verify against
+}
+
+/**
+ * The POSITIVE half of isPasteConfirmed: true only when the buffer carries
+ * actual evidence the TUI committed the paste (its own marker, Claude's
+ * collapsed chip, or the prompt text rendering). Unlike isPasteConfirmed it
+ * does NOT return true just because there is nothing to verify against, so a
+ * caller can use it to WAIT for a commit rather than to decide whether to
+ * declare one swallowed. That distinction is what the patient codex paste
+ * attempt (PASTE_COMMIT_PATIENCE_MS) polls on.
+ *
+ * Callers MUST pass an ANSI-STRIPPED buffer.
+ *
+ * @param {string} strippedBuffer - ANSI-stripped post-paste output accumulator.
+ * @param {{ verifiablePrefix?: string|null, promptMarkerCount?: number }} [opts]
+ * @returns {boolean}
+ */
+export function isPasteCommitted(strippedBuffer, { verifiablePrefix = null, promptMarkerCount = 0 } = {}) {
+  // Counted once and reused for the chip check below — isCollapsedPasteChip
+  // would re-scan the whole buffer, and this runs on the paste poll.
+  const markers = countPasteMarkers(strippedBuffer);
+  if (markers > promptMarkerCount) return true; // marker is authoritative
+  // Collapsed chip is the TUI's own commit (#2228).
+  if (markers >= 1 && COLLAPSED_PASTE_CHIP_PATTERN.test(strippedBuffer)) return true;
+  return !!verifiablePrefix && verifyPasteRendered(strippedBuffer, verifiablePrefix);
+}
+
+// Positive "the launched program's input is ready to receive a bracketed paste"
+// signal, derived from the terminal's bracketed-paste-mode toggles in the RAW
+// (un-stripped) PTY stream. A program enables bracketed-paste mode (`ESC[?2004h`)
+// exactly when its input prompt is live and ready to accept a paste — which is
+// precisely the precondition for the `ESC[200~…ESC[201~` paste the spawner is
+// about to send. The launch shell already had paste mode ON at its own prompt,
+// so we must NOT treat that initial ON as the signal: only an ON that arrives
+// AFTER the shell turned it OFF (`ESC[?2004l`) to run the command is the
+// launched program (e.g. Claude Code) declaring its input ready. The spawner
+// pairs this with a liveness probe to disambiguate "claude's prompt is ready"
+// from "claude exited and the shell's prompt came back" (both re-enable paste
+// mode). This replaces the old "saw some output, then went idle" heuristic that
+// fired during a startup lull — before claude's input existed — and dumped the
+// prompt into the bare shell.
+// Bracketed-paste mode toggles in the RAW stream — the RELIABLE input-ready
+// signal. `ESC[?2004h` = ON (the program will read `ESC[200~…ESC[201~` as a
+// paste); `ESC[?2004l` = OFF (then the leading `ESC` of our paste is read as
+// Escape, which CANCELS claude's input — the intermittent "something other than
+// Enter canceled it"). claude enables paste mode exactly when its input box is
+// live, so "paste mode re-enabled after the shell turned it off to run the
+// command" means claude is ready AND the paste won't be misread.
+//
+// (We deliberately do NOT key on claude's visible footer text — `bypass
+// permissions on (shift+tab to cycle)` etc. — because claude renders it with
+// inter-glyph cursor moves, so its spaces vanish after ANSI stripping and the
+// text is not reliably matchable. Terminal-mode toggles survive intact.)
+export const BRACKETED_PASTE_MODE_PATTERN = /\x1b\[\?2004([hl])/g;
+
+// First-run folder-trust gates. Claude Code's ("Is this a project you trust? →
+// 1. Yes, I trust this folder / 2. No, exit"), agy's ("Do you trust the contents
+// of this project?"), and Codex's ("You are in <dir> / Do you trust the contents
+// of this directory? → 1. Yes, continue / 2. No, quit"). NONE of them is bypassed
+// by the vendor's own danger flag (`--dangerously-skip-permissions`,
+// `--dangerously-bypass-approvals-and-sandbox`), and CoS agents routinely start
+// in folders the CLI has never seen — a fresh worktree, or the per-agent temp cwd
+// creative-director tasks run in, which is a NEW directory on every single run.
+// Matched against the WHITESPACE-STRIPPED text (same inter-glyph-spacing caveat
+// as the footer). The spawner auto-confirms the default (claude/agy "Yes, I
+// trust"; codex "Yes, continue").
+//
+// Codex's wording carries neither "trust this folder" nor "is this a project
+// you…", so before the third alternative it matched nothing: the dialog sat
+// unanswered, the idle heuristic pasted the task into it, and the run died
+// `paste-not-rendered` (agent-671af38f, 2026-08-21).
+export const TUI_TRUST_PROMPT_PATTERN =
+  /trustthisfolder|isthisaprojectyou(?:created|trust)|doyoutrustthecontentsofthis(?:directory|project|folder)/i;
+
+// Trust selectors have changed ordering across Claude Code releases. Older
+// builds (and Codex/agy) highlight the affirmative choice first, while newer
+// Claude Code builds can render "No, exit" first and highlight it. Consumers must
+// wait until the choices themselves have painted, then move off a highlighted
+// decline choice instead of assuming a bare Enter always accepts the folder.
+// These patterns run against createInputReadyTracker's whitespace-free tail.
+const TUI_TRUST_ACCEPT_OPTION_PATTERN = /(?:yes,?itrustthisfolder|yes,?continue|\[a\]trustthisworkspace)/i;
+const TUI_TRUST_DECLINE_OPTION_PATTERN = /no,?(?:exit|quit)/i;
+const TUI_HIGHLIGHT_PATTERN_PREFIX = String.raw`(?:❯|›|>)\d*\.?`;
+const TUI_TRUST_HIGHLIGHTED_ACCEPT_PATTERN = new RegExp(
+  `${TUI_HIGHLIGHT_PATTERN_PREFIX}(?:yes,?itrustthisfolder|yes,?continue)`,
+  'i',
+);
+const TUI_TRUST_HIGHLIGHTED_DECLINE_PATTERN = new RegExp(
+  `${TUI_HIGHLIGHT_PATTERN_PREFIX}no,?(?:exit|quit)`,
+  'i',
+);
+
+// Claude Code's auto-mode opt-in offer ("Make auto mode your default permission
+// mode? → 1. Yes, set auto mode as my default permission mode / 2. No, keep
+// don't ask"), added in v2.1.233. Like the trust gate it is NOT bypassed by
+// `--dangerously-skip-permissions`, but unlike the trust gate it paints AFTER
+// the composer is live — bracketed-paste mode is already ON, so `ready` goes
+// true and the prompt is pasted straight into a modal that ignores it. Every
+// one of the four claude-code-tui agents launched on 2026-08-14 died
+// `paste-not-rendered` this way (agent-f71b794e et al.).
+//
+// The spawner answers "2. No, keep don't ask" rather than accepting the
+// highlighted default: option 1 rewrites the HUMAN's global default permission
+// mode in `~/.claude.json`, and an unattended agent must not mutate the
+// operator's config as a side effect of dismissing a dialog. Option 2 preserves
+// whatever posture the user already chose, and the agent's own session keeps
+// the `--dangerously-skip-permissions` it was launched with either way.
+export const TUI_AUTO_MODE_PROMPT_PATTERN =
+  /automodeyourdefaultpermissionmode|setautomodeasmydefaultpermissionmode/i;
+
+// Claude Code can discover a parent workspace's AGENTS.md (via CLAUDE.md) when PortOS places a
+// managed-app worktree below its own data/cos/worktrees directory. If that file
+// imports an instruction file outside the managed app's checkout, Claude stops
+// on an "allow external imports" selector before its composer exists. Importing
+// the parent repository's instructions would cross the managed-app boundary, so
+// unattended runs choose "No, disable external imports". Without recognizing
+// this gate, the normal task paste is swallowed and the agent never starts.
+// Match the stable heading and choice wording after whitespace stripping.
+export const TUI_EXTERNAL_IMPORTS_PROMPT_PATTERN =
+  /claude\.mdimportsfilesoutsidethecurrentworkingdirectory|disableexternalimports/i;
+
+// Codex can stop before its composer on a hook-review selector when a newly
+// configured hook has not yet been trusted. `--dangerously-bypass-approvals-and-
+// sandbox` deliberately does not answer this prompt: trusting a hook permits
+// code outside the sandbox, so unattended PortOS runs must choose Codex's
+// explicit "Continue without trusting" option instead. Without this gate the
+// normal startup paste lands in the selector and all paste retries are swallowed.
+// Match the stable heading after whitespace stripping; the exact count/plural
+// wording below it varies with the configured hooks.
+export const TUI_HOOK_REVIEW_PROMPT_PATTERN = /hooksneedreview/i;
+
+// Antigravity (agy) needs a SECOND, positive readiness signal on top of paste
+// mode. agy enables bracketed paste the moment it enters the alt screen — while
+// it is still "Signing in…", before its folder-trust gate has painted and long
+// before its composer exists. So `sawCommandRun && pasteModeOn` goes true within
+// ~200ms of launch and the paste fires into whatever screen happens to be up.
+// When agy's sign-in round trip outran the 2.5s prompt delay, that screen was
+// the trust gate — it swallowed the prompt and all three paste retries, and the
+// agent died `paste-not-rendered` without the trust auto-confirm ever running
+// (`needsTrust` was still false when the paste went out). agy renders
+// `? for shortcuts` under its composer, and ONLY once the composer is live —
+// i.e. strictly after the trust gate is resolved — so gating on it orders the
+// two signals correctly and removes the race.
+//
+// (`--dangerously-skip-permissions` does NOT bypass agy's trust gate, despite
+// what the flag name suggests — real transcripts show the gate appearing under
+// it, same as claude's.)
+export const AGY_INPUT_READY_PATTERN = /\?forshortcuts/i;
+
+// Handshake markers are matched against a rolling window of whitespace-stripped
+// output rather than a single chunk, so a marker split across two PTY reads
+// (`? for short` | `cuts`) still matches. Sized to a few screens of chrome.
+const OBSERVE_TAIL_MAX_LEN = 4000;
+
+// readyTextPattern: optional extra positive gate, tested against the stripped
+// rolling tail. When supplied, `ready` also requires that marker to have been
+// seen (see AGY_INPUT_READY_PATTERN).
+//
+/**
+ * Test whether a launch shape owns its own PTY process.
+ * 'runner' and 'direct' shapes own their PTY; 'login-shell' is hosted in a shell.
+ */
+function shapeHasOwnPty(launchShape) {
+  return launchShape === 'runner' || launchShape === 'direct';
+}
+
+/**
+ * Test whether a launch shape has a login shell to fall back to.
+ * Only 'login-shell' has a persistent shell; 'runner' and 'direct' do not.
+ */
+export function shapeHasLoginShell(launchShape) {
+  return launchShape === 'login-shell';
+}
+
+// launchShape: which PTY shape this TUI runs in. 'runner' and 'direct' shapes
+// own their PTY from byte zero and have no launch shell, so the shell's
+// paste-mode OFF (`ESC[?2004l`) that normally proves "the command is now
+// running" never occurs; the first `ESC[?2004h` in the stream comes from the
+// TUI itself and IS the ready signal. Without this knowledge a runner/direct
+// session can never become ready (the durable-runner regression: every
+// runner-tui claude agent died `tui-not-ready` at the 45s deadline while its
+// input box sat live on screen). 'login-shell' has a persistent shell that
+// handles paste-mode negotiation.
+export function createInputReadyTracker({ readyTextPattern = null, launchShape = 'login-shell' } = {}) {
+  let pasteModeOn = false;   // LIVE bracketed-paste mode state from the stream
+  // Shell turned paste mode OFF to run the command. Pre-latched when the TUI
+  // owns its own PTY (runner/direct shapes), where no shell OFF exists.
+  const hasOwnPty = shapeHasOwnPty(launchShape);
+  let sawCommandRun = hasOwnPty;
+  let needsTrust = false;
+  let trustAnswered = false;
+  let trustChoiceReady = false;
+  let trustSelectionKey = '';
+  let sawReadyText = false;
+  // Auto-mode offer: latched when seen, cleared once answered. `autoModeAnswered`
+  // makes the ack TERMINAL — `tail` is a rolling 4000-char window, so the modal's
+  // text lingers in it long after the dialog is gone and would otherwise re-arm
+  // the flag on the very next chunk, re-answering forever and pinning `ready`
+  // false until the 45s deadline. Arm-once, same as the gates above it.
+  let needsAutoModeChoice = false;
+  let autoModeAnswered = false;
+  // External-import selector: latched until the consumer sends the conservative
+  // "disable" choice, then terminally acknowledged so its stale screen text
+  // cannot re-arm the gate from the rolling tail.
+  let needsExternalImportsChoice = false;
+  let externalImportsAnswered = false;
+  // Like the auto-mode offer, hook-review text remains in the rolling tail
+  // after its selector closes. A terminal acknowledgement prevents a repaint
+  // from re-arming the dialog and blocking delivery forever.
+  let needsHookReview = false;
+  let hookReviewAnswered = false;
+  let tail = '';
+  // node-pty can split `ESC[?2004h` across reads. Keep only the trailing
+  // prefix of that exact toggle so the next chunk can complete it without
+  // treating unrelated escape traffic as a readiness signal.
+  let rawTail = '';
+  return {
+    // Ready once the TUI has RE-ENABLED bracketed-paste mode after the launch
+    // shell turned it off to run the command — for claude that means its input
+    // box is live and a paste will be read as a paste. (The launch shell's own
+    // initial ON does not count: sawCommandRun gates on the intervening OFF.)
+    // Providers that enable paste mode before their composer exists supply a
+    // readyTextPattern to close the gap.
+    // The auto-mode offer is the one gate that paints with paste mode already ON,
+    // so it must SUPPRESS ready — every other signal here says "go" while the
+    // modal is still swallowing input. Cleared by ackAutoModeChoice() once the
+    // spawner has answered it.
+    get ready() {
+      return sawCommandRun && pasteModeOn && !needsTrust && !needsAutoModeChoice
+        && !needsExternalImportsChoice && !needsHookReview
+        && (!readyTextPattern || sawReadyText);
+    },
+    get needsTrust() { return needsTrust; },
+    get trustChoiceReady() { return trustChoiceReady; },
+    get trustSelectionKey() { return trustSelectionKey; },
+    get needsAutoModeChoice() { return needsAutoModeChoice; },
+    get needsExternalImportsChoice() { return needsExternalImportsChoice; },
+    get needsHookReview() { return needsHookReview; },
+    /** Spawner selected the affirmative trust choice. */
+    ackTrustChoice() { needsTrust = false; trustAnswered = true; },
+    /** Spawner reports the dismissal keystrokes went out; re-arms `ready`. */
+    ackAutoModeChoice() { needsAutoModeChoice = false; autoModeAnswered = true; },
+    /** Spawner selected Claude's "No, disable external imports" option. */
+    ackExternalImportsChoice() { needsExternalImportsChoice = false; externalImportsAnswered = true; },
+    /** Spawner selected Codex's safe "Continue without trusting" option. */
+    ackHookReview() { needsHookReview = false; hookReviewAnswered = true; },
+    // rawText: un-stripped chunk (paste-mode toggles live here);
+    // strippedText: ANSI-stripped chunk (the trust-gate / composer text).
+    observe(rawText, strippedText) {
+      if (rawText) {
+        const raw = rawTail + rawText;
+        rawTail = '';
+        for (const m of raw.matchAll(BRACKETED_PASTE_MODE_PATTERN)) {
+          if (m[1] === 'l') { pasteModeOn = false; sawCommandRun = true; }
+          else pasteModeOn = true;
+        }
+        const lastEscape = raw.lastIndexOf('\x1b');
+        const possibleTogglePrefix = lastEscape === -1 ? '' : raw.slice(lastEscape);
+        if (possibleTogglePrefix && '\x1b[?2004'.startsWith(possibleTogglePrefix)) {
+          rawTail = possibleTogglePrefix;
+        }
+      }
+      if (strippedText) {
+        tail = (tail + strippedText.replace(/\s+/g, '')).slice(-OBSERVE_TAIL_MAX_LEN);
+        if (!needsTrust && !trustAnswered && TUI_TRUST_PROMPT_PATTERN.test(tail)) needsTrust = true;
+        if (needsTrust && !trustChoiceReady) {
+          const acceptMatch = TUI_TRUST_ACCEPT_OPTION_PATTERN.exec(tail);
+          const declineMatch = TUI_TRUST_DECLINE_OPTION_PATTERN.exec(tail);
+          if (acceptMatch) {
+            trustChoiceReady = true;
+            if (acceptMatch[0].toLowerCase() === '[a]trustthisworkspace') {
+              // Cursor exposes a direct accelerator, independent of highlight
+              // position (including Linux terminals using the ▶ cursor glyph).
+              trustSelectionKey = 'a';
+            } else if (TUI_TRUST_HIGHLIGHTED_DECLINE_PATTERN.test(tail)) {
+              trustSelectionKey = declineMatch && declineMatch.index < acceptMatch.index ? '\x1b[B' : '\x1b[A';
+            } else if (TUI_TRUST_HIGHLIGHTED_ACCEPT_PATTERN.test(tail)) {
+              trustSelectionKey = '';
+            } else if (declineMatch) {
+              // Ink highlights the first rendered option when its cursor glyph
+              // is unavailable in a captured transcript. Use ordering only as
+              // that fallback; explicit highlight chrome wins above.
+              trustSelectionKey = declineMatch.index < acceptMatch.index ? '\x1b[B' : '';
+            }
+          }
+        }
+        if (!needsAutoModeChoice && !autoModeAnswered && TUI_AUTO_MODE_PROMPT_PATTERN.test(tail)) needsAutoModeChoice = true;
+        if (!needsExternalImportsChoice && !externalImportsAnswered && TUI_EXTERNAL_IMPORTS_PROMPT_PATTERN.test(tail)) {
+          needsExternalImportsChoice = true;
+        }
+        if (!needsHookReview && !hookReviewAnswered && TUI_HOOK_REVIEW_PROMPT_PATTERN.test(tail)) needsHookReview = true;
+        if (readyTextPattern && !sawReadyText && readyTextPattern.test(tail)) sawReadyText = true;
+      }
+    },
+  };
+}
+
+
+// ─── Startup-dialog answers ───────────────────────────────────────────────
+
+// One row per modal a TUI can paint before (or just after) its composer
+// exists, in the exact order the spawner's poll must try them. Adding a
+// provider's next dialog is a row here plus the `needs…`/`ack…` pair on
+// createInputReadyTracker — not another boolean in the spawner's closure and
+// another arm hundreds of lines away from it.
+//
+// `stage` says WHEN the dialog paints, which is also which providers see it:
+//   'before-composer' — runs for every TUI. Codex takes the idle/deadline
+//     paste path and these dialogs go quiet the instant they paint, so the
+//     idle heuristic reads that silence as "ready" and pastes the task into
+//     the menu, which swallows it and all three paste retries (2026-08-21,
+//     `paste-not-rendered`). Answering first is what lets the composer appear.
+//   'after-composer' — claude's auto-mode offer paints once the composer is
+//     already live, so it only concerns the positive-input-ready providers.
+//
+// `keys` is the answer written to the PTY. `\x1b[B` is arrow-down, so
+// `'\x1b[B\r'` picks option 2 and `'\x1b[B\x1b[B\r'` option 3; a bare Enter is
+// deliberately never sent, because it would accept whatever the TUI happened
+// to highlight (which can be "No, exit", or rewriting the user's global
+// permission default).
+const STARTUP_DIALOGS = [
+  // Claude can discover PortOS's parent AGENTS.md (via CLAUDE.md) from a
+  // managed-app worktree nested under data/cos/worktrees, then ask whether to
+  // allow that file's external AGENTS.md import. Decline it: the parent
+  // repository's instructions must not leak into the target app, and option 2
+  // leaves the target's own instruction files intact.
+  {
+    id: 'external-imports',
+    stage: 'before-composer',
+    answered: 'externalImportsDeclined',
+    asks: (inputReady) => inputReady.needsExternalImportsChoice,
+    keys: () => '\x1b[B\r',
+    ack: (inputReady) => inputReady.ackExternalImportsChoice(),
+    describe: (command) => `Declined ${command} external instruction imports`,
+  },
+  // Codex can present a hook-review selector before its composer exists. Do
+  // not trust hooks from an unattended run: option 3 keeps them disabled for
+  // this session and lets the agent continue without executing code outside
+  // its sandbox.
+  {
+    id: 'hook-review',
+    stage: 'before-composer',
+    answered: 'hookReviewDeclined',
+    asks: (inputReady) => inputReady.needsHookReview,
+    keys: () => '\x1b[B\x1b[B\r',
+    ack: (inputReady) => inputReady.ackHookReview(),
+    describe: (command) => `Continued ${command} without trusting startup hooks`,
+  },
+  // Auto-confirm the first-run "trust this folder?" gate so agents can run in
+  // fresh worktrees. Waits for the choices themselves to paint: Claude Code
+  // releases disagree about their ordering and newer builds can highlight
+  // "No, exit" by default, so `trustSelectionKey` — derived from the painted
+  // options — is what moves to the affirmative one before submitting.
+  {
+    id: 'folder-trust',
+    stage: 'before-composer',
+    answered: 'trustAccepted',
+    asks: (inputReady) => inputReady.needsTrust && inputReady.trustChoiceReady,
+    keys: (inputReady) => `${inputReady.trustSelectionKey}${SUBMIT_KEY}`,
+    ack: (inputReady) => inputReady.ackTrustChoice(),
+    describe: (command) => `Auto-confirmed ${command} folder-trust prompt`,
+  },
+  // Decline claude's "make auto mode your default permission mode?" offer
+  // (v2.1.233+). Unlike the trust gate this one paints AFTER the composer is
+  // live, so it swallows the paste and every retry unless it is cleared first
+  // — see TUI_AUTO_MODE_PROMPT_PATTERN. Arrow-down + Enter rather than the
+  // digit `2`: it lands on "No, keep don't ask" under both of Ink's selection
+  // models (digit-immediate-select and navigate-then-confirm).
+  {
+    id: 'auto-mode',
+    stage: 'after-composer',
+    answered: 'autoModeDeclined',
+    asks: (inputReady) => inputReady.needsAutoModeChoice,
+    keys: () => '\x1b[B\r',
+    ack: (inputReady) => inputReady.ackAutoModeChoice(),
+    describe: (command) => `Declined ${command} auto-mode default offer`,
+  },
+];
+
+/**
+ * A fresh "which startup dialogs has this session already answered?" record —
+ * one value per STARTUP_DIALOGS row, so a new row needs no caller edit.
+ *
+ * The tracker's own `needs…` getters go false on ack, so they already stop a
+ * second answer on their own. These latches are the second guard the spawner
+ * carried as four sibling booleans, kept rather than reasoned away in a change
+ * whose contract is that nothing behaves differently.
+ */
+export const createStartupDialogAnswers = () =>
+  Object.fromEntries(STARTUP_DIALOGS.map((dialog) => [dialog.answered, false]));
+
+/**
+ * Answer at most ONE unanswered startup dialog for `stage`, in table order.
+ *
+ * One per call on purpose: answering changes what the TUI is showing, so the
+ * caller returns to its poll and re-reads the tracker before trying the next.
+ * The stage split is also what preserves the caller's original ordering — the
+ * "trust heading painted but its choices are unrecognized" failure check sits
+ * between the two stages and must keep winning over the after-composer arm.
+ *
+ * Mutates `answers` in place: the record is the session's, not this call's.
+ *
+ * @param {object} args
+ * @param {object} args.inputReady - createInputReadyTracker instance.
+ * @param {object} args.answers - createStartupDialogAnswers() record.
+ * @param {'before-composer'|'after-composer'} args.stage
+ * @param {string} args.command - TUI command name, for the transcript line.
+ * @param {(keys: string) => void} args.write - writes the answer to the PTY.
+ * @returns {{ id: string, message: string } | null} the dialog answered and
+ *   the transcript phrase for it, or null when there was nothing to answer.
+ *   The caller owns the log line and the idle-clock rewind, which differ by
+ *   stage.
+ */
+export function answerStartupDialogs({ inputReady, answers, stage, command, write }) {
+  for (const dialog of STARTUP_DIALOGS) {
+    if (dialog.stage !== stage) continue;
+    if (answers[dialog.answered]) continue;
+    if (!dialog.asks(inputReady)) continue;
+    answers[dialog.answered] = true;
+    write(dialog.keys(inputReady));
+    dialog.ack(inputReady);
+    return { id: dialog.id, message: dialog.describe(command) };
+  }
+  return null;
+}
+
+
+// Claude Code and Codex render a bulleted elapsed counter while a model request
+// is in flight; agy uses its own `Generating…` indicator.
+export const WORK_COUNTER_PATTERN = /\(\s*(\d+)\s*s\s*[·•]/g;
+
+// Chrome a TUI paints only while a model request is actually IN FLIGHT. agy
+// renders an animated `Generating…` for exactly as long as the request runs;
+// Claude Code and Codex render their bulleted elapsed counter, so
+// WORK_COUNTER_PATTERN's shape is spliced in (rather than re-spelled) to keep the
+// two from drifting apart.
+//
+// `esc to cancel` is DELIBERATELY NOT HERE, despite being half of agy's in-flight
+// footer. It is ambiguous chrome: agy paints the identical footer (down to the
+// trailing `Gemini 3.6 Flash · medium` status) for its SLASH-COMMAND PALETTE,
+// where it means "esc to cancel the palette". agent-03904eb1 (2026-08-12) is the
+// receipt: parked on the eligibility banner, a `/usage` scrape opened the palette
+// in its session, the palette footer read as "the provider recovered", and the
+// gate latched — which disarms BOTH the re-submission and the fail-over, so the
+// run sat at the banner until an old silent-session fallback finalized it as a
+// bogus success. That is the failure this whole mechanism exists to prevent,
+// and no local feature separates the two footers.
+//
+// Dropping it costs nothing measurable: across every agy transcript on disk, each
+// healthy run carries 10–115 `Generating` hits (2026-08-02 → 08-05, n=14) while
+// every stuck-on-the-banner run carries zero. `Generating` alone is the clean
+// separator; `esc to cancel` only ever added false positives.
+export const GENERATION_ACTIVITY_PATTERN =
+  new RegExp(`Generating\\s*[.·•…]|${WORK_COUNTER_PATTERN.source}`, 'i');
+
+// Carry-over kept across chunks so in-flight chrome split by a PTY chunk boundary
+// (`Generat` + `ing…`) still matches.
+//
+// Only needs to span the longest pattern alternative, because `observe` tests the
+// FULL `carry + chunk` window and trims only afterwards (see below) — the cap
+// bounds retained state, it never bounds what gets matched.
+const GENERATION_ACTIVITY_CARRY_CAP = 64;
+
+/**
+ * Stateful latch for "the TUI is actively generating a response". Feed it each
+ * ANSI-stripped chunk via `observe(strippedText)`; it becomes (and stays)
+ * `active` once any in-flight chrome appears, and returns true on the call that
+ * flipped it (so a caller can react to the transition).
+ *
+ * This does not try to be echo-proof by construction — the gate that owns it
+ * handles the one case where the prompt can
+ * re-enter the stream (a re-submission; see SELF_CLEARING_RESUBMIT_ECHO_MS).
+ *
+ * It is NOT, however, a "match anything that looks alive" pattern, which is how
+ * `esc to cancel` got in and then cost a run (see GENERATION_ACTIVITY_PATTERN).
+ * The cost asymmetry runs the other way now that the grace window re-submits: a
+ * false "still stuck" merely re-asks a provider that was about to answer, while a
+ * false "recovered" latches, disarming the retry AND the fail-over and leaving
+ * the run to complete as a reported success it never earned. Only chrome that
+ * a TUI paints EXCLUSIVELY while a request is in flight belongs here.
+ *
+ * @returns {{ observe: (strippedText: string) => boolean, readonly active: boolean }}
+ */
+export function createGenerationActivityTracker() {
+  let active = false;
+  let tail = '';
+  return {
+    observe(strippedText) {
+      if (active) return true;
+      if (typeof strippedText !== 'string' || !strippedText) return false;
+      // Test the WHOLE window, then trim. Trimming first (the sibling trackers'
+      // shape) throws away everything but the last CAP characters of the chunk,
+      // so chrome anywhere earlier in a typical multi-hundred-byte PTY repaint
+      // is never matched at all — the tracker would miss a provider that HAD
+      // recovered and the run would be failed over to a fallback for nothing.
+      const window = tail + strippedText;
+      if (GENERATION_ACTIVITY_PATTERN.test(window)) active = true;
+      tail = window.slice(-GENERATION_ACTIVITY_CARRY_CAP);
+      return active;
+    },
+    get active() { return active; },
+  };
+}
+
+// How often to re-submit the prompt while a self-clearing signal's grace window
+// is open.
+//
+// A passive wait CANNOT clear agy's eligibility banner: the banner is that
+// submission's REJECTION, not a progress spinner. agy discards the submitted
+// prompt, empties its composer and returns to the idle `? for shortcuts` footer
+// — verbatim from agent-1f08178b's raw.txt, and confirmed on a live session left
+// sitting at the banner. Nothing is in flight, so the generation chrome the gate
+// watches for can never appear and the window's only possible outcome is
+// expiry + fail-over. Retrying is also exactly what the vendor's own copy asks
+// for ("Please try again shortly"), so the window now re-pastes and re-submits
+// on this cadence and only fails over once the retries are exhausted.
+//
+// 20s: slow enough that a re-paste can't outrun agy's own reflow + round trip
+// (a submission that IS accepted starts painting `Generating…` within ~1s, which
+// closes the window before the next retry is due), and fast enough to fit
+// several attempts inside the grace window.
+export const SELF_CLEARING_RESUBMIT_INTERVAL_MS = 20000;
+
+// How often a consumer without its own poll should ASK the gate whether a
+// re-submission is due. Deliberately a sub-multiple of the interval above rather
+// than equal to it: a timer whose period matches the cadence exactly can tick a
+// hair early (timer rounding vs. `Date.now()`, or an event-loop stall shifting
+// phase), `takeResubmit` refuses, and that attempt is silently forfeited for a
+// whole interval. Polling faster than the cadence leaves the gate the single
+// authority on timing — the same shape the agent path gets for free by folding
+// the question into its existing 5s provider-signal poll.
+export const SELF_CLEARING_RESUBMIT_POLL_MS = 5000;
+
+// How long after a re-submission the gate ignores output when deciding whether
+// the provider recovered.
+//
+// The generation tracker matches a single chunk, which is safe only while the
+// stream cannot contain the prompt. Re-pasting breaks that: a prompt quoting
+// `Generating…` (a task about this very failure mode does) echoes straight into
+// the tracker and latches a bogus recovery — strictly worse than the expiry it
+// replaced, because a recovered gate neither retries nor fails over, leaving the
+// run to remain latched as a false recovery. 3s covers the paste and its spaced
+// submit-Enters (~1.4s).
+//
+// Applied to every re-submission rather than only to prompts whose text could
+// actually match: conditioning on that made the gate's behavior depend on a
+// content coincidence in the caller's payload, and the thing it bought — up to
+// 3s of recovery latency on a 20s retry cadence, against chrome that repaints
+// continuously — is not worth the coupling.
+export const SELF_CLEARING_RESUBMIT_ECHO_MS = 3000;
+
+/**
+ * The wait-it-out policy for a provider signal that carries a `graceMs` (today:
+ * agy's account-eligibility banner — see IMMEDIATE_FALLBACK_SIGNALS in
+ * aiToolkit/errorDetection.js for the canonical account of why it exists).
+ *
+ * Owns the whole state machine so the consumers can't drift: arm-once (a
+ * repainting TUI re-matches constantly and must not restart the clock),
+ * feed-the-tracker only inside the window, re-submit the prompt on a cadence
+ * (see SELF_CLEARING_RESUBMIT_INTERVAL_MS — the wait is ACTIVE, because the
+ * banner rejected the submission), disarm the moment the provider is
+ * demonstrably generating again, and hand back a verdict at the deadline. Each
+ * consumer keeps only its own timing mechanism — `agentTuiSpawning` folds the
+ * deadline and the retry cadence into its existing 5s provider-signal timer, while
+ * `tuiPromptRunner` needs its own timers because its idle watcher is created
+ * lazily on the first post-prompt chunk and may not exist yet when the banner
+ * paints.
+ *
+ * Usage per chunk: `gate.observe(stripped, now)` then, on a match,
+ * `gate.arm(analysis, now)`. `gate.armed` tells the provider-signal timer that
+ * the handshake is still active; a session waiting out a handshake is silent by
+ * design. `gate.takeResubmit(Date.now())` returns the 1-based
+ * attempt number when it is time to re-send the prompt (0 otherwise), and
+ * `gate.takeExpired(Date.now())` returns the analysis to fail over with, or null
+ * while still waiting / after a recovery.
+ *
+ * @returns {{ arm: (analysis: object, nowMs: number) => boolean,
+ *             observe: (strippedText: string, nowMs: number) => boolean,
+ *             takeResubmit: (nowMs: number) => number,
+ *             takeExpired: (nowMs: number) => object|null,
+ *             readonly armed: boolean }}
+ */
+export function createSelfClearingSignalGate() {
+  let armed = null; // { analysis, deadlineAt, nextResubmitAt, echoUntil, resubmits }
+  let activity = null;
+  // Latched once a window is ridden out successfully, which suppresses re-arming
+  // for the rest of the run. This is not just tidiness: the caller's detector is
+  // a BUFFERED stream matcher (createImmediateFallbackSignalDetector keeps a
+  // 512-char window), so the banner keeps matching for many chunks after the
+  // provider has recovered. Without this latch the first post-recovery chunk
+  // re-arms a fresh window and fails the run over a full grace window later —
+  // the exact bug the grace window exists to prevent (and it would now re-paste
+  // the prompt into a working session on the way there). A genuine second banner
+  // is therefore ignored rather than re-waited; the provider has demonstrably
+  // worked once, and the caller's normal failure/runtime handling remains in charge.
+  let recovered = false;
+  return {
+    get armed() { return armed !== null; },
+    get recovered() { return recovered; },
+    arm(analysis, nowMs) {
+      if (armed || recovered || !analysis || !(analysis.graceMs > 0)) return false;
+      armed = {
+        analysis,
+        deadlineAt: nowMs + analysis.graceMs,
+        // First retry is one full interval out, not immediate: the banner paints
+        // within a second of the submit-Enter, and re-pasting on top of a TUI
+        // still settling from the rejected paste is how you get two prompts
+        // concatenated in the composer.
+        nextResubmitAt: nowMs + SELF_CLEARING_RESUBMIT_INTERVAL_MS,
+        // Nothing has been re-pasted yet, so nothing in the stream is our echo.
+        echoUntil: 0,
+        // 1-based count of re-submissions made inside THIS window, used only to
+        // label the attempt in the consumers' logs. Lives on `armed` so its
+        // per-window lifetime is structural rather than a reset to remember.
+        resubmits: 0,
+      };
+      activity = createGenerationActivityTracker();
+      return true;
+    },
+    // Returns true on the call that ends the window because the provider came
+    // back — disarming here (rather than at the deadline) is what stops a
+    // recovered run from sitting under idle suppression for the rest of the
+    // window. `nowMs` is required: without a clock there is no way to tell our
+    // own re-pasted prompt from the provider's output.
+    observe(strippedText, nowMs) {
+      if (!armed || nowMs < armed.echoUntil) return false;
+      if (!activity.observe(strippedText)) return false;
+      armed = null;
+      activity = null;
+      recovered = true;
+      return true;
+    },
+    // Returns the 1-based attempt number when the prompt is due to be re-sent,
+    // or 0. The consumer owns the actual paste; this only owns "is it time?" so
+    // both consumers keep the same cadence. Deliberately silent once the
+    // provider has recovered (not armed) — and once the deadline has passed,
+    // because a retry that lands after `takeExpired` would paste into a session
+    // the fail-over is already tearing down.
+    takeResubmit(nowMs) {
+      if (!armed || nowMs < armed.nextResubmitAt || nowMs >= armed.deadlineAt) return 0;
+      armed.nextResubmitAt = nowMs + SELF_CLEARING_RESUBMIT_INTERVAL_MS;
+      armed.echoUntil = nowMs + SELF_CLEARING_RESUBMIT_ECHO_MS;
+      armed.resubmits += 1;
+      return armed.resubmits;
+    },
+    // Returns the analysis to fail over with, or null while still waiting (or
+    // after a recovery). `nowMs` is OPTIONAL: a poller passes the clock and gets
+    // a deadline comparison, while a consumer whose own `setTimeout` fired for
+    // exactly this window omits it and force-expires. That distinction matters —
+    // a timer scheduled for `graceMs` can fire a hair before `Date.now()` reaches
+    // `deadlineAt` (ms-resolution clock vs. timer rounding), and since the timer
+    // is one-shot with nothing to reschedule it, a null there would strand the
+    // gate armed: idle-completion suppressed and no fail-over, until the run's
+    // hard timeout. Force-expiry has no such edge.
+    takeExpired(nowMs) {
+      if (!armed) return null;
+      if (nowMs !== undefined && nowMs < armed.deadlineAt) return null;
+      const { analysis } = armed;
+      armed = null;
+      activity = null;
+      return analysis;
+    },
+  };
+}
+
+// A SINGLE Enter after a large bracketed paste is unreliable: the TUI can still
+// be processing/reflowing the multi-line paste when the `\r` arrives and
+// swallow it, leaving the whole prompt sitting unsent in the input box. The
+// old fallback could then falsely finalize the run as success — observed as the
+// "the prompt was typed but I had to hit Enter myself" bug. (The marker fast
+// path above now fires again once matched against stripped output — see
+// detectPasteMarker — but the marker only renders for large multi-line pastes;
+// short prompts still lean on the fallback timer, so multi-Enter remains the
+// safety net for both.) Send a few Enters spaced apart so at least one lands
+// after the paste settles. Re-sending
+// is safe: once the prompt submits the input box is empty and a bare Enter is a
+// no-op in every TUI we drive (claude/codex/gemini), so the extra Enters can't
+// fire a spurious empty message.
+export const SUBMIT_ENTER_ATTEMPTS = 3;
+export const SUBMIT_ENTER_SPACING_MS = 700;
+
+// The byte a real terminal sends when the user presses Enter — the one every
+// `write()` above hands to a PTY, and the terminator on any command PortOS
+// injects into a shell session (services/shell.js#submitToSession).
+//
+// CR, never LF. A POSIX pty's line discipline sets ICRNL, which translates an
+// incoming CR into NL, so on macOS/Linux either byte submits the line and the
+// difference is invisible. Windows ConPTY does no such translation: cmd.exe's
+// line input accepts ONLY CR, and an LF-terminated write leaves the command
+// typed at the prompt but never executed — the next injection then concatenates
+// onto it. That is why the Shell page's "cd to app" picker and quick-command
+// buttons still did nothing on Windows after the cd line itself was rendered in
+// the right dialect (lib/shellCd.js). xterm.js already sends CR for a real Enter
+// keypress, so an injected command submits exactly the way typing does.
+export const SUBMIT_KEY = '\r';
+
+/**
+ * Submit a freshly-pasted TUI prompt by sending Enter SUBMIT_ENTER_ATTEMPTS
+ * times: once immediately, then on a SUBMIT_ENTER_SPACING_MS interval until the
+ * attempt budget is spent (see the constants above for why a single Enter is
+ * unreliable). Shared by both the agent path and the one-shot runner so the two
+ * can't drift.
+ *
+ * @param {() => void} write — sends one `\r` to the TUI. The caller owns the
+ *   write mechanism (PTY vs shell session) and its error handling.
+ * @param {() => boolean} isFinalized — true once the run has ended; stops the
+ *   retry loop so it can't write into a torn-down session.
+ * @returns {ReturnType<typeof setInterval>|null} the retry interval id (null
+ *   when no retries were scheduled). The caller stores it so its finalize path
+ *   can cancel pending retries; calling clearInterval on an already-self-cleared
+ *   id is a harmless no-op.
+ */
+export function scheduleSubmitEnters(write, isFinalized) {
+  if (isFinalized()) return null;
+  write();
+  let attemptsLeft = SUBMIT_ENTER_ATTEMPTS - 1;
+  if (attemptsLeft <= 0) return null;
+  const timer = setInterval(() => {
+    if (isFinalized() || attemptsLeft <= 0) {
+      clearInterval(timer);
+      return;
+    }
+    attemptsLeft -= 1;
+    write();
+  }, SUBMIT_ENTER_SPACING_MS);
+  return timer;
+}
+
+// Defaults the consumer applies when the provider config doesn't pin
+// per-provider prompt timing values (provider.tuiPromptDelayMs).
+export const DEFAULT_TUI_PROMPT_DELAY_MS = 2500;
+
+
+// ─── Codex MCP-server boot detection ──────────────────────────────────────
+//
+// Codex (unlike Claude Code) boots any MCP servers configured in the user's
+// GLOBAL `~/.codex/config.toml` on every startup — INCLUDING for our headless
+// CoS agents, which never asked for them. A user with heavyweight interactive
+// servers (e.g. `playwright` via `npx @playwright/mcp@latest`, or a `node_repl`
+// with `startup_timeout_sec = 120`) makes codex spend tens of seconds — up to
+// two minutes — booting that stack before its input box will accept a paste.
+//
+// During that boot codex renders its input box EARLY but SWALLOWS pastes, and
+// while it waits on a silent boot subprocess (an `npx` download, a stalled
+// server) its PTY output goes IDLE — indistinguishable from "ready" to the
+// idle-detect readiness heuristic. So the spawner pastes mid-boot, codex
+// swallows it (no `[Pasted Content N chars]` marker, and its single-line input
+// viewport shows only the TAIL of the long paste, never the verifiable prefix),
+// and the paste-verify retry (issue #2192) exhausts its 3 short attempts and
+// fails `paste-not-rendered` — killing codex BEFORE its MCP boot ever finished
+// (real incident 2026-07-10: agent-c5a26b40 / agent-3f4ae3b1, both gpt-5.6-sol;
+// the same prompt succeeded on 2026-07-03..09 back when no MCP servers were
+// configured and codex was ready in <10s).
+//
+// The fix is NOT a new readiness signal (codex gives no reliable boot-complete
+// one — a slow boot looks identical to a ready box) but a boot-aware RETRY
+// BUDGET: once boot chrome is seen, keep re-pasting until codex finishes booting
+// and a paste finally lands its marker, up to MCP_BOOT_PASTE_DEADLINE_MS. The
+// spawner (agentTuiSpawning.js) consumes `createMcpBootTracker` for exactly that.
+//
+// Matched against ANSI-stripped output. Detection is deliberately conservative:
+// a false POSITIVE only extends the
+// (bounded) retry window, and a false NEGATIVE just preserves the pre-fix 3-retry
+// behavior. The two phrases are anchored to codex's literal boot banners rather
+// than a bare "mcp server" substring so an agent whose prompt/output merely
+// mentions MCP servers can't latch the extended window.
+const MCP_BOOT_MARKERS = ['booting mcp server', 'starting mcp servers'];
+
+// Covers a `node_repl` with the documented `startup_timeout_sec = 120` plus an
+// `npx`-fetched server's cold download and margin, while still bounding a
+// genuinely-hung boot's failure. The deadline is independent of CoS agent
+// runtime handling so a slow MCP boot gets its full retry budget.
+export const MCP_BOOT_PASTE_DEADLINE_MS = 150000;
+// Spacing between paste retries while codex is booting MCP servers. A swallowed
+// mid-boot paste renders nothing, so a re-paste every few seconds is a cheap
+// no-op until the box is finally live; this is additive to each attempt's own
+// marker-wait + verify window (~5.5s), so the effective cadence is ~10s.
+export const MCP_BOOT_PASTE_RETRY_DELAY_MS = 5000;
+
+// Rolling tail cap for createMcpBootTracker's cross-chunk buffer: a boot banner
+// can split across two onData chunks
+// during streaming, so concatenate onto a short tail before testing.
+const MCP_BOOT_TAIL_CAP = 256;
+
+/**
+ * True when a chunk of ANSI-stripped TUI output shows codex booting its MCP
+ * servers. Callers MUST pass stripped output. Non-string / empty input → false.
+ *
+ * @param {string} strippedText — ANSI-stripped output (a chunk or accumulator).
+ * @returns {boolean}
+ */
+export function isMcpBootSignal(strippedText) {
+  if (typeof strippedText !== 'string' || !strippedText) return false;
+  const lower = strippedText.toLowerCase();
+  return MCP_BOOT_MARKERS.some((marker) => lower.includes(marker));
+}
+
+/**
+ * Latching tracker for "this TUI is booting its MCP servers" — the codex slow-
+ * boot failure mode above. Feed it each ANSI-stripped STARTUP chunk (before the
+ * prompt is submitted) via `observe(text)`; it latches `active` the first time a
+ * boot banner appears and STAYS active thereafter. Latching (not a sliding
+ * window) is deliberate: the boot banner prints once and then codex updates the
+ * line via cursor-positioned partial redraws that don't reprint the full phrase,
+ * and the whole point is to keep the extended paste-retry budget in force across
+ * the (often silent) boot. Keeps a small rolling tail so a marker split across a
+ * chunk boundary still matches. Lives here so the detection is unit-testable.
+ *
+ * @returns {{ observe: (strippedText: string) => boolean, readonly active: boolean }}
+ */
+export function createMcpBootTracker() {
+  let active = false;
+  let tail = '';
+  return {
+    observe(strippedText) {
+      if (active) return true;
+      if (typeof strippedText !== 'string' || !strippedText) return active;
+      // Search BEFORE truncating. Codex commonly sends a whole-screen repaint
+      // in one PTY chunk: the MCP status sits above the composer/footer, and
+      // that suffix alone can exceed MCP_BOOT_TAIL_CAP. Truncating first drops
+      // a perfectly visible `Starting MCP servers` banner and falls back to the
+      // ordinary three-paste budget while Codex is still booting. The retained
+      // tail exists only to join a marker split across consecutive chunks.
+      const combined = tail + strippedText;
+      if (isMcpBootSignal(combined)) active = true;
+      tail = combined.slice(-MCP_BOOT_TAIL_CAP);
+      return active;
+    },
+    get active() { return active; },
+  };
+}
+
+// ─── Buffer caps (defensive RAM bounds) ───────────────────────────────────
+//
+// RAW caps stay small — the raw PTY stream is only used for paste-marker
+// detection and a short failure-tail in the exit error message, both of
+// which need only the recent past.
+//
+// OUTPUT caps are larger because the ANSI-stripped buffer is the fallback
+// response text when a TUI fails to write its response file. A 1MB cap was
+// silently truncating the *head* of large model responses mid-token; bumped
+// to 8MB so realistic full-context replies (~600KB UTF-8 from a 200K-token
+// window, plus screen chrome) fit cleanly. Consumers should still treat
+// overflow as a fault — see `outputBufferTruncated` tracking in
+// `tuiPromptRunner.js`.
+// Cap on the spawner's post-paste accumulator (agentTuiSpawning.js's
+// `pasteState.buffer`), which retains stripped output from a paste attempt until
+// the commit resolves. Both signals it carries are LOCAL — a paste-commit chip
+// and a ~40-char prompt prefix — so a few screens of tail is everything the
+// predicate can use, while a codex booting for the full PASTE_COMMIT_PATIENCE_MS
+// window would otherwise retain every byte of its boot repaint and make each
+// poll scan grow without bound.
+export const POST_PASTE_BUFFER_CAP = 64 * 1024;
+export const RAW_BUFFER_CAP = 512 * 1024;
+export const RAW_BUFFER_HEADROOM = 640 * 1024;
+export const OUTPUT_BUFFER_CAP = 8 * 1024 * 1024;
+export const OUTPUT_BUFFER_HEADROOM = 10 * 1024 * 1024;
+// Disk safety valve for the agent-mode raw.txt spool. Counted as UTF-8 bytes
+// actually written. Tests can override this via the same vi.mock pattern that
+// shrinks OUTPUT_BUFFER_HEADROOM, so the cap-overflow test doesn't have to
+// push hundreds of MB through the spawner to exercise the truncation path.
+export const RAW_SPOOL_MAX_BYTES = 256 * 1024 * 1024;
+
+// ─── Command + args helpers ───────────────────────────────────────────────
+
+/**
+ * The launch command a TUI provider gets when it names none — the spawners'
+ * blank-`provider.command` fallback (`buildTuiSpawnConfig`, and mirrored by
+ * `buildCliSpawnConfig`'s default branch). An unrecognized id resolves to
+ * `claude`, matching `isClaudeCommand`'s blank-is-Claude policy.
+ *
+ * Also read by `resolveSlashdoStyle`'s `assumeClaudeWhenUnknown` posture, which
+ * asks "which command will actually be spawned?" before deciding whether the
+ * session can type `/do:pr` — so a missing signature here means a provider is
+ * told to run slash commands its real binary doesn't have.
+ *
+ * Defined in providerVendors.js (the PROVIDER_VENDORS registry, #3618);
+ * re-exported here for existing importers of this module.
+ * @param {string|null|undefined} id - provider id
+ * @returns {string}
+ */
+export { inferTuiCommand };
+
+/**
+ * TUI posture-flag dispatch (approval/trust bypass per vendor). Defined in
+ * providerVendors.js (the PROVIDER_VENDORS registry, #3618); re-exported here
+ * for existing importers of this module.
+ */
+export { applyCommandDefaults };
+
+/**
+ * Build the spawn args for a TUI invocation. When `provider.args` already
+ * has a `--model X` (or `-m X`) pin, the args-baked flag wins and we skip
+ * the per-call --model append — otherwise the CLI would see two flags and
+ * either error or take the last one (provider-specific). Matches the same
+ * gate `runner.js#buildCliArgs` uses for CLI providers.
+ *
+ * `provider.effort` carries a per-run reasoning-effort override (callers clone
+ * the provider with it pinned, same as `defaultModel`) and becomes
+ * `--effort <level>` / codex's `-c model_reasoning_effort=<level>`. For agy an
+ * effort-suffixed model id is split so the base rides `--model` and its baked
+ * tier becomes the `--effort` — see antigravity.js for why. The antigravity-
+ * vs-everyone-else split lives in providerVendors.js#injectTuiModelAndEffort,
+ * shared with agentTuiSpawning.js#buildTuiSpawnConfig so the two spawn paths
+ * can't diverge (they already had once, before #3618).
+ */
+export function buildTuiInvocation(provider, model) {
+  const command = provider?.command || inferTuiCommand(provider?.id);
+  const baseArgs = applyCommandDefaults(command, [...(provider?.args || [])], provider);
+  const effort = provider?.effort || null;
+  return {
+    command,
+    args: injectTuiModelAndEffort(command, baseArgs, provider, model, effort),
+  };
+}
+
+/**
+ * Returns true when the stripped chunk looks like a `command not found`
+ * error for our spawned TUI binary. Used as an early-fail probe so a typo'd
+ * provider.command surfaces in seconds instead of after a completion timeout.
+ */
+export function detectMissingTuiBinary(strippedText, commandName) {
+  const lower = strippedText.toLowerCase();
+  return lower.includes('command not found') && lower.includes(commandName.toLowerCase());
+}
+
+// ── Local-runtime OOM nudge ────────────────────────────────────────────────
+// Recovery policy for a LOCAL inference runtime that ran out of accelerator
+// memory mid-turn (detectLocalRuntimeOom in aiToolkit/errorDetection.js).
+//
+// This is NOT the self-clearing gate above, and the difference is what the
+// provider did with the turn. agy's eligibility banner REJECTS the submission:
+// the composer empties, nothing is in flight, and the remedy is to re-send the
+// whole prompt. A Metal/CUDA OOM kills a turn the server had already ACCEPTED:
+// the TUI session still holds the entire conversation, so the remedy is a
+// one-word nudge to carry on. Re-pasting the task prompt there would restart
+// the task on top of the work already done.
+//
+// Provenance: agent-011d0c27 (2026-08-22, OpenCode on
+// `mtplx/mtplx-qwen38-27b-optimized-speed`) died on
+// `kIOGPUCommandBufferCallbackErrorOutOfMemory` and sat at its idle footer
+// until a human typed `continue`, at which point it resumed and finished the
+// turn. Nothing in the unattended path would ever have typed it — the
+// long-running agent path has no idle watchdog by design ("a CoS TUI may remain
+// silent for as long as the provider needs").
+
+// How long the session must have been SILENT before a nudge goes out. This is
+// the whole false-positive defense, and it is deliberately a silence test
+// rather than a chrome test: the generation-activity tracker above is spelled in
+// agy/claude/codex footer text that OpenCode does not paint at all (its
+// in-flight chrome is an animated block wave plus an `esc interrupt` footer that
+// repaints only ~8 times across a 74MB transcript), so a chrome-based recovery
+// check would read a perfectly healthy OpenCode session as stuck. Silence is
+// provider-agnostic and needs no per-TUI vocabulary.
+export const OOM_NUDGE_SETTLE_MS = 25000;
+// How long an armed nudge waits for that silence before giving up. Bounds the
+// blast radius of the one case the cooldown can't dedupe — the error box being
+// repainted long after the session recovered — so a stale arm can't sit around
+// and fire into the next quiet stretch of a healthy run.
+export const OOM_NUDGE_ARM_WINDOW_MS = 120000;
+// Two matches this close together are one OOM: the detector re-tests a 512-char
+// rolling window, and a TUI repaint re-delivers the same error box for many
+// chunks after the event.
+export const OOM_NUDGE_COOLDOWN_MS = 120000;
+// After this many nudges the OOM is not transient — the conversation no longer
+// fits the device, and it only grows — so the caller fails the run over to a
+// fallback provider rather than nudging forever.
+export const OOM_NUDGE_MAX_ATTEMPTS = 3;
+// What gets pasted. The literal word a human used, for the literal reason it
+// worked: the TUI still holds the conversation and the model just needs a turn.
+export const OOM_NUDGE_TEXT = 'continue';
+
+/**
+ * State machine for "nudge a TUI session that a local-GPU OOM left parked".
+ *
+ * Feed it every OOM detection via `arm(analysis, nowMs)`, then poll
+ * `takeNudge(nowMs, lastOutputAtMs)` on whatever timer the consumer already
+ * runs. Owns the dedupe cooldown, the silence test, the arm window and the
+ * attempt budget so a consumer can't get any of them subtly wrong.
+ *
+ * `arm` returns:
+ *   - `'armed'`     — a fresh OOM; wait for silence, then nudge
+ *   - `'exhausted'` — a fresh OOM with the budget already spent; the caller
+ *                     should fail the run over to a fallback provider
+ *   - `null`        — a repaint of an OOM already accounted for, or a window
+ *                     that is still open
+ *
+ * @returns {{ arm: (analysis: object, nowMs: number) => 'armed'|'exhausted'|null,
+ *             takeNudge: (nowMs: number, lastOutputAtMs: number) => number }}
+ */
+export function createOomNudgeGate() {
+  const gate = createSilenceNudgeGate({
+    cooldownMs: OOM_NUDGE_COOLDOWN_MS,
+    settleMs: OOM_NUDGE_SETTLE_MS,
+    armWindowMs: OOM_NUDGE_ARM_WINDOW_MS,
+    maxAttempts: OOM_NUDGE_MAX_ATTEMPTS,
+  });
+  return {
+    arm: (analysis, nowMs) => (analysis ? gate.arm(nowMs) : null),
+    takeNudge: gate.takeNudge,
+  };
+}
+
+// ─── Truncation nudge — "the harness cut the response off mid-generation" ────
+//
+// pi's TUI halts the whole session on `Response was truncated before
+// completion.` — the turn is dead, but the session still holds the whole
+// conversation, and the only thing that resumes it is somebody typing
+// `continue` and pressing Enter. Unattended, nothing ever does: the run sits
+// at the halted screen holding its lane. Same shape as the OOM gate above
+// (a dead turn, an intact session), so it rides the same silence policy and
+// the same budget — only the detector differs
+// (detectTruncatedResponse in ../aiToolkit/errorDetection.js).
+
+// Reuses the OOM gate's timing wholesale. The truncation banner, like the OOM
+// box, keeps repainting for chunks after the event, so the cooldown and the
+// wait-for-silence window are the same load-bearing details; and a response
+// that truncates three times in one run is not going to complete on the
+// fourth, for the same reason an OOM that outlasts three nudges isn't.
+export const TRUNCATION_NUDGE_MAX_ATTEMPTS = OOM_NUDGE_MAX_ATTEMPTS;
+// What gets pasted — the same word the OOM nudge pastes, for the same reason:
+// the TUI still holds the conversation and the model just needs a turn.
+export const TRUNCATION_NUDGE_TEXT = OOM_NUDGE_TEXT;
+
+/**
+ * State machine for "nudge a TUI session a truncated response left halted".
+ * Delegates to `createOomNudgeGate` — the two conditions share every policy
+ * detail (a dead turn, an intact session, a banner that repaints), so the
+ * gate is literally the same machine under a name that says what it watches
+ * for. See `createSilenceNudgeGate` for the semantics of `arm` / `takeNudge`.
+ *
+ * @returns {{ arm: (analysis: object, nowMs: number) => 'armed'|'exhausted'|null,
+ *             takeNudge: (nowMs: number, lastOutputAtMs: number) => number }}
+ */
+export function createTruncationNudgeGate() {
+  return createOomNudgeGate();
+}
+
+/**
+ * The "wait for silence, then nudge" policy the OOM gate and the
+ * tool-permission gate share: dedupe sightings inside `cooldownMs` (a TUI
+ * repaints an error box for many chunks), fire once the session has been quiet
+ * for `settleMs`, drop an arm the session outran (`armWindowMs` — it recovered
+ * on its own), and report `'exhausted'` once `maxAttempts` nudges have already
+ * been spent on a condition that keeps coming back.
+ *
+ * `arm(nowMs)` returns `'armed'`, `'exhausted'`, or null for a sighting inside
+ * the cooldown or while a nudge is already pending. `inCooldown(nowMs)` lets a consumer skip its detector while a
+ * just-handled sighting is still repainting. `takeNudge(nowMs, lastOutputAtMs)`
+ * returns the 1-based nudge number when one is due, or 0 — disarming either
+ * way, on a nudge because it fired and on an expired window because the
+ * session never went quiet.
+ */
+export function createSilenceNudgeGate({ cooldownMs, settleMs, armWindowMs, maxAttempts }) {
+  let armedAt = null;
+  let lastArmedAt = null;
+  let attempts = 0;
+  return {
+    inCooldown: (nowMs) => lastArmedAt !== null && nowMs - lastArmedAt < cooldownMs,
+    arm(nowMs) {
+      // A sighting while a nudge is already pending is the same condition
+      // still on screen: it neither restarts the window (a box that repaints
+      // forever must still expire it) nor refreshes the cooldown (or a repaint
+      // outlasting the window could never re-arm once it stops).
+      if (armedAt !== null) return null;
+      if (lastArmedAt !== null && nowMs - lastArmedAt < cooldownMs) return null;
+      lastArmedAt = nowMs;
+      // Budget spent: this is a genuinely NEW sighting (it cleared the cooldown)
+      // after the nudges already bought the run more than one recovery. Hand the
+      // verdict back rather than arming a window nobody will act on.
+      if (attempts >= maxAttempts) return 'exhausted';
+      armedAt = nowMs;
+      return 'armed';
+    },
+    takeNudge(nowMs, lastOutputAtMs) {
+      if (armedAt === null) return 0;
+      if (nowMs - armedAt > armWindowMs) { armedAt = null; return 0; }
+      if (nowMs - lastOutputAtMs < settleMs) return 0;
+      armedAt = null;
+      attempts += 1;
+      return attempts;
+    },
+  };
+}
+
+// How long one request's retry sequence may span before the run is failed over.
+//
+// Long enough that Claude Code's own retry ladder for a transient cloud fault
+// (ten attempts, seconds of backoff each) always finishes inside it — that
+// ladder either recovers or ends in a terminal gutter line the idle reaper
+// handles — and short enough that a request the provider can never answer is
+// not left to burn a lane for the run's whole 3h ceiling. The gate also demands
+// the banner ADVANCE at least twice (attempt N → N+2): a single sighting is
+// often chrome that recovered a second later, and one advance can be a fault
+// that cleared on the next try, but a third attempt of the same request ten
+// minutes on is a request this provider is not going to answer.
+export const RETRY_STALL_MS = 10 * 60 * 1000;
+export const RETRY_STALL_MIN_ADVANCES = 2;
+// Carry-over kept across chunks so a banner split by a PTY chunk boundary still
+// matches. Spans the longest banner (`Retrying in 999s · attempt 10/10`) plus
+// the cursor-positioning residue stripping leaves around it.
+const RETRY_STALL_CARRY_CAP = 96;
+
+/**
+ * State machine for "the TUI keeps retrying the same request and it never
+ * answers" — the incident is told once, on TUI_RETRY_BANNER_PATTERN in
+ * aiToolkit/errorDetection.js.
+ *
+ * Feed it every ANSI-stripped chunk after the prompt is in via
+ * `observe(strippedText, nowMs)`; poll `takeStall(nowMs)` on whatever timer the
+ * consumer already runs. It tracks one EPISODE at a time — the retry sequence
+ * of a single request, recognised by its attempt counter climbing. A counter
+ * that goes back down is the next request's ladder (Claude Code numbers each
+ * request's retries from 1), and a banner more than RETRY_STALL_MS after the
+ * last one is a new episode too, so a run that hit a blip, recovered, and did
+ * an hour of work before the next blip is never judged across both.
+ *
+ * The verdict is decided AT A SIGHTING, never by the clock alone: a ladder
+ * that climbed to attempt 10 in two minutes and then succeeded must not turn
+ * into a stall ten quiet minutes later. Only a banner painted RETRY_STALL_MS
+ * or more after the episode began — the provider failing this request yet
+ * again — counts. It is handed back once (the episode is cleared with it), so
+ * a consumer acting on it fails over exactly once.
+ *
+ * @returns {{ observe: (strippedText: string, nowMs: number) => void,
+ *             takeStall: (nowMs: number) => object|null }}
+ */
+export function createRetryStallGate() {
+  let episode = null; // { firstSeenAt, lastSeenAt, firstAttempt, lastAttempt }
+  let verdict = null;
+  let tail = '';
+  return {
+    observe(strippedText, nowMs) {
+      if (typeof strippedText !== 'string' || !strippedText) return;
+      const window = tail + strippedText;
+      const banner = detectTuiRetryBanner(window);
+      // Consume through the match so the carry-over cannot re-sight the same
+      // banner on the next chunk; without one, keep only the cap.
+      tail = (banner ? window.slice(banner.endIndex) : window).slice(-RETRY_STALL_CARRY_CAP);
+      if (!banner) return;
+      const isNewEpisode = !episode
+        || banner.attempt < episode.lastAttempt
+        || nowMs - episode.lastSeenAt > RETRY_STALL_MS;
+      if (isNewEpisode) {
+        episode = { firstSeenAt: nowMs, lastSeenAt: nowMs, firstAttempt: banner.attempt, lastAttempt: banner.attempt };
+        return;
+      }
+      episode.lastSeenAt = nowMs;
+      episode.lastAttempt = banner.attempt;
+      const spanMs = nowMs - episode.firstSeenAt;
+      if (episode.lastAttempt - episode.firstAttempt < RETRY_STALL_MIN_ADVANCES || spanMs < RETRY_STALL_MS) return;
+      verdict = describeTuiRetryStall({ attempts: episode.lastAttempt - episode.firstAttempt + 1, spanMs });
+      episode = null;
+    },
+    // The stall analysis to fail over with, once, or null.
+    takeStall() {
+      const analysis = verdict;
+      verdict = null;
+      return analysis;
+    },
+  };
+}
+
+// Claude Code's tool-permission dialog, as the ANSI-stripped screen renders it
+// (spaces between cursor-positioned glyphs can vanish, hence `\s*`):
+//
+//   Read(/data.reference/providers.json)
+//   Do you want to proceed?
+//   ❯ 1. Yes
+//     2. Yes, allow reading from /data.reference during this session
+//     3. No
+//   Esc to cancel · Tab to amend
+//
+// It paints whenever a tool call falls outside what the launch posture
+// pre-approved — under the hardened public-review recipe (`--permission-mode
+// acceptEdits` + sandbox) that is any read or write outside the worktree, which
+// a local model reaches for the moment it hallucinates an absolute path
+// (agent-e057cca7, 2026-09-04, sat on one for 30+ minutes while the spinner kept
+// the idle reaper happy). Nobody is at the keyboard, and the posture already
+// decided the answer: an unattended run never widens its own scope, so the
+// dialog is DECLINED. "No" is always the last numbered option, but its number
+// varies with the tool (two options for some, three for most), so it is read
+// off the screen. The question pattern is shared with the post-mortem
+// analyzer's AWAITING_INPUT_MARKERS so live and after-the-fact detection cannot
+// drift apart.
+export const TUI_TOOL_PERMISSION_PROMPT_PATTERN = /do\s*you\s*want\s*to\s*proceed\?/i;
+const TUI_TOOL_PERMISSION_NO_OPTION_PATTERN = /(\d+)\.\s*No\b/i;
+const TUI_TOOL_PERMISSION_CALL_PATTERN = /([A-Z][A-Za-z]*\([^\n]{0,300}?\))\s*do\s*you\s*want\s*to\s*proceed\?/i;
+// Screen around the question: how far back the tool-call header may sit, and
+// how far ahead the option list may span before it is judged not painted yet.
+const TUI_TOOL_PERMISSION_CALL_LEAD = 400;
+const TUI_TOOL_PERMISSION_OPTIONS_SPAN = 600;
+
+/**
+ * The tool-permission dialog on screen, or null. Null also while the question
+ * has painted but the option list has not — the consumer waits for the next
+ * repaint rather than guessing which key declines.
+ *
+ * @returns {{ noOption: number, toolCall: string|null }|null}
+ */
+export function detectToolPermissionPrompt(strippedText) {
+  if (typeof strippedText !== 'string' || !strippedText) return null;
+  const question = TUI_TOOL_PERMISSION_PROMPT_PATTERN.exec(strippedText);
+  if (!question) return null;
+  const options = strippedText.slice(question.index, question.index + TUI_TOOL_PERMISSION_OPTIONS_SPAN);
+  const no = TUI_TOOL_PERMISSION_NO_OPTION_PATTERN.exec(options);
+  if (!no) return null;
+  const lead = strippedText.slice(Math.max(0, question.index - TUI_TOOL_PERMISSION_CALL_LEAD), question.index + question[0].length);
+  const call = TUI_TOOL_PERMISSION_CALL_PATTERN.exec(lead);
+  return { noOption: Number(no[1]), toolCall: call ? call[1].replace(/\s+/g, ' ') : null };
+}
+
+// A declined dialog keeps repainting for a few chunks and the keystrokes take a
+// moment to land; sightings this close to a decline are the same dialog.
+export const TOOL_PERMISSION_REPAINT_COOLDOWN_MS = 15000;
+// Declining a tool call ends the assistant turn in current Claude Code builds
+// ("What should Claude do instead?"), so the session then needs a message to
+// carry on. It rides the OOM nudge's silence policy (OOM_NUDGE_SETTLE_MS /
+// OOM_NUDGE_ARM_WINDOW_MS): sent only once the session has gone quiet, so a
+// build that instead hands the model a rejection and lets it continue is left
+// alone. A model still reaching outside its scope after this many DECLINES —
+// whether or not each one needed a nudge — is not going to finish inside it;
+// the caller fails the run rather than looping until the max-runtime ceiling.
+export const TOOL_PERMISSION_DECLINE_MAX = 8;
+export const TOOL_PERMISSION_NUDGE_TEXT = 'That tool call reached outside this run\'s allowed scope, so it was declined. Nobody is watching this session and no permission can be granted. Everything you need is inside your worktree and your prompt; continue using paths under the worktree only, and write the completion sentinel when you are done.';
+
+/**
+ * "Decline every tool-permission dialog, then get the session moving again":
+ * the dialog detector with a carry-over tail, on top of createSilenceNudgeGate.
+ * Feed it every ANSI-stripped chunk after the prompt is in via
+ * `observe(strippedText, nowMs)`: it returns the dialog to decline
+ * (`{ noOption, toolCall, count }`) once per dialog, `'exhausted'` once
+ * TOOL_PERMISSION_DECLINE_MAX dialogs have been declined, or null. Poll
+ * `takeNudge(nowMs, lastOutputAtMs)` on the consumer's existing timer. The
+ * tail is dropped after a decline so that dialog cannot be re-sighted from the
+ * carry-over, but keeps accumulating through the repaint cooldown: a DIFFERENT
+ * dialog painted seconds after a decline (the model's very next call is also
+ * out of scope) must still be seen once the cooldown lifts, or the session
+ * hangs on it exactly as it did before this gate existed.
+ *
+ * @returns {{ observe: (strippedText: string, nowMs: number) => object|'exhausted'|null,
+ *             takeNudge: (nowMs: number, lastOutputAtMs: number) => number }}
+ */
+export function createToolPermissionGate() {
+  const nudge = createSilenceNudgeGate({
+    cooldownMs: TOOL_PERMISSION_REPAINT_COOLDOWN_MS,
+    settleMs: OOM_NUDGE_SETTLE_MS,
+    armWindowMs: OOM_NUDGE_ARM_WINDOW_MS,
+    // The budget is counted in declines (below), not nudges: a build that lets
+    // the model continue after a rejection never goes quiet, so a nudge budget
+    // would never be spent while the declines climbed forever.
+    maxAttempts: Infinity,
+  });
+  let tail = '';
+  let declines = 0;
+  return {
+    observe(strippedText, nowMs) {
+      if (typeof strippedText !== 'string' || !strippedText) return null;
+      tail = (tail + strippedText).slice(-1024);
+      if (nudge.inCooldown(nowMs)) return null;
+      const dialog = detectToolPermissionPrompt(tail);
+      if (!dialog) return null;
+      tail = '';
+      if (declines >= TOOL_PERMISSION_DECLINE_MAX) return 'exhausted';
+      declines += 1;
+      // A null here means a nudge is already pending from the previous decline;
+      // it will fire on the same silence and covers this one too.
+      nudge.arm(nowMs);
+      return { ...dialog, count: declines };
+    },
+    takeNudge: nudge.takeNudge,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Stall nudge — "the session stopped mid-task and nothing will ever re-ask"
+// ---------------------------------------------------------------------------
+//
+// The failure this exists for has no error banner, no dialog and no exit: the
+// model narrates its next step ("Next: /do:pr"), ends its turn, and the TUI
+// returns to its idle composer. The run is not finished, the sentinel is not
+// written, and — since the wall-clock ceiling was removed — nothing else in the
+// unattended path will ever touch that session again. A human dropping into the
+// Shell tab and typing `continue` recovers it every time; this gate types it.
+//
+// Unlike the OOM and tool-permission gates, there is nothing to ARM on: the
+// condition IS the silence, so this one is poll-only. That also makes the
+// threshold the entire false-positive defense — see STALL_NUDGE_IDLE_MS.
+
+// How long the session must have printed NOTHING before it counts as stopped.
+//
+// Deliberately a silence test rather than a chrome test, for the reason
+// OOM_NUDGE_SETTLE_MS spells out: in-flight chrome is per-provider vocabulary,
+// while silence is universal. One number covers every TUI because what it
+// measures is bytes on the PTY, not a footer — Claude Code repaints its working
+// counter about once a second for as long as ANY tool or API call is in flight,
+// and the provider that barely repaints its chrome at all (OpenCode, ~8 times
+// across a 74MB transcript) is streaming that 74MB through this same stream.
+// Ten unbroken minutes of NOTHING is a composer at rest under both.
+//
+// Bumped from 3 → 10 minutes: three minutes triggered too many false positives
+// on agents doing long tool calls or extended thinking steps. The cost asymmetry
+// still runs one way — a nudge that was not needed is queued into the composer
+// and read as "keep going", while a nudge that never comes leaves the run
+// holding its lane forever — but ten minutes gives enough headroom to avoid
+// interrupting work in progress.
+export const STALL_NUDGE_IDLE_MS = 10 * 60 * 1000;
+// How much output AFTER a nudge proves the session took the hint. Long enough to
+// exclude the bracketed-paste echo of the nudge itself (which lands within a
+// second or so), short enough that a session that genuinely resumed clears its
+// streak immediately. A run that works for hours and then stalls again gets the
+// full budget back rather than inheriting a spent one.
+export const STALL_NUDGE_RECOVERY_MS = 30000;
+// After this many CONSECUTIVE unanswered nudges, stop. A session that ignored
+// three of them is wedged below the composer (a dead child, a TUI that stopped
+// reading its PTY), and pasting into it forever only fills raw.txt.
+export const STALL_NUDGE_MAX_ATTEMPTS = 3;
+// Lifetime ceiling across every streak of one session. The recovery reset above
+// trusts "it printed for 30s" as proof the nudge worked, but a model that has
+// lost the thread answers every nudge with a paragraph ("the story is finished")
+// and then stops again — each reply clears the streak, so the per-streak budget
+// never runs out and the run loops for hours on a local GPU. A run that has
+// needed this many nudges is not going to finish on the next one.
+export const STALL_NUDGE_MAX_TOTAL = 6;
+// What gets pasted. The same word a human types into the Shell tab: the TUI
+// still holds the conversation, and the unattended-run rules already live in
+// the prompt. A longer paste only clutters the composer.
+export const STALL_NUDGE_TEXT = 'continue';
+
+/**
+ * State machine for "nudge a TUI session that stopped mid-task".
+ *
+ * Poll `takeNudge(nowMs, lastOutputAtMs)` on whatever timer the consumer already
+ * runs. It owns the silence threshold, the post-nudge quiet period, the recovery
+ * reset and the attempt budget so a consumer can't get any of them subtly wrong,
+ * and returns:
+ *   - the 1-based nudge number — paste and say so
+ *   - `'exhausted'` (once) — the budget is spent and the session is STILL quiet,
+ *     so it is wedged below its composer rather than merely stopped. Reported
+ *     rather than swallowed because giving up silently is the very condition
+ *     this gate exists to end: the run holds its lane with nothing to show for
+ *     it, and the sibling gates all announce their verdict.
+ *   - 0 — nothing to do
+ *
+ * Recovery refills the per-streak budget but never the lifetime one
+ * (`maxTotal`), so a session that answers every nudge and then stops again is
+ * still reported as wedged instead of being nudged forever.
+ *
+ * The post-nudge wait is measured from the NUDGE, not from output, and that is
+ * the load-bearing detail: a session wedged below its composer never echoes the
+ * paste, so a purely output-based gate would re-fire on the very next poll tick
+ * and paste continuously until the budget ran out seconds later.
+ *
+ * @param {{ idleMs?: number, recoveryMs?: number, maxAttempts?: number, maxTotal?: number }} [options]
+ * @returns {{ takeNudge: (nowMs: number, lastOutputAtMs: number) => number|'exhausted', readonly nudgesSent: number }}
+ */
+export function createStallNudgeGate({
+  idleMs = STALL_NUDGE_IDLE_MS,
+  recoveryMs = STALL_NUDGE_RECOVERY_MS,
+  maxAttempts = STALL_NUDGE_MAX_ATTEMPTS,
+  maxTotal = STALL_NUDGE_MAX_TOTAL,
+} = {}) {
+  let attempts = 0;
+  let total = 0;
+  let nudgedAt = null;
+  let reportedExhausted = false;
+  return {
+    takeNudge(nowMs, lastOutputAtMs) {
+      // Checked before the budget so an exhausted streak can still be cleared by
+      // a session that came back to life — which also re-arms the verdict, since
+      // a run that recovered and stalled again is wedged afresh.
+      if (nudgedAt !== null && lastOutputAtMs - nudgedAt > recoveryMs) {
+        attempts = 0;
+        nudgedAt = null;
+        reportedExhausted = false;
+      }
+      if (nowMs - lastOutputAtMs < idleMs) return 0;
+      if (nudgedAt !== null && nowMs - nudgedAt < idleMs) return 0;
+      if (attempts >= maxAttempts || total >= maxTotal) {
+        if (reportedExhausted) return 0;
+        reportedExhausted = true;
+        return 'exhausted';
+      }
+      attempts += 1;
+      total += 1;
+      nudgedAt = nowMs;
+      return attempts;
+    },
+    get nudgesSent() { return total; },
+  };
+}
+
+// ─── agy exited to its launch shell ─────────────────────────────────────────
+//
+// When agy quits (a crash, a dropped connection, a stray `/exit`), it prints
+//
+//   Resume with -c (or command below):
+//   agy --conversation=<uuid>
+//
+// and the LOGIN SHELL it was typed into survives. Every nudge above then pastes
+// into a bare prompt, and the stall gate burns its budget on a shell — the
+// worktree holds a half-finished run that nothing will ever continue. The
+// banner carries the one thing needed to recover: the conversation id.
+const AGY_CONVERSATION_PATTERN = /--conversation=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/gi;
+// Carry-over so a banner split by a PTY chunk boundary still matches: the flag
+// plus a full uuid is 51 chars.
+const AGY_RESUME_CARRY_CAP = 96;
+// A run that exits to the shell this many times is not going to survive one
+// more relaunch.
+export const AGY_RESUME_MAX_ATTEMPTS = 3;
+// The shell must have been silent this long before the relaunch is typed, so
+// the banner has finished painting and the prompt is back.
+export const AGY_RESUME_SETTLE_MS = 3000;
+
+/**
+ * State machine for "agy left its shell behind — relaunch it on the same
+ * conversation". `observe` records the newest conversation id seen in the
+ * (ANSI-stripped) stream; `takeResume` returns it once, when the stream has been
+ * quiet long enough and the budget allows, else null; the caller reports each
+ * real relaunch via `recordRelaunch`.
+ *
+ * @returns {{ observe: (chunk: string) => void,
+ *             takeResume: (nowMs: number, lastOutputAtMs: number) => string|null,
+ *             recordRelaunch: () => void, readonly attempts: number }}
+ */
+export function createAgyResumeGate({ settleMs = AGY_RESUME_SETTLE_MS, maxAttempts = AGY_RESUME_MAX_ATTEMPTS } = {}) {
+  let carry = '';
+  let pending = null;
+  let attempts = 0;
+  return {
+    observe(chunk) {
+      if (!chunk) return;
+      const window = carry + chunk;
+      carry = window.slice(-AGY_RESUME_CARRY_CAP);
+      let last = null;
+      for (const match of window.matchAll(AGY_CONVERSATION_PATTERN)) last = match[1];
+      if (last) pending = last.toLowerCase();
+    },
+    takeResume(nowMs, lastOutputAtMs) {
+      if (!pending || attempts >= maxAttempts) return null;
+      if (nowMs - lastOutputAtMs < settleMs) return null;
+      const id = pending;
+      pending = null;
+      return id;
+    },
+    // Counted separately from `takeResume`: a banner that scrolled past in a
+    // session whose agy is still alive is not a relaunch and must not spend budget.
+    recordRelaunch() { attempts += 1; },
+    get attempts() { return attempts; },
+  };
+}

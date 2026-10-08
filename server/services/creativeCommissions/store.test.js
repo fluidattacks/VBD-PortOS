@@ -1,0 +1,923 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { creativeCommissionCreateSchema, creativeCommissionUpdateSchema } from '../../lib/creativeCommissionValidation.js';
+
+// In-memory collectionStore so CRUD is exercised without touching the filesystem.
+// Keyed by collection `type` so the machine-local commission store and the
+// federated commissionFeedback store (#2686) don't share one map — `records` is
+// the commission map the assertions reach into directly.
+const records = new Map();
+const feedbackRecords = new Map();
+const mapForType = (type) => (type === 'commission-feedback' ? feedbackRecords : records);
+const makeMemStore = (type) => {
+  const store = mapForType(type);
+  return {
+    loadAll: async () => [...store.values()],
+    loadOne: async (id) => store.get(id) || null,
+    saveOne: async (id, rec) => { store.set(id, rec); },
+    saveOneNow: async (id, rec) => { store.set(id, rec); },
+    deleteOne: async (id) => { store.delete(id); },
+    deleteOneNow: async (id) => { store.delete(id); },
+    saveTypeIndex: async () => {},
+    verifySchemaVersion: async () => ({ ok: true }),
+  };
+};
+vi.mock('../../lib/collectionStore.js', () => ({ createCollectionStore: ({ type }) => makeMemStore(type) }));
+vi.mock('../../lib/fileUtils.js', () => ({ PATHS: { data: '/tmp/portos-test-data' } }));
+// Keep peer push inert, but model the conflict-journal batch boundary so the
+// prune test can assert that multiple evictions share one terminal flush.
+vi.mock('../sharing/recordEvents.js', () => ({
+  emitRecordUpdated: vi.fn(), emitRecordDeleted: vi.fn(), emitRecordInvalidated: vi.fn(),
+  autoSubscribeRecordToAllPeers: vi.fn(() => Promise.resolve()),
+}));
+const conflictJournalMock = vi.hoisted(() => {
+  const state = { batchDepth: 0, baseHashWrites: 0 };
+  const flushBaseHashes = vi.fn(async () => {
+    if (state.batchDepth === 0) state.baseHashWrites += 1;
+  });
+  return {
+    state,
+    contentHashForRecord: vi.fn(() => 'hash'),
+    setSyncBaseHash: vi.fn(() => Promise.resolve()),
+    deleteSyncBaseHash: vi.fn(() => flushBaseHashes()),
+    flushBaseHashes,
+    withBaseHashFlushBatch: vi.fn(async (fn) => {
+      state.batchDepth += 1;
+      try {
+        return await fn();
+      } finally {
+        state.batchDepth -= 1;
+        if (state.batchDepth === 0) await flushBaseHashes();
+      }
+    }),
+    maybeJournalBeforeOverwrite: vi.fn(() => Promise.resolve()),
+  };
+});
+vi.mock('../../lib/conflictJournal.js', () => conflictJournalMock);
+
+const {
+  sanitizeCommission,
+  sanitizeFeedbackEntry,
+  assertValidSchedule,
+  createCommission,
+  updateCommission,
+  deleteCommission,
+  getCommission,
+  listCommissions,
+  recordCommissionRun,
+  getCommissionMusicContextForProject,
+  recordCommissionMusicOutput,
+  submitCommissionFeedback,
+  backfillAllCommissionFeedback,
+  sanitizeCommissionForSync,
+  mergeCommissionRecord,
+  getCommissionForSync,
+  mergeCommissionsFromSync,
+  pruneTombstonedCommissions,
+  commissionStore,
+  commissionEvents,
+  MAX_RUN_PROMPT_LEN,
+  ERR_VALIDATION,
+  ERR_NOT_FOUND,
+} = await import('./store.js');
+const { buildCommissionDirective } = await import('./abilityAdapters.js');
+
+beforeEach(() => {
+  records.clear();
+  feedbackRecords.clear();
+  conflictJournalMock.state.batchDepth = 0;
+  conflictJournalMock.state.baseHashWrites = 0;
+  vi.clearAllMocks();
+});
+
+const validInput = () => ({
+  name: 'Nightly Surreal',
+  enabled: true,
+  targetAbility: 'video',
+  brief: { intent: 'surreal', styleSpec: 'flat', constraints: { universeId: 'u-1' }, seedRefs: [] },
+  schedule: { kind: 'DAILY', atLocalTime: '02:00', timezone: null },
+  generation: { quality: 'high', aspectRatio: '9:16', targetDurationSeconds: 20 },
+  feedbackWindow: 3,
+});
+
+describe('sanitizeCommission', () => {
+  it('drops a null / id-less record', () => {
+    expect(sanitizeCommission(null)).toBeNull();
+    expect(sanitizeCommission({ name: 'no id' })).toBeNull();
+  });
+
+  it('normalizes a partial record to the canonical shape', () => {
+    const rec = sanitizeCommission({ id: 'c1' });
+    expect(rec.name).toBe('Untitled Commission');
+    expect(rec.enabled).toBe(true);
+    expect(rec.targetAbility).toBe('video');
+    expect(rec.brief).toMatchObject({ intent: '', styleSpec: '', seedRefs: [] });
+    expect(rec.generation).toMatchObject({ quality: 'standard', aspectRatio: '16:9', targetDurationSeconds: 10 });
+    expect(rec.runs).toEqual([]);
+    expect(rec.feedback).toEqual([]);
+    expect(rec.brief.musicTaste).toBeUndefined();
+  });
+
+  it('preserves bounded Digital Twin taste configuration in the federated brief', () => {
+    const rec = sanitizeCommission({ id: 'c-taste', brief: {
+      intent: 'ambient',
+      musicTaste: { source: 'digital-twin', anchorCount: 4, explorationPercent: 40, musicEngineId: '  engine-a  ' },
+    } });
+    expect(rec.brief.musicTaste).toEqual({
+      source: 'digital-twin', window: 'month', anchorCount: 4, explorationPercent: 40,
+      musicEngineId: 'engine-a', musicModelId: null,
+    });
+    expect(creativeCommissionCreateSchema.parse({
+      name: 'Example Taste Commission',
+      brief: { intent: 'ambient', musicTaste: { source: 'digital-twin' } },
+      schedule: { kind: 'DAILY', atLocalTime: '02:00' },
+    }).brief.musicTaste).toMatchObject({ source: 'digital-twin', anchorCount: 3, explorationPercent: 20 });
+  });
+
+  it('routes generation through the ability adapter per output type (#2769)', () => {
+    const img = sanitizeCommission({ id: 'c1', targetAbility: 'image', generation: { imageCount: 4, targetDurationSeconds: 30 } });
+    expect(img.targetAbility).toBe('image');
+    // Keeps the image key; drops the off-type video duration key.
+    expect(img.generation).toEqual({
+      model: null, quality: 'standard', aspectRatio: '16:9', imageCount: 4,
+      imageMode: 'auto', imageModelId: null,
+    });
+
+    const music = sanitizeCommission({ id: 'c2', targetAbility: 'music', generation: { lengthSeconds: 60 } });
+    expect(music.generation).toEqual({ model: null, lengthSeconds: 60 });
+
+    const series = sanitizeCommission({ id: 'c3', targetAbility: 'series', generation: { episodeCount: 2 } });
+    expect(series.generation).toEqual({ model: null, episodeCount: 2 });
+  });
+
+  it('round-trips a render-backend pin and normalizes a blank model id to null (#3135)', () => {
+    const pinned = sanitizeCommission({
+      id: 'c-pin', targetAbility: 'image',
+      generation: { imageMode: 'grok', imageModelId: '  ' },
+    });
+    expect(pinned.generation.imageMode).toBe('grok');
+    // A blank id means "the install default" — a real value, normalized not rejected.
+    expect(pinned.generation.imageModelId).toBeNull();
+
+    const localPin = sanitizeCommission({
+      id: 'c-pin2', targetAbility: 'video',
+      generation: { videoMode: 'local', videoModelId: ' example-model ' },
+    });
+    expect(localPin.generation.videoMode).toBe('local');
+    expect(localPin.generation.videoModelId).toBe('example-model');
+  });
+
+  it('defaults a legacy (pre-#3135) record to the auto sentinel — no behavior change', () => {
+    // The hard back-compat criterion: an existing commission with no pin reads as
+    // `auto`, which buildRenderBackendPin turns into no project pin at all.
+    const legacy = sanitizeCommission({ id: 'c-legacy', targetAbility: 'image', generation: { imageCount: 2 } });
+    expect(legacy.generation.imageMode).toBe('auto');
+    expect(legacy.generation.imageModelId).toBeNull();
+  });
+
+  it('falls back to auto for an unrecognized backend value (a hand-edited row)', () => {
+    const bad = sanitizeCommission({ id: 'c-bad', targetAbility: 'image', generation: { imageMode: 'midjourney' } });
+    expect(bad.generation.imageMode).toBe('auto');
+  });
+
+  it('preserves an unknown (forward-version) output type verbatim so a newer peer record round-trips (#2769)', () => {
+    // A newer peer might sync an output type this install does not know yet.
+    // Rewriting it to `video` would corrupt the newer brief on read (and could
+    // push the downgrade back via LWW), so it is preserved untouched; the
+    // scheduler skips it rather than mis-generating.
+    const rec = sanitizeCommission({ id: 'c1', targetAbility: 'story', generation: { chapters: 5 } });
+    expect(rec.targetAbility).toBe('story');
+    expect(rec.generation).toEqual({ chapters: 5 });
+  });
+
+  it('falls back to video for a missing/blank output type', () => {
+    expect(sanitizeCommission({ id: 'c1' }).targetAbility).toBe('video');
+    expect(sanitizeCommission({ id: 'c2', targetAbility: '' }).targetAbility).toBe('video');
+  });
+
+  it('caps runs to the last MAX_PERSISTED_RUNS', () => {
+    const runs = Array.from({ length: 80 }, (_, i) => ({ id: `run-${i}` }));
+    const rec = sanitizeCommission({ id: 'c1', runs });
+    expect(rec.runs).toHaveLength(50);
+    expect(rec.runs[0].id).toBe('run-30');
+  });
+
+  it('defaults the LLM assignment to unset (install default)', () => {
+    const rec = sanitizeCommission({ id: 'c1' });
+    expect(rec.assignment).toEqual({ providerId: null, model: null });
+  });
+
+  it('normalizes and trims a set assignment pin', () => {
+    const rec = sanitizeCommission({ id: 'c1', assignment: { providerId: '  claude-tui  ', model: '  sonnet  ' } });
+    expect(rec.assignment).toEqual({ providerId: 'claude-tui', model: 'sonnet' });
+  });
+
+  it('drops a provider-less model so the pin can never dangle', () => {
+    const rec = sanitizeCommission({ id: 'c1', assignment: { model: 'sonnet' } });
+    expect(rec.assignment).toEqual({ providerId: null, model: null });
+  });
+});
+
+describe('assertValidSchedule', () => {
+  it('returns the derived cron for a valid schedule', () => {
+    expect(assertValidSchedule({ kind: 'DAILY', atLocalTime: '02:00' })).toBe('0 2 * * *');
+  });
+
+  it('throws ERR_VALIDATION for an underivable/invalid schedule', () => {
+    expect(() => assertValidSchedule({ kind: 'DAILY' })).toThrow();
+    try { assertValidSchedule({ kind: 'CUSTOM', cron: 'not a cron' }); }
+    catch (e) { expect(e.code).toBe(ERR_VALIDATION); }
+  });
+
+  it('accepts an anchored calendar recurrence', () => {
+    const recurrence = { frequency: 'weekly', interval: 2, weekdays: [1], time: '02:00', anchorDate: '2026-08-31' };
+    expect(assertValidSchedule({ kind: 'RECURRENCE', recurrence })).toEqual(recurrence);
+  });
+});
+
+describe('createCommission', () => {
+  it('mints an id, sanitizes, and persists', async () => {
+    const rec = await createCommission(validInput());
+    expect(rec.id).toMatch(/^commission-/);
+    expect(rec.name).toBe('Nightly Surreal');
+    expect(rec.generation.quality).toBe('high');
+    expect(rec.brief.constraints).toEqual({ universeId: 'u-1' });
+    expect(records.get(rec.id)).toEqual(rec);
+  });
+
+  it('rejects an invalid schedule before persisting', async () => {
+    await expect(createCommission({ ...validInput(), schedule: { kind: 'DAILY' } })).rejects.toThrow();
+    expect(records.size).toBe(0);
+  });
+});
+
+describe('mergeCommissionsFromSync — synced tombstone stops local work', () => {
+  const capture = async (fn) => {
+    const seen = [];
+    const onChange = (e) => seen.push(e);
+    commissionEvents.on('commission:changed', onChange);
+    try { await fn(); } finally { commissionEvents.off('commission:changed', onChange); }
+    return seen;
+  };
+
+  it('emits a per-id delete when a tombstone arrives, so the receiver stops the projects IT owns', async () => {
+    // Only the brief travels; the projects live on whichever machine minted them.
+    // The batch 'merge' event carries no id, so without this the reconciler no-ops
+    // and a commission deleted on another machine keeps generating here forever.
+    const created = await createCommission(validInput());
+    const events = await capture(() => mergeCommissionsFromSync([{
+      ...created, deleted: true, deletedAt: '2030-01-01T00:00:00.000Z',
+      briefUpdatedAt: '2030-01-01T00:00:00.000Z', updatedAt: '2030-01-01T00:00:00.000Z',
+    }]));
+    expect(events).toContainEqual({ id: created.id, action: 'delete' });
+  });
+
+  it('does NOT re-emit for a tombstone it already holds — a re-sync must not re-stop resumed work', async () => {
+    const created = await createCommission(validInput());
+    const tombstone = {
+      ...created, deleted: true, deletedAt: '2030-01-01T00:00:00.000Z',
+      briefUpdatedAt: '2030-01-01T00:00:00.000Z', updatedAt: '2030-01-01T00:00:00.000Z',
+    };
+    await mergeCommissionsFromSync([tombstone]);
+    const events = await capture(() => mergeCommissionsFromSync([tombstone]));
+    expect(events.filter((e) => e.action === 'delete')).toEqual([]);
+  });
+});
+
+describe('updateCommission — changed-field event payload', () => {
+  // The project reconciler (creativeCommissions/projectControl.js) keys on this
+  // payload to decide whether to tear down a commission's in-flight LLM stages.
+  // The commission editor posts the WHOLE form on every save — its `assignment`
+  // rides along even when the user only fixed a typo — so a patch-key list here
+  // would read as "the provider changed" on every save and SIGKILL a healthy
+  // planner agent mid-run, every time.
+  const captureFields = async (id, patch) => {
+    let fields;
+    const onChange = (e) => { if (e?.action === 'update') fields = e.fields; };
+    commissionEvents.on('commission:changed', onChange);
+    try { await updateCommission(id, patch); } finally { commissionEvents.off('commission:changed', onChange); }
+    return fields;
+  };
+
+  it('omits assignment when the patch resends the SAME pin', async () => {
+    const created = await createCommission(validInput());
+    await updateCommission(created.id, { assignment: { providerId: 'claude-tui', model: 'sonnet' } });
+    // Exactly what the editor sends when the user edits only the brief.
+    const fields = await captureFields(created.id, {
+      name: created.name,
+      brief: { intent: 'a typo fix' },
+      assignment: { providerId: 'claude-tui', model: 'sonnet' },
+    });
+    expect(fields).toContain('brief');
+    expect(fields).not.toContain('assignment');
+    expect(fields).not.toContain('enabled');
+  });
+
+  it('reports assignment when the pin genuinely changes', async () => {
+    const created = await createCommission(validInput());
+    await updateCommission(created.id, { assignment: { providerId: 'claude-tui', model: 'sonnet' } });
+    const fields = await captureFields(created.id, {
+      assignment: { providerId: 'lmstudio-tui', model: 'qwen3' },
+    });
+    expect(fields).toContain('assignment');
+  });
+
+  it('reports enabled when the commission is paused', async () => {
+    const created = await createCommission(validInput());
+    const fields = await captureFields(created.id, { enabled: false });
+    expect(fields).toContain('enabled');
+  });
+});
+
+describe('updateCommission', () => {
+  it('deep-merges a partial brief without wiping other fields', async () => {
+    const created = await createCommission(validInput());
+    const updated = await updateCommission(created.id, { brief: { intent: 'new intent' } });
+    expect(updated.brief.intent).toBe('new intent');
+    expect(updated.brief.styleSpec).toBe('flat'); // preserved
+    expect(updated.createdAt).toBe(created.createdAt);
+  });
+
+  it('replaces the assignment pin on patch and clears it with a null provider', async () => {
+    const created = await createCommission(validInput());
+    const pinned = await updateCommission(created.id, { assignment: { providerId: 'claude-tui', model: 'sonnet' } });
+    expect(pinned.assignment).toEqual({ providerId: 'claude-tui', model: 'sonnet' });
+    // A clear (null provider) resets to the install default and drops the model.
+    const cleared = await updateCommission(created.id, { assignment: { providerId: null, model: null } });
+    expect(cleared.assignment).toEqual({ providerId: null, model: null });
+  });
+
+  it('preserves the assignment pin when a patch omits it', async () => {
+    const created = await createCommission(validInput());
+    await updateCommission(created.id, { assignment: { providerId: 'claude-tui', model: 'sonnet' } });
+    const updated = await updateCommission(created.id, { name: 'Renamed' });
+    expect(updated.assignment).toEqual({ providerId: 'claude-tui', model: 'sonnet' });
+  });
+
+  it('preserves brief.constraints when a partial brief patch omits them', async () => {
+    // Regression: the create-path brief schema defaults constraints/seedRefs, so
+    // a PATCH that omitted them used to wipe a stored universeId. The update-path
+    // schema carries no defaults, so an omitted key is preserved by the merge.
+    const created = await createCommission(validInput()); // constraints.universeId = 'u-1'
+    const parsed = creativeCommissionUpdateSchema.parse({ brief: { intent: 'reworked' } });
+    const updated = await updateCommission(created.id, parsed);
+    expect(updated.brief.constraints).toEqual({ universeId: 'u-1' });
+  });
+
+  it('deep-merges constraints so a partial constraints patch keeps the other key', async () => {
+    const created = await createCommission({
+      ...validInput(),
+      brief: { intent: 'x', constraints: { universeId: 'u-1', seriesId: 's-1' } },
+    });
+    const parsed = creativeCommissionUpdateSchema.parse({ brief: { constraints: { universeId: 'u-2' } } });
+    const updated = await updateCommission(created.id, parsed);
+    expect(updated.brief.constraints).toEqual({ universeId: 'u-2', seriesId: 's-1' });
+  });
+
+  it('preserves omitted generation fields on a partial generation patch', async () => {
+    const created = await createCommission(validInput()); // quality 'high', aspect '9:16', duration 20
+    const parsed = creativeCommissionUpdateSchema.parse({ generation: { quality: 'draft' } });
+    const updated = await updateCommission(created.id, parsed);
+    expect(updated.generation.quality).toBe('draft');
+    expect(updated.generation.aspectRatio).toBe('9:16'); // preserved, not defaulted to 16:9
+    expect(updated.generation.targetDurationSeconds).toBe(20); // preserved, not defaulted to 10
+  });
+
+  it('preserves or explicitly clears taste configuration on a partial brief patch', async () => {
+    const created = await createCommission({
+      ...validInput(),
+      targetAbility: 'music',
+      brief: { ...validInput().brief, musicTaste: { source: 'digital-twin', anchorCount: 2 } },
+    });
+    const parsed = creativeCommissionUpdateSchema.parse({ brief: { intent: 'reworked' } });
+    const preserved = await updateCommission(created.id, parsed);
+    expect(preserved.brief.musicTaste).toMatchObject({ source: 'digital-twin', anchorCount: 2 });
+    const partiallyUpdated = await updateCommission(created.id, creativeCommissionUpdateSchema.parse({
+      brief: { musicTaste: { explorationPercent: 45 } },
+    }));
+    expect(partiallyUpdated.brief.musicTaste).toMatchObject({ anchorCount: 2, explorationPercent: 45 });
+    const cleared = await updateCommission(created.id, creativeCommissionUpdateSchema.parse({ brief: { musicTaste: null } }));
+    expect(cleared.brief.musicTaste).toBeUndefined();
+  });
+
+  it('throws NOT_FOUND for an unknown id', async () => {
+    try { await updateCommission('nope', { enabled: false }); }
+    catch (e) { expect(e.code).toBe(ERR_NOT_FOUND); }
+  });
+});
+
+describe('recordCommissionRun', () => {
+  it('appends a run and caps history', async () => {
+    const created = await createCommission(validInput());
+    await recordCommissionRun(created.id, { status: 'started', projectId: 'cd-1', promptUsed: 'g' });
+    const after = await getCommission(created.id);
+    expect(after.runs).toHaveLength(1);
+    expect(after.runs[0]).toMatchObject({ status: 'started', projectId: 'cd-1', promptUsed: 'g' });
+    expect(after.runs[0].id).toMatch(/^run-/);
+  });
+
+  // The directive goal now carries a full instruction set, but a run's copy of it
+  // is an excerpt: it is retained MAX_PERSISTED_RUNS deep in a record rewritten
+  // whole on every mutation, AND handed to the audio enqueue as the music prompt.
+  it('stores the prompt as a bounded excerpt, not the whole directive goal', async () => {
+    const created = await createCommission(validInput());
+    const goal = 'p'.repeat(MAX_RUN_PROMPT_LEN * 3);
+    await recordCommissionRun(created.id, { status: 'started', projectId: 'cd-1', promptUsed: goal });
+    const after = await getCommission(created.id);
+    expect(after.runs[0].promptUsed.length).toBeLessThanOrEqual(MAX_RUN_PROMPT_LEN);
+    expect(after.runs[0].promptUsed.startsWith('ppp')).toBe(true);
+  });
+
+  it('persists a manual trigger and defaults everything else to schedule', async () => {
+    const created = await createCommission(validInput());
+    await recordCommissionRun(created.id, { status: 'started', trigger: 'manual' });
+    await recordCommissionRun(created.id, { status: 'started' });
+    await recordCommissionRun(created.id, { status: 'started', trigger: 'bogus' });
+    const after = await getCommission(created.id);
+    expect(after.runs.map((r) => r.trigger)).toEqual(['manual', 'schedule', 'schedule']);
+  });
+
+  it('persists bounded taste recipe provenance only on the local run history', async () => {
+    const created = await createCommission({
+      ...validInput(),
+      targetAbility: 'music',
+      brief: { intent: 'ambient', musicTaste: { source: 'digital-twin' } },
+      generation: { lengthSeconds: 45 },
+    });
+    const recipe = {
+      version: 1,
+      source: 'digital-twin',
+      window: 'month',
+      anchorCount: 1,
+      explorationPercent: 20,
+      explorationCount: 0,
+      explorationDirection: 'balanced',
+      anchors: [{ kind: 'artist', name: 'Example Artist', count: 3, source: 'observed' }],
+      statedContext: 'Example preference',
+      sourceVersion: 'music-taste-v1:example',
+      sourceHash: 'example-hash',
+    };
+    const run = await recordCommissionRun(created.id, {
+      status: 'started', projectId: 'cd-taste', promptUsed: 'Original bounded directive', tasteRecipe: recipe,
+      musicGeneration: { engine: 'musicgen', modelId: 'example-model', repo: 'example/model', durationSec: 45 },
+    });
+    const after = await getCommission(created.id);
+    expect(after.runs[0].tasteRecipe).toEqual(recipe);
+    expect(after.runs[0].musicGeneration).toEqual({
+      engine: 'musicgen', modelId: 'example-model', repo: 'example/model', durationSec: 45,
+    });
+    expect(sanitizeCommission({ ...after, runs: after.runs }).runs[0].tasteRecipe).toEqual(recipe);
+    const ctx = await getCommissionMusicContextForProject('cd-taste');
+    expect(ctx).toMatchObject({ commissionId: created.id, runId: run.id });
+    // The audio prompt carries the brief AND the recipe's authoritative anchors +
+    // original-work constraint, re-rendered from the run's own stored recipe.
+    expect(ctx.prompt).toContain('Original bounded directive');
+    expect(ctx.prompt).toContain('Example Artist');
+    expect(ctx.prompt).toContain('do not reproduce source tracks');
+    await recordCommissionMusicOutput(created.id, run.id, {
+      filename: 'music-gen-example.wav', durationSec: 45, engine: 'musicgen', modelId: 'example-model',
+      recipeVersion: 1, sourceHash: 'example-hash', completedAt: '2026-08-16T00:00:00.000Z',
+    });
+    const completed = await getCommission(created.id);
+    expect(completed.runs[0].musicOutput).toMatchObject({
+      filename: 'music-gen-example.wav', engine: 'musicgen', modelId: 'example-model', sourceHash: 'example-hash',
+    });
+  });
+
+  // The music adapter composes the goal as lead + intent, THEN the taste recipe, so
+  // a brief long enough to fill the run-prompt excerpt pushes the recipe off the end.
+  // The render must still get the anchors and the original-work constraint.
+  it('keeps the taste anchors in the audio prompt when the brief overruns the excerpt', async () => {
+    const created = await createCommission({
+      ...validInput(),
+      targetAbility: 'music',
+      brief: { intent: 'ambient', musicTaste: { source: 'digital-twin' } },
+      generation: { lengthSeconds: 45 },
+    });
+    const recipe = {
+      version: 1, source: 'digital-twin', window: 'month', anchorCount: 1,
+      explorationPercent: 20, explorationCount: 0, explorationDirection: 'balanced',
+      anchors: [{ kind: 'artist', name: 'Example Artist', count: 3, source: 'observed' }],
+      statedContext: 'Example preference',
+      sourceVersion: 'music-taste-v1:example', sourceHash: 'example-hash',
+    };
+    await recordCommissionRun(created.id, {
+      status: 'started', projectId: 'cd-long', tasteRecipe: recipe,
+      musicGeneration: { engine: 'musicgen', modelId: 'example-model', repo: 'example/model', durationSec: 45 },
+      // A goal whose head alone would consume the entire excerpt budget.
+      promptUsed: `Compose an original ~45s music piece. ${'b'.repeat(MAX_RUN_PROMPT_LEN * 2)}`,
+    });
+    const ctx = await getCommissionMusicContextForProject('cd-long');
+    expect(ctx.prompt).toContain('Example Artist');
+    expect(ctx.prompt).toContain('do not reproduce source tracks');
+    expect(ctx.prompt.length).toBeLessThanOrEqual(MAX_RUN_PROMPT_LEN);
+  });
+});
+
+describe('deleteCommission', () => {
+  it('SOFT-deletes (tombstones) the record so the deletion federates (#2686)', async () => {
+    const created = await createCommission(validInput());
+    const r = await deleteCommission(created.id);
+    expect(r).toEqual({ id: created.id, deleted: true });
+    // The row survives as a tombstone (LWW never propagates a hard delete), but
+    // it's excluded from live reads.
+    expect(records.get(created.id)).toMatchObject({ deleted: true });
+    expect(typeof records.get(created.id).deletedAt).toBe('string');
+    await expect(getCommission(created.id)).rejects.toMatchObject({ code: ERR_NOT_FOUND });
+    expect((await listCommissions()).some((c) => c.id === created.id)).toBe(false);
+  });
+
+  it('a second delete of an already-tombstoned commission 404s', async () => {
+    const created = await createCommission(validInput());
+    await deleteCommission(created.id);
+    await expect(deleteCommission(created.id)).rejects.toMatchObject({ code: ERR_NOT_FOUND });
+  });
+});
+
+describe('pruneTombstonedCommissions', () => {
+  it('batches base-hash eviction for multiple tombstones', async () => {
+    const tombstone = (id, deletedAt) => ({
+      id, name: id, enabled: false, targetAbility: 'video', brief: {}, generation: {},
+      schedule: { kind: 'DAILY', atLocalTime: null, timezone: null }, runs: [], feedback: [],
+      assignment: null, createdAt: deletedAt, updatedAt: deletedAt, briefUpdatedAt: deletedAt,
+      deleted: true, deletedAt,
+    });
+    records.set('commission-prune-old-1', tombstone('commission-prune-old-1', '2020-01-01T00:00:00.000Z'));
+    records.set('commission-prune-old-2', tombstone('commission-prune-old-2', '2020-01-02T00:00:00.000Z'));
+    records.set('commission-prune-new', tombstone('commission-prune-new', '2099-01-01T00:00:00.000Z'));
+
+    const result = await pruneTombstonedCommissions(Date.parse('2030-01-01T00:00:00.000Z'));
+
+    expect(result).toEqual({
+      pruned: 2,
+      ids: ['commission-prune-old-1', 'commission-prune-old-2'],
+    });
+    expect(conflictJournalMock.deleteSyncBaseHash).toHaveBeenCalledTimes(2);
+    expect(conflictJournalMock.state.baseHashWrites).toBe(1);
+    expect(records.has('commission-prune-new')).toBe(true);
+  });
+
+  it('tombstones the commission\'s feedback BEFORE the hard-prune so it GCs instead of staying live', async () => {
+    const created = await createCommission(validInput());
+    await recordCommissionRun(created.id, { id: 'run-A', status: 'completed' });
+    await submitCommissionFeedback(created.id, { runId: 'run-A', rating: 'up', note: 'more Magritte' });
+    await deleteCommission(created.id);
+    // Age the commission tombstone past the cutoff.
+    const rec = records.get(created.id);
+    records.set(created.id, { ...rec, deletedAt: '2020-01-01T00:00:00.000Z' });
+
+    const result = await pruneTombstonedCommissions(Date.parse('2021-01-01T00:00:00.000Z'));
+
+    expect(result.pruned).toBe(1);
+    expect(records.has(created.id)).toBe(false); // commission hard-pruned
+    // The orphan-prevention contract: every feedback row for the pruned
+    // commission is now a tombstone (not live, not hard-deleted), so it
+    // federates its removal and ages out through normal tombstone GC.
+    const rows = [...feedbackRecords.values()].filter((f) => f.commissionId === created.id);
+    expect(rows.length).toBeGreaterThan(0);
+    for (const f of rows) expect(f.deleted).toBe(true);
+  });
+
+  it('a restore landing mid-sweep keeps its feedback (revalidated inside the per-id queue)', async () => {
+    const created = await createCommission(validInput());
+    await recordCommissionRun(created.id, { id: 'run-A', status: 'completed' });
+    await submitCommissionFeedback(created.id, { runId: 'run-A', rating: 'up', note: 'keep me' });
+    await deleteCommission(created.id);
+    records.set(created.id, { ...records.get(created.id), deletedAt: '2020-01-01T00:00:00.000Z' });
+
+    // Hold the commission's write queue with a gated "restore" so the sweep's
+    // eligibility listing sees the stale tombstone, then let the restore land
+    // FIRST — the sweep's queued revalidation must then skip the commission.
+    const store = commissionStore();
+    let releaseRestore;
+    const gate = new Promise((resolve) => { releaseRestore = resolve; });
+    const restoreDone = store.queueRecordWrite(created.id, async () => {
+      await gate;
+      const rec = await store.readRaw(created.id, { includeDeleted: true });
+      await store.writeRaw(created.id, { ...rec, deleted: false, deletedAt: null });
+    });
+    const prunePromise = pruneTombstonedCommissions(Date.parse('2021-01-01T00:00:00.000Z'));
+    await new Promise((resolve) => setTimeout(resolve, 10)); // let listPrunable observe the tombstone
+    releaseRestore();
+    const result = await prunePromise;
+    await restoreDone;
+
+    expect(result).toEqual({ pruned: 0, ids: [] });
+    expect(records.get(created.id)).toMatchObject({ deleted: false }); // restore won
+    const rows = [...feedbackRecords.values()].filter((f) => f.commissionId === created.id);
+    expect(rows.length).toBeGreaterThan(0);
+    for (const f of rows) expect(f.deleted).not.toBe(true); // ratings survived
+  });
+
+  it('a FRESHER tombstone landing mid-sweep restarts its grace period instead of being pruned', async () => {
+    const created = await createCommission(validInput());
+    await deleteCommission(created.id);
+    records.set(created.id, { ...records.get(created.id), deletedAt: '2020-01-01T00:00:00.000Z' });
+
+    // Mid-sweep, a peer merge rewrites the tombstone with a fresh deletedAt
+    // (still deleted:true). The queued revalidation must recheck the FULL
+    // prune predicate — deleted alone would pass and hard-delete early,
+    // letting an offline peer resurrect the stale record.
+    const store = commissionStore();
+    let releaseMerge;
+    const gate = new Promise((resolve) => { releaseMerge = resolve; });
+    const mergeDone = store.queueRecordWrite(created.id, async () => {
+      await gate;
+      const rec = await store.readRaw(created.id, { includeDeleted: true });
+      await store.writeRaw(created.id, { ...rec, deletedAt: new Date().toISOString() });
+    });
+    const prunePromise = pruneTombstonedCommissions(Date.parse('2021-01-01T00:00:00.000Z'));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    releaseMerge();
+    const result = await prunePromise;
+    await mergeDone;
+
+    expect(result).toEqual({ pruned: 0, ids: [] });
+    expect(records.get(created.id)).toMatchObject({ deleted: true }); // tombstone retained for its new grace period
+  });
+});
+
+describe('sanitizeFeedbackEntry', () => {
+  it('normalizes an up/down reaction and mints an id', () => {
+    const e = sanitizeFeedbackEntry({ runId: 'run-1', rating: 'up', note: 'more Magritte' });
+    expect(e).toMatchObject({ runId: 'run-1', rating: 'up', note: 'more Magritte' });
+    expect(e.id).toMatch(/^feedback-/);
+    expect(typeof e.at).toBe('string');
+  });
+
+  it('preserves a non-zero numeric rating verbatim', () => {
+    expect(sanitizeFeedbackEntry({ rating: 2 }).rating).toBe(2);
+    expect(sanitizeFeedbackEntry({ rating: -3 }).rating).toBe(-3);
+  });
+
+  it('drops a reaction with no usable rating (null/0/garbage)', () => {
+    expect(sanitizeFeedbackEntry({ note: 'x' })).toBeNull();
+    expect(sanitizeFeedbackEntry({ rating: 0 })).toBeNull();
+    expect(sanitizeFeedbackEntry({ rating: 'meh' })).toBeNull();
+    expect(sanitizeFeedbackEntry(null)).toBeNull();
+  });
+});
+
+describe('sanitizeCommission (feedback)', () => {
+  it('deep-sanitizes and caps feedback, dropping ratingless entries', () => {
+    const feedback = [
+      { id: 'f-keep', runId: 'r1', rating: 'up', note: 'keep' },
+      { note: 'no rating — dropped' },
+      ...Array.from({ length: 120 }, (_, i) => ({ id: `f-${i}`, rating: 'down' })),
+    ];
+    const rec = sanitizeCommission({ id: 'c1', feedback });
+    expect(rec.feedback).toHaveLength(100); // MAX_PERSISTED_FEEDBACK
+    // The ratingless entry is filtered before capping.
+    expect(rec.feedback.every((f) => f.rating === 'up' || f.rating === 'down')).toBe(true);
+  });
+});
+
+describe('commission BRIEF federation (#2686)', () => {
+  it('sanitizeCommissionForSync normalizes the soft-delete trio and drops a bad id', () => {
+    expect(sanitizeCommissionForSync({ id: 'not-a-commission' })).toBeNull();
+    const rec = sanitizeCommissionForSync({ id: 'commission-x', name: 'Nightly' });
+    expect(rec).toMatchObject({ id: 'commission-x', deleted: false, deletedAt: null });
+  });
+
+  it('mergeCommissionRecord inserts a remote and preserves LOCAL schedule/runs/assignment on a remote win', () => {
+    const local = sanitizeCommission({
+      id: 'commission-x', name: 'Local', updatedAt: '2026-01-01T00:00:00.000Z',
+      schedule: { kind: 'DAILY', atLocalTime: '02:00' }, runs: [{ id: 'run-1', status: 'ok' }],
+      assignment: { providerId: 'claude', model: 'opus' },
+    });
+    // Remote is the WIRE form (schedule/runs/assignment stripped) with a newer brief.
+    const remote = { id: 'commission-x', name: 'Renamed on peer', brief: { intent: 'surreal' }, updatedAt: '2026-06-06T00:00:00.000Z' };
+    const { next, remoteWins } = mergeCommissionRecord(local, remote);
+    expect(remoteWins).toBe(true);
+    expect(next.name).toBe('Renamed on peer');
+    expect(next.brief.intent).toBe('surreal');
+    // Machine-local fields carried forward from LOCAL, not reset by the remote.
+    expect(next.schedule.atLocalTime).toBe('02:00');
+    expect(next.runs).toHaveLength(1);
+    expect(next.assignment.providerId).toBe('claude');
+  });
+
+  // A behind sender's sanitizer strips the brief fields its version predates,
+  // so its winning brief omits them for lack of a slot — not as a clear (#8414).
+  describe('additive brief fields from a behind sender (#8414)', () => {
+    const LOCAL_TS = '2026-01-01T00:00:00.000Z';
+    const REMOTE_TS = '2026-06-06T00:00:00.000Z';
+    const musicTaste = { source: 'digital-twin', anchorCount: 4, explorationPercent: 40 };
+    const localRecord = (overrides) => sanitizeCommission({
+      id: 'commission-x', name: 'Local', updatedAt: LOCAL_TS,
+      schedule: { kind: 'DAILY', atLocalTime: '02:00' }, runs: [{ id: 'run-1', status: 'ok' }],
+      assignment: { providerId: 'claude', model: 'opus' },
+      ...overrides,
+    });
+    const merge = (local, remote, version) => mergeCommissionRecord(
+      local, { ...remote, id: 'commission-x', name: 'Renamed on peer', updatedAt: REMOTE_TS },
+      { senderSchemaVersions: { creativeCommissions: version } },
+    );
+
+    it('keeps brief.musicTaste from a v3 sender but applies a v4 clear', () => {
+      const local = localRecord({ targetAbility: 'music', brief: { intent: 'ambient', musicTaste } });
+      const remote = { targetAbility: 'music', brief: { intent: 'ambient drone' } };
+
+      const behind = merge(local, remote, 3);
+      expect(behind.remoteWins).toBe(true);
+      expect(behind.next.brief.intent).toBe('ambient drone');
+      expect(behind.next.brief.musicTaste).toEqual(local.brief.musicTaste);
+      // Machine-local fields still carry forward exactly as before.
+      expect(behind.next.schedule.atLocalTime).toBe('02:00');
+      expect(behind.next.runs).toHaveLength(1);
+      expect(behind.next.assignment.providerId).toBe('claude');
+
+      expect(merge(local, remote, 4).next.brief.musicTaste).toBeUndefined();
+    });
+
+    it('keeps the generation backend pin from a v2 sender but applies a v3 reset', () => {
+      const local = localRecord({
+        targetAbility: 'image',
+        generation: { imageCount: 2, imageMode: 'codex', imageModelId: 'img-model-a' },
+      });
+      const remote = { targetAbility: 'image', generation: { imageCount: 4 } };
+
+      const behind = merge(local, remote, 2).next;
+      expect(behind.generation).toMatchObject({ imageCount: 4, imageMode: 'codex', imageModelId: 'img-model-a' });
+      expect(behind.assignment.providerId).toBe('claude');
+
+      const current = merge(local, remote, 3).next;
+      expect(current.generation).toMatchObject({ imageCount: 4, imageMode: 'auto', imageModelId: null });
+    });
+  });
+
+  it('a stale remote loses to a newer local (no clobber)', () => {
+    const local = sanitizeCommission({ id: 'commission-x', name: 'Newer', updatedAt: '2026-09-09T00:00:00.000Z' });
+    const remote = { id: 'commission-x', name: 'Older', updatedAt: '2020-01-01T00:00:00.000Z' };
+    const { next, remoteWins } = mergeCommissionRecord(local, remote);
+    expect(remoteWins).toBe(false);
+    expect(next.name).toBe('Newer');
+  });
+
+  it('mergeCommissionsFromSync inserts a remote commission DORMANT (no cron, disabled) so it never double-runs', async () => {
+    const remote = { id: 'commission-peer', name: 'From peer A', enabled: true, brief: { intent: 'dreamlike' }, updatedAt: '2026-05-05T00:00:00.000Z' };
+    const res = await mergeCommissionsFromSync([remote], { source: { via: 'sync', peerId: 'peer-a' } });
+    expect(res).toEqual({ applied: true, count: 1 });
+    const got = await getCommission('commission-peer');
+    expect(got.name).toBe('From peer A');
+    // Dormant on the receiver: no usable schedule AND disabled, so the user must
+    // explicitly enable + schedule it locally to activate — no double-run.
+    expect(got.schedule.atLocalTime).toBeNull();
+    expect(got.enabled).toBe(false);
+  });
+
+  it('a schedule-only edit does NOT advance the brief clock; a brief edit does', async () => {
+    const created = await createCommission(validInput());
+    const briefClock0 = records.get(created.id).briefUpdatedAt;
+    await updateCommission(created.id, { schedule: { kind: 'DAILY', atLocalTime: '05:00' } });
+    const afterSched = records.get(created.id);
+    // Machine-local edit → brief clock preserved, so a peer's brief edit isn't
+    // beaten by it (deterministic: the schedule path copies current.briefUpdatedAt).
+    expect(afterSched.briefUpdatedAt).toBe(briefClock0);
+    await updateCommission(created.id, { name: 'Renamed' });
+    const afterName = records.get(created.id);
+    // Federated edit → brief clock advances to the update moment (== updatedAt).
+    expect(afterName.briefUpdatedAt).toBe(afterName.updatedAt);
+  });
+
+  it('a tombstone advances the brief clock so the delete wins the LWW on peers', async () => {
+    const created = await createCommission(validInput());
+    await deleteCommission(created.id);
+    const tomb = records.get(created.id);
+    expect(tomb.deleted).toBe(true);
+    // Delete bumps the brief clock to the delete moment (== updatedAt == deletedAt),
+    // so a peer's briefUpdatedAt-keyed LWW applies the tombstone.
+    expect(tomb.briefUpdatedAt).toBe(tomb.updatedAt);
+    expect(tomb.briefUpdatedAt).toBe(tomb.deletedAt);
+    // The wire form's LWW key (updatedAt) is the brief clock — a peer will apply it.
+    expect(sanitizeCommissionForSync(tomb).briefUpdatedAt).toBe(tomb.briefUpdatedAt);
+  });
+
+  it('getCommissionForSync surfaces a tombstone after delete', async () => {
+    const created = await createCommission(validInput());
+    await deleteCommission(created.id);
+    const wire = await getCommissionForSync(created.id);
+    expect(wire).toMatchObject({ id: created.id, deleted: true });
+  });
+});
+
+describe('legacy inline feedback → federated split (#2686)', () => {
+  // Seed a pre-#2686 record that still carries INLINE feedback (Phase 2 storage),
+  // written straight into the machine-local commission map.
+  const seedLegacy = () => {
+    records.set('commission-legacy', {
+      id: 'commission-legacy', name: 'Legacy', enabled: true, targetAbility: 'video',
+      brief: {}, schedule: { kind: 'DAILY', atLocalTime: '02:00' }, generation: {},
+      runs: [{ id: 'run-A', status: 'started' }],
+      feedback: [{ id: 'feedback-old', runId: 'run-A', rating: 'up', note: 'legacy like', at: '2026-01-01T00:00:00.000Z' }],
+      createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z',
+    });
+  };
+
+  it('listCommissions falls back to inline feedback before migration (no under-report)', async () => {
+    seedLegacy();
+    const list = await listCommissions();
+    const legacy = list.find((c) => c.id === 'commission-legacy');
+    expect(legacy.feedback).toHaveLength(1);
+    expect(legacy.feedback[0]).toMatchObject({ runId: 'run-A', rating: 'up', note: 'legacy like' });
+  });
+
+  it('getCommission migrates inline → federated and clears the inline array', async () => {
+    seedLegacy();
+    const rec = await getCommission('commission-legacy');
+    expect(rec.feedback).toHaveLength(1);
+    expect(rec.feedback[0]).toMatchObject({ runId: 'run-A', rating: 'up', note: 'legacy like' });
+    // Inline array on the machine-local record is now cleared; a federated record exists.
+    expect(records.get('commission-legacy').feedback).toEqual([]);
+    expect([...feedbackRecords.values()].some((f) => f.commissionId === 'commission-legacy')).toBe(true);
+  });
+
+  it('a PARTIAL migration never hides the un-migrated tail (inline ∪ federated on read)', async () => {
+    // Seed a legacy record with 2 inline reactions, then pre-federate ONLY the
+    // first (simulating a backfill that wrote a prefix then threw, inline retained).
+    records.set('commission-partial', {
+      id: 'commission-partial', name: 'Partial', enabled: true, targetAbility: 'video',
+      brief: {}, schedule: { kind: 'DAILY', atLocalTime: '02:00' }, generation: {},
+      runs: [{ id: 'run-A' }, { id: 'run-B' }],
+      feedback: [
+        { id: 'feedback-a', runId: 'run-A', rating: 'up', note: 'A', at: '2026-01-01T00:00:00.000Z' },
+        { id: 'feedback-b', runId: 'run-B', rating: 'down', note: 'B', at: '2026-01-02T00:00:00.000Z' },
+      ],
+      createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z',
+    });
+    feedbackRecords.set('cfeedback-run-A', {
+      id: 'cfeedback-run-A', commissionId: 'commission-partial', runId: 'run-A',
+      rating: 'up', note: 'A', at: '2026-01-01T00:00:00.000Z', createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z', deleted: false, deletedAt: null,
+    });
+    // listCommissions must show BOTH reactions (federated run-A ∪ inline run-B), not just run-A.
+    const list = await listCommissions();
+    const rec = list.find((c) => c.id === 'commission-partial');
+    expect(rec.feedback.map((f) => f.runId).sort()).toEqual(['run-A', 'run-B']);
+  });
+
+  it('backfillAllCommissionFeedback splits every commission idempotently', async () => {
+    seedLegacy();
+    const first = await backfillAllCommissionFeedback();
+    expect(first.migrated).toBe(1);
+    // Re-running is a no-op (inline already cleared).
+    const second = await backfillAllCommissionFeedback();
+    expect(second.migrated).toBe(0);
+    expect(records.get('commission-legacy').feedback).toEqual([]);
+  });
+});
+
+describe('submitCommissionFeedback', () => {
+  it('appends a reaction keyed to an existing run and returns the updated commission', async () => {
+    const created = await createCommission(validInput());
+    await recordCommissionRun(created.id, { id: 'run-A', status: 'started', projectId: 'cd-1' });
+    const updated = await submitCommissionFeedback(created.id, { runId: 'run-A', rating: 'up', note: 'more Magritte' });
+    expect(updated.feedback).toHaveLength(1);
+    expect(updated.feedback[0]).toMatchObject({ runId: 'run-A', rating: 'up', note: 'more Magritte' });
+    // Feedback now lives in the federated commissionFeedback store (#2686), keyed
+    // by a deterministic per-run id so a re-rating LWW-updates in place.
+    expect(updated.feedback[0].id).toMatch(/^cfeedback-/);
+  });
+
+  it('closes the loop: the reaction folds into the next directive', async () => {
+    const created = await createCommission(validInput());
+    await recordCommissionRun(created.id, { id: 'run-A', status: 'started', projectId: 'cd-1' });
+    await submitCommissionFeedback(created.id, { runId: 'run-A', rating: 'down', note: 'less horror' });
+    const after = await getCommission(created.id);
+    const directive = buildCommissionDirective(after);
+    expect(directive.goal).toContain('Recent dislikes: less horror.');
+  });
+
+  it('re-rating a run REPLACES its prior reaction (no contradictory stacking)', async () => {
+    const created = await createCommission(validInput());
+    await recordCommissionRun(created.id, { id: 'run-A', status: 'started', projectId: 'cd-1' });
+    await submitCommissionFeedback(created.id, { runId: 'run-A', rating: 'up', note: 'first take' });
+    const updated = await submitCommissionFeedback(created.id, { runId: 'run-A', rating: 'down', note: 'changed my mind' });
+    // Exactly one reaction for the run — the latest — not two.
+    const forRun = updated.feedback.filter((f) => f.runId === 'run-A');
+    expect(forRun).toHaveLength(1);
+    expect(forRun[0]).toMatchObject({ rating: 'down', note: 'changed my mind' });
+    // And the digest reflects only the latest vote, not both.
+    const directive = buildCommissionDirective(await getCommission(created.id));
+    expect(directive.goal).toContain('Recent dislikes: changed my mind.');
+    expect(directive.goal).not.toContain('first take');
+  });
+
+  it('rejects a reaction referencing a run not on the commission (VALIDATION)', async () => {
+    const created = await createCommission(validInput());
+    await expect(
+      submitCommissionFeedback(created.id, { runId: 'ghost', rating: 'up' }),
+    ).rejects.toMatchObject({ code: ERR_VALIDATION });
+  });
+
+  it('throws NOT_FOUND for an unknown commission', async () => {
+    await expect(
+      submitCommissionFeedback('nope', { runId: 'r', rating: 'up' }),
+    ).rejects.toMatchObject({ code: ERR_NOT_FOUND });
+  });
+});
+
+
+it('keeps effort on a valid commission assignment and clears orphaned effort', () => {
+  expect(sanitizeCommission({ id: 'example', assignment: { providerId: 'agent', effort: 'high' } }).assignment).toEqual({ providerId: 'agent', model: null, effort: 'high' });
+  expect(sanitizeCommission({ id: 'example', assignment: { effort: 'high' } }).assignment).toEqual({ providerId: null, model: null });
+});

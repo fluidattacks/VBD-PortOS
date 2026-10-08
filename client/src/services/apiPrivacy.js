@@ -1,0 +1,190 @@
+import { request } from './apiCore.js';
+
+// Privacy Center — encrypted PII Vault + Trusted Organizations registry
+// (issues #2140, #2141; UI shell #2142; Digital Twin cross-link #2147). Every
+// wrapper takes an optional `options` object so callers that own their own error
+// UI (useAsyncAction, custom catch) can pass `{ silent: true }` per the toasting
+// convention.
+
+// Household subjects (#3658): every scoped read/write takes an optional
+// `subjectId` inside that same trailing `options` object, so no pre-#3658 caller
+// changed signature. The server resolves an absent `subjectId` to the seeded
+// `self` subject, so omitting it reproduces the single-subject v1 behavior
+// exactly. There is no "all subjects" mode — the API scopes to exactly one.
+const scoped = (path, { subjectId, ...rest } = {}, params = {}) => {
+  // Only override when the caller actually passed one — a bare `subjectId` key
+  // here would clobber a `params.subjectId` with `undefined`, silently
+  // re-scoping `getPrivacyOrgs({ subjectId })` back to `self`.
+  const qs = new URLSearchParams(
+    Object.entries({ ...params, ...(subjectId === undefined ? {} : { subjectId }) })
+      .filter(([, v]) => v != null && v !== ''),
+  ).toString();
+  return [qs ? `${path}?${qs}` : path, rest];
+};
+
+// POST bodies carry `subjectId` inline instead of as a query param.
+const scopedPost = (path, { subjectId, ...rest } = {}) => [path, {
+  method: 'POST',
+  ...(subjectId ? { body: JSON.stringify({ subjectId }) } : {}),
+  ...rest,
+}];
+
+// ── Household subjects (#3658) ──────────────────────────────────────────────
+/** All subjects, `self` first, each with `consentCount`, `recordCount`, and `activeScopes`. */
+export const getPrivacySubjects = (options) => request('/privacy/subjects', options);
+/** Create: { displayName, relationship?, consentMethod, consentNote? } — consent is mandatory. */
+export const createPrivacySubject = (data, options) => request('/privacy/subjects', {
+  method: 'POST',
+  body: JSON.stringify(data),
+  ...options,
+});
+/** Hard delete — cascades this subject's vault records, orgs, changes, and cases. */
+export const deletePrivacySubject = (id, options) => request(`/privacy/subjects/${id}`, {
+  method: 'DELETE',
+  ...options,
+});
+/** Consent audit trail for one subject, newest first (revoked grants carry `revokedAt`). */
+export const getPrivacySubjectConsents = (id, options) =>
+  request(`/privacy/subjects/${id}/consents`, options);
+/** Grant one purpose: { scope, method, note? } (#8332). */
+export const grantPrivacySubjectConsent = (id, data, options) =>
+  request(`/privacy/subjects/${id}/consents`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+    ...options,
+  });
+/** Revoke one broker purpose (`broker_scan` | `broker_optout`); the subject and records stay. */
+export const revokePrivacySubjectConsent = (id, scope, options) =>
+  request(`/privacy/subjects/${id}/consents/revoke`, {
+    method: 'POST',
+    body: JSON.stringify({ scope }),
+    ...options,
+  });
+
+// ── Status (doctor-style readout) ───────────────────────────────────────────
+export const getPrivacyStatus = (options) => request(...scoped('/privacy/status', options));
+
+// ── Vault records ───────────────────────────────────────────────────────────
+export const getVaultRecords = (type, options) =>
+  request(...scoped('/privacy/vault', options, { type }));
+export const createVaultRecord = (data, options) => request('/privacy/vault', {
+  method: 'POST',
+  body: JSON.stringify(data),
+  ...options,
+});
+export const updateVaultRecord = (id, patch, options) => request(`/privacy/vault/${id}`, {
+  method: 'PUT',
+  body: JSON.stringify(patch),
+  ...options,
+});
+export const deleteVaultRecord = (id, options) => request(`/privacy/vault/${id}`, {
+  method: 'DELETE',
+  ...options,
+});
+// The ONE decrypt path — explicit user action. Returns { id, type, value }.
+export const revealVaultRecord = (id, options) => request(`/privacy/vault/${id}/reveal`, {
+  method: 'POST',
+  ...options,
+});
+
+// ── Trusted Organizations registry ──────────────────────────────────────────
+export const getPrivacyOrgs = (filters = {}, options) =>
+  request(...scoped('/privacy/orgs', options, filters));
+export const createPrivacyOrg = (data, options) => request('/privacy/orgs', {
+  method: 'POST',
+  body: JSON.stringify(data),
+  ...options,
+});
+export const updatePrivacyOrg = (id, patch, options) => request(`/privacy/orgs/${id}`, {
+  method: 'PUT',
+  body: JSON.stringify(patch),
+  ...options,
+});
+export const deletePrivacyOrg = (id, options) => request(`/privacy/orgs/${id}`, {
+  method: 'DELETE',
+  ...options,
+});
+
+// ── Org holdings (which vault records an org holds) ─────────────────────────
+export const getOrgHoldings = (id, options) => request(`/privacy/orgs/${id}/holdings`, options);
+// Replace-set semantics: `holdings` is the FULL list of { vaultRecordId, status }.
+export const setOrgHoldings = (id, holdings, options) => request(`/privacy/orgs/${id}/holdings`, {
+  method: 'PUT',
+  body: JSON.stringify({ holdings }),
+  ...options,
+});
+
+// ── Change-of-address events + inventory (#2143) ────────────────────────────
+export const getPrivacyChanges = (options) => request(...scoped('/privacy/changes', options));
+export const getPrivacyChange = (id, options) => request(`/privacy/changes/${id}`, options);
+// Declare a change: { vaultRecordId, replacement?|replacementRecordId?, kind?, note? }.
+export const declarePrivacyChange = (data, options) => request('/privacy/changes', {
+  method: 'POST',
+  body: JSON.stringify(data),
+  ...options,
+});
+export const markChangeOrgUpdated = (id, orgId, options) =>
+  request(`/privacy/changes/${id}/orgs/${orgId}/updated`, { method: 'POST', ...options });
+export const markChangeOrgRemoved = (id, orgId, options) =>
+  request(`/privacy/changes/${id}/orgs/${orgId}/removed`, { method: 'POST', ...options });
+// Drafts a "please update my records" email into the Comms queue (unapproved).
+export const draftChangeUpdateEmail = (id, orgId, options) =>
+  request(`/privacy/changes/${id}/orgs/${orgId}/draft-email`, { method: 'POST', ...options });
+
+// ── Data-broker database + case ledger + opt-out engine (#2144/#2145; UI #2146) ─
+/** Broker database rows. `enabled` filters to enabled-only when true/false. */
+export const getPrivacyBrokers = (enabled, options) =>
+  request(`/privacy/brokers${enabled === undefined ? '' : `?enabled=${enabled ? 'true' : 'false'}`}`, options);
+/** Toggle a broker on/off (skips it in scan + opt-out passes). */
+export const setPrivacyBrokerEnabled = (id, enabled, options) => request(`/privacy/brokers/${id}`, {
+  method: 'PUT',
+  body: JSON.stringify({ enabled }),
+  ...options,
+});
+/** User-triggered broker-list refresh (BADBOOL + CA registry; never clobbers curated). */
+export const refreshPrivacyBrokers = (options) => request('/privacy/brokers/refresh', {
+  method: 'POST',
+  ...options,
+});
+/** Case ledger rows (joined with broker name/tier). `state` filters when set. */
+export const getPrivacyBrokerCases = (state, options) =>
+  request(...scoped('/privacy/broker-cases', options, { state }));
+/** Force a case due for recheck now. */
+export const recheckPrivacyCase = (id, options) =>
+  request(`/privacy/broker-cases/${id}/recheck`, { method: 'POST', ...options });
+/**
+ * Reveal a case's sealed identity evidence (matched name/location, search +
+ * listing URLs) for the case drawer: `{ caseId, sealed, evidence }` (#8333).
+ */
+export const getPrivacyCaseEvidence = (id, options) =>
+  request(`/privacy/broker-cases/${id}/evidence`, options);
+/** Erase a case's identity evidence; state + verdict metadata stay. Returns the case. */
+export const erasePrivacyCaseEvidence = (id, options) =>
+  request(`/privacy/broker-cases/${id}/evidence`, { method: 'DELETE', ...options });
+/** Manual case transition (digest done/dismiss, drawer controls): { toState, reason? }. */
+export const transitionPrivacyCase = (id, toState, reason, options) => request(`/privacy/broker-cases/${id}/transition`, {
+  method: 'POST',
+  body: JSON.stringify(reason ? { toState, reason } : { toState }),
+  ...options,
+});
+/** Aggregate exposure readout: enabledBrokers, caseCounts (per state), dueForRecheck. */
+export const getPrivacyScanStatus = (options) => request(...scoped('/privacy/scan/status', options));
+/** Run a read-only exposure scan pass over enabled brokers. Refused without consent. */
+export const runPrivacyScan = (options) => request(...scopedPost('/privacy/scan', options));
+/** Run one opt-out pass (submit found/indirect cases via the chosen lane, poll verifications). */
+export const runPrivacyOptOut = (options) => request(...scopedPost('/privacy/optout', options));
+/** Human-task digest: cases needing a person (blocked / human-only channels). */
+export const getPrivacyOptOutDigest = (options) => request(...scoped('/privacy/optout/digest', options));
+/** Recheck-schedule status: { enabled, cronExpression, autoApproveOptOutEmails, autoSubmitWebForms, nextRun }. */
+export const getPrivacyOptOutSchedule = (options) => request('/privacy/optout/schedule', options);
+/** Update the recheck cron + autonomy toggles; restarts the scheduler. Returns the new status. */
+export const updatePrivacyOptOutSchedule = (patch, options) => request('/privacy/optout/schedule', {
+  method: 'PUT',
+  body: JSON.stringify(patch),
+  ...options,
+});
+
+// ── Digital Twin cross-link (#2147) ─────────────────────────────────────────
+/** Social-account → org links for the Twin's "in org registry" badges. */
+export const getSocialAccountOrgLinks = (options) =>
+  request('/privacy/social-account-links', options);

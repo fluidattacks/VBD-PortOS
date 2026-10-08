@@ -1,0 +1,1259 @@
+/**
+ * FableLoom record lifecycle — looms, episodes, scene nodes, and intent
+ * transitions.
+ *
+ * A loom is a branching-narrative story: episodes hold a directed graph of
+ * scene nodes; each node carries prose, image and single-clip video prompts,
+ * camera direction, rendered media, and a list of intent-triggered transitions
+ * the play LLM matches against free-text reader input. Legacy nodes without a
+ * video prompt still render from scene text. All ids are server-minted. Every
+ * write funnels through `mutateLoom` (per-record write queue + full re-sanitize),
+ * so a malformed mutation can never persist.
+ */
+
+import { sanitizeShot } from '../../lib/fableLoomShots.js';
+import { randomUUID } from 'crypto';
+import { ServerError } from '../../lib/errorHandler.js';
+import { sanitizeLlmRoutePin } from '../../lib/llmRoutePin.js';
+import { sanitizeCharacterEvolutionList } from '../../lib/characterEvolution.js';
+import { sanitizeSeriesDesign } from '../../lib/storyArc.js';
+import { compareNewerWins } from '../../lib/lwwTimestamp.js';
+import { sanitizeSoftDeleteFields } from '../../lib/syncWire.js';
+import {
+  contentHashForRecord,
+  deleteSyncBaseHash,
+  flushBaseHashes,
+  maybeJournalBeforeOverwrite,
+  setSyncBaseHash,
+  withBaseHashFlushBatch,
+} from '../../lib/conflictJournal.js';
+import { getUniverse } from '../universeBuilder.js';
+import { getSeries } from '../pipeline/series.js';
+import {
+  autoSubscribeRecordToAllPeers,
+  emitRecordDeleted,
+  emitRecordUpdated,
+} from '../sharing/recordEvents.js';
+import {
+  deleteRaw,
+  isValidLoomId,
+  listRaw,
+  listTombstoneIdsBefore,
+  queueLoomWrite,
+  readRaw,
+  writeRaw,
+} from './store.js';
+import { LOOM_LIMITS } from './limits.js';
+import { asLoomFormat, isLoomFormat } from './formats.js';
+import {
+  asFableLoomPlaybackMode,
+  FABLELOOM_PROTAGONIST_PRESENCE,
+  isSafeVideoHistoryId,
+  sanitizeInteractionWindow,
+  sanitizePlaybackAssets,
+  sanitizeVisualConditioning,
+} from '../../lib/fableLoomPlayback.js';
+import {
+  FABLELOOM_LEGACY_PARTICIPATION_MODE,
+  asFableLoomAudienceConnection,
+  asFableLoomParticipationMode,
+} from '../../lib/fableLoomParticipation.js';
+import { normalizeFableLoomCameraMovement } from '../../lib/fableLoomCameraMovements.js';
+import {
+  analyzeStoryOutline,
+  analyzeStoryOutlineTeleplaySync,
+  FABLELOOM_CHALLENGE_PHASES,
+  fableLoomEpisodeChallenges,
+  fableLoomPlotPointKind,
+  sanitizeStoryOutline,
+} from '../../lib/fableLoomOutline.js';
+import {
+  FABLELOOM_RENDER_PREFERENCE_KEYS,
+  mergeFableLoomRenderSettings,
+  sanitizeFableLoomRenderSettings,
+} from '../../lib/fableLoomProduction.js';
+import { isStr, trimTo } from '../../lib/textUtils.js';
+
+export { LOOM_LIMITS };
+
+const isSafeImageFilename = (value) =>
+  typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]*\.(png|jpg|jpeg|webp)$/i.test(value);
+
+const nullableRef = (value) => (isStr(value) && value.trim() ? value.trim().slice(0, LOOM_LIMITS.REF_ID_MAX) : null);
+
+const sanitizePos = (raw) => (raw && typeof raw === 'object'
+  && Number.isFinite(raw.x) && Number.isFinite(raw.y)
+  ? { x: Math.round(raw.x), y: Math.round(raw.y) }
+  : null);
+
+const sanitizeVisualCanon = (raw) => {
+  if (!raw || typeof raw !== 'object') return null;
+  const appearances = (Array.isArray(raw.characterAppearances) ? raw.characterAppearances : [])
+    .filter((item) => item && typeof item === 'object' && nullableRef(item.characterId))
+    .slice(0, LOOM_LIMITS.VISUAL_BINDINGS_MAX)
+    .map((item) => ({
+      characterId: nullableRef(item.characterId),
+      wardrobeId: nullableRef(item.wardrobeId),
+      ...(isSafeImageFilename(item.referenceImage) ? { referenceImage: item.referenceImage } : {}),
+      expression: trimTo(item.expression, LOOM_LIMITS.VISUAL_NOTE_MAX),
+      continuityNotes: trimTo(item.continuityNotes, LOOM_LIMITS.VISUAL_NOTE_MAX),
+    }));
+  return {
+    mode: raw.mode === 'draft' ? 'draft' : 'locked',
+    characterAppearances: appearances,
+    placeId: nullableRef(raw.placeId),
+    objectIds: (Array.isArray(raw.objectIds) ? raw.objectIds : [])
+      .map(nullableRef).filter(Boolean).slice(0, LOOM_LIMITS.VISUAL_BINDINGS_MAX),
+    continuitySourceNodeId: nullableRef(raw.continuitySourceNodeId),
+    shotNotes: trimTo(raw.shotNotes, LOOM_LIMITS.VISUAL_NOTE_MAX),
+    storyboardImageApproved: raw.storyboardImageApproved === true,
+  };
+};
+
+function sanitizeTransition(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const intent = trimTo(raw.intent, LOOM_LIMITS.INTENT_MAX);
+  const targetNodeId = isStr(raw.targetNodeId) ? raw.targetNodeId : '';
+  if (!targetNodeId) return null;
+  return {
+    id: isStr(raw.id) && raw.id ? raw.id : `tr-${randomUUID()}`,
+    targetNodeId,
+    intent,
+    triggers: (Array.isArray(raw.triggers) ? raw.triggers : [])
+      .map((t) => trimTo(t, LOOM_LIMITS.TRIGGER_MAX))
+      .filter(Boolean)
+      .slice(0, LOOM_LIMITS.TRIGGERS_MAX),
+    description: trimTo(raw.description, LOOM_LIMITS.TRANSITION_DESC_MAX),
+  };
+}
+
+function sanitizeNode(raw) {
+  if (!raw || typeof raw !== 'object' || !isStr(raw.id) || !raw.id) return null;
+  return {
+    id: raw.id,
+    title: trimTo(raw.title, LOOM_LIMITS.NODE_TITLE_MAX),
+    prose: trimTo(raw.prose, LOOM_LIMITS.PROSE_MAX),
+    ...(raw.shot ? { shot: sanitizeShot(raw.shot) } : {}),
+    plotPointId: isStr(raw.plotPointId)
+      ? raw.plotPointId.trim().slice(0, LOOM_LIMITS.OUTLINE_KEY_MAX)
+      : null,
+    challengePhase: FABLELOOM_CHALLENGE_PHASES.includes(raw.challengePhase)
+      ? raw.challengePhase
+      : null,
+    imagePrompt: trimTo(raw.imagePrompt, LOOM_LIMITS.IMAGE_PROMPT_MAX),
+    image: isSafeImageFilename(raw.image) ? raw.image : null,
+    imageJobId: isStr(raw.imageJobId) && raw.imageJobId ? raw.imageJobId.slice(0, 200) : null,
+    videoPrompt: trimTo(raw.videoPrompt, LOOM_LIMITS.VIDEO_PROMPT_MAX),
+    cameraMovement: trimTo(normalizeFableLoomCameraMovement(raw.cameraMovement), LOOM_LIMITS.CAMERA_MOVEMENT_MAX),
+    visualCanon: sanitizeVisualCanon(raw.visualCanon),
+    visualConditioning: sanitizeVisualConditioning(raw.visualConditioning),
+    playbackMode: asFableLoomPlaybackMode(raw.playbackMode),
+    audienceConnection: asFableLoomAudienceConnection(raw.audienceConnection),
+    protagonistPresence: FABLELOOM_PROTAGONIST_PRESENCE.includes(raw.protagonistPresence)
+      ? raw.protagonistPresence
+      : null,
+    videoHistoryId: isSafeVideoHistoryId(raw.videoHistoryId) ? raw.videoHistoryId : null,
+    playbackAssets: sanitizePlaybackAssets(raw.playbackAssets),
+    interactionWindow: sanitizeInteractionWindow(raw.interactionWindow),
+    isEnding: raw.isEnding === true,
+    // The format this scene's text is actually WRITTEN in — server-set, not
+    // patchable. `null` means unknown (authored before the field existed, or
+    // by hand), which a reformat treats as "needs converting". Without it a
+    // rewrite that stopped at the per-request ceiling would re-send the scenes
+    // it already converted and never reach the ones it didn't.
+    format: isLoomFormat(raw.format) ? raw.format : null,
+    endingLabel: trimTo(raw.endingLabel, LOOM_LIMITS.ENDING_LABEL_MAX),
+    transitions: (Array.isArray(raw.transitions) ? raw.transitions : [])
+      .map(sanitizeTransition)
+      .filter(Boolean)
+      .slice(0, LOOM_LIMITS.TRANSITIONS_MAX),
+    pos: sanitizePos(raw.pos),
+  };
+}
+
+function sanitizeEpisode(raw, participationMode = 'protagonist') {
+  if (!raw || typeof raw !== 'object' || !isStr(raw.id) || !raw.id) return null;
+  const nodes = (Array.isArray(raw.nodes) ? raw.nodes : [])
+    .map(sanitizeNode)
+    .filter(Boolean)
+    .slice(0, LOOM_LIMITS.NODES_MAX);
+  const nodeIds = new Set(nodes.map((n) => n.id));
+  // Dangling transitions (a target dropped by the node cap, or authored to a
+  // since-deleted id) are deliberately KEPT — the graph validation surfaces
+  // them as errors the author resolves, rather than silently rewriting edges.
+  const now = new Date().toISOString();
+  const storyOutline = sanitizeStoryOutline(raw.storyOutline, { participationMode });
+  return {
+    id: raw.id,
+    number: Number.isFinite(raw.number) ? Math.max(1, Math.round(raw.number)) : 1,
+    title: trimTo(raw.title, LOOM_LIMITS.EPISODE_TITLE_MAX),
+    synopsis: trimTo(raw.synopsis, LOOM_LIMITS.SYNOPSIS_MAX),
+    startNodeId: isStr(raw.startNodeId) && nodeIds.has(raw.startNodeId) ? raw.startNodeId : (nodes[0]?.id ?? null),
+    nodes,
+    ...(storyOutline ? { storyOutline } : {}),
+    createdAt: isStr(raw.createdAt) && raw.createdAt ? raw.createdAt : now,
+    updatedAt: isStr(raw.updatedAt) && raw.updatedAt ? raw.updatedAt : now,
+  };
+}
+
+const planItemId = (prefix, value, seenIds) => {
+  const candidate = isStr(value) && value.trim() ? value.trim().slice(0, 80) : '';
+  const id = candidate && !seenIds.has(candidate) ? candidate : `${prefix}-${randomUUID()}`;
+  seenIds.add(id);
+  return id;
+};
+
+const planEpisodeRef = (value, episodeIds) => (
+  isStr(value) && episodeIds.has(value) ? value : null
+);
+
+function sanitizeSeriesPlan(raw, episodes) {
+  const source = raw && typeof raw === 'object' ? raw : {};
+  const episodeIds = new Set(episodes.map((episode) => episode.id));
+  const plotIds = new Set();
+  const questIds = new Set();
+  const hasDeliveryPlan = source.deliveryOptions && typeof source.deliveryOptions === 'object'
+    || Array.isArray(source.interEpisodeVoicemails)
+    || source.nextSeasonTeaser !== undefined;
+  const deliveryOptions = source.deliveryOptions && typeof source.deliveryOptions === 'object'
+    ? {
+      overnightVoicemails: source.deliveryOptions.overnightVoicemails === true,
+      nextSeasonTeaser: source.deliveryOptions.nextSeasonTeaser === true,
+    }
+    : { overnightVoicemails: false, nextSeasonTeaser: false };
+  const voicemailIds = new Set();
+  const interEpisodeVoicemails = (Array.isArray(source.interEpisodeVoicemails)
+    ? source.interEpisodeVoicemails : [])
+    .slice(0, LOOM_LIMITS.EPISODES_MAX)
+    .filter((item) => item && typeof item === 'object')
+    .map((item) => ({
+      id: planItemId('voicemail', item.id, voicemailIds),
+      fromEpisodeId: planEpisodeRef(item.fromEpisodeId, episodeIds),
+      toEpisodeId: planEpisodeRef(item.toEpisodeId, episodeIds),
+      title: trimTo(item.title, LOOM_LIMITS.PLAN_ITEM_TITLE_MAX),
+      transcript: trimTo(item.transcript, LOOM_LIMITS.DELIVERY_MESSAGE_MAX),
+    }));
+  const teaser = source.nextSeasonTeaser && typeof source.nextSeasonTeaser === 'object'
+    ? {
+      title: trimTo(source.nextSeasonTeaser.title, LOOM_LIMITS.PLAN_ITEM_TITLE_MAX),
+      transcript: trimTo(source.nextSeasonTeaser.transcript, LOOM_LIMITS.DELIVERY_MESSAGE_MAX),
+    }
+    : null;
+  // The OPTIONAL five-stage character evolution lens (#6440), one per
+  // character, keyed by the canon `chr-` id. Evidence anchors (episodeId /
+  // sceneKey) are PRESERVED as authored even when they no longer resolve —
+  // `fableLoomEvolutionEvidenceRefs` lets a reader derive `stale` on read,
+  // the same way `sanitizeStoryOutline` keeps an unknown `targetKey` so
+  // DANGLING_TRANSITION can report it. Absent on every pre-#6440 plan.
+  const characterEvolutions = sanitizeCharacterEvolutionList(source.characterEvolutions);
+  const seriesDesign = sanitizeSeriesDesign(source.seriesDesign);
+  return {
+    storyArc: trimTo(source.storyArc, LOOM_LIMITS.STORY_ARC_MAX),
+    plotPoints: (Array.isArray(source.plotPoints) ? source.plotPoints : [])
+      .filter((item) => item && typeof item === 'object')
+      .slice(0, LOOM_LIMITS.PLAN_ITEMS_MAX)
+      .map((item) => ({
+        id: planItemId('plot', item.id, plotIds),
+        kind: fableLoomPlotPointKind(item),
+        title: trimTo(item.title, LOOM_LIMITS.PLAN_ITEM_TITLE_MAX),
+        description: trimTo(item.description, LOOM_LIMITS.PLAN_ITEM_DESCRIPTION_MAX),
+        episodeId: planEpisodeRef(item.episodeId, episodeIds),
+      })),
+    sideQuests: (Array.isArray(source.sideQuests) ? source.sideQuests : [])
+      .filter((item) => item && typeof item === 'object')
+      .slice(0, LOOM_LIMITS.PLAN_ITEMS_MAX)
+      .map((item) => ({
+        id: planItemId('quest', item.id, questIds),
+        title: trimTo(item.title, LOOM_LIMITS.PLAN_ITEM_TITLE_MAX),
+        description: trimTo(item.description, LOOM_LIMITS.PLAN_ITEM_DESCRIPTION_MAX),
+        status: ['idea', 'planned', 'active', 'resolved'].includes(item.status) ? item.status : 'idea',
+        startEpisodeId: planEpisodeRef(item.startEpisodeId, episodeIds),
+        endEpisodeId: planEpisodeRef(item.endEpisodeId, episodeIds),
+      })),
+    ...(hasDeliveryPlan ? {
+      deliveryOptions,
+      interEpisodeVoicemails,
+      nextSeasonTeaser: teaser,
+    } : {}),
+    // Omitted entirely when no lens is authored, so a pre-#6440 plan is
+    // byte-identical after a round trip (same shape rule the delivery plan
+    // above follows) and `preserveLegacyCharacterEvolutions` can tell "this
+    // sender cannot represent the field" from "the author cleared it".
+    ...(characterEvolutions.length ? { characterEvolutions } : {}),
+    // Keep legacy omission byte-identical while preserving an explicit null as
+    // a clear on current-version records and sync payloads.
+    ...(source.seriesDesign !== undefined ? { seriesDesign } : {}),
+  };
+}
+
+/**
+ * Reference sets a FableLoom evolution lens's evidence anchors resolve
+ * against — every episode id, and every scene an anchor can name across the
+ * loom: expanded teleplay node ids AND authored outline keys. The sync
+ * contract makes those the same string once an outline is expanded, so the
+ * union only widens for a graph-first episode whose outline was never written
+ * — where a live scene must not read as a deleted one.
+ * Hand it to `evolutionEvidenceStatus` so a stage pointing at a deleted
+ * episode or a renamed scene reports `stale` rather than passing as proof.
+ */
+export function fableLoomEvolutionEvidenceRefs(loom) {
+  const episodes = Array.isArray(loom?.episodes) ? loom.episodes : [];
+  const sceneKeys = new Set();
+  for (const episode of episodes) {
+    for (const node of episode?.nodes || []) {
+      if (node?.id) sceneKeys.add(node.id);
+    }
+    for (const scene of episode?.storyOutline?.scenes || []) {
+      if (scene?.key) sceneKeys.add(scene.key);
+    }
+  }
+  return { episodeIds: new Set(episodes.map((episode) => episode.id)), sceneKeys };
+}
+
+export function sanitizeLoom(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  if (!isStr(raw.id) || !raw.id) return null;
+  const name = trimTo(raw.name, LOOM_LIMITS.NAME_MAX);
+  if (!name) return null;
+  const now = new Date().toISOString();
+  const { deleted, deletedAt } = sanitizeSoftDeleteFields(raw);
+  const participationMode = asFableLoomParticipationMode(raw.participationMode);
+  const episodes = (Array.isArray(raw.episodes) ? raw.episodes : [])
+    .map((episode) => sanitizeEpisode(episode, participationMode))
+    .filter(Boolean)
+    .slice(0, LOOM_LIMITS.EPISODES_MAX)
+    .sort((a, b) => a.number - b.number || a.createdAt.localeCompare(b.createdAt));
+  const seriesPlan = sanitizeSeriesPlan(raw.seriesPlan, episodes);
+  for (const episode of episodes) {
+    if (episode.storyOutline?.validation?.status !== 'valid') continue;
+    const outline = analyzeStoryOutline(episode.storyOutline, {
+      participationMode,
+      requireAudienceIntroduction: episode === episodes[0],
+      challenges: fableLoomEpisodeChallenges({ seriesPlan }, episode.id),
+    });
+    if (outline.stats.errorCount > 0) {
+      episode.storyOutline.validation = { status: 'invalid', issues: outline.issues };
+      continue;
+    }
+    const sync = analyzeStoryOutlineTeleplaySync(episode, episode.storyOutline, {
+      participationMode,
+    });
+    if (!sync.stats.matches) {
+      episode.storyOutline.validation = { status: 'draft', issues: sync.issues };
+    }
+  }
+  const protagonistCharacterId = nullableRef(raw.protagonistCharacterId);
+  const protagonistWardrobeId = nullableRef(raw.protagonistWardrobeId);
+  const productionStatus = raw.productionStatus && typeof raw.productionStatus === 'object'
+    ? {
+      editorialApprovedAt: isStr(raw.productionStatus.editorialApprovedAt)
+        ? raw.productionStatus.editorialApprovedAt.slice(0, 80)
+        : null,
+      editorialApprovalSource: ['manual', 'autopilot'].includes(raw.productionStatus.editorialApprovalSource)
+        ? raw.productionStatus.editorialApprovalSource
+        : null,
+      deliveryApprovedAt: isStr(raw.productionStatus.deliveryApprovedAt)
+        ? raw.productionStatus.deliveryApprovedAt.slice(0, 80)
+        : null,
+    }
+    : {
+      editorialApprovedAt: null,
+      editorialApprovalSource: null,
+      deliveryApprovedAt: null,
+    };
+  return {
+    id: raw.id,
+    schemaVersion: 3,
+    name,
+    logline: trimTo(raw.logline, LOOM_LIMITS.LOGLINE_MAX),
+    premise: trimTo(raw.premise, LOOM_LIMITS.PREMISE_MAX),
+    styleNotes: trimTo(raw.styleNotes, LOOM_LIMITS.STYLE_NOTES_MAX),
+    participationMode,
+    audienceCommunicationMedium: trimTo(
+      raw.audienceCommunicationMedium,
+      LOOM_LIMITS.AUDIENCE_COMMUNICATION_MEDIUM_MAX,
+    ),
+    format: asLoomFormat(raw.format),
+    // The loom's route pin for the play stage — which provider/model/effort
+    // turns a reader's free text into a path. An unset dimension stays null
+    // ('fall through to the stage pin / active provider').
+    playSettings: sanitizeLlmRoutePin(raw.playSettings),
+    renderSettings: sanitizeFableLoomRenderSettings(raw.renderSettings),
+    protagonistCharacterId,
+    protagonistWardrobeId,
+    protagonistWardrobeLocked: Boolean(protagonistWardrobeId && raw.protagonistWardrobeLocked !== false),
+    universeId: nullableRef(raw.universeId),
+    seriesId: nullableRef(raw.seriesId),
+    seriesPlan,
+    productionStatus,
+    episodes,
+    createdAt: isStr(raw.createdAt) && raw.createdAt ? raw.createdAt : now,
+    updatedAt: isStr(raw.updatedAt) && raw.updatedAt ? raw.updatedAt : now,
+    deleted,
+    deletedAt,
+  };
+}
+
+const editorialVisualCanon = (visualCanon) => {
+  if (!visualCanon) return null;
+  const { storyboardImageApproved: _storyboardImageApproved, ...storyCanon } = visualCanon;
+  return storyCanon;
+};
+
+// Approval invalidation is content-aware: authoring edits reopen editorial and
+// final delivery, while a completed render only reopens delivery. This avoids
+// using loom.updatedAt as a proxy, because media completion also updates it.
+const editorialContentSignature = (loom) => JSON.stringify({
+  name: loom.name,
+  logline: loom.logline,
+  premise: loom.premise,
+  styleNotes: loom.styleNotes,
+  participationMode: loom.participationMode,
+  audienceCommunicationMedium: loom.audienceCommunicationMedium,
+  format: loom.format,
+  protagonistCharacterId: loom.protagonistCharacterId,
+  protagonistWardrobeId: loom.protagonistWardrobeId,
+  protagonistWardrobeLocked: loom.protagonistWardrobeLocked,
+  universeId: loom.universeId,
+  seriesId: loom.seriesId,
+  seriesPlan: loom.seriesPlan,
+  episodes: loom.episodes.map((episode) => ({
+    id: episode.id,
+    number: episode.number,
+    title: episode.title,
+    synopsis: episode.synopsis,
+    startNodeId: episode.startNodeId,
+    storyOutline: episode.storyOutline ? {
+      version: episode.storyOutline.version,
+      startKey: episode.storyOutline.startKey,
+      scenes: episode.storyOutline.scenes,
+    } : null,
+    nodes: episode.nodes.map((node) => ({
+      id: node.id,
+      title: node.title,
+      prose: node.prose,
+      shot: node.shot,
+      plotPointId: node.plotPointId,
+      challengePhase: node.challengePhase,
+      imagePrompt: node.imagePrompt,
+      videoPrompt: node.videoPrompt,
+      cameraMovement: node.cameraMovement,
+      visualCanon: editorialVisualCanon(node.visualCanon),
+      playbackMode: node.playbackMode,
+      audienceConnection: node.audienceConnection,
+      protagonistPresence: node.protagonistPresence,
+      interactionWindow: node.interactionWindow,
+      isEnding: node.isEnding,
+      format: node.format,
+      endingLabel: node.endingLabel,
+      transitions: node.transitions,
+    })),
+  })),
+});
+
+const deliveryContentSignature = (loom) => JSON.stringify({
+  renderSettings: loom.renderSettings,
+  episodes: loom.episodes.map((episode) => ({
+    id: episode.id,
+    nodes: episode.nodes.map((node) => ({
+      id: node.id,
+      image: node.image,
+      imageJobId: node.imageJobId,
+      videoHistoryId: node.videoHistoryId,
+      playbackAssets: node.playbackAssets,
+      visualConditioning: node.visualConditioning,
+      storyboardImageApproved: node.visualCanon?.storyboardImageApproved === true,
+    })),
+  })),
+});
+
+const notFound = (what = 'Loom') => new ServerError(`${what} not found`, { status: 404, code: 'NOT_FOUND' });
+
+// Soft refs are validated at write time (against the trimmed value that will
+// actually persist) so a typo'd id fails loudly here rather than silently
+// producing an empty canon digest at weave time. Lives in the service — not
+// the route — because createLoom/updateLoom are public barrel exports any
+// non-HTTP caller can reach (games' requireApp precedent).
+async function assertRefsExist({ universeId, seriesId } = {}) {
+  const [universe, series] = await Promise.all([
+    universeId ? getUniverse(universeId).catch(() => null) : null,
+    seriesId ? getSeries(seriesId).catch(() => null) : null,
+  ]);
+  if (universeId && !universe) {
+    throw new ServerError('Linked universe not found', { status: 400, code: 'INVALID_UNIVERSE' });
+  }
+  if (seriesId && !series) {
+    throw new ServerError('Linked series not found', { status: 400, code: 'INVALID_SERIES' });
+  }
+}
+
+const requireLoomRaw = async (id) => {
+  if (!isValidLoomId(id)) throw notFound();
+  const loom = sanitizeLoom(await readRaw(id));
+  if (!loom || loom.deleted) throw notFound();
+  return loom;
+};
+
+export async function listLooms({ includeDeleted = false } = {}) {
+  const records = (await listRaw()).map(sanitizeLoom).filter(Boolean);
+  const visible = includeDeleted ? records : records.filter((loom) => !loom.deleted);
+  return visible.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || a.name.localeCompare(b.name));
+}
+
+/**
+ * Index-page projection: everything the list UI shows, WITHOUT the episode
+ * graphs — a woven episode carries up to 20k chars of prose per node, so the
+ * full records would make the index multi-MB to render three counts.
+ *
+ * `seriesId` scopes the list to one pipeline series' linked looms. The link is
+ * a soft ref, so a series that no longer exists simply matches nothing — this
+ * never throws on a dangling id.
+ */
+export async function listLoomSummaries({ seriesId: scopeSeriesId } = {}) {
+  const looms = await listLooms();
+  const scoped = scopeSeriesId ? looms.filter((loom) => loom.seriesId === scopeSeriesId) : looms;
+  return scoped.map(({
+    id, name, logline, format, participationMode, audienceCommunicationMedium,
+    universeId, seriesId, createdAt, updatedAt, episodes,
+  }) => ({
+    id,
+    name,
+    logline,
+    format,
+    participationMode,
+    audienceCommunicationMedium,
+    universeId,
+    seriesId,
+    createdAt,
+    updatedAt,
+    episodeCount: episodes.length,
+    sceneCount: episodes.reduce((sum, e) => sum + e.nodes.length, 0),
+    endingCount: episodes.reduce((sum, e) => sum + e.nodes.filter((n) => n.isEnding).length, 0),
+  }));
+}
+
+export async function getLoom(id, { includeDeleted = false } = {}) {
+  if (!isValidLoomId(id)) return null;
+  const loom = sanitizeLoom(await readRaw(id));
+  return loom && (includeDeleted || !loom.deleted) ? loom : null;
+}
+
+const assertParticipationConfigured = ({ participationMode, audienceCommunicationMedium }) => {
+  if (asFableLoomParticipationMode(participationMode) === 'helper'
+    && !trimTo(audienceCommunicationMedium, LOOM_LIMITS.AUDIENCE_COMMUNICATION_MEDIUM_MAX)) {
+    throw new ServerError('Helper stories need an audience communication medium', {
+      status: 400,
+      code: 'AUDIENCE_MEDIUM_REQUIRED',
+    });
+  }
+};
+
+export async function createLoom({
+  name, logline, premise, styleNotes, format, playSettings, renderSettings, seriesPlan,
+  protagonistCharacterId, protagonistWardrobeId, protagonistWardrobeLocked,
+  participationMode = FABLELOOM_LEGACY_PARTICIPATION_MODE,
+  audienceCommunicationMedium, universeId, seriesId,
+} = {}) {
+  const now = new Date().toISOString();
+  assertParticipationConfigured({ participationMode, audienceCommunicationMedium });
+  await assertRefsExist({ universeId: nullableRef(universeId), seriesId: nullableRef(seriesId) });
+  const loom = sanitizeLoom({
+    id: `loom-${randomUUID()}`,
+    name,
+    logline,
+    premise,
+    styleNotes,
+    participationMode,
+    audienceCommunicationMedium,
+    format,
+    playSettings,
+    renderSettings,
+    protagonistCharacterId,
+    protagonistWardrobeId,
+    protagonistWardrobeLocked,
+    seriesPlan,
+    universeId,
+    seriesId,
+    episodes: [],
+    createdAt: now,
+    updatedAt: now,
+  });
+  if (!loom) throw new ServerError('Loom needs a name', { status: 400, code: 'VALIDATION_ERROR' });
+  await writeRaw(loom.id, loom);
+  emitRecordUpdated('fableLoom', loom.id);
+  autoSubscribeRecordToAllPeers('fableLoom', loom.id).catch(() => {});
+  return loom;
+}
+
+/**
+ * Serialized read-modify-write. `mutator(current)` returns the changed record
+ * (or a falsy value to skip the write). The result is re-sanitized before
+ * persisting so a mutation can never store a malformed record.
+ */
+export async function mutateLoom(id, mutator) {
+  if (!isValidLoomId(id)) throw notFound();
+  const result = await queueLoomWrite(id, async () => {
+    const current = await requireLoomRaw(id);
+    const currentEditorialSignature = editorialContentSignature(current);
+    const currentDeliverySignature = deliveryContentSignature(current);
+    const changed = await mutator(current);
+    if (!changed) return { loom: current, changed: false };
+    const next = sanitizeLoom({ ...changed, id, updatedAt: new Date().toISOString() });
+    if (!next) throw new ServerError('Invalid loom record', { status: 400, code: 'VALIDATION_ERROR' });
+    const editorialChanged = editorialContentSignature(next) !== currentEditorialSignature;
+    const deliveryChanged = deliveryContentSignature(next) !== currentDeliverySignature;
+    if (editorialChanged) {
+      next.productionStatus.editorialApprovedAt = null;
+      next.productionStatus.editorialApprovalSource = null;
+      next.productionStatus.deliveryApprovedAt = null;
+    } else if (deliveryChanged) {
+      next.productionStatus.deliveryApprovedAt = null;
+    }
+    await writeRaw(id, next);
+    return { loom: next, changed: true };
+  });
+  if (result.changed) emitRecordUpdated('fableLoom', id);
+  return result.loom;
+}
+
+const PATCH_FIELDS = [
+  'name', 'logline', 'premise', 'styleNotes', 'format', 'playSettings', 'renderSettings', 'seriesPlan',
+  'productionStatus',
+  'protagonistCharacterId', 'protagonistWardrobeId', 'protagonistWardrobeLocked',
+  'participationMode', 'audienceCommunicationMedium', 'universeId', 'seriesId',
+];
+
+const RESTORABLE_FIELDS = [
+  'name', 'logline', 'premise', 'styleNotes', 'format', 'playSettings', 'renderSettings', 'seriesPlan',
+  'productionStatus',
+  'protagonistCharacterId', 'protagonistWardrobeId', 'protagonistWardrobeLocked',
+  'participationMode', 'audienceCommunicationMedium', 'episodes',
+];
+
+export async function updateLoom(id, patch = {}) {
+  await assertRefsExist({
+    universeId: 'universeId' in patch ? nullableRef(patch.universeId) : null,
+    seriesId: 'seriesId' in patch ? nullableRef(patch.seriesId) : null,
+  });
+  return mutateLoom(id, (loom) => {
+    const next = { ...loom };
+    for (const key of PATCH_FIELDS) {
+      if (key in patch) {
+        next[key] = key === 'renderSettings'
+          ? mergeFableLoomRenderSettings(loom.renderSettings, patch[key])
+          : patch[key];
+      }
+    }
+    assertParticipationConfigured(next);
+    return next;
+  });
+}
+
+/** Reapply a conflict snapshot through the normal mutation/push lifecycle. */
+export function restoreLoom(id, patch = {}) {
+  return mutateLoom(id, (loom) => {
+    const next = { ...loom };
+    for (const key of RESTORABLE_FIELDS) {
+      if (key in patch) {
+        next[key] = key === 'renderSettings'
+          ? mergeFableLoomRenderSettings(loom.renderSettings, patch[key])
+          : patch[key];
+      }
+    }
+    assertParticipationConfigured(next);
+    return next;
+  });
+}
+
+export async function deleteLoom(id) {
+  if (!isValidLoomId(id)) throw notFound();
+  await queueLoomWrite(id, async () => {
+    const current = await requireLoomRaw(id);
+    const now = new Date().toISOString();
+    await writeRaw(id, sanitizeLoom({
+      ...current,
+      deleted: true,
+      deletedAt: now,
+      updatedAt: now,
+    }));
+  });
+  emitRecordDeleted('fableLoom', id);
+}
+
+// Episode beat outlines arrived with schema v4, alongside the series delivery
+// plan. A <=v3 sender round-trips the record through an outline-unaware
+// sanitizer, so an absent outline there means "cannot represent" rather than
+// "the author deleted it" — restore the local one whole. A v4 sender knows the
+// outline but not the v5 plot-point/challenge mapping on its scenes, so its
+// outline wins except for those two per-scene fields.
+const preserveLegacyStoryOutline = (episode, localEpisode, senderVersion) => {
+  if (!episode.storyOutline) {
+    return senderVersion < 4 && localEpisode?.storyOutline
+      ? { storyOutline: localEpisode.storyOutline }
+      : {};
+  }
+  if (senderVersion >= 5) return {};
+  const localScenes = new Map((localEpisode?.storyOutline?.scenes || [])
+    .map((scene) => [scene.key, scene]));
+  return {
+    storyOutline: {
+      ...episode.storyOutline,
+      scenes: episode.storyOutline.scenes.map((scene) => ({
+        ...scene,
+        ...(localScenes.has(scene.key) ? {
+          plotPointId: localScenes.get(scene.key).plotPointId,
+          challengePhase: localScenes.get(scene.key).challengePhase,
+        } : {}),
+      })),
+    },
+  };
+};
+
+// The series delivery plan (overnight voicemails, inter-episode voicemails, and
+// the next-season teaser) also arrived with v4. `sanitizeSeriesPlan` omits the
+// three keys entirely when a record predates the feature, so a <=v3 sender that
+// omits them means "cannot represent" and the local plan must survive. A v4+
+// sender that omits them describes a record with genuinely no delivery plan.
+const preserveLegacyDeliveryPlan = (remotePlan, localPlan, senderVersion) => (
+  senderVersion < 4
+    && localPlan
+    && Object.prototype.hasOwnProperty.call(localPlan, 'deliveryOptions')
+    && !Object.prototype.hasOwnProperty.call(remotePlan || {}, 'deliveryOptions')
+    ? {
+      deliveryOptions: localPlan.deliveryOptions,
+      interEpisodeVoicemails: localPlan.interEpisodeVoicemails,
+      nextSeasonTeaser: localPlan.nextSeasonTeaser,
+    }
+    : {}
+);
+
+// The per-character evolution lens (#6440) arrived with v8. `sanitizeSeriesPlan`
+// omits the key entirely when a plan has none, so a <=v7 sender that omits it
+// means "cannot represent" and the local lenses must survive; a v8+ sender that
+// omits it describes a plan whose lenses were genuinely cleared. Same shape as
+// preserveLegacyDeliveryPlan above — without it, one sync from a not-yet-
+// upgraded peer silently drops every authored lens and LWWs the loss back.
+const preserveLegacyCharacterEvolutions = (remotePlan, localPlan, senderVersion) => (
+  senderVersion < 8
+    && localPlan
+    && Object.prototype.hasOwnProperty.call(localPlan, 'characterEvolutions')
+    && !Object.prototype.hasOwnProperty.call(remotePlan || {}, 'characterEvolutions')
+    ? { characterEvolutions: localPlan.characterEvolutions }
+    : {}
+);
+
+// The shared author-owned series brief arrived with v9. A pre-v9 sender's
+// omission means it cannot represent the field; a v9 sender's omission is the
+// wholesale series-plan PATCH clear used by the local editor.
+const preserveLegacySeriesDesign = (remotePlan, localPlan, senderVersion) => (
+  senderVersion < 9
+    && localPlan
+    && Object.prototype.hasOwnProperty.call(localPlan, 'seriesDesign')
+    && !Object.prototype.hasOwnProperty.call(remotePlan || {}, 'seriesDesign')
+    ? { seriesDesign: localPlan.seriesDesign }
+    : {}
+);
+
+// Everything an older sender cannot represent inside `seriesPlan`, in one
+// place: the v4 delivery plan, the v5 plot-point kinds, the v8 evolution
+// lenses, and the v9 series design. Returns `remote` BY REFERENCE when there is
+// nothing to restore, so the common merge allocates no copy.
+const preserveLegacySeriesPlan = (remote, local, senderVersion) => {
+  const evolutions = preserveLegacyCharacterEvolutions(remote, local, senderVersion);
+  const seriesDesign = preserveLegacySeriesDesign(remote, local, senderVersion);
+  if (senderVersion >= 5) {
+    return evolutions.characterEvolutions || seriesDesign.seriesDesign !== undefined
+      ? { ...remote, ...evolutions, ...seriesDesign }
+      : remote;
+  }
+  const localPlotPoints = new Map((local?.plotPoints || []).map((item) => [item.id, item]));
+  return {
+    ...remote,
+    ...preserveLegacyDeliveryPlan(remote, local, senderVersion),
+    plotPoints: (remote?.plotPoints || []).map((item) => ({
+      ...item,
+      ...(localPlotPoints.has(item.id) ? { kind: localPlotPoints.get(item.id).kind } : {}),
+    })),
+    // Last, so the key lands where `sanitizeSeriesPlan` puts it — this merge
+    // result is persisted without a re-sanitize.
+    ...evolutions,
+    ...seriesDesign,
+  };
+};
+
+// An older peer cannot represent newer scene production fields. When that
+// peer wins whole-record LWW after an unrelated edit, retain the local fields
+// on nodes that still exist instead of letting its unaware sanitizer clear
+// them. A sender at the current schema version's present null remains an
+// intentional clear.
+const preserveLegacyVisualProduction = (remote, local, senderVersion) => {
+  if (!local || senderVersion >= 9) return remote;
+  const seriesPlan = preserveLegacySeriesPlan(remote.seriesPlan, local.seriesPlan, senderVersion);
+  // A v7/v8 sender's only unrepresentable plan fields are restored above —
+  // every branch below is gated at <7 or lower. Returning early keeps the
+  // dominant legacy path off the O(episodes x nodes) rebuild it would all skip.
+  if (senderVersion >= 7) {
+    return seriesPlan === remote.seriesPlan ? remote : { ...remote, seriesPlan };
+  }
+  const localEpisodes = new Map(local.episodes.map((episode) => [episode.id, episode]));
+  return {
+    ...remote,
+    ...(senderVersion < 6 ? {
+      // v5 peers understand the aspect-ratio format but would strip the
+      // provider/model preferences added in v6 during an unrelated update.
+      renderSettings: senderVersion < 5 ? local.renderSettings : {
+        ...remote.renderSettings,
+        ...Object.fromEntries(FABLELOOM_RENDER_PREFERENCE_KEYS
+          .filter((key) => Object.prototype.hasOwnProperty.call(local.renderSettings, key))
+          .map((key) => [key, local.renderSettings[key]])),
+      },
+    } : {}),
+    ...(senderVersion < 5 ? {
+      productionStatus: local.productionStatus,
+    } : {}),
+    seriesPlan,
+    ...(senderVersion < 4 ? {
+      protagonistCharacterId: local.protagonistCharacterId,
+      protagonistWardrobeId: local.protagonistWardrobeId,
+      protagonistWardrobeLocked: local.protagonistWardrobeLocked,
+    } : {}),
+    episodes: remote.episodes.map((episode) => {
+      const localEpisode = localEpisodes.get(episode.id);
+      const localNodes = new Map((localEpisode?.nodes || []).map((node) => [node.id, node]));
+      return {
+        ...episode,
+        ...preserveLegacyStoryOutline(episode, localEpisode, senderVersion),
+        nodes: episode.nodes.map((node) => {
+          const localNode = localNodes.get(node.id);
+          return localNode ? {
+            ...node,
+            ...(senderVersion < 7 ? {
+              ...(localNode.shot ? { shot: localNode.shot } : {}),
+              ...(senderVersion >= 3 && node.visualCanon ? {
+                visualCanon: {
+                  ...node.visualCanon,
+                  characterAppearances: node.visualCanon.characterAppearances.map((appearance) => {
+                    const previous = localNode.visualCanon?.characterAppearances.find((item) => item.characterId === appearance.characterId);
+                    return previous?.referenceImage ? { ...appearance, referenceImage: previous.referenceImage } : appearance;
+                  }),
+                },
+              } : {}),
+            } : {}),
+            ...(senderVersion < 5 ? {
+              plotPointId: localNode.plotPointId,
+              challengePhase: localNode.challengePhase,
+            } : {}),
+            ...(senderVersion < 4 ? { protagonistPresence: localNode.protagonistPresence } : {}),
+            ...(senderVersion < 3 ? {
+              visualCanon: localNode.visualCanon,
+              visualConditioning: localNode.visualConditioning,
+              playbackAssets: {
+                ...node.playbackAssets,
+                ...(localNode.playbackAssets?.visualConditioningByAsset
+                  ? { visualConditioningByAsset: localNode.playbackAssets.visualConditioningByAsset }
+                  : {}),
+              },
+            } : {}),
+          } : node;
+        }),
+      };
+    }),
+  };
+};
+
+/**
+ * Merge FableLoom records received from a federated peer. Records are
+ * sanitized before persistence, unioned by id, and resolved by whole-record
+ * LWW on `updatedAt`; tombstones travel through the same path.
+ */
+export async function mergeLoomsFromSync(
+  remoteLooms,
+  {
+    source = { via: 'sync', peerId: null },
+    senderSchemaVersions = { fableLoom: 9 },
+  } = {},
+) {
+  if (!Array.isArray(remoteLooms)) return { applied: false, count: 0 };
+  const byId = new Map();
+  for (const raw of remoteLooms) {
+    const remote = sanitizeLoom(raw);
+    if (!remote || !isValidLoomId(remote.id) || byId.has(remote.id)) continue;
+    byId.set(remote.id, remote);
+  }
+  let changed = 0;
+  for (const remote of byId.values()) {
+    const applied = await queueLoomWrite(remote.id, async () => {
+      const local = sanitizeLoom(await readRaw(remote.id));
+      if (local && !compareNewerWins(remote.updatedAt, local.updatedAt)) return false;
+      const merged = preserveLegacyVisualProduction(
+        remote,
+        local,
+        Number(senderSchemaVersions?.fableLoom) || 0,
+      );
+      if (local) {
+        await maybeJournalBeforeOverwrite({
+          kind: 'fableLoom', id: remote.id, local, remote: merged, source,
+        });
+      } else {
+        await setSyncBaseHash(
+          'fableLoom',
+          merged.id,
+          contentHashForRecord('fableLoom', merged),
+        );
+      }
+      await writeRaw(merged.id, merged);
+      return true;
+    });
+    if (applied) changed += 1;
+  }
+  await flushBaseHashes();
+  if (changed > 0) console.log(`🧶 FableLoom sync: merged ${changed} loom(s)`);
+  return { applied: changed > 0, count: changed };
+}
+
+/** Hard-prune tombstones only after the shared federation GC computes a safe cutoff. */
+export async function pruneTombstonedLooms(olderThanMs) {
+  if (!Number.isFinite(olderThanMs)) return { pruned: 0 };
+  // Id-only candidate scan — SQL projection on Postgres, hydrate+filter on the
+  // file escape hatch. The sweep almost never finds a tombstone, so this must
+  // not pay for every loom's JSONB body (episode graphs included) just to
+  // find zero candidates. The authoritative re-check inside each per-id queue
+  // below still re-reads and re-sanitizes the record.
+  const candidateIds = await listTombstoneIdsBefore(olderThanMs);
+  let pruned = 0;
+  await withBaseHashFlushBatch(async () => {
+    for (const id of candidateIds) {
+      const removed = await queueLoomWrite(id, async () => {
+        const current = sanitizeLoom(await readRaw(id));
+        const deletedAtMs = Date.parse(current?.deletedAt || '');
+        if (!current?.deleted || !Number.isFinite(deletedAtMs) || deletedAtMs >= olderThanMs) return false;
+        await deleteRaw(id);
+        await deleteSyncBaseHash('fableLoom', id);
+        return true;
+      });
+      if (removed) pruned += 1;
+    }
+  });
+  return { pruned };
+}
+
+// --- Episodes ---------------------------------------------------------------
+
+export const findEpisode = (loom, episodeId) => {
+  const episode = loom.episodes.find((e) => e.id === episodeId);
+  if (!episode) throw notFound('Episode');
+  return episode;
+};
+
+export const findNode = (episode, nodeId) => {
+  const node = episode.nodes.find((n) => n.id === nodeId);
+  if (!node) throw notFound('Scene');
+  return node;
+};
+
+export const findTransition = (node, transitionId) => {
+  const transition = (node.transitions || []).find((t) => t.id === transitionId);
+  if (!transition) throw notFound('Path');
+  return transition;
+};
+
+export function addEpisode(loomId, { title, synopsis } = {}) {
+  return mutateLoom(loomId, (loom) => {
+    if (loom.episodes.length >= LOOM_LIMITS.EPISODES_MAX) {
+      throw new ServerError('Episode limit reached', { status: 400, code: 'LIMIT_REACHED' });
+    }
+    const now = new Date().toISOString();
+    const number = loom.episodes.reduce((max, e) => Math.max(max, e.number), 0) + 1;
+    loom.episodes.push({
+      id: `ep-${randomUUID()}`,
+      number,
+      title,
+      synopsis,
+      startNodeId: null,
+      nodes: [],
+      createdAt: now,
+      updatedAt: now,
+    });
+    return loom;
+  });
+}
+
+export function updateEpisode(loomId, episodeId, patch = {}) {
+  return mutateLoom(loomId, (loom) => {
+    const episode = findEpisode(loom, episodeId);
+    for (const key of ['title', 'synopsis', 'number', 'startNodeId']) {
+      if (key in patch) episode[key] = patch[key];
+    }
+    if ('storyOutline' in patch) {
+      episode.storyOutline = patch.storyOutline
+        ? { ...patch.storyOutline, validation: { status: 'draft', issues: [] } }
+        : null;
+    } else if (('title' in patch || 'synopsis' in patch) && episode.storyOutline) {
+      // A changed synopsis or title can change the dramatic contract the
+      // outline was validated against, so expansion must pass through the
+      // outline validation step again.
+      episode.storyOutline.validation = { status: 'draft', issues: [] };
+    }
+    episode.updatedAt = new Date().toISOString();
+    return loom;
+  });
+}
+
+export function deleteEpisode(loomId, episodeId) {
+  return mutateLoom(loomId, (loom) => {
+    findEpisode(loom, episodeId);
+    loom.episodes = loom.episodes.filter((e) => e.id !== episodeId);
+    return loom;
+  });
+}
+
+// --- Nodes & transitions ----------------------------------------------------
+
+const NODE_PATCH_FIELDS = [
+  'shot',
+  'title', 'prose', 'plotPointId', 'challengePhase', 'imagePrompt', 'videoPrompt', 'cameraMovement', 'playbackMode',
+  'audienceConnection', 'protagonistPresence', 'visualCanon', 'videoHistoryId', 'playbackAssets', 'interactionWindow',
+  'isEnding', 'endingLabel', 'pos', 'transitions',
+];
+
+export function addNode(loomId, episodeId, fields = {}) {
+  return mutateLoom(loomId, (loom) => {
+    const episode = findEpisode(loom, episodeId);
+    if (episode.nodes.length >= LOOM_LIMITS.NODES_MAX) {
+      throw new ServerError('Scene limit reached', { status: 400, code: 'LIMIT_REACHED' });
+    }
+    const node = { id: `node-${randomUUID()}`, ...fields };
+    if (asFableLoomParticipationMode(loom.participationMode) === 'helper'
+      && asFableLoomAudienceConnection(fields.audienceConnection) !== 'connected'
+      && !('playbackMode' in fields)) {
+      node.playbackMode = 'cut';
+    }
+    episode.nodes.push(node);
+    if (!episode.startNodeId) episode.startNodeId = node.id;
+    // Optionally wire the new node in as a branch of an existing one. The
+    // sanitizer mints the transition id and fills triggers/description.
+    if (isStr(fields.fromNodeId)) {
+      const from = episode.nodes.find((n) => n.id === fields.fromNodeId);
+      if (from) {
+        from.transitions = [...(from.transitions || []), { targetNodeId: node.id, intent: fields.fromIntent }];
+      }
+    }
+    episode.updatedAt = new Date().toISOString();
+    return loom;
+  });
+}
+
+export function updateNode(loomId, episodeId, nodeId, patch = {}) {
+  return mutateLoom(loomId, (loom) => {
+    const episode = findEpisode(loom, episodeId);
+    const node = findNode(episode, nodeId);
+    for (const key of NODE_PATCH_FIELDS) {
+      if (key in patch) node[key] = patch[key];
+    }
+    episode.updatedAt = new Date().toISOString();
+    return loom;
+  });
+}
+
+export function deleteNode(loomId, episodeId, nodeId) {
+  return mutateLoom(loomId, (loom) => {
+    const episode = findEpisode(loom, episodeId);
+    if (!episode.nodes.some((n) => n.id === nodeId)) throw notFound('Scene');
+    episode.nodes = episode.nodes.filter((n) => n.id !== nodeId);
+    // Strip inbound edges so deleting a scene never leaves dangling paths.
+    for (const node of episode.nodes) {
+      node.transitions = (node.transitions || []).filter((t) => t.targetNodeId !== nodeId);
+    }
+    if (episode.startNodeId === nodeId) episode.startNodeId = episode.nodes[0]?.id ?? null;
+    episode.updatedAt = new Date().toISOString();
+    return loom;
+  });
+}
+
+// --- Transitions as sub-resources -------------------------------------------
+//
+// The whole-array `transitions` key on the node PATCH still works (the
+// sanitizer owns it, and an older client or a peer on a previous version keeps
+// using it). These three add/edit/drop ONE edge, so a second writer — a voice
+// action, a CoS agent, the AI branch lane — no longer has to replay the whole
+// array off a snapshot that may already be stale.
+
+const TRANSITION_PATCH_FIELDS = ['targetNodeId', 'intent', 'triggers', 'description'];
+
+// The sanitizer re-runs on every write, so the row that comes back out is the
+// one that actually persisted (id, trimmed fields, capped triggers) — not the
+// input echoed back.
+const readTransition = (loom, episodeId, nodeId, transitionId) =>
+  loom.episodes.find((e) => e.id === episodeId)
+    ?.nodes.find((n) => n.id === nodeId)
+    ?.transitions.find((t) => t.id === transitionId) ?? null;
+
+/**
+ * Add one path out of a scene. The id is minted here rather than inside the
+ * sanitizer so the caller can read the stored row back out by it — that is the
+ * whole point of the sub-resource: the client knows the id at create time and
+ * never has to reconcile server-minted ids into locally-added rows.
+ */
+export async function addNodeTransition(loomId, episodeId, nodeId, fields = {}) {
+  const id = `tr-${randomUUID()}`;
+  const loom = await mutateLoom(loomId, (record) => {
+    const episode = findEpisode(record, episodeId);
+    const node = findNode(episode, nodeId);
+    if ((node.transitions || []).length >= LOOM_LIMITS.TRANSITIONS_MAX) {
+      throw new ServerError('Path limit reached', { status: 400, code: 'LIMIT_REACHED' });
+    }
+    node.transitions = [...(node.transitions || []), { ...fields, id }];
+    episode.updatedAt = new Date().toISOString();
+    return record;
+  });
+  return { loom, transition: readTransition(loom, episodeId, nodeId, id) };
+}
+
+export function updateNodeTransition(loomId, episodeId, nodeId, transitionId, patch = {}) {
+  return mutateLoom(loomId, (record) => {
+    const episode = findEpisode(record, episodeId);
+    const transition = findTransition(findNode(episode, nodeId), transitionId);
+    for (const key of TRANSITION_PATCH_FIELDS) {
+      if (key in patch) transition[key] = patch[key];
+    }
+    episode.updatedAt = new Date().toISOString();
+    return record;
+  });
+}
+
+export function deleteNodeTransition(loomId, episodeId, nodeId, transitionId) {
+  return mutateLoom(loomId, (record) => {
+    const episode = findEpisode(record, episodeId);
+    const node = findNode(episode, nodeId);
+    findTransition(node, transitionId);
+    node.transitions = node.transitions.filter((t) => t.id !== transitionId);
+    episode.updatedAt = new Date().toISOString();
+    return record;
+  });
+}
+
+/**
+ * Durable image attach for the media-job completion hook: files a finished
+ * render onto its node, even when the editor unmounted mid-render. Returns the
+ * updated node (or null when the loom/episode/node has since been deleted —
+ * the hook logs and moves on rather than erroring).
+ */
+export async function attachNodeImage(loomId, episodeId, nodeId, { filename, jobId, visualConditioning = null }) {
+  if (!isValidLoomId(loomId) || !isSafeImageFilename(filename)) return null;
+  const updated = await mutateLoom(loomId, (loom) => {
+    const episode = loom.episodes.find((e) => e.id === episodeId);
+    const node = episode?.nodes.find((n) => n.id === nodeId);
+    if (!node) return null;
+    node.image = filename;
+    node.imageJobId = isStr(jobId) ? jobId : null;
+    node.visualConditioning = visualConditioning;
+    const retainedConditioning = Object.fromEntries(Object.entries(
+      node.playbackAssets?.visualConditioningByAsset || {},
+    ).filter(([, manifest]) => manifest?.capability?.kind !== 'image'));
+    if (node.playbackAssets) {
+      node.playbackAssets = {
+        ...node.playbackAssets,
+        ...(Object.keys(retainedConditioning).length
+          ? { visualConditioningByAsset: retainedConditioning }
+          : {}),
+      };
+      if (!Object.keys(retainedConditioning).length) delete node.playbackAssets.visualConditioningByAsset;
+    }
+    if (visualConditioning && isSafeVideoHistoryId(visualConditioning.assetId)) {
+      node.playbackAssets = {
+        ...(node.playbackAssets || {}),
+        visualConditioningByAsset: {
+          ...(node.playbackAssets?.visualConditioningByAsset || {}),
+          [visualConditioning.assetId]: visualConditioning,
+        },
+      };
+    }
+    if (node.visualCanon) node.visualCanon.storyboardImageApproved = false;
+    episode.updatedAt = new Date().toISOString();
+    return loom;
+  }).catch(() => null);
+  return updated?.episodes.find((e) => e.id === episodeId)?.nodes.find((n) => n.id === nodeId) ?? null;
+}
+
+/**
+ * Durable video attach for the media-job completion hook. Video history ids
+ * are also the generated filenames under data/videos, but are kept as ids so
+ * the node can use the same history/media conventions as other video surfaces.
+ */
+export async function attachNodeVideo(loomId, episodeId, nodeId, { videoHistoryId, visualConditioning = null }) {
+  if (!isValidLoomId(loomId) || !isSafeVideoHistoryId(videoHistoryId)) return null;
+  const updated = await mutateLoom(loomId, (loom) => {
+    const episode = loom.episodes.find((e) => e.id === episodeId);
+    const node = episode?.nodes.find((n) => n.id === nodeId);
+    if (!node) return null;
+    node.videoHistoryId = videoHistoryId;
+    node.visualConditioning = visualConditioning;
+    episode.updatedAt = new Date().toISOString();
+    return loom;
+  }).catch(() => null);
+  return updated?.episodes.find((e) => e.id === episodeId)?.nodes.find((n) => n.id === nodeId) ?? null;
+}
+
+/**
+ * Attach a typed playback asset (entry clip, hold loop, or transition exit) onto
+ * a node with optional audio occupancy manifest and provenance.
+ */
+export async function attachNodePlaybackAsset(loomId, episodeId, nodeId, {
+  role = 'entry',
+  videoHistoryId,
+  transitionId = null,
+  audioOccupancy = null,
+  provenance = null,
+  visualConditioning = null,
+} = {}) {
+  if (!isValidLoomId(loomId) || !isSafeVideoHistoryId(videoHistoryId)) return null;
+  const updated = await mutateLoom(loomId, (loom) => {
+    const episode = loom.episodes.find((e) => e.id === episodeId);
+    const node = episode?.nodes.find((n) => n.id === nodeId);
+    if (!node) return null;
+
+    const currentAssets = node.playbackAssets || {
+      entryVideoHistoryId: null,
+      holdLoopVideoHistoryIds: [],
+      exitByTransition: {},
+      audioOccupancy: {},
+    };
+
+    const nextAssets = {
+      ...currentAssets,
+      exitByTransition: { ...(currentAssets.exitByTransition || {}) },
+      audioOccupancy: { ...(currentAssets.audioOccupancy || {}) },
+      holdLoopVideoHistoryIds: [...(currentAssets.holdLoopVideoHistoryIds || [])],
+      visualConditioningByAsset: { ...(currentAssets.visualConditioningByAsset || {}) },
+    };
+
+    if (role === 'entry') {
+      nextAssets.entryVideoHistoryId = videoHistoryId;
+      node.videoHistoryId = videoHistoryId;
+    } else if (role === 'hold') {
+      if (!nextAssets.holdLoopVideoHistoryIds.includes(videoHistoryId)) {
+        nextAssets.holdLoopVideoHistoryIds.push(videoHistoryId);
+      }
+      if (!node.videoHistoryId) node.videoHistoryId = videoHistoryId;
+    } else if (role === 'exit' && isStr(transitionId)) {
+      nextAssets.exitByTransition[transitionId] = videoHistoryId;
+    }
+
+    if (audioOccupancy) {
+      nextAssets.audioOccupancy[videoHistoryId] = audioOccupancy;
+    }
+    if (provenance) {
+      nextAssets.provenance = provenance;
+    }
+    if (visualConditioning) {
+      nextAssets.visualConditioningByAsset[videoHistoryId] = visualConditioning;
+      node.visualConditioning = visualConditioning;
+    }
+
+    node.playbackAssets = nextAssets;
+    episode.updatedAt = new Date().toISOString();
+    return loom;
+  }).catch(() => null);
+
+  return updated?.episodes.find((e) => e.id === episodeId)?.nodes.find((n) => n.id === nodeId) ?? null;
+}

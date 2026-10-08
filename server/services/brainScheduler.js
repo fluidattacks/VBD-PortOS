@@ -1,0 +1,181 @@
+/**
+ * Brain Scheduler Service
+ *
+ * Manages scheduled jobs for the Brain feature:
+ * - Daily digest generation (default midnight)
+ * - Weekly review generation (default Sunday midnight)
+ *
+ * Handles catch-up logic for missed runs (max 1 per type)
+ */
+
+import * as storage from './brainStorage.js';
+import { runDailyDigest, runWeeklyReview } from './brain.js';
+
+let schedulerInterval = null;
+let lastCheckTime = null;
+const CHECK_INTERVAL_MS = 60000; // Check every minute
+const FAILURE_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes cooldown after failure
+
+// Track failures to prevent retry spam
+let lastDailyFailure = null;
+let lastWeeklyFailure = null;
+
+// Track in-flight runs to prevent overlapping calls
+let dailyRunning = false;
+let weeklyRunning = false;
+
+// Day name to number mapping
+const DAY_MAP = {
+  sunday: 0,
+  monday: 1,
+  tuesday: 2,
+  wednesday: 3,
+  thursday: 4,
+  friday: 5,
+  saturday: 6
+};
+
+/**
+ * Parse time string (HH:MM) to hours and minutes
+ */
+function parseTime(timeStr) {
+  const [hours, minutes] = timeStr.split(':').map(Number);
+  return { hours, minutes };
+}
+
+/**
+ * Check if it's time for daily digest
+ */
+function isDailyDigestTime(settings, now) {
+  const { hours, minutes } = parseTime(settings.dailyDigestTime);
+  return now.getHours() === hours && now.getMinutes() === minutes;
+}
+
+/**
+ * Check if it's time for weekly review
+ */
+function isWeeklyReviewTime(settings, now) {
+  const { hours, minutes } = parseTime(settings.weeklyReviewTime);
+  const targetDay = DAY_MAP[settings.weeklyReviewDay];
+  return now.getDay() === targetDay &&
+         now.getHours() === hours &&
+         now.getMinutes() === minutes;
+}
+
+/**
+ * Check if we're in cooldown after a failure
+ */
+function isInCooldown(lastFailure, now) {
+  if (!lastFailure) return false;
+  return (now.getTime() - lastFailure.getTime()) < FAILURE_COOLDOWN_MS;
+}
+
+/**
+ * Check if daily digest was missed (should have run today but didn't)
+ */
+function isDailyDigestMissed(settings, now) {
+  // Don't re-trigger while already running
+  if (dailyRunning) return false;
+  // Respect cooldown after failure
+  if (isInCooldown(lastDailyFailure, now)) return false;
+
+  const { hours, minutes } = parseTime(settings.dailyDigestTime);
+
+  // Create target time for today
+  const todayTarget = new Date(now);
+  todayTarget.setHours(hours, minutes, 0, 0);
+
+  // Only consider catch-up if we're past today's target time
+  if (now <= todayTarget) return false;
+
+  // Never run before — catch up now
+  if (!settings.lastDailyDigest) return true;
+
+  // Last run was before today — catch up
+  const lastRun = new Date(settings.lastDailyDigest);
+  return lastRun.toDateString() !== now.toDateString();
+}
+
+/**
+ * Check if weekly review was missed
+ */
+function isWeeklyReviewMissed(settings, now) {
+  // Don't re-trigger while already running
+  if (weeklyRunning) return false;
+  // Respect cooldown after failure
+  if (isInCooldown(lastWeeklyFailure, now)) return false;
+
+  // Never run before — catch up now
+  if (!settings.lastWeeklyReview) return true;
+
+  const lastRun = new Date(settings.lastWeeklyReview);
+  const daysSinceLastRun = Math.floor((now - lastRun) / (24 * 60 * 60 * 1000));
+
+  // If more than 7 days since last run, we missed one
+  return daysSinceLastRun > 7;
+}
+
+/**
+ * Run the scheduler check
+ */
+async function checkSchedule() {
+  const now = new Date();
+  const settings = await storage.loadMeta();
+
+  // Avoid running multiple times in the same minute
+  const currentMinute = `${now.getFullYear()}-${now.getMonth()}-${now.getDate()}-${now.getHours()}-${now.getMinutes()}`;
+  if (lastCheckTime === currentMinute) return;
+  lastCheckTime = currentMinute;
+
+  // Check for daily digest
+  if (!dailyRunning && (isDailyDigestTime(settings, now) || isDailyDigestMissed(settings, now))) {
+    const isCatchUp = !isDailyDigestTime(settings, now);
+    console.log(`🧠 Scheduler: Running ${isCatchUp ? 'missed ' : ''}daily digest${isCatchUp ? ' (catch-up)' : ''}...`);
+    dailyRunning = true;
+    runDailyDigest()
+      .catch(err => {
+        lastDailyFailure = new Date();
+        console.error(`🧠 Scheduler: ${isCatchUp ? 'Catch-up d' : 'D'}aily digest failed: ${err.message}${isCatchUp ? ' (retry in 30min)' : ''}`);
+      })
+      .finally(() => { dailyRunning = false; });
+  }
+
+  // Check for weekly review
+  if (!weeklyRunning && (isWeeklyReviewTime(settings, now) || isWeeklyReviewMissed(settings, now))) {
+    const isCatchUp = !isWeeklyReviewTime(settings, now);
+    console.log(`🧠 Scheduler: Running ${isCatchUp ? 'missed ' : ''}weekly review${isCatchUp ? ' (catch-up)' : ''}...`);
+    weeklyRunning = true;
+    runWeeklyReview()
+      .catch(err => {
+        lastWeeklyFailure = new Date();
+        console.error(`🧠 Scheduler: ${isCatchUp ? 'Catch-up w' : 'W'}eekly review failed: ${err.message}${isCatchUp ? ' (retry in 30min)' : ''}`);
+      })
+      .finally(() => { weeklyRunning = false; });
+  }
+}
+
+/**
+ * Start the Brain scheduler
+ */
+export function startBrainScheduler() {
+  if (schedulerInterval) {
+    console.log('🧠 Scheduler: Already running');
+    return;
+  }
+
+  console.log('🧠 Scheduler: Starting Brain scheduler...');
+
+  // Run initial check
+  checkSchedule().catch(err => {
+    console.error(`🧠 Scheduler: Initial check failed: ${err.message}`);
+  });
+
+  // Set up interval
+  schedulerInterval = setInterval(() => {
+    checkSchedule().catch(err => {
+      console.error(`🧠 Scheduler: Check failed: ${err.message}`);
+    });
+  }, CHECK_INTERVAL_MS);
+
+  console.log('🧠 Scheduler: Brain scheduler started');
+}

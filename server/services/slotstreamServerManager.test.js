@@ -1,0 +1,402 @@
+import { mkdir, mkdtemp, rm, writeFile } from 'fs/promises';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'vitest';
+
+// The manager reaches settings through a dynamic `import('./settings.js')` for
+// both the saved launch line and the idle window. Backing it with an in-memory
+// store keeps the launch-line round-trip (start → persist → status) assertable
+// without the suite reading or writing an install's real settings file.
+const settingsStore = vi.hoisted(() => ({ current: {} }));
+vi.mock('./settings.js', () => ({
+  getSettings: async () => settingsStore.current,
+  updateSettingsWith: async (mutate) => {
+    settingsStore.current = await mutate(settingsStore.current);
+    return settingsStore.current;
+  },
+}));
+
+import {
+  getSlotstreamServerStatus,
+  startSlotstreamServer,
+  stopSlotstreamServer,
+  installSlotstream,
+  _resetSlotstreamServerStateForTests,
+  ensureSlotstreamRunning,
+  isSlotstreamProvider,
+  slotstreamCachedModelIds,
+  SLOTSTREAM_APP,
+} from './slotstreamServerManager.js';
+import * as processEnv from '../lib/processEnv.js';
+import * as platform from '../lib/platform.js';
+import * as openAiModelsProbe from '../lib/openAiModelsProbe.js';
+import * as slotstreamModels from '../lib/slotstreamModels.js';
+import * as pm2Module from './pm2.js';
+import * as commandExistsModule from '../lib/commandExists.js';
+import * as streamingSpawn from '../lib/streamingSpawn.js';
+import { PORTS } from '../lib/ports.js';
+
+const BINARY = '/opt/homebrew/bin/slotstream';
+const cachedModel = (id) => ({ id, path: `/tmp/${id}` });
+const FAST_TIMING = {
+  startupWait: 50,
+  startupPoll: 0,
+  relaunchReadyTimeout: 30,
+  relaunchPoll: 0,
+};
+const resetForTest = (overrides = {}) => {
+  _resetSlotstreamServerStateForTests({ ...FAST_TIMING, ...overrides });
+};
+
+describe('slotstreamServerManager', () => {
+  let pm2State = null;
+  let execPm2Calls = [];
+  let testLogDir = null;
+
+  beforeEach(async () => {
+    testLogDir = await mkdtemp(join(tmpdir(), 'portos-slotstream-test-'));
+    resetForTest({
+      logFiles: {
+        stdout: join(testLogDir, 'portos-slotstream-out.log'),
+        stderr: join(testLogDir, 'portos-slotstream-error.log'),
+      },
+    });
+    vi.restoreAllMocks();
+    pm2State = null;
+    execPm2Calls = [];
+    settingsStore.current = {};
+
+    vi.spyOn(platform, 'isPortInUse').mockResolvedValue(false);
+    vi.spyOn(openAiModelsProbe, 'probeOpenAiModels')
+      .mockImplementation(async () => ({ reachable: pm2State?.status === 'online' }));
+    vi.spyOn(platform, 'isAppleSilicon').mockReturnValue(true);
+    vi.spyOn(pm2Module, 'getSavedProcessNames').mockResolvedValue([]);
+    vi.spyOn(slotstreamModels, 'listSlotstreamCachedModels').mockResolvedValue({
+      models: [cachedModel('qwen-moe')],
+      error: null,
+    });
+
+    vi.spyOn(pm2Module, 'execPm2').mockImplementation(async (args) => {
+      execPm2Calls.push(args);
+      if (args[0] === 'start') {
+        const nameIdx = args.indexOf('--name');
+        const dashIdx = args.indexOf('--');
+        pm2State = {
+          name: nameIdx !== -1 ? args[nameIdx + 1] : args[1],
+          status: 'online',
+          pid: 4242,
+          args: dashIdx !== -1 ? args.slice(dashIdx + 1) : [],
+        };
+      }
+      if (args[0] === 'delete') pm2State = null;
+      return { stdout: '', stderr: '' };
+    });
+    vi.spyOn(pm2Module, 'getAppStatusStrict').mockImplementation(async (name) => (
+      pm2State && pm2State.name === name ? pm2State : { name, status: 'not_found', pm2_env: null }
+    ));
+    vi.spyOn(pm2Module, 'clearJlistCache').mockImplementation(() => {});
+  });
+
+  afterEach(async () => {
+    _resetSlotstreamServerStateForTests();
+    vi.restoreAllMocks();
+    await rm(testLogDir, { recursive: true, force: true });
+    testLogDir = null;
+  });
+
+  describe('getSlotstreamServerStatus', () => {
+    it('reports not installed when the binary is not on PATH', async () => {
+      vi.spyOn(processEnv, 'findCommandOnPath').mockReturnValue(null);
+      const status = await getSlotstreamServerStatus();
+      expect(status.installed).toBe(false);
+      expect(status.running).toBe(false);
+      expect(status.cacheError).toBeNull();
+      expect(status.memoryPlan).toEqual(expect.objectContaining({
+        targetGb: expect.any(Number),
+        expectedPeakGb: expect.any(Number),
+        expectedWarmDecodeToks: expect.any(Number),
+      }));
+    });
+
+    it('surfaces the cached checkpoints an installed Slotstream can be started on', async () => {
+      vi.spyOn(processEnv, 'findCommandOnPath').mockReturnValue(BINARY);
+      const status = await getSlotstreamServerStatus();
+      expect(status.installed).toBe(true);
+      expect(status.cachedModels).toEqual(['qwen-moe']);
+      expect(status.endpoint).toBe(`http://127.0.0.1:${PORTS.SLOTSTREAM}/v1`);
+    });
+
+    it('reports the platform gate only when nothing is installed here', async () => {
+      vi.spyOn(platform, 'isAppleSilicon').mockReturnValue(false);
+      vi.spyOn(processEnv, 'findCommandOnPath').mockReturnValue(null);
+      expect((await getSlotstreamServerStatus()).supported).toBe(false);
+
+      vi.spyOn(processEnv, 'findCommandOnPath').mockReturnValue(BINARY);
+      const installed = await getSlotstreamServerStatus();
+      expect(installed.supported).toBe(true);
+      expect(installed.unsupportedReason).toBeNull();
+    });
+
+    it('flags the process as boot-persisted only when the PM2 dump names it', async () => {
+      vi.spyOn(processEnv, 'findCommandOnPath').mockReturnValue(BINARY);
+      expect((await getSlotstreamServerStatus()).runAtStartup).toBe(false);
+      vi.spyOn(pm2Module, 'getSavedProcessNames').mockResolvedValue([SLOTSTREAM_APP]);
+      expect((await getSlotstreamServerStatus()).runAtStartup).toBe(true);
+    });
+  });
+
+  describe('startSlotstreamServer', () => {
+    beforeEach(() => {
+      vi.spyOn(processEnv, 'findCommandOnPath').mockReturnValue(BINARY);
+    });
+
+    it('starts `slotstream serve` under PM2 on a cached checkpoint with an explicit port', async () => {
+      const result = await startSlotstreamServer();
+      expect(result.success).toBe(true);
+      expect(result.managed).toBe(true);
+      expect(result.endpoint).toBe(`http://127.0.0.1:${PORTS.SLOTSTREAM}/v1`);
+
+      const start = execPm2Calls.find((args) => args[0] === 'start');
+      expect(start[start.indexOf('--name') + 1]).toBe(SLOTSTREAM_APP);
+      const launch = start.slice(start.indexOf('--') + 1);
+      expect(launch[0]).toBe('serve');
+      expect(launch[launch.indexOf('--port') + 1]).toBe(String(PORTS.SLOTSTREAM));
+      expect(launch).toContain('--memory-gb');
+      expect(launch).toContain('--model');
+      expect(launch[launch.indexOf('--model') + 1]).toBe('qwen-moe');
+    });
+
+    it('persists an explicit memory-cap override on the launch line', async () => {
+      const result = await startSlotstreamServer({ memoryGb: 22 });
+      const launch = execPm2Calls.find((a) => a[0] === 'start');
+      expect(launch[launch.indexOf('--memory-gb') + 1]).toBe('22');
+      expect(result.config.memoryGb).toBe(22);
+      expect(result.memoryPlan.auto).toBe(false);
+    });
+
+    it('saves the cap an explicit start used, so the on-demand restart replays it', async () => {
+      // Started from the card WITHOUT pressing "Save configuration": before the
+      // launch line was persisted here, the idle reaper's restart re-sized from
+      // host RAM and silently discarded the cap the user chose.
+      await startSlotstreamServer({ memoryGb: 22 });
+      expect(settingsStore.current.localLlm.slotstream.launch.memoryGb).toBe(22);
+
+      await stopSlotstreamServer();
+      execPm2Calls = [];
+      await ensureSlotstreamRunning();
+      const relaunch = execPm2Calls.find((a) => a[0] === 'start');
+      expect(relaunch[relaunch.indexOf('--memory-gb') + 1]).toBe('22');
+    });
+
+    it('records an auto-sized start as auto, not as a cap the user chose', async () => {
+      // `--memory-gb` is on the launch line either way, so the saved override is
+      // the only thing that can tell them apart — reading the arg back would
+      // report every auto start as an explicit cap.
+      await startSlotstreamServer();
+      expect(settingsStore.current.localLlm.slotstream.launch.memoryGb).toBeNull();
+      expect((await getSlotstreamServerStatus()).memoryPlan.auto).toBe(true);
+    });
+
+    it('refuses Ollama\'s default port instead of colliding with a managed Ollama', async () => {
+      const err = await startSlotstreamServer({ port: 11434 }).catch((e) => e);
+      expect(err.message).toMatch(/11434/);
+      expect(err.message).toMatch(/Ollama/);
+      expect(execPm2Calls.some((args) => args[0] === 'start')).toBe(false);
+    });
+
+    it('refuses with an in-app fix when the cache was read and is empty', async () => {
+      vi.spyOn(slotstreamModels, 'listSlotstreamCachedModels').mockResolvedValue({ models: [], error: null });
+      const err = await startSlotstreamServer().catch((e) => e);
+      expect(err.message).toMatch(/never downloads weights|no model weights cached/i);
+      expect(err.message).not.toMatch(/terminal/);
+      expect(execPm2Calls.some((args) => args[0] === 'start')).toBe(false);
+    });
+
+    it('refuses incomplete checkpoints using the real cache inventory', async () => {
+      const cacheDir = join(testLogDir, 'cache');
+      const modelDir = join(cacheDir, 'incomplete');
+      await mkdir(modelDir, { recursive: true });
+      await writeFile(join(modelDir, 'config.json'), '{}');
+      slotstreamModels.listSlotstreamCachedModels.mockRestore();
+      const readCache = slotstreamModels.listSlotstreamCachedModels;
+      vi.spyOn(slotstreamModels, 'listSlotstreamCachedModels').mockImplementation(() => readCache({ cacheDir }));
+      await expect(startSlotstreamServer({ model: 'incomplete' })).rejects.toThrow(/no model weights cached/i);
+      await writeFile(join(modelDir, 'model.safetensors'), 'weights');
+      await writeFile(join(modelDir, slotstreamModels.SLOTSTREAM_INCOMPLETE_MARKER), 'interrupted');
+      await expect(startSlotstreamServer({ model: 'incomplete' })).rejects.toThrow(/no model weights cached/i);
+      expect(execPm2Calls.some((args) => args[0] === 'start')).toBe(false);
+    });
+
+    it('refuses an explicit checkpoint that is not cached, rather than letting the runtime fetch it', async () => {
+      const err = await startSlotstreamServer({ model: 'not-on-disk' }).catch((e) => e);
+      expect(err.message).toMatch(/never downloads weights/i);
+      expect(err.message).toMatch(/qwen-moe/);
+      expect(execPm2Calls.some((args) => args[0] === 'start')).toBe(false);
+    });
+
+    it('refuses to start on a host the runtime does not support', async () => {
+      vi.spyOn(platform, 'isAppleSilicon').mockReturnValue(false);
+      await expect(startSlotstreamServer()).rejects.toThrow(/Apple Silicon/);
+      expect(execPm2Calls.some((args) => args[0] === 'start')).toBe(false);
+    });
+
+    it('refuses rather than launching onto a bound port', async () => {
+      vi.spyOn(platform, 'isPortInUse').mockResolvedValue(true);
+      await expect(startSlotstreamServer()).rejects.toThrow(/already in use/);
+    });
+
+    it('refuses when the binary is not installed', async () => {
+      vi.spyOn(processEnv, 'findCommandOnPath').mockReturnValue(null);
+      await expect(startSlotstreamServer()).rejects.toThrow(/not found/);
+    });
+  });
+
+  describe('installSlotstream', () => {
+    beforeEach(() => {
+      vi.spyOn(streamingSpawn, 'runStreamingCommand').mockResolvedValue({ success: true });
+      vi.spyOn(processEnv, 'findCommandOnPath').mockReturnValue(BINARY);
+      vi.spyOn(slotstreamModels, 'slotstreamBinDir').mockReturnValue(testLogDir);
+    });
+
+    it('installs the Apple Silicon release via GitHub CLI, never a remote shell script', async () => {
+      vi.spyOn(commandExistsModule, 'commandExists').mockResolvedValue(true);
+      const result = await installSlotstream();
+      expect(result.success).toBe(true);
+      const [cmd, args] = streamingSpawn.runStreamingCommand.mock.calls[0];
+      expect(cmd).toBe('gh');
+      expect(args).toEqual(expect.arrayContaining(['release', 'download', '--repo', 'carloslfu/slotstream']));
+      expect(streamingSpawn.runStreamingCommand.mock.calls.flat().join(' ')).not.toMatch(/install\.sh/);
+    });
+
+    it('refuses on a host that cannot run it', async () => {
+      vi.spyOn(platform, 'isAppleSilicon').mockReturnValue(false);
+      await expect(installSlotstream()).rejects.toThrow(/macOS with Apple Silicon/);
+      expect(streamingSpawn.runStreamingCommand).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('stopSlotstreamServer', () => {
+    it('deletes the PM2 process it manages', async () => {
+      vi.spyOn(processEnv, 'findCommandOnPath').mockReturnValue(BINARY);
+      await startSlotstreamServer();
+      const result = await stopSlotstreamServer();
+      expect(result.success).toBe(true);
+      expect(pm2State).toBeNull();
+    });
+
+    it('will not claim to stop a server PortOS did not start', async () => {
+      vi.spyOn(openAiModelsProbe, 'probeOpenAiModels').mockResolvedValue({ reachable: true });
+      const result = await stopSlotstreamServer();
+      expect(result.success).toBe(false);
+      expect(result.message).toMatch(/external process/i);
+    });
+  });
+
+  describe('ensureSlotstreamRunning', () => {
+    it('is a no-op when the daemon is already online', async () => {
+      pm2State = { name: SLOTSTREAM_APP, status: 'online', pid: 777, args: ['serve', '--port', String(PORTS.SLOTSTREAM)] };
+      const result = await ensureSlotstreamRunning();
+      expect(result).toEqual({ ready: true, reason: null });
+      expect(execPm2Calls.filter((c) => c[0] === 'start')).toHaveLength(0);
+    });
+
+    it('reports the reason rather than throwing when the start fails', async () => {
+      vi.spyOn(processEnv, 'findCommandOnPath').mockReturnValue(null);
+      const result = await ensureSlotstreamRunning();
+      expect(result.ready).toBe(false);
+      expect(result.reason).toMatch(/not found/);
+    });
+
+    // Regression for #8105: the death-detecting readiness loop used to be a
+    // hand-rolled copy that reported only a bare `PM2 status: errored` — MTPLX's
+    // copy of the same loop already tailed the PM2 log, and the two have drifted
+    // back together onto `onDemand.waitForReady`'s shared `exitTail`.
+    it('reports the PM2 log tail when it dies after startup but before it answers', async () => {
+      vi.spyOn(processEnv, 'findCommandOnPath').mockReturnValue(BINARY);
+      // Skip `startSlotstreamServer`'s own startup-window poll (deadline
+      // immediately in the past) so the ONLY readiness loop exercised is the
+      // shared one `ensureSlotstreamRunning` waits on afterward.
+      resetForTest({ startupWait: 0 });
+      vi.spyOn(openAiModelsProbe, 'probeOpenAiModels').mockResolvedValue({ reachable: false });
+      // Errored throughout — including the initial guards — so this cannot start
+      // a REAL managed process the assertions below have to unwind.
+      vi.spyOn(pm2Module, 'getAppStatusStrict').mockImplementation(async (name) => (
+        name === SLOTSTREAM_APP ? { name, status: 'errored', pid: null } : { name, status: 'not_found', pm2_env: null }
+      ));
+      vi.spyOn(pm2Module, 'execPm2').mockImplementation(async (args) => {
+        execPm2Calls.push(args);
+        if (args[0] === 'logs') return { stdout: '', stderr: 'metal buffer allocation failed' };
+        return { stdout: '', stderr: '' };
+      });
+
+      const result = await ensureSlotstreamRunning();
+
+      expect(result.ready).toBe(false);
+      expect(result.reason).toMatch(/errored/);
+      expect(result.reason).toMatch(/metal buffer allocation failed/);
+    });
+  });
+
+  describe('isSlotstreamProvider', () => {
+    it('matches a local Slotstream endpoint on the dedicated port', () => {
+      expect(isSlotstreamProvider({
+        type: 'api',
+        endpoint: `http://127.0.0.1:${PORTS.SLOTSTREAM}/v1`,
+        id: 'slotstream',
+      })).toBe(true);
+    });
+
+    it('does not match a Slotstream on another machine', () => {
+      expect(isSlotstreamProvider({
+        type: 'api',
+        endpoint: `http://192.0.2.10:${PORTS.SLOTSTREAM}/v1`,
+        id: 'slotstream',
+      })).toBe(false);
+    });
+  });
+
+  /**
+   * The catalog a Slotstream provider's "Refresh Models" merges in. The daemon
+   * serves ONE checkpoint and answers only under that id, while the shipped
+   * record lists three — so before this, a refresh pruned the other two shipped
+   * ids (and the `defaultModel` pin whenever it was not the loaded one) down to
+   * whatever happened to be loaded.
+   */
+  describe('slotstreamCachedModelIds', () => {
+    const local = { type: 'api', id: 'slotstream', endpoint: `http://127.0.0.1:${PORTS.SLOTSTREAM}/v1` };
+
+    it('lists every cached checkpoint, not just the loaded one', async () => {
+      vi.spyOn(slotstreamModels, 'listSlotstreamCachedModels').mockResolvedValue({
+        models: [cachedModel('qwen-moe'), cachedModel('gpt-oss-120b-mxfp4')],
+        error: null,
+      });
+      expect(await slotstreamCachedModelIds(local)).toEqual(['qwen-moe', 'gpt-oss-120b-mxfp4']);
+    });
+
+    it('answers null for a provider that is not this daemon’s', async () => {
+      expect(await slotstreamCachedModelIds({ ...local, endpoint: `http://192.0.2.10:${PORTS.SLOTSTREAM}/v1` })).toBeNull();
+    });
+
+    // `null`, never `[]`: a cache PortOS could not read must not read as "this
+    // machine has no checkpoints" and blank a provider's model list.
+    it('answers null when the cache could not be read', async () => {
+      vi.spyOn(slotstreamModels, 'listSlotstreamCachedModels').mockResolvedValue({ models: null, error: 'EACCES' });
+      expect(await slotstreamCachedModelIds(local)).toBeNull();
+    });
+  });
+
+  // Every test routes real log writes through testLogDir (cleaned above), but
+  // a `_resetSlotstreamServerStateForTests()` call with no `logFiles` falls
+  // back to the module's fixed DEFAULT `tmpdir()` path (not an mkdtemp root)
+  // — including a reset that races an idle-reaper/watchdog callback still in
+  // flight when a test's assertions finish. Remove the DEFAULT path once here
+  // so that race never leaves the fixed-name files behind (#9032), mirroring
+  // mtplxServerManager.test.js.
+  afterAll(async () => {
+    const { rm: rmDefaults } = await import('fs/promises');
+    const { tmpdir: realTmpdir } = await import('os');
+    const { join: joinPath } = await import('path');
+    await rmDefaults(joinPath(realTmpdir(), 'portos-slotstream-out.log'), { force: true });
+    await rmDefaults(joinPath(realTmpdir(), 'portos-slotstream-error.log'), { force: true });
+  });
+});

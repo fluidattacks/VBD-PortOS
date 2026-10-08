@@ -1,0 +1,1183 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+
+vi.mock('./providers.js', () => ({
+  getActiveProvider: vi.fn(),
+  getProviderById: vi.fn(),
+}));
+
+vi.mock('./promptService.js', () => ({
+  buildPrompt: vi.fn().mockResolvedValue('rendered-prompt'),
+  getStage: vi.fn(),
+}));
+
+// The live `/v1/models` listing `resolveStageContext` budgets against (#7447).
+// Mocked rather than spied so no test in this file can reach a real socket; the
+// registry covers the dynamic import `resolveStageContext` reaches it through.
+vi.mock('../lib/openAiModelsProbeCache.js', () => ({
+  probeOpenAiModelsCached: vi.fn(),
+  resetOpenAiModelsProbeCache: vi.fn(),
+}));
+
+vi.mock('./runner.js', () => ({
+  createRun: vi.fn(async () => ({ runId: 'run-abc12345' })),
+  executeApiRun: vi.fn(),
+  executeCliRun: vi.fn(),
+  extractBakedModel: vi.fn(() => null),
+  hasModelFlag: vi.fn(() => false),
+  patchRunMetadata: vi.fn(async () => undefined),
+}));
+
+const providers = await import('./providers.js');
+const prompts = await import('./promptService.js');
+const runner = await import('./runner.js');
+const probeCache = await import('../lib/openAiModelsProbeCache.js');
+const { buildEffortArgs } = await import('../lib/providerModels.js');
+const { CREATIVE_LATITUDE_HEADING } = await import('../lib/creativeLatitude.js');
+const {
+  runStagedLLM,
+  runInlineLLM,
+  resolveModel,
+  extractJson,
+  effectiveContextWindow,
+  resolveStageContext,
+  resolveStageRoute,
+  resolveJudgeForStage,
+  resolveEffortHint,
+  effectiveStage,
+  withLocalConcurrencyGate,
+  LOCAL_LLM_MAX_CONCURRENCY,
+} = await import('./stageRunner.js');
+const { withStagePinsIgnored, stagePinsIgnored } = await import('../lib/stagePinPolicy.js');
+const { CODEX_CONTEXT_WINDOW, DEFAULT_LARGE_CONTEXT_WINDOW } = await import('../lib/providerContextWindows.js');
+// The pre-dispatch gate itself, imported from the toolkit leaf rather than its
+// `fs`/`child_process`-reaching barrel: the contract test below asserts the
+// budgeter and the gate agree, so it has to ask the real gate.
+const { contextWindowRejection, knownContextWindow } = await import('../lib/aiToolkit/providerStatus.js');
+// The host's projection of a provider for a context question, and the resolver
+// the DAEMON LAUNCHER reads. The contract test below pins the budget against
+// what the launcher actually holds Ollama at — budgeter/gate agreement alone
+// cannot catch a rung they are both blind to (#7472).
+const { withOllamaRuntimeContextWindow, resolveOllamaContextLength } = await import('../lib/ollamaContext.js');
+
+const apiProvider = (extra = {}) => ({
+  id: 'mock-api', name: 'Mock', type: 'api', enabled: true, defaultModel: 'm-default', ...extra,
+});
+const cliProvider = (extra = {}) => ({
+  id: 'codex', name: 'Codex', type: 'cli', enabled: true, defaultModel: 'm-default', timeout: 5000, ...extra,
+});
+
+// The live `/v1/models` listing `resolveStageContext` budgets against. Module
+// scope so the shape of the probe's return value is spelled in ONE place —
+// two describes stub it, and a change to the probe should break once.
+const serving = (contextWindows) => probeCache.probeOpenAiModelsCached.mockResolvedValue({
+  reachable: true,
+  models: Object.keys(contextWindows),
+  contextWindows,
+  error: null,
+});
+
+// `vi.clearAllMocks()` clears calls but keeps implementations, so the probe stub
+// has to be torn down explicitly or it leaks into later describes.
+const resetProbe = () => probeCache.probeOpenAiModelsCached.mockReset();
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  runner.extractBakedModel.mockReturnValue(null);
+  runner.hasModelFlag.mockReturnValue(false);
+});
+
+describe('stageRunner — resolveModel', () => {
+  it('returns provider.defaultModel when no hint', () => {
+    expect(resolveModel({ defaultModel: 'd' }, null)).toBe('d');
+    expect(resolveModel({ defaultModel: 'd' }, undefined)).toBe('d');
+  });
+
+  it('maps tier names to per-tier provider keys, falls back to defaultModel when missing', () => {
+    const p = { defaultModel: 'd', lightModel: 'l', mediumModel: 'm', heavyModel: 'h' };
+    expect(resolveModel(p, 'light')).toBe('l');
+    expect(resolveModel(p, 'medium')).toBe('m');
+    // Legacy stage spellings stay readable (older peers, backups) — #8149.
+    expect(resolveModel(p, 'quick')).toBe('l');
+    expect(resolveModel(p, 'coding')).toBe('m');
+    expect(resolveModel(p, 'heavy')).toBe('h');
+    expect(resolveModel(p, 'default')).toBe('d');
+    expect(resolveModel({ defaultModel: 'd' }, 'heavy')).toBe('d'); // tier missing → fall back
+  });
+
+  it('returns explicit model id verbatim when not a tier name', () => {
+    expect(resolveModel({ defaultModel: 'd' }, 'gpt-5-explicit')).toBe('gpt-5-explicit');
+  });
+
+  it('falls back to provider.models[0] when defaultModel is unset (no hint)', () => {
+    expect(resolveModel({ models: ['m0', 'm1'] }, null)).toBe('m0');
+    expect(resolveModel({ models: ['m0'], defaultModel: '' }, null)).toBe('m0');
+  });
+
+  it('falls back to provider.models[0] when both tier slot and defaultModel are unset', () => {
+    expect(resolveModel({ models: ['m0', 'm1'] }, 'heavy')).toBe('m0');
+  });
+
+  it('returns null when neither defaultModel nor models[] is available', () => {
+    expect(resolveModel({}, null)).toBeNull();
+    expect(resolveModel({ models: [] }, null)).toBeNull();
+    expect(resolveModel({}, 'heavy')).toBeNull();
+  });
+});
+
+describe('stageRunner — context windows', () => {
+  it('keeps an explicit provider contextWindow above model defaults', () => {
+    expect(effectiveContextWindow(
+      { type: 'tui', contextWindow: 64_000 },
+      'claude-opus-4-8'
+    )).toBe(64_000);
+  });
+
+  it('uses the catalog window a model refresh recorded, above the regex table and the assumed default', () => {
+    // The OpenCode/OpenRouter wrapper case: a TUI provider matching no vendor
+    // row used to fall straight to the blanket 128K, so a 1M model was chunked
+    // at an eighth of its real window.
+    const wrapper = {
+      id: 'opencode-openrouter-tui',
+      type: 'tui',
+      command: 'opencode',
+      modelContextWindows: { 'stealth/ox-alpha': 1_000_000 },
+    };
+    expect(effectiveContextWindow(wrapper, 'stealth/ox-alpha')).toBe(1_000_000);
+    // A model the catalog never mentioned still takes the old ladder.
+    expect(effectiveContextWindow(wrapper, 'openrouter/auto')).toBe(DEFAULT_LARGE_CONTEXT_WINDOW);
+    // The catalog beats the hand-maintained model table — it is the serving
+    // side's own declaration of what THIS provider will accept.
+    expect(effectiveContextWindow(
+      { type: 'api', endpoint: 'https://api.example.test/v1', modelContextWindows: { 'claude-sonnet-4-6': 200_000 } },
+      'claude-sonnet-4-6'
+    )).toBe(200_000);
+    // …and loses to an explicit user override.
+    expect(effectiveContextWindow(
+      { type: 'tui', contextWindow: 64_000, modelContextWindows: { m: 1_000_000 } },
+      'm'
+    )).toBe(64_000);
+  });
+
+  it('holds every wider rung down to the Ollama numCtx the daemon was launched with', () => {
+    // #7466: `numCtx` used to rank LAST, so a model whose declared window is
+    // wider than the daemon's launch window was budgeted at the declared one and
+    // then refused by the pre-dispatch gate, which had always clamped. It is an
+    // upper BOUND, not a fallback rung — including over a typed override, which
+    // is a preference the daemon has no way to honor past its launch window.
+    expect(effectiveContextWindow(
+      { type: 'api', endpoint: 'http://localhost:11434/v1', numCtx: 32_768 },
+      'claude-sonnet-4-6'
+    )).toBe(32_768);
+    expect(effectiveContextWindow(
+      { type: 'api', endpoint: 'http://localhost:11434/v1', numCtx: 8_192, modelContextWindows: { 'qwen3:32b': 40_960 } },
+      'qwen3:32b'
+    )).toBe(8_192);
+    expect(effectiveContextWindow(
+      { type: 'api', endpoint: 'http://localhost:11434/v1', numCtx: 8_192, contextWindow: 64_000 },
+      'unknown-local-model'
+    )).toBe(8_192);
+    // A ceiling never RAISES a narrower window.
+    expect(effectiveContextWindow(
+      { type: 'api', endpoint: 'http://localhost:11434/v1', numCtx: 131_072, modelContextWindows: { 'qwen3:32b': 40_960 } },
+      'qwen3:32b'
+    )).toBe(40_960);
+    // Only an Ollama daemon is sent num_ctx (native /api/chat); for anything else the
+    // field constrains nothing, so the ladder is untouched.
+    expect(effectiveContextWindow(
+      { id: 'codex', type: 'cli', command: 'codex', numCtx: 32_768 },
+      'codex-configured-default'
+    )).toBe(CODEX_CONTEXT_WINDOW);
+  });
+
+  it('falls back to numCtx, large-provider default, or null', () => {
+    expect(effectiveContextWindow(
+      { type: 'api', endpoint: 'http://localhost:11434/v1', numCtx: 32_768 },
+      'unknown-local-model'
+    )).toBe(32_768);
+    // A non-Ollama local endpoint ignores num_ctx, so it stays a last-resort
+    // hint there rather than becoming a ceiling nothing enforces.
+    expect(effectiveContextWindow(
+      { type: 'api', endpoint: 'http://localhost:1234/v1', numCtx: 32_768 },
+      'unknown-local-model'
+    )).toBe(32_768);
+    expect(effectiveContextWindow(
+      { type: 'cli' },
+      'unknown-cli-model'
+    )).toBe(DEFAULT_LARGE_CONTEXT_WINDOW);
+    expect(effectiveContextWindow(
+      { type: 'api', endpoint: 'http://localhost:1234/v1' },
+      'unknown-local-model'
+    )).toBeNull();
+  });
+
+  it('budgets with the effective model when a CLI provider has a baked model flag', async () => {
+    prompts.getStage.mockReturnValue(null);
+    providers.getActiveProvider.mockResolvedValue(cliProvider({
+      args: ['--model', 'claude-opus-4-8'],
+      defaultModel: 'claude-sonnet-4-6',
+    }));
+    runner.hasModelFlag.mockReturnValue(true);
+    runner.extractBakedModel.mockReturnValue('claude-opus-4-8');
+
+    const context = await resolveStageContext('any-stage');
+    expect(context.model).toBe('claude-opus-4-8');
+    expect(context.contextWindow).toBe(1_000_000);
+  });
+});
+
+// #7447 — see `resolveStageContext`'s docblock for why the live window matters.
+describe('stageRunner — resolveStageContext reads the live daemon window', () => {
+  // The shipped vLLM wrapper: seeded with no `contextWindow` and no
+  // `modelContextWindows`, so every rung below it used to answer 128K.
+  const daemonProvider = (extra = {}) => ({
+    id: 'opencode-vllm',
+    name: 'OpenCode vLLM',
+    type: 'cli',
+    enabled: true,
+    command: 'opencode',
+    endpoint: 'http://127.0.0.1:18020/v1',
+    defaultModel: 'qwen3.8-27b',
+    models: ['qwen3.8-27b'],
+    vllmBacked: true,
+    ...extra,
+  });
+
+  beforeEach(() => {
+    prompts.getStage.mockReturnValue(null);
+  });
+
+  afterEach(resetProbe);
+
+  it('budgets to the 32K the daemon is serving, not the 128K assumption', async () => {
+    providers.getActiveProvider.mockResolvedValue(daemonProvider());
+    serving({ 'qwen3.8-27b': 32_768 });
+
+    const context = await resolveStageContext('any-stage');
+    expect(context.contextWindow).toBe(32_768);
+  });
+
+  it('lets the observation outrank a stale catalog entry, but not a typed override', async () => {
+    // Both rungs at once: the record remembers 128K from whenever the user last
+    // pressed Refresh Models, and the daemon has since been relaunched at 32K.
+    providers.getActiveProvider.mockResolvedValue(daemonProvider({
+      modelContextWindows: { 'qwen3.8-27b': 128_000 },
+    }));
+    serving({ 'qwen3.8-27b': 32_768 });
+    await expect(resolveStageContext('any-stage')).resolves.toMatchObject({ contextWindow: 32_768 });
+
+    // A number the user typed is a deliberate override, not a stale guess.
+    providers.getActiveProvider.mockResolvedValue(daemonProvider({ contextWindow: 8_192 }));
+    await expect(resolveStageContext('any-stage')).resolves.toMatchObject({ contextWindow: 8_192 });
+  });
+
+  it('spends no probe at all when an explicit window already decides the answer', async () => {
+    // The override short-circuits the ladder's first rung, so observing could
+    // not change the result — and a chunked run would otherwise pay a round trip
+    // per stage (up to the probe timeout on a black-holed endpoint) for it.
+    providers.getActiveProvider.mockResolvedValue(daemonProvider({ contextWindow: 8_192 }));
+    serving({ 'qwen3.8-27b': 32_768 });
+
+    await expect(resolveStageContext('any-stage')).resolves.toMatchObject({ contextWindow: 8_192 });
+    expect(probeCache.probeOpenAiModelsCached).not.toHaveBeenCalled();
+  });
+
+  it('resolveStageRoute answers provider/model without touching the network', async () => {
+    // `universeCastIntegrity` renders a deterministic report and reads only the
+    // provider's identity; budgeting enrichment must not put a daemon probe on
+    // that read path.
+    providers.getActiveProvider.mockResolvedValue(daemonProvider());
+    serving({ 'qwen3.8-27b': 32_768 });
+
+    const route = await resolveStageRoute('any-stage');
+    expect(route).toEqual({ provider: expect.objectContaining({ id: 'opencode-vllm' }), model: 'qwen3.8-27b' });
+    expect(route.contextWindow).toBeUndefined();
+    expect(probeCache.probeOpenAiModelsCached).not.toHaveBeenCalled();
+  });
+
+  it('budgets exactly as before when the daemon is unreachable or silent about windows', async () => {
+    // The regression guard for "unknown stays unknown": a down daemon must not
+    // become a NEW answer, and must not become a new failure mode either.
+    providers.getActiveProvider.mockResolvedValue(daemonProvider());
+    probeCache.probeOpenAiModelsCached.mockRejectedValue(new Error('ECONNREFUSED'));
+    await expect(resolveStageContext('any-stage')).resolves.toMatchObject({
+      contextWindow: DEFAULT_LARGE_CONTEXT_WINDOW,
+    });
+
+    serving({});
+    await expect(resolveStageContext('any-stage')).resolves.toMatchObject({
+      contextWindow: DEFAULT_LARGE_CONTEXT_WINDOW,
+    });
+  });
+
+  it('returns the provider record UNMERGED, so observed runtime state rides nothing persistable', async () => {
+    providers.getActiveProvider.mockResolvedValue(daemonProvider());
+    serving({ 'qwen3.8-27b': 32_768 });
+
+    const context = await resolveStageContext('any-stage');
+    expect(context.provider.modelContextWindows).toBeUndefined();
+  });
+});
+
+// #7466 — the budgeter and the pre-dispatch gate must resolve ONE window. They
+// are separate modules (the gate is in the vendored toolkit, which may not
+// import out), so nothing but a contract test keeps them from drifting again.
+describe('stageRunner — the budget never exceeds what the dispatch gate allows', () => {
+  // The reported failure: Ollama launched at 8K, `qwen3:32b`'s own catalog entry
+  // 40K. The chunker was told 40,960, built ~32,000 tokens, and the gate threw
+  // `known 8192-token context is below the 32000-token request budget` — so the
+  // stage never dispatched at all.
+  const ollama = apiProvider({
+    id: 'ollama',
+    endpoint: 'http://localhost:11434/v1',
+    defaultModel: 'qwen3:32b',
+    models: ['qwen3:32b'],
+    numCtx: 8_192,
+    modelContextWindows: { 'qwen3:32b': 40_960 },
+  });
+
+  beforeEach(() => {
+    prompts.getStage.mockReturnValue(null);
+  });
+
+  afterEach(resetProbe);
+
+  it('budgets a chunked stage to the daemon\'s launch window instead of building a prompt the gate refuses', async () => {
+    providers.getActiveProvider.mockResolvedValue(ollama);
+    serving({ 'qwen3:32b': 40_960 });
+
+    const { contextWindow, model } = await resolveStageContext('any-stage');
+    expect(contextWindow).toBe(8_192);
+    // …and a prompt built to that budget dispatches rather than being refused.
+    expect(contextWindowRejection(ollama, model, { requiredContextTokens: contextWindow })).toBeNull();
+  });
+
+  it('never plans wider than the gate would admit', () => {
+    // Only shapes where the gate DECLARES a window — an unknown one is "no
+    // constraint" on both sides and proves nothing. The count assertion is the
+    // point: without it a future ladder change that made every shape unknown
+    // would leave this passing with zero comparisons.
+    const shapes = [
+      ollama,
+      { ...ollama, modelContextWindows: undefined, contextWindow: 64_000 },
+      { id: 'ollama', type: 'api', enabled: true, numCtx: 16_000, contextWindow: 128_000 },
+      { type: 'tui', command: 'opencode', modelContextWindows: { 'qwen3:32b': 40_960 } },
+      // The env rung: no `numCtx`, so the ceiling exists only in the window
+      // PortOS launched the daemon at. Before #7472 this shape was COMPARED and
+      // still passed — budgeter and gate agreed on 40,960, the wrong answer —
+      // which is why the assertion below it is what proves the fix.
+      { ...ollama, numCtx: undefined, runtimeContextWindow: 16_384 },
+    ];
+    const compared = shapes.filter((provider) => {
+      // Projected exactly as the host projects it before asking the gate
+      // (`promptRunner.js#assertRequestFitsContext`): the toolkit cannot resolve
+      // the ambient rung itself, so a gate asked about the RAW record is not the
+      // gate any request meets.
+      const admitted = knownContextWindow(withOllamaRuntimeContextWindow(provider), 'qwen3:32b');
+      expect(admitted, `the gate declares no window for ${JSON.stringify(provider)}`).toBeGreaterThan(0);
+      expect(effectiveContextWindow(provider, 'qwen3:32b'),
+        `budgeted wider than the gate admits for ${JSON.stringify(provider)}`)
+        .toBeLessThanOrEqual(admitted);
+      return true;
+    });
+    expect(compared).toHaveLength(shapes.length);
+  });
+
+  // #7472 — the rung #7466 left open. Budgeter/gate agreement cannot catch this
+  // one: with no `numCtx` both ends read no ceiling and agree on the model's
+  // catalog window, while the daemon is running at the env-configured one and
+  // rejects the prompt with `exceed_context_size_error`. So this pins the budget
+  // against what the LAUNCHER holds the daemon at, not against the gate.
+  describe('an env-configured daemon (OLLAMA_CONTEXT_LENGTH, no numCtx)', () => {
+    const envOllama = { ...ollama, numCtx: undefined };
+
+    beforeEach(() => {
+      // Pinned rather than inherited: this machine may have either set already,
+      // and `OLLAMA_HOST` decides whether the provider counts as the daemon
+      // PortOS manages at all.
+      vi.stubEnv('OLLAMA_CONTEXT_LENGTH', '16384');
+      vi.stubEnv('OLLAMA_HOST', '');
+      vi.stubEnv('OLLAMA_URL', '');
+    });
+
+    afterEach(() => { vi.unstubAllEnvs(); });
+
+    it('budgets to the window the daemon was launched at, not the catalog window', async () => {
+      providers.getActiveProvider.mockResolvedValue(envOllama);
+      serving({ 'qwen3:32b': 40_960 });
+
+      const { contextWindow, model } = await resolveStageContext('any-stage');
+      // The daemon's ACTUAL window — the same number `ollamaAgentContext.js`
+      // hands `ensureContextWindow` and `withOllamaContextEnv` puts on
+      // `ollama serve`. Asserting against the resolver rather than the literal
+      // is the point: budget and launch must not be able to diverge.
+      expect(contextWindow).toBe(resolveOllamaContextLength(envOllama));
+      expect(contextWindow).toBe(16_384);
+      // …and the gate the host actually asks agrees, in both directions.
+      const gated = withOllamaRuntimeContextWindow(envOllama);
+      expect(contextWindowRejection(gated, model, { requiredContextTokens: contextWindow })).toBeNull();
+      expect(contextWindowRejection(gated, model, { requiredContextTokens: 40_960 })).toMatch(/16384/);
+    });
+
+    it('lets an explicit numCtx outrank it, and leaves a REMOTE daemon alone', async () => {
+      // `numCtx` first, exactly as `resolveOllamaContextLength` ranks the two —
+      // so a provider form's unsaved edit is not overruled by the ambient value.
+      expect(effectiveContextWindow({ ...envOllama, numCtx: 8_192 }, 'qwen3:32b')).toBe(8_192);
+      // The env var only ever reaches the daemon THIS install launches. Applied
+      // to a provider pointed at another host it would budget someone else's
+      // daemon down to this machine's VRAM headroom.
+      const remote = { ...envOllama, endpoint: 'http://192.0.2.10:11434/v1' };
+      expect(effectiveContextWindow(remote, 'qwen3:32b')).toBe(40_960);
+    });
+  });
+});
+
+describe('stageRunner — extractJson', () => {
+  it('parses JSON inside markdown code fences', () => {
+    expect(extractJson('```json\n{"a":1}\n```')).toEqual({ a: 1 });
+  });
+  it('recovers a response that serializes its remaining JSON tail as escaped text', () => {
+    const raw = '{"items":[{"id":"one"}\\n, {\\n  \\"id\\": \\"two\\"\\n}\\n]}';
+    expect(extractJson(raw)).toEqual({ items: [{ id: 'one' }, { id: 'two' }] });
+  });
+  it('extracts the first balanced object even when prose is prepended', () => {
+    expect(extractJson('Sure! Here is the data: {"a":1,"b":2} cheers.')).toEqual({ a: 1, b: 2 });
+  });
+  it('parses an array', () => {
+    expect(extractJson('[1,2,3]')).toEqual([1, 2, 3]);
+  });
+  it('preserves an array-of-objects wrapper instead of grabbing the inner object', () => {
+    // Regression: an "object-first then array-fallback" strategy used to
+    // return `{"a":1}` from `[{"a":1},{"a":2}]`, silently dropping the
+    // array wrapper. The current strategy walks balanced candidates for
+    // BOTH shapes, sorts by source-text start position, and returns the
+    // first that parses — so the array opener at position 0 wins over
+    // the inner object opener at position 1.
+    expect(extractJson('[{"a":1},{"a":2}]')).toEqual([{ a: 1 }, { a: 2 }]);
+  });
+  it('preserves an array-of-objects wrapper inside a fenced response', () => {
+    expect(extractJson('```json\n[{"id":"x"}]\n```')).toEqual([{ id: 'x' }]);
+  });
+  it('still extracts a leading object when an array appears later in prose', () => {
+    expect(extractJson('Sure! {"a":1} (example array later: [1,2])')).toEqual({ a: 1 });
+  });
+  it('skips a Codex CLI banner `[workdir, /tmp]` and returns the actual object', () => {
+    // Regression: a raw `indexOf('[') < indexOf('{')` peek would prefer
+    // array-mode and (in the worst case) return an inner array field
+    // instead of the wrapping object. Earliest-parseable-block ordering
+    // skips the banner because its contents don't parse as JSON.
+    const raw = 'OpenAI Codex CLI v2.1.0\n[workdir, /tmp]\n\n{"a":1,"b":[2,3]}\n[finished]';
+    expect(extractJson(raw)).toEqual({ a: 1, b: [2, 3] });
+  });
+  it('returns the wrapping object — not its inner array field — when both walks succeed', () => {
+    // Object opener comes before the inner array opener, so the object
+    // wins on earliest-start ordering.
+    expect(extractJson('{"items":[1,2,3]}')).toEqual({ items: [1, 2, 3] });
+  });
+  it('strips a known echoed prompt before walking so the real response wins', () => {
+    // Regression: Codex CLI echoes stdin to stdout, so when a stage
+    // prompt contains a fenced JSON schema example, both that schema
+    // AND the model's actual response are present in the captured
+    // text. Picking by source order returns the schema (placeholder
+    // data). Passing the prompt verbatim lets extractJson strip the
+    // echo first, so the response wins.
+    const prompt = 'Prompt echo:\n```json\n{"_schema":"example"}\n```';
+    const raw = `${prompt}\n\nResponse:\n{"answer":42}`;
+    expect(extractJson(raw, { promptToStrip: prompt })).toEqual({ answer: 42 });
+  });
+  it('without promptToStrip, an echoed schema block still wins on source order (documents the failure mode)', () => {
+    // This is the failure mode that runStagedLLM avoids by ALWAYS
+    // passing the prompt down. Kept here so future contributors who
+    // bypass the stripping path know they have to provide it.
+    const raw = 'Prompt echo:\n```json\n{"_schema":"example"}\n```\n\nResponse:\n{"answer":42}';
+    expect(extractJson(raw)).toEqual({ _schema: 'example' });
+  });
+  it('throws on empty or non-string input', () => {
+    expect(() => extractJson('')).toThrow(/Empty AI response/);
+    expect(() => extractJson(null)).toThrow(/Empty AI response/);
+  });
+});
+
+describe('stageRunner — runStagedLLM provider resolution', () => {
+  it('uses the active provider when stage and overrides leave it unspecified', async () => {
+    prompts.getStage.mockReturnValue(null);
+    providers.getActiveProvider.mockResolvedValue(apiProvider());
+    runner.executeApiRun.mockImplementation(async ({ onData, onComplete }) => {
+      onData('hello');
+      onComplete({ success: true });
+    });
+    const out = await runStagedLLM('any-stage', {});
+    expect(out.providerId).toBe('mock-api');
+    expect(out.content).toBe('hello');
+    expect(runner.createRun).toHaveBeenCalledTimes(1);
+    expect(runner.executeApiRun).toHaveBeenCalledTimes(1);
+  });
+
+  it('honors providerOverride beating stage.provider', async () => {
+    prompts.getStage.mockReturnValue({ provider: 'should-not-use' });
+    providers.getProviderById.mockImplementation(async (id) => (
+      id === 'override-id' ? apiProvider({ id: 'override-id' }) : null
+    ));
+    runner.executeApiRun.mockImplementation(async ({ onData, onComplete }) => {
+      onData('override-content');
+      onComplete({ success: true });
+    });
+    const out = await runStagedLLM('s', {}, { providerOverride: 'override-id' });
+    expect(out.providerId).toBe('override-id');
+    expect(providers.getActiveProvider).not.toHaveBeenCalled();
+  });
+
+  it('uses stage.provider when set and no override', async () => {
+    prompts.getStage.mockReturnValue({ provider: 'stage-pinned' });
+    providers.getProviderById.mockImplementation(async (id) => (
+      id === 'stage-pinned' ? apiProvider({ id: 'stage-pinned' }) : null
+    ));
+    runner.executeApiRun.mockImplementation(async ({ onData, onComplete }) => {
+      onData('pinned');
+      onComplete({ success: true });
+    });
+    const out = await runStagedLLM('s', {});
+    expect(out.providerId).toBe('stage-pinned');
+  });
+
+  it('lets stage.provider beat a blanket providerDefault (pin wins over run default)', async () => {
+    prompts.getStage.mockReturnValue({ provider: 'stage-pinned' });
+    providers.getProviderById.mockImplementation(async (id) => (
+      id === 'stage-pinned' ? apiProvider({ id: 'stage-pinned' }) : apiProvider({ id })
+    ));
+    runner.executeApiRun.mockImplementation(async ({ onData, onComplete }) => {
+      onData('pinned');
+      onComplete({ success: true });
+    });
+    const out = await runStagedLLM('s', {}, { providerDefault: 'run-default' });
+    expect(out.providerId).toBe('stage-pinned');
+    expect(providers.getActiveProvider).not.toHaveBeenCalled();
+  });
+
+  it('uses providerDefault when the stage has no pin', async () => {
+    prompts.getStage.mockReturnValue(null);
+    providers.getProviderById.mockImplementation(async (id) => (
+      id === 'run-default' ? apiProvider({ id: 'run-default' }) : null
+    ));
+    runner.executeApiRun.mockImplementation(async ({ onData, onComplete }) => {
+      onData('defaulted');
+      onComplete({ success: true });
+    });
+    const out = await runStagedLLM('s', {}, { providerDefault: 'run-default' });
+    expect(out.providerId).toBe('run-default');
+    expect(providers.getActiveProvider).not.toHaveBeenCalled();
+  });
+
+  it('falls through to the active provider when providerDefault is unavailable (soft default)', async () => {
+    prompts.getStage.mockReturnValue(null);
+    providers.getProviderById.mockResolvedValue(null);
+    providers.getActiveProvider.mockResolvedValue(apiProvider());
+    runner.executeApiRun.mockImplementation(async ({ onData, onComplete }) => {
+      onData('active');
+      onComplete({ success: true });
+    });
+    const out = await runStagedLLM('s', {}, { providerDefault: 'gone' });
+    expect(out.providerId).toBe('mock-api');
+  });
+
+  it('throws STAGE_PROVIDER_UNAVAILABLE when stage.provider is set but disabled', async () => {
+    prompts.getStage.mockReturnValue({ provider: 'pinned-but-gone' });
+    providers.getProviderById.mockResolvedValue(null);
+    await expect(runStagedLLM('s', {})).rejects.toMatchObject({ code: 'STAGE_PROVIDER_UNAVAILABLE' });
+  });
+
+  it('throws PROVIDER_OVERRIDE_UNAVAILABLE when override is unknown', async () => {
+    prompts.getStage.mockReturnValue(null);
+    providers.getProviderById.mockResolvedValue(null);
+    await expect(runStagedLLM('s', {}, { providerOverride: 'nope' })).rejects.toMatchObject({ code: 'PROVIDER_OVERRIDE_UNAVAILABLE' });
+  });
+
+  it('throws NO_PROVIDER when no active provider is available', async () => {
+    prompts.getStage.mockReturnValue(null);
+    providers.getActiveProvider.mockResolvedValue(null);
+    await expect(runStagedLLM('s', {})).rejects.toMatchObject({ code: 'NO_PROVIDER' });
+  });
+});
+
+// Soft model-default tier (#1558): mirrors the providerDefault provider tests
+// above, one dimension over — but deliberately NOT symmetric. Precedence is
+// modelOverride (hard) > explicit stage.model pin > modelDefault (soft, Series
+// Autopilot's run model) > stage.model tier > provider default. The key
+// asymmetry (and the bug codex caught in review): nearly every stage carries a
+// *tier* value, which the run model MUST override — only an explicit model id is
+// a deliberate pin that beats the run model. Each case asserts the model carried
+// into the run record (out.model) = resolveEffectiveModel(provider, resolveModel(...)).
+describe('stageRunner — runStagedLLM model resolution (#1558)', () => {
+  const onComplete = (text) => async ({ onData, onComplete: done }) => { onData(text); done({ success: true }); };
+
+  it('lets an explicit stage.model pin beat a blanket modelDefault (deliberate pin wins)', async () => {
+    prompts.getStage.mockReturnValue({ model: 'pinned-model-id' });
+    providers.getActiveProvider.mockResolvedValue(apiProvider());
+    runner.executeApiRun.mockImplementation(onComplete('ok'));
+    const out = await runStagedLLM('s', {}, { modelDefault: 'run-model' });
+    expect(out.model).toBe('pinned-model-id');
+  });
+
+  it('lets modelDefault OVERRIDE a stage TIER value (the run model applies to unpinned/tier stages)', async () => {
+    // A tier (default/light/medium/heavy/ultra) is NOT a deliberate pin — the run model
+    // must win, else launching autopilot with a model is a no-op on ~every stage.
+    prompts.getStage.mockReturnValue({ model: 'heavy' });
+    providers.getActiveProvider.mockResolvedValue(apiProvider({ heavyModel: 'h' }));
+    runner.executeApiRun.mockImplementation(onComplete('ok'));
+    const out = await runStagedLLM('s', {}, { modelDefault: 'run-model' });
+    expect(out.model).toBe('run-model');
+  });
+
+  it('resolves a stage TIER normally when no modelDefault is set (unchanged behavior)', async () => {
+    prompts.getStage.mockReturnValue({ model: 'heavy' });
+    providers.getActiveProvider.mockResolvedValue(apiProvider({ heavyModel: 'h' }));
+    runner.executeApiRun.mockImplementation(onComplete('ok'));
+    const out = await runStagedLLM('s', {});
+    expect(out.model).toBe('h');
+  });
+
+  it('uses modelDefault when the stage has no model field at all', async () => {
+    prompts.getStage.mockReturnValue(null);
+    providers.getActiveProvider.mockResolvedValue(apiProvider());
+    runner.executeApiRun.mockImplementation(onComplete('ok'));
+    const out = await runStagedLLM('s', {}, { modelDefault: 'run-model' });
+    expect(out.model).toBe('run-model');
+  });
+
+  it('lets modelOverride (hard) beat an explicit pin, a tier, and modelDefault', async () => {
+    prompts.getStage.mockReturnValue({ model: 'pinned-model-id' });
+    providers.getActiveProvider.mockResolvedValue(apiProvider());
+    runner.executeApiRun.mockImplementation(onComplete('ok'));
+    const out = await runStagedLLM('s', {}, { modelOverride: 'hard-model', modelDefault: 'run-model' });
+    expect(out.model).toBe('hard-model');
+  });
+
+  it('falls through to the provider default when no override, pin, tier, or modelDefault is set', async () => {
+    prompts.getStage.mockReturnValue(null);
+    providers.getActiveProvider.mockResolvedValue(apiProvider());
+    runner.executeApiRun.mockImplementation(onComplete('ok'));
+    const out = await runStagedLLM('s', {});
+    expect(out.model).toBe('m-default');
+  });
+});
+
+describe('stageRunner — runInlineLLM (#1346)', () => {
+  it('runs a caller-supplied prompt with no stage (active provider, no buildPrompt)', async () => {
+    providers.getActiveProvider.mockResolvedValue(apiProvider());
+    let executedPrompt;
+    runner.executeApiRun.mockImplementation(async ({ prompt, onData, onComplete }) => {
+      executedPrompt = prompt;
+      onData('{"findings": []}');
+      onComplete({ success: true });
+    });
+    const out = await runInlineLLM('my inline prompt body', { returnsJson: true, source: 'pipeline-editorial-custom' });
+    expect(out.providerId).toBe('mock-api');
+    expect(out.content).toEqual({ findings: [] });
+    // The body rides through unrendered — buildPrompt/getStage are not consulted.
+    // It arrives prefixed with the IP-latitude clause, which the runner stamps on
+    // any creative run source (a custom editorial check reads the manuscript).
+    expect(executedPrompt.endsWith('my inline prompt body')).toBe(true);
+    expect(executedPrompt).toContain(CREATIVE_LATITUDE_HEADING);
+    expect(prompts.buildPrompt).not.toHaveBeenCalled();
+    expect(prompts.getStage).not.toHaveBeenCalled();
+  });
+
+  it('rejects an empty prompt', async () => {
+    await expect(runInlineLLM('   ')).rejects.toMatchObject({ code: 'INLINE_PROMPT_REQUIRED' });
+    await expect(runInlineLLM(null)).rejects.toMatchObject({ code: 'INLINE_PROMPT_REQUIRED' });
+  });
+});
+
+describe('stageRunner — runStagedLLM dispatch', () => {
+  it('routes CLI providers through executeCliRun', async () => {
+    prompts.getStage.mockReturnValue(null);
+    providers.getActiveProvider.mockResolvedValue(cliProvider());
+    runner.executeCliRun.mockImplementation(async ({ onData, onComplete }) => {
+      onData('cli-output');
+      onComplete({ success: true });
+    });
+    const out = await runStagedLLM('s', {});
+    expect(out.content).toBe('cli-output');
+    expect(runner.executeCliRun).toHaveBeenCalledTimes(1);
+    expect(runner.executeApiRun).not.toHaveBeenCalled();
+  });
+
+  it('rejects when executeApiRun reports an error', async () => {
+    prompts.getStage.mockReturnValue(null);
+    providers.getActiveProvider.mockResolvedValue(apiProvider());
+    runner.executeApiRun.mockImplementation(async ({ onComplete }) => {
+      onComplete({ error: 'simulated 500' });
+    });
+    await expect(runStagedLLM('s', {})).rejects.toThrow(/simulated 500/);
+  });
+
+  it('rejects when executeCliRun reports success: false', async () => {
+    prompts.getStage.mockReturnValue(null);
+    providers.getActiveProvider.mockResolvedValue(cliProvider());
+    runner.executeCliRun.mockImplementation(async ({ onComplete }) => {
+      onComplete({ success: false, error: 'cli failed' });
+    });
+    await expect(runStagedLLM('s', {})).rejects.toThrow(/cli failed/);
+  });
+
+  it('parses JSON when returnsJson is true', async () => {
+    prompts.getStage.mockReturnValue(null);
+    providers.getActiveProvider.mockResolvedValue(apiProvider());
+    runner.executeApiRun.mockImplementation(async ({ onData, onComplete }) => {
+      onData('```json\n{"x":1}\n```');
+      onComplete({ success: true });
+    });
+    const out = await runStagedLLM('s', {}, { returnsJson: true });
+    expect(out.content).toEqual({ x: 1 });
+  });
+
+  it('carries the output budget and terminal reason through the API transport', async () => {
+    prompts.getStage.mockReturnValue(null);
+    providers.getActiveProvider.mockResolvedValue(apiProvider());
+    runner.executeApiRun.mockImplementation(async ({ onData, onComplete }) => {
+      onData('{}');
+      onComplete({ success: true, finishReason: 'length' });
+    });
+    const result = await runStagedLLM('s', {}, { maxTokens: 2048, allowFallback: false });
+    expect(runner.executeApiRun).toHaveBeenCalledWith(expect.objectContaining({ maxTokens: 2048 }));
+    expect(result).toMatchObject({ content: '{}', finishReason: 'length' });
+  });
+
+  it('forwards source to createRun for transcript filtering', async () => {
+    prompts.getStage.mockReturnValue(null);
+    providers.getActiveProvider.mockResolvedValue(apiProvider());
+    runner.executeApiRun.mockImplementation(async ({ onData, onComplete }) => {
+      onData('out');
+      onComplete({ success: true });
+    });
+    await runStagedLLM('s', {}, { source: 'pipeline-text-stage' });
+    expect(runner.createRun).toHaveBeenCalledWith(expect.objectContaining({ source: 'pipeline-text-stage' }));
+  });
+
+  it('disables proactive and runtime fallback for provider-budgeted prompts', async () => {
+    prompts.getStage.mockReturnValue(null);
+    providers.getActiveProvider.mockResolvedValue(apiProvider({ contextWindow: 1_000_000 }));
+    runner.executeApiRun.mockImplementation(async ({ onComplete }) => {
+      onComplete({ error: 'primary failed' });
+    });
+
+    await expect(runStagedLLM('s', {}, { allowFallback: false }))
+      .rejects.toThrow(/primary failed/);
+
+    expect(runner.createRun).toHaveBeenCalledWith(expect.objectContaining({ allowFallback: false }));
+    expect(runner.executeApiRun).toHaveBeenCalledTimes(1);
+  });
+
+  it('passes stage.timeout to executeCliRun when set', async () => {
+    prompts.getStage.mockReturnValue({ timeout: 900000 });
+    providers.getActiveProvider.mockResolvedValue(cliProvider({ timeout: 5000 }));
+    runner.executeCliRun.mockImplementation(async ({ onComplete }) => {
+      onComplete({ success: true });
+    });
+    await runStagedLLM('s', {});
+    // executeCliRun({ runId, provider, prompt, workspacePath, onData, onComplete, timeout })
+    expect(runner.executeCliRun.mock.calls[0][0].timeout).toBe(900000);
+  });
+
+  it('falls back to provider.timeout when stage.timeout is missing', async () => {
+    prompts.getStage.mockReturnValue(null);
+    providers.getActiveProvider.mockResolvedValue(cliProvider({ timeout: 5000 }));
+    runner.executeCliRun.mockImplementation(async ({ onComplete }) => {
+      onComplete({ success: true });
+    });
+    await runStagedLLM('s', {});
+    expect(runner.executeCliRun.mock.calls[0][0].timeout).toBe(5000);
+  });
+
+  it('coerces a legacy digit-only stringified stage.timeout to a number', async () => {
+    prompts.getStage.mockReturnValue({ timeout: '900000' });
+    providers.getActiveProvider.mockResolvedValue(cliProvider({ timeout: 5000 }));
+    runner.executeCliRun.mockImplementation(async ({ onComplete }) => {
+      onComplete({ success: true });
+    });
+    await runStagedLLM('s', {});
+    expect(runner.executeCliRun.mock.calls[0][0].timeout).toBe(900000);
+  });
+
+  it('rejects exponent/hex/float string forms (matches parseTimeoutMs)', async () => {
+    // Number('1e3') === 1000 would silently sneak past a bare Number()
+    // coercion. The digit-only gate keeps the runner in lockstep with
+    // the route validator and client parser.
+    prompts.getStage.mockReturnValue({ timeout: '1e3' });
+    providers.getActiveProvider.mockResolvedValue(cliProvider({ timeout: 5000 }));
+    runner.executeCliRun.mockImplementation(async ({ onComplete }) => {
+      onComplete({ success: true });
+    });
+    await runStagedLLM('s', {});
+    expect(runner.executeCliRun.mock.calls[0][0].timeout).toBe(5000);
+  });
+
+  it('rejects zero/negative stage.timeout instead of cancelling instantly', async () => {
+    prompts.getStage.mockReturnValue({ timeout: 0 });
+    providers.getActiveProvider.mockResolvedValue(cliProvider({ timeout: 5000 }));
+    runner.executeCliRun.mockImplementation(async ({ onComplete }) => {
+      onComplete({ success: true });
+    });
+    await runStagedLLM('s', {});
+    expect(runner.executeCliRun.mock.calls[0][0].timeout).toBe(5000);
+  });
+
+  it('honors timeoutOverride beating both stage.timeout and provider.timeout', async () => {
+    prompts.getStage.mockReturnValue({ timeout: 900000 });
+    providers.getActiveProvider.mockResolvedValue(cliProvider({ timeout: 5000 }));
+    runner.executeCliRun.mockImplementation(async ({ onComplete }) => {
+      onComplete({ success: true });
+    });
+    await runStagedLLM('s', {}, { timeoutOverride: 1234 });
+    expect(runner.executeCliRun.mock.calls[0][0].timeout).toBe(1234);
+  });
+
+  it('rejects a non-integer stage.timeout (no silent truncation)', async () => {
+    // 1000.9 must NOT round to 1000 — both parseTimeoutMs on the client
+    // and z.number().int() on the server reject non-integers, so the
+    // runner mirrors that. Falls back to provider default.
+    prompts.getStage.mockReturnValue({ timeout: 1000.9 });
+    providers.getActiveProvider.mockResolvedValue(cliProvider({ timeout: 5000 }));
+    runner.executeCliRun.mockImplementation(async ({ onComplete }) => {
+      onComplete({ success: true });
+    });
+    await runStagedLLM('s', {});
+    expect(runner.executeCliRun.mock.calls[0][0].timeout).toBe(5000);
+  });
+
+  it('rejects a non-positive timeoutOverride instead of running unbounded', async () => {
+    // The runner treats `0` as "no timeout" — a caller bug must not silently
+    // turn into an unbounded run. Drop to stage.timeout (or provider.timeout
+    // when neither is set).
+    prompts.getStage.mockReturnValue(null);
+    providers.getActiveProvider.mockResolvedValue(cliProvider({ timeout: 5000 }));
+    runner.executeCliRun.mockImplementation(async ({ onComplete }) => {
+      onComplete({ success: true });
+    });
+    await runStagedLLM('s', {}, { timeoutOverride: 0 });
+    expect(runner.executeCliRun.mock.calls[0][0].timeout).toBe(5000);
+  });
+
+  it('rejects a too-large timeoutOverride (above 12-hour cap) and falls back', async () => {
+    // Matches the route validator's max: anything > 43_200_000 is invalid,
+    // not silently clamped. Falls through to provider.timeout.
+    prompts.getStage.mockReturnValue(null);
+    providers.getActiveProvider.mockResolvedValue(cliProvider({ timeout: 5000 }));
+    runner.executeCliRun.mockImplementation(async ({ onComplete }) => {
+      onComplete({ success: true });
+    });
+    await runStagedLLM('s', {}, { timeoutOverride: 9_999_999_999 });
+    expect(runner.executeCliRun.mock.calls[0][0].timeout).toBe(5000);
+  });
+
+  it('rejects a timeoutOverride below the 1s floor', async () => {
+    // Internal callers (extractors / pipeline stages) bypass the route
+    // validator, so the runner enforces the same min as the schema. A `1`
+    // override would otherwise become a near-instant cancel.
+    prompts.getStage.mockReturnValue(null);
+    providers.getActiveProvider.mockResolvedValue(cliProvider({ timeout: 5000 }));
+    runner.executeCliRun.mockImplementation(async ({ onComplete }) => {
+      onComplete({ success: true });
+    });
+    await runStagedLLM('s', {}, { timeoutOverride: 999 });
+    expect(runner.executeCliRun.mock.calls[0][0].timeout).toBe(5000);
+  });
+
+  it('passes effectiveTimeout into createRun so /runs metadata matches execution', async () => {
+    prompts.getStage.mockReturnValue({ timeout: 900000 });
+    providers.getActiveProvider.mockResolvedValue(cliProvider({ timeout: 5000 }));
+    runner.executeCliRun.mockImplementation(async ({ onComplete }) => {
+      onComplete({ success: true });
+    });
+    await runStagedLLM('s', {});
+    expect(runner.createRun).toHaveBeenCalledWith(expect.objectContaining({ timeout: 900000 }));
+  });
+
+  it('falls back to provider.timeout in createRun call when no override is set', async () => {
+    prompts.getStage.mockReturnValue(null);
+    providers.getActiveProvider.mockResolvedValue(cliProvider({ timeout: 5000 }));
+    runner.executeCliRun.mockImplementation(async ({ onComplete }) => {
+      onComplete({ success: true });
+    });
+    await runStagedLLM('s', {});
+    // /runs metadata must record what executeXxxRun actually enforces,
+    // not `undefined`. The runner's per-call timeout always resolves to
+    // provider.timeout when there's no stage/caller override; the run
+    // record needs to mirror that.
+    expect(runner.createRun).toHaveBeenCalledWith(expect.objectContaining({ timeout: 5000 }));
+  });
+
+  it('reconciles to a fallback provider when createRun returns a different provider', async () => {
+    prompts.getStage.mockReturnValue(null);
+    const original = cliProvider({ id: 'unavailable', timeout: 5000 });
+    const fallback = cliProvider({ id: 'fallback-cli', defaultModel: 'fallback-model', timeout: 7000 });
+    providers.getActiveProvider.mockResolvedValue(original);
+    runner.createRun.mockResolvedValueOnce({ runId: 'run-abc12345', provider: fallback });
+    runner.executeCliRun.mockImplementation(async ({ provider: providerArg, onComplete }) => {
+      // Critical: execution must run against the fallback (the one createRun
+      // returned), NOT the original requested provider.
+      expect(providerArg.id).toBe('fallback-cli');
+      onComplete({ success: true });
+    });
+    const out = await runStagedLLM('s', {});
+    expect(out.providerId).toBe('fallback-cli');
+    // /runs attribution must be patched too so the record matches execution.
+    expect(runner.patchRunMetadata).toHaveBeenCalledWith(
+      'run-abc12345',
+      expect.objectContaining({ providerId: 'fallback-cli' })
+    );
+  });
+});
+
+describe('withLocalConcurrencyGate', () => {
+  // Build a fn that records peak concurrency while it runs.
+  const makeTracker = () => {
+    const state = { active: 0, peak: 0 };
+    const fn = () => {
+      state.active += 1;
+      state.peak = Math.max(state.peak, state.active);
+      return new Promise((resolve) => setTimeout(() => { state.active -= 1; resolve('ok'); }, 5));
+    };
+    return { state, fn };
+  };
+
+  it('serializes concurrent calls to a LOCAL api endpoint (peak ≤ limit)', async () => {
+    const provider = { type: 'api', endpoint: 'http://localhost:11434' };
+    const { state, fn } = makeTracker();
+    await Promise.all(Array.from({ length: 6 }, () => withLocalConcurrencyGate(provider, fn)));
+    expect(state.peak).toBeLessThanOrEqual(LOCAL_LLM_MAX_CONCURRENCY);
+    expect(LOCAL_LLM_MAX_CONCURRENCY).toBe(1); // default — serialized
+  });
+
+  it('does NOT gate a remote api endpoint (runs concurrently)', async () => {
+    const provider = { type: 'api', endpoint: 'https://api.openai.com' };
+    const { state, fn } = makeTracker();
+    await Promise.all(Array.from({ length: 4 }, () => withLocalConcurrencyGate(provider, fn)));
+    expect(state.peak).toBeGreaterThan(1); // ungated
+  });
+
+  it('does NOT gate CLI/TUI providers (no endpoint)', async () => {
+    const provider = { type: 'cli', id: 'codex' };
+    const { state, fn } = makeTracker();
+    await Promise.all(Array.from({ length: 4 }, () => withLocalConcurrencyGate(provider, fn)));
+    expect(state.peak).toBeGreaterThan(1);
+  });
+
+  it('serializes concurrent TUI calls to a LOCAL endpoint', async () => {
+    const provider = { type: 'tui', endpoint: 'http://127.0.0.1:8000/v1' };
+    const { state, fn } = makeTracker();
+    await Promise.all(Array.from({ length: 4 }, () => withLocalConcurrencyGate(provider, fn)));
+    expect(state.peak).toBeLessThanOrEqual(LOCAL_LLM_MAX_CONCURRENCY);
+  });
+
+  it('releases the slot even when the gated fn throws (no deadlock)', async () => {
+    const provider = { type: 'api', endpoint: 'http://127.0.0.1:1234' };
+    await expect(withLocalConcurrencyGate(provider, () => Promise.reject(new Error('boom')))).rejects.toThrow('boom');
+    // A subsequent call still acquires the freed slot and resolves.
+    await expect(withLocalConcurrencyGate(provider, () => Promise.resolve('after'))).resolves.toBe('after');
+  });
+});
+
+describe('stageRunner — resolveJudgeForStage (writer/judge split, #2167)', () => {
+  it('resolves the stage judge pin to the pinned provider + model', async () => {
+    const judge = { id: 'judge-cli', name: 'Judge', type: 'cli', enabled: true, defaultModel: 'jm-default', heavyModel: 'jm-heavy' };
+    providers.getProviderById.mockResolvedValue(judge);
+    const out = await resolveJudgeForStage({ provider: 'writer', model: 'default', judgeProvider: 'judge-cli', judgeModel: 'heavy' });
+    expect(out.provider.id).toBe('judge-cli');
+    expect(out.model).toBe('jm-heavy'); // tier mapped against the judge provider
+  });
+
+  it('throws STAGE_JUDGE_PROVIDER_UNAVAILABLE when the pinned judge is disabled/missing', async () => {
+    providers.getProviderById.mockResolvedValue({ id: 'judge-cli', enabled: false });
+    await expect(resolveJudgeForStage({ judgeProvider: 'judge-cli' }))
+      .rejects.toMatchObject({ code: 'STAGE_JUDGE_PROVIDER_UNAVAILABLE' });
+  });
+
+  it('an explicit providerOverride beats the stage judge pin', async () => {
+    const override = { id: 'override-cli', name: 'Override', type: 'cli', enabled: true, defaultModel: 'om' };
+    providers.getProviderById.mockImplementation(async (id) => (id === 'override-cli' ? override : { id, enabled: true, type: 'cli', defaultModel: 'x' }));
+    const out = await resolveJudgeForStage({ judgeProvider: 'judge-cli' }, { providerOverride: 'override-cli' });
+    expect(out.provider.id).toBe('override-cli');
+  });
+
+  it('with no judge pin, falls back to the writer stage provider/model', async () => {
+    const active = apiProvider({ id: 'writer-api', defaultModel: 'wm-default' });
+    providers.getActiveProvider.mockResolvedValue(active);
+    providers.getProviderById.mockResolvedValue(null);
+    const out = await resolveJudgeForStage({ model: 'default' }); // no provider pin → active
+    expect(out.provider.id).toBe('writer-api');
+    expect(out.model).toBe('wm-default');
+  });
+});
+
+describe('stageRunner — resolveEffortHint (#3641)', () => {
+  it('prefers an explicit effortOverride over every softer signal', () => {
+    expect(resolveEffortHint({ effort: 'low' }, { effortOverride: 'max', effortDefault: 'medium' })).toBe('max');
+  });
+
+  it('lets a deliberate stage.effort pin beat the run-level default', () => {
+    expect(resolveEffortHint({ effort: 'low' }, { effortDefault: 'high' })).toBe('low');
+  });
+
+  it('applies the run-level effortDefault to a stage with no pin', () => {
+    expect(resolveEffortHint({ model: 'quick' }, { effortDefault: 'high' })).toBe('high');
+    expect(resolveEffortHint(null, { effortDefault: 'high' })).toBe('high');
+  });
+
+  it('returns null when nothing sets an effort (provider config decides)', () => {
+    expect(resolveEffortHint(null, {})).toBeNull();
+    expect(resolveEffortHint({ model: 'quick' }, undefined)).toBeNull();
+  });
+});
+
+describe('stageRunner — effort threading into the run (#3641)', () => {
+  // The runner has no `effort` argument: `buildCliArgs` reads `provider.effort`
+  // off the per-run clone, so asserting on the clone IS asserting on what the
+  // spawned CLI gets.
+  const runWithEffort = async (provider, options) => {
+    providers.getActiveProvider.mockResolvedValue(provider);
+    runner.executeCliRun.mockImplementation(async ({ onComplete }) => { onComplete({ success: true }); });
+    await runStagedLLM('s', {}, options);
+    return runner.executeCliRun.mock.calls[0][0].provider;
+  };
+
+  it('hands the run-level effortDefault to the runner for an unpinned stage', async () => {
+    prompts.getStage.mockReturnValue(null);
+    const provider = await runWithEffort(cliProvider(), { effortDefault: 'high' });
+    expect(provider.effort).toBe('high');
+  });
+
+  it('hands the stage pin, not the run default, to the runner', async () => {
+    prompts.getStage.mockReturnValue({ effort: 'low' });
+    const provider = await runWithEffort(cliProvider(), { effortDefault: 'high' });
+    expect(provider.effort).toBe('low');
+  });
+
+  it('sets no effort on the run when nobody asked for one', async () => {
+    prompts.getStage.mockReturnValue(null);
+    const provider = await runWithEffort(cliProvider(), {});
+    expect(provider.effort).toBeUndefined();
+  });
+
+  it('emits the provider-appropriate flag, and nothing for a provider with no effort control', async () => {
+    // The drop/clamp lives in buildEffortArgs — feed it the SAME resolved hint
+    // stageRunner passes so the "safe to pass unconditionally" claim is proven
+    // end-to-end rather than assumed.
+    const effort = resolveEffortHint(null, { effortDefault: 'high' });
+    expect(buildEffortArgs(effort, { id: 'codex', command: 'codex' })).toEqual(['-c', 'model_reasoning_effort=high']);
+    expect(buildEffortArgs(effort, { id: 'claude-cli', command: 'claude' })).toEqual(['--effort', 'high']);
+    expect(buildEffortArgs(effort, { id: 'grok-cli', command: 'grok' })).toEqual(['--effort', 'high']);
+    expect(buildEffortArgs(effort, { id: 'kimi-cli', command: 'kimi' })).toEqual([]);
+    expect(buildEffortArgs(effort, { id: 'openai-api', type: 'api' })).toEqual([]);
+  });
+});
+
+// "Use one provider/model for every stage" (Series Autopilot's overrideStagePins).
+// The switch is an async-context flag rather than an option key — these assert
+// that flipping it changes exactly the four pin lookups and nothing else, and
+// that the flag does not leak outside the wrapped subtree.
+describe('stageRunner — withStagePinsIgnored', () => {
+  const onComplete = (text) => async ({ onData, onComplete: done }) => { onData(text); done({ success: true }); };
+
+  it('skips stage.provider so the run-level providerDefault wins', async () => {
+    prompts.getStage.mockReturnValue({ provider: 'stage-pinned' });
+    providers.getProviderById.mockImplementation(async (id) => apiProvider({ id }));
+    runner.executeApiRun.mockImplementation(onComplete('ok'));
+    const out = await withStagePinsIgnored(true, () =>
+      runStagedLLM('s', {}, { providerDefault: 'run-default' }));
+    expect(out.providerId).toBe('run-default');
+  });
+
+  it('skips a stage.provider pin whose provider is gone instead of throwing', async () => {
+    prompts.getStage.mockReturnValue({ provider: 'pinned-but-gone' });
+    providers.getProviderById.mockResolvedValue(null);
+    providers.getActiveProvider.mockResolvedValue(apiProvider());
+    runner.executeApiRun.mockImplementation(onComplete('ok'));
+    const out = await withStagePinsIgnored(true, () => runStagedLLM('s', {}));
+    expect(out.providerId).toBe('mock-api');
+  });
+
+  it('skips an explicit stage.model pin so modelDefault wins', async () => {
+    prompts.getStage.mockReturnValue({ model: 'pinned-model-id' });
+    providers.getActiveProvider.mockResolvedValue(apiProvider());
+    runner.executeApiRun.mockImplementation(onComplete('ok'));
+    const out = await withStagePinsIgnored(true, () =>
+      runStagedLLM('s', {}, { modelDefault: 'run-model' }));
+    expect(out.model).toBe('run-model');
+  });
+
+  it('keeps resolving a stage TIER — a tier is a per-provider mapping, not a pin', async () => {
+    prompts.getStage.mockReturnValue({ model: 'heavy' });
+    providers.getActiveProvider.mockResolvedValue(apiProvider({ heavyModel: 'h' }));
+    runner.executeApiRun.mockImplementation(onComplete('ok'));
+    const out = await withStagePinsIgnored(true, () => runStagedLLM('s', {}));
+    expect(out.model).toBe('h');
+  });
+
+  it('drops a stage.effort pin so the run-level effortDefault reaches the runner', async () => {
+    prompts.getStage.mockReturnValue({ effort: 'low' });
+    providers.getActiveProvider.mockResolvedValue(cliProvider());
+    runner.executeCliRun.mockImplementation(async ({ onComplete: done }) => { done({ success: true }); });
+    await withStagePinsIgnored(true, () => runStagedLLM('s', {}, { effortDefault: 'high' }));
+    expect(runner.executeCliRun.mock.calls[0][0].provider.effort).toBe('high');
+  });
+
+  it('skips a stage judge pin so the judge follows the forced writer route', async () => {
+    const active = apiProvider({ id: 'run-api', defaultModel: 'run-model' });
+    providers.getActiveProvider.mockResolvedValue(active);
+    providers.getProviderById.mockImplementation(async (id) => apiProvider({ id, defaultModel: `${id}-m` }));
+    const pinned = await resolveJudgeForStage({ judgeProvider: 'judge-cli' });
+    expect(pinned.provider.id).toBe('judge-cli');
+    const out = await withStagePinsIgnored(true, () => resolveJudgeForStage({ judgeProvider: 'judge-cli' }));
+    expect(out.provider.id).toBe('run-api');
+    expect(out.model).toBe('run-model');
+  });
+
+  it('changes nothing when the flag is off', async () => {
+    prompts.getStage.mockReturnValue({ provider: 'stage-pinned' });
+    providers.getProviderById.mockImplementation(async (id) => apiProvider({ id }));
+    runner.executeApiRun.mockImplementation(onComplete('ok'));
+    const off = await withStagePinsIgnored(false, () =>
+      runStagedLLM('s', {}, { providerDefault: 'run-default' }));
+    expect(off.providerId).toBe('stage-pinned');
+  });
+
+  // The pin list itself, since every resolver now reads a masked stage rather
+  // than testing pins one at a time — this is the one place that says WHICH
+  // fields the switch strips and which deliberately survive.
+  it('effectiveStage strips exactly the routing pins, keeping the tier and the timeout', () => {
+    const stage = {
+      provider: 'p', model: 'pinned-model-id', effort: 'low', judgeProvider: 'jp', judgeModel: 'jm',
+      timeout: 60_000, template: 'x',
+    };
+    expect(effectiveStage(stage)).toBe(stage); // identity outside a forced run
+    const masked = withStagePinsIgnored(true, () => effectiveStage(stage));
+    expect(masked).toEqual({ timeout: 60_000, template: 'x' });
+    expect(stage.provider).toBe('p'); // the caller's stage object is not mutated
+    // A tier is a per-provider mapping, not a pin — it survives.
+    expect(withStagePinsIgnored(true, () => effectiveStage({ model: 'heavy' }))).toEqual({ model: 'heavy' });
+    expect(withStagePinsIgnored(true, () => effectiveStage(null))).toBeNull();
+  });
+
+  it('does not reach a concurrent call outside the context (async-context scoping)', async () => {
+    let insideSaw;
+    let outsideSaw;
+    await Promise.all([
+      withStagePinsIgnored(true, async () => {
+        await new Promise((r) => setTimeout(r, 5));
+        insideSaw = stagePinsIgnored();
+      }),
+      (async () => {
+        await new Promise((r) => setTimeout(r, 1));
+        outsideSaw = stagePinsIgnored();
+      })(),
+    ]);
+    expect(insideSaw).toBe(true);
+    expect(outsideSaw).toBe(false);
+  });
+});
+
+it('resolves an Ultra stage without passing a tier name to the provider', () => {
+  expect(resolveModel({ ultraModel: 'frontier', heavyModel: 'strong' }, 'ultra')).toBe('frontier');
+  expect(resolveModel({ heavyModel: 'strong' }, 'ultra')).toBe('strong');
+  expect(resolveModel({ defaultModel: 'default' }, 'ultra')).toBe('default');
+});

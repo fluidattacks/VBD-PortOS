@@ -1,0 +1,505 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Folder, FolderPlus, FilePlus, FileText, ChevronDown, ChevronRight, Trash2, GripVertical, PanelLeftClose } from 'lucide-react';
+import {
+  DndContext, DragOverlay, KeyboardSensor, PointerSensor,
+  useDraggable, useDroppable, useSensor, useSensors,
+} from '@dnd-kit/core';
+import { createFreeDroppableKeyboardCoordinates, keyboardAwareCollisionDetection } from '../../lib/dndKeyboardCoordinates';
+import toast from '../ui/Toast';
+import CollapsibleListItem from '../ui/CollapsibleListItem';
+import InfiniteScrollFooter from '../ui/InfiniteScrollFooter';
+import { formatCount } from '../../utils/formatters';
+import ConfirmButtonPair from '../ui/ConfirmButtonPair';
+import {
+  createWritersRoomFolder,
+  deleteWritersRoomFolder,
+  createWritersRoomWork,
+  deleteWritersRoomWork,
+  updateWritersRoomWork,
+} from '../../services/apiWritersRoom';
+import { useConfirmDelete } from '../../hooks/useConfirmDelete';
+import { KIND_LABELS } from './labels';
+
+const UNFILED_DROP_ID = 'wr-unfiled';
+
+// Arrow keys step between the folder rows and the Unfiled zone rather than
+// nudging the drag 25px at a time, which is dnd-kit's default and skips right
+// past a collapsed folder row.
+const libraryKeyboardCoordinates = createFreeDroppableKeyboardCoordinates();
+
+export default function LibraryPane({
+  folders, works, activeWorkId, onSelectWork, onRefresh, onCollapse,
+  creatingWork, onCreatingWorkChange, paging,
+}) {
+  const deletingWorks = useRef(new Set());
+  const [removingWorks, setRemovingWorks] = useState(new Set());
+  const [openFolders, setOpenFolders] = useState({});
+  const [creatingFolder, setCreatingFolder] = useState(false);
+  const [folderName, setFolderName] = useState('');
+  const [workTitle, setWorkTitle] = useState('');
+  const [workKind, setWorkKind] = useState('short-story');
+
+  // The page-level empty state can start work creation too. Keep the two
+  // inline creation forms mutually exclusive regardless of which CTA fired.
+  useEffect(() => {
+    if (creatingWork) setCreatingFolder(false);
+  }, [creatingWork]);
+  // Inline delete confirm (no two-click-arm, no toast re-arm) — one row armed at
+  // a time, keyed by `work:<id>` / `folder:<id>`.
+  const { isConfirming, requestDelete, cancelDelete, confirmDelete } = useConfirmDelete();
+
+  const grouped = useMemo(() => {
+    const byFolder = new Map();
+    byFolder.set(null, []);
+    folders.forEach((f) => byFolder.set(f.id, []));
+    works.forEach((w) => {
+      const key = w.folderId && byFolder.has(w.folderId) ? w.folderId : null;
+      byFolder.get(key).push(w);
+    });
+    for (const arr of byFolder.values()) {
+      arr.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
+    }
+    return byFolder;
+  }, [folders, works]);
+
+  const toggleFolder = (id) => setOpenFolders((s) => ({ ...s, [id]: !s[id] }));
+
+  const submitFolder = async (e) => {
+    e.preventDefault();
+    if (!folderName.trim()) return;
+    const folder = await createWritersRoomFolder({ name: folderName.trim() }, { silent: true }).catch((err) => {
+      toast.error(`Failed to create folder: ${err.message}`);
+      return null;
+    });
+    if (!folder) return;
+    setFolderName('');
+    setCreatingFolder(false);
+    setOpenFolders((s) => ({ ...s, [folder.id]: true }));
+    onRefresh?.({ folder });
+  };
+
+  const submitWork = async (e) => {
+    e.preventDefault();
+    if (!workTitle.trim()) return;
+    const folderId = creatingWork === 'unfiled' ? null : creatingWork;
+    const work = await createWritersRoomWork({ title: workTitle.trim(), kind: workKind, folderId }, { silent: true }).catch((err) => {
+      toast.error(`Failed to create work: ${err.message}`);
+      return null;
+    });
+    if (!work) return;
+    setWorkTitle('');
+    setWorkKind('short-story');
+    onCreatingWorkChange(null);
+    onRefresh?.({ work });
+    onSelectWork?.(work.id);
+  };
+
+  const handleDeleteFolder = (id) => confirmDelete(async () => {
+    const result = await deleteWritersRoomFolder(id, { silent: true }).catch((err) => {
+      toast.error(`Delete failed: ${err.message}`);
+      return null;
+    });
+    if (result) onRefresh?.({ deletedFolderId: id });
+  });
+
+  const handleDeleteWork = (id) => confirmDelete(async () => {
+    if (deletingWorks.current.has(id)) return;
+    deletingWorks.current.add(id);
+    const result = await deleteWritersRoomWork(id, { silent: true }).catch((err) => {
+      toast.error(`Delete failed: ${err.message}`);
+      return null;
+    });
+    if (!result) { deletingWorks.current.delete(id); return; }
+    setRemovingWorks(prev => new Set([...prev, id]));
+  });
+
+  // PointerSensor with a small activation distance so a quick click still
+  // selects the work — only an actual drag gesture starts a DnD operation.
+  // KeyboardSensor is not optional here: filing a work into a folder is the
+  // ONLY write of `folderId` in the client, so without it a keyboard-only user
+  // can never move a work in or out of a folder (WCAG 2.1.1).
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: libraryKeyboardCoordinates }),
+  );
+  const [draggingWork, setDraggingWork] = useState(null);
+
+  const handleDragStart = useCallback((event) => {
+    setDraggingWork(event.active.data.current?.work || null);
+  }, []);
+
+
+  const handleDragEnd = useCallback(async (event) => {
+    setDraggingWork(null);
+    const { active, over } = event;
+    if (!over || !active) return;
+    const work = active.data.current?.work;
+    if (!work) return;
+    const targetFolderId = over.data.current?.folderId ?? null;
+    if (work.folderId === targetFolderId) return;
+    const updated = await updateWritersRoomWork(work.id, { folderId: targetFolderId }, { silent: true }).catch((err) => {
+      toast.error(`Move failed: ${err.message}`);
+      return null;
+    });
+    if (!updated) return;
+    const targetFolder = folders.find((f) => f.id === targetFolderId);
+    toast.success(`Moved "${work.title}" to ${targetFolder ? targetFolder.name : 'Unfiled'}`);
+    if (targetFolderId) setOpenFolders((s) => ({ ...s, [targetFolderId]: true }));
+    onRefresh?.({ work: updated });
+  }, [folders, onRefresh]);
+
+  // Escape (and a pointer drag released outside any zone) ends the drag without
+  // a drop; without this the overlay and the "Drop here to unfile" affordance
+  // stay on screen for good.
+  const handleDragCancel = useCallback(() => setDraggingWork(null), []);
+
+  // dnd-kit's stock announcements only ever say "draggable item N", which is an
+  // id. Name the work and the folder instead — for the Unfiled zone and for
+  // every folder, resolved off the drop target's own `folderId`.
+  const accessibility = useMemo(() => {
+    const zoneName = (over) => {
+      if (!over) return null;
+      const folderId = over.data?.current?.folderId ?? null;
+      if (!folderId) return 'Unfiled';
+      return folders.find((f) => f.id === folderId)?.name || 'a folder';
+    };
+    const workTitle = (active) => active?.data?.current?.work?.title || 'work';
+    return {
+      announcements: {
+        onDragStart: ({ active }) => `Picked up ${workTitle(active)}. Use the arrow keys to choose a folder, Space to file it there, or Escape to cancel.`,
+        onDragOver: ({ active, over }) => {
+          const zone = zoneName(over);
+          return zone
+            ? `${workTitle(active)} is over ${zone}.`
+            : `${workTitle(active)} is not over a folder.`;
+        },
+        onDragEnd: ({ active, over }) => {
+          const zone = zoneName(over);
+          return zone
+            ? `Filed ${workTitle(active)} in ${zone}.`
+            : `${workTitle(active)} was dropped outside a folder and did not move.`;
+        },
+        onDragCancel: ({ active }) => `Cancelled moving ${workTitle(active)}. It stayed where it was.`,
+      },
+      screenReaderInstructions: {
+        draggable: 'To move this work into a folder, press Space or Enter. While moving, use the arrow keys to choose a folder or the Unfiled section, then press Space to file it there, or Escape to cancel.',
+      },
+    };
+  }, [folders]);
+
+  const renderWorkRow = (work) => (
+    <li key={work.id} tabIndex={-1}>
+      <CollapsibleListItem removing={removingWorks.has(work.id)} spacing="0.125rem" onExited={() => {
+        if (activeWorkId === work.id) onSelectWork?.(null);
+        onRefresh?.({ deletedWorkId: work.id });
+        deletingWorks.current.delete(work.id);
+        setRemovingWorks(prev => { const next = new Set(prev); next.delete(work.id); return next; });
+      }}>
+    <WorkRow
+      work={work}
+      isActive={work.id === activeWorkId}
+      confirming={isConfirming(`work:${work.id}`)}
+      onSelect={() => onSelectWork?.(work.id)}
+      onRequestDelete={() => requestDelete(`work:${work.id}`)}
+      onConfirmDelete={() => handleDeleteWork(work.id)}
+      onCancelDelete={cancelDelete}
+    />
+      </CollapsibleListItem>
+    </li>
+  );
+
+  return (
+    <div className="space-y-4 text-sm">
+      <div className="flex items-center justify-between">
+        <h2 className="text-xs uppercase text-gray-400 tracking-wider">Library</h2>
+        {/* The three header actions wrap 14px icons, so they need an explicit
+            44px floor to be tappable — the same treatment the row-level actions
+            below already carry. The row has no padding of its own to bleed the
+            extra height back into (unlike the bible/snapshot rows in #3565), so
+            it grows to 44px rather than clawing it back with a negative margin. */}
+        <div className="flex items-center gap-1">
+          <button
+            onClick={() => { setCreatingFolder(true); onCreatingWorkChange(null); }}
+            className="flex items-center justify-center min-w-[44px] min-h-[44px] text-gray-400 hover:text-port-accent"
+            title="New folder"
+            aria-label="New folder"
+          >
+            <FolderPlus size={14} />
+          </button>
+          <button
+            onClick={() => { onCreatingWorkChange('unfiled'); setCreatingFolder(false); }}
+            className="flex items-center justify-center min-w-[44px] min-h-[44px] text-gray-400 hover:text-port-accent"
+            title="New work"
+            aria-label="New work"
+          >
+            <FilePlus size={14} />
+          </button>
+          {onCollapse && (
+            <button
+              onClick={onCollapse}
+              className="hidden md:inline-flex items-center justify-center min-w-[44px] min-h-[44px] text-gray-400 hover:text-white"
+              title="Hide library"
+              aria-label="Hide library"
+            >
+              <PanelLeftClose size={14} />
+            </button>
+          )}
+        </div>
+      </div>
+
+      {creatingFolder && (
+        <form onSubmit={submitFolder} className="space-y-1 bg-port-card border border-port-border rounded p-2">
+          <input
+            autoFocus
+            value={folderName}
+            onChange={(e) => setFolderName(e.target.value)}
+            placeholder="Folder name"
+            aria-label="Folder name"
+            className="w-full bg-port-bg border border-port-border rounded px-2 py-1 text-xs min-w-0 min-h-[44px]"
+          />
+          <div className="flex items-center gap-1">
+            <button type="submit" className="text-xs px-2 py-1 bg-port-accent text-white rounded flex-1 min-h-[44px]">Add</button>
+            <button type="button" onClick={() => { setCreatingFolder(false); setFolderName(''); }}
+              className="text-xs px-2 py-1 text-gray-400 min-w-[44px] min-h-[44px]">Cancel</button>
+          </div>
+        </form>
+      )}
+
+      {creatingWork && (
+        <form onSubmit={submitWork} className="space-y-1 bg-port-card border border-port-border rounded p-2">
+          <input
+            autoFocus
+            value={workTitle}
+            onChange={(e) => setWorkTitle(e.target.value)}
+            placeholder="Title"
+            aria-label="Work title"
+            className="w-full bg-port-bg border border-port-border rounded px-2 py-1 text-xs min-h-[44px]"
+          />
+          <select
+            aria-label="Work kind"
+            value={workKind}
+            onChange={(e) => setWorkKind(e.target.value)}
+            className="w-full bg-port-bg border border-port-border rounded px-2 py-1 text-xs min-h-[44px]"
+          >
+            {Object.entries(KIND_LABELS).map(([k, l]) => <option key={k} value={k}>{l}</option>)}
+          </select>
+          <div className="flex items-center gap-1">
+            <button type="submit" className="text-xs px-2 py-1 bg-port-accent text-white rounded flex-1 min-h-[44px]">Create</button>
+            <button type="button" onClick={() => onCreatingWorkChange(null)} className="text-xs px-2 py-1 text-gray-400 min-w-[44px] min-h-[44px]">Cancel</button>
+          </div>
+        </form>
+      )}
+
+      <DndContext
+        sensors={sensors}
+        accessibility={accessibility}
+        collisionDetection={keyboardAwareCollisionDetection}
+        onDragStart={handleDragStart}
+        onDragEnd={handleDragEnd}
+        onDragCancel={handleDragCancel}
+      >
+        <ul className="space-y-1">
+          {(!paging || (paging.loaded && !paging.hasMore && !paging.error)) && folders.length === 0 && grouped.get(null).length === 0 && !creatingFolder && !creatingWork && (
+            <li className="px-2 py-3 text-center">
+              <p className="text-xs text-gray-500 mb-2">No works yet.</p>
+              <button
+                type="button"
+                onClick={() => { onCreatingWorkChange('unfiled'); setCreatingFolder(false); }}
+                className="inline-flex min-h-[44px] items-center gap-1.5 rounded px-3 py-2 text-xs font-medium text-port-accent hover:bg-port-accent/10"
+              >
+                <FilePlus size={14} aria-hidden="true" />
+                New work
+              </button>
+            </li>
+          )}
+
+          <UnfiledZone
+            works={grouped.get(null)}
+            renderWorkRow={renderWorkRow}
+            showHeader={folders.length > 0 || grouped.get(null).length > 0}
+            isDragging={!!draggingWork}
+          />
+
+          {folders.map((folder) => (
+            <FolderRow
+              key={folder.id}
+              folder={folder}
+              partial={paging?.hasMore}
+              works={grouped.get(folder.id) || []}
+              isOpen={!!openFolders[folder.id]}
+              isDragging={!!draggingWork}
+              confirming={isConfirming(`folder:${folder.id}`)}
+              onToggle={() => toggleFolder(folder.id)}
+              onCreateWork={() => { onCreatingWorkChange(folder.id); setCreatingFolder(false); }}
+              onRequestDelete={() => requestDelete(`folder:${folder.id}`)}
+              onConfirmDelete={() => handleDeleteFolder(folder.id)}
+              onCancelDelete={cancelDelete}
+              renderWorkRow={renderWorkRow}
+            />
+          ))}
+        </ul>
+
+        <DragOverlay>
+          {draggingWork && (
+            <div className="flex items-center gap-2 px-2 py-1.5 rounded bg-port-card border border-port-accent text-sm text-port-accent shadow-lg">
+              <FileText size={14} aria-hidden="true" />
+              <span className="truncate max-w-[200px]">{draggingWork.title}</span>
+            </div>
+          )}
+        </DragOverlay>
+      </DndContext>
+      {paging && (
+        <>
+          <p className="px-2 text-xs text-port-text-muted">
+            {formatCount(works.length)} works loaded
+          </p>
+          <InfiniteScrollFooter
+            autoLoad={false}
+            hasMore={paging.hasMore}
+            loading={paging.loading}
+            error={paging.error}
+            onLoadMore={paging.error?.code === 'CURSOR_EXPIRED' ? paging.reload : paging.loadMore}
+            label="Load more works"
+          />
+        </>
+      )}
+    </div>
+  );
+}
+
+// ---------- DnD-aware subcomponents ----------
+
+function WorkRow({ work, isActive, confirming, onSelect, onRequestDelete, onConfirmDelete, onCancelDelete }) {
+  const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
+    id: `work:${work.id}`,
+    data: { work },
+  });
+  return (
+    <div className={`group relative ${isDragging ? 'opacity-30' : ''}`}>
+      <div className="flex items-stretch">
+        <button
+          ref={setNodeRef}
+          {...attributes}
+          {...listeners}
+          className="shrink-0 px-1 flex items-center cursor-grab active:cursor-grabbing touch-none text-gray-600 hover:text-gray-300"
+          title="Drag to move into a folder"
+          aria-label={`Drag ${work.title}`}
+        >
+          <GripVertical size={12} />
+        </button>
+        <button
+          onClick={onSelect}
+          className={`flex-1 flex items-center gap-2 px-2 py-1.5 rounded text-left text-sm transition-colors min-w-0 ${
+            isActive ? 'bg-port-accent/20 text-port-accent' : 'text-gray-300 hover:bg-port-card hover:text-white'
+          }`}
+        >
+          <FileText size={14} aria-hidden="true" className="shrink-0" />
+          <span className="truncate flex-1">{work.title}</span>
+          <span className="text-[10px] text-gray-500 uppercase">{work.wordCount} w</span>
+        </button>
+      </div>
+      {confirming ? (
+        <div className="absolute inset-0 flex items-center justify-end gap-2 pr-1 bg-port-bg/95 rounded">
+          <ConfirmButtonPair
+            prompt="Delete?"
+            ariaLabel={`Confirm delete ${work.title}`}
+            onConfirm={onConfirmDelete}
+            onCancel={onCancelDelete}
+          />
+        </div>
+      ) : (
+        <button
+          onClick={onRequestDelete}
+          className="absolute right-0 top-1/2 -translate-y-1/2 flex items-center justify-center min-w-[44px] min-h-[44px] transition-opacity opacity-40 sm:opacity-0 group-hover:opacity-100 focus:opacity-100 text-gray-500 hover:text-port-error"
+          aria-label={`Delete ${work.title}`}
+          title="Delete"
+        >
+          <Trash2 size={14} />
+        </button>
+      )}
+    </div>
+  );
+}
+
+function UnfiledZone({ works, renderWorkRow, showHeader, isDragging }) {
+  const { setNodeRef, isOver } = useDroppable({ id: UNFILED_DROP_ID, data: { folderId: null } });
+  const hasWorks = works.length > 0;
+  // Always render the drop target while a drag is in flight so a user can
+  // unfile a work even when the section is currently empty.
+  if (!hasWorks && !isDragging) return null;
+  return (
+    <li
+      ref={setNodeRef}
+      className={`rounded transition-colors ${isOver ? 'bg-port-accent/10 ring-1 ring-port-accent' : ''}`}
+    >
+      {(showHeader || isDragging) && (
+        <div className="text-[10px] uppercase text-gray-500 px-2 py-1">Unfiled</div>
+      )}
+      {hasWorks ? (
+        <ul className="pl-1 relative">{works.map(renderWorkRow)}</ul>
+      ) : (
+        <div className="text-xs text-gray-600 italic px-2 py-1">Drop here to unfile</div>
+      )}
+    </li>
+  );
+}
+
+function FolderRow({ folder, partial, works, isOpen, isDragging, confirming, onToggle, onCreateWork, onRequestDelete, onConfirmDelete, onCancelDelete, renderWorkRow }) {
+  const { setNodeRef, isOver } = useDroppable({ id: `folder:${folder.id}`, data: { folderId: folder.id } });
+  return (
+    <li className="group/folder">
+      <div
+        ref={setNodeRef}
+        className={`flex items-center gap-1 rounded transition-colors ${
+          isOver && isDragging ? 'bg-port-accent/15 ring-1 ring-port-accent' : ''
+        }`}
+      >
+        <button
+          onClick={onToggle}
+          className="flex-1 flex items-center gap-1 px-2 py-1 text-gray-300 hover:text-white text-sm min-w-0"
+        >
+          {isOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+          <Folder size={14} className="text-gray-400" />
+          <span className="flex-1 text-left truncate">{folder.name}</span>
+          <span className="text-[10px] text-gray-500">{formatCount(works.length)}{partial ? '+ loaded' : ''}</span>
+        </button>
+        {confirming ? (
+          <ConfirmButtonPair
+            prompt="Delete?"
+            className="shrink-0 pr-1"
+            ariaLabel={`Confirm delete folder ${folder.name}`}
+            onConfirm={onConfirmDelete}
+            onCancel={onCancelDelete}
+          />
+        ) : (
+          <>
+            <button
+              onClick={onCreateWork}
+              className="flex items-center justify-center min-w-[44px] min-h-[44px] text-gray-500 hover:text-port-accent transition-opacity opacity-40 sm:opacity-0 group-hover/folder:opacity-100 focus:opacity-100"
+              aria-label="Add work to folder"
+              title="New work in folder"
+            >
+              <FilePlus size={14} />
+            </button>
+            <button
+              onClick={onRequestDelete}
+              className="flex items-center justify-center min-w-[44px] min-h-[44px] transition-opacity opacity-40 sm:opacity-0 group-hover/folder:opacity-100 focus:opacity-100 text-gray-500 hover:text-port-error"
+              aria-label={`Delete folder ${folder.name}`}
+              title="Delete folder"
+            >
+              <Trash2 size={14} />
+            </button>
+          </>
+        )}
+      </div>
+      {isOpen && (
+        <ul className="pl-5 relative">
+          {works.length === 0 && (
+            <li className="text-xs text-gray-500 px-2 py-1">{partial ? 'No loaded works in this folder' : 'Empty'}</li>
+          )}
+          {works.map(renderWorkRow)}
+        </ul>
+      )}
+    </li>
+  );
+}

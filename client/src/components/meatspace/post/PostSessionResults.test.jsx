@@ -1,0 +1,229 @@
+import { describe, it, expect, vi } from 'vitest';
+import { render, screen, fireEvent, within, act } from '@testing-library/react';
+import PostSessionResults from './PostSessionResults';
+import PostSessionSummary from './PostSessionSummary';
+import { usePostSession } from '../../../hooks/usePostSession';
+import { generatePostDrill, submitPostSession } from '../../../services/api';
+
+vi.mock('../../../services/api', () => ({
+  generatePostDrill: vi.fn(), submitPostSession: vi.fn(),
+  scorePostLlmDrill: vi.fn(), submitTrainingRun: vi.fn(),
+}));
+vi.mock('../../ui/Toast', () => ({ default: { success: vi.fn(), error: vi.fn() } }));
+
+// Issue #2093 — the drill-breakdown expansion previously only ever showed
+// data for LLM drills (`isLlm && isExpanded && result.evaluation`); math and
+// cognitive drills rendered a dead, chevron-less button. These tests guard
+// both the fix (per-question review for non-LLM drills) and the regression
+// (LLM behavior stays exactly as it was).
+
+function makeSession(overrides = {}) {
+  return {
+    drillResults: [
+      {
+        type: 'multiplication',
+        score: 60,
+        questions: [
+          { prompt: '6 x 7', expected: 42, answered: 41, correct: false, responseMs: 2000 },
+          { prompt: '3 x 3', expected: 9, answered: 9, correct: true, responseMs: 900 },
+        ],
+      },
+      {
+        type: 'word-association',
+        score: 80,
+        evaluation: { summary: 'Nice variety', scores: [{ score: 80, feedback: 'Good range' }] },
+        responses: [{ response: 'apple, banana' }],
+      },
+    ],
+    sessionScore: 70,
+    state: 'complete',
+    saveSession: vi.fn(),
+    isTraining: false,
+    ...overrides,
+  };
+}
+
+function renderResults(overrides = {}) {
+  return render(
+    <PostSessionResults session={makeSession(overrides)} conditions={{}} onSaved={() => {}} onBack={() => {}} />
+  );
+}
+
+describe('PostSessionResults drill breakdown', () => {
+  it('opens a digit-span drill review by default', () => {
+    const { container } = renderResults({
+      drillResults: [{
+        type: 'digit-span',
+        score: 80,
+        questions: [{ prompt: '123', expected: '123', answered: '123', correct: true, responseMs: 800 }],
+      }],
+    });
+
+    expect(within(container.querySelector('table')).getAllByText('123')).not.toHaveLength(0);
+    expect(container.querySelector('.lucide-chevron-up')).toBeInTheDocument();
+    expect(container.querySelector('.lg\\:col-span-2')).toBeInTheDocument();
+  });
+
+  it('leaves non-digit-span drills collapsed by default', () => {
+    const { container } = renderResults();
+
+    expect(container.querySelector('table')).not.toBeInTheDocument();
+    expect(container.querySelectorAll('.lucide-chevron-down')).toHaveLength(2);
+  });
+
+  it('renders a chevron on every drill row — including non-LLM ones (regression: dead expand affordance)', () => {
+    const { container } = renderResults();
+    // Both rows start collapsed, so both show ChevronDown. Previously this
+    // icon was gated behind `isLlm &&`, so a math/cognitive row (like
+    // "multiplication" here) rendered no chevron at all.
+    expect(container.querySelectorAll('.lucide-chevron-down')).toHaveLength(2);
+  });
+
+  it('expanding a math drill row reveals its per-question review (regression for the isLlm-only gate)', () => {
+    const { container } = renderResults();
+    fireEvent.click(screen.getByText('Multiplication'));
+    const table = within(container.querySelector('table'));
+    expect(table.getByText('6 x 7')).toBeInTheDocument();
+    expect(table.getByText('41')).toBeInTheDocument();
+    expect(table.getByText('42')).toBeInTheDocument();
+  });
+
+  it('leads the math review with a missed-items summary', () => {
+    renderResults();
+    fireEvent.click(screen.getByText('Multiplication'));
+    expect(screen.getByText('1 missed')).toBeInTheDocument();
+  });
+
+  it('expanding an LLM drill row still shows its evaluation, unchanged', () => {
+    renderResults();
+    // "Nice variety" is already visible pre-expansion (it's the row subtitle);
+    // expanding adds a second copy in the evaluation block, plus the
+    // per-response feedback text which only exists once expanded.
+    expect(screen.getAllByText('Nice variety')).toHaveLength(1);
+    fireEvent.click(screen.getByText('Word Association'));
+    expect(screen.getAllByText('Nice variety')).toHaveLength(2);
+    expect(screen.getByText('Good range')).toBeInTheDocument();
+  });
+
+  it('does not render the per-question table for an LLM row', () => {
+    renderResults();
+    fireEvent.click(screen.getByText('Word Association'));
+    expect(screen.queryByText('6 x 7')).not.toBeInTheDocument();
+  });
+
+  it('surfaces wrong Schulte taps in the saved-performance summary', () => {
+    renderResults({
+      drillResults: [{
+        type: 'schulte-table',
+        score: 72,
+        accuracy: 2 / 3,
+        completion: 1,
+        avgResponseMs: 1200,
+        errorCount: 1,
+        questions: [
+          { prompt: '1', expected: 1, answered: 2, correct: false, responseMs: 400 },
+          { prompt: '1', expected: 1, answered: 1, correct: true, responseMs: 700 },
+          { prompt: '2', expected: 2, answered: 2, correct: true, responseMs: 1200 },
+        ],
+      }],
+    });
+
+    expect(screen.getByText(/67% acc · 1 error · 1\.2s/)).toBeInTheDocument();
+  });
+
+  it('collapses the review again on a second click', () => {
+    const { container } = renderResults();
+    const row = screen.getByText('Multiplication');
+    fireEvent.click(row);
+    expect(within(container.querySelector('table')).getByText('6 x 7')).toBeInTheDocument();
+    fireEvent.click(row);
+    expect(container.querySelector('table')).not.toBeInTheDocument();
+  });
+});
+
+describe('PostSessionResults daily routine actions', () => {
+  it('saves before requesting the next scheduled lesson', async () => {
+    const saved = { id: 'session-example' };
+    const saveSession = vi.fn().mockResolvedValue(saved);
+    const onSaved = vi.fn();
+    render(
+      <PostSessionResults
+        session={makeSession({ saveSession })}
+        conditions={{}}
+        onSaved={onSaved}
+        onBack={() => {}}
+      />
+    );
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Continue Today's Routine"));
+    });
+
+    expect(saveSession).toHaveBeenCalledWith({});
+    expect(onSaved).toHaveBeenCalledWith(saved, { continueDaily: true });
+  });
+});
+
+describe('PostSessionResults estimation grading band', () => {
+  // A live drill result carries its resolved `config`; a stored history task
+  // carries the same map as `difficulty`. Both have to reach the review, or a
+  // ✓ beside "600 / Expected 616" reads as a scoring bug.
+  const estimationResult = (overrides) => ({
+    type: 'estimation',
+    score: 80,
+    questions: [{ prompt: '925 - 309', expected: 616, answered: 600, correct: true, responseMs: 3000 }],
+    ...overrides,
+  });
+
+  it('names the band from a live result config', () => {
+    renderResults({ drillResults: [estimationResult({ config: { count: 5, tolerancePct: 20 } })] });
+    fireEvent.click(screen.getByText('Estimation'));
+    expect(screen.getByText('Within 20% counts — 2 significant figures is close enough')).toBeInTheDocument();
+  });
+
+  it('names it from a history task, whose config is stored as `difficulty`', () => {
+    renderResults({ drillResults: [estimationResult({ difficulty: { count: 5, tolerancePct: 3 } })] });
+    fireEvent.click(screen.getByText('Estimation'));
+    expect(screen.getByText('Within 3% counts — 3 significant figures is close enough')).toBeInTheDocument();
+  });
+});
+
+
+describe('PostSessionResults saved acknowledgement (#9459)', () => {
+  it('renders the saved score, metrics, and question review identically to the History summary', async () => {
+    sessionStorage.clear();
+    const tasks = [{ type: 'stroop', module: 'cognitive', score: 80, accuracy: 1, avgResponseMs: 1500,
+      completion: 1, questions: [{ prompt: 'Saved color', expected: 'red', answered: 'red', correct: true, responseMs: 1500 }] }];
+    generatePostDrill.mockResolvedValue({ type: 'stroop', trials: [], config: {} });
+    submitPostSession.mockResolvedValue({ id: 'example-session', score: 80, tasks });
+    function LiveResults() {
+      const session = usePostSession();
+      return <>
+        <button onClick={() => session.startSession({ drills: [{ type: 'stroop', config: {} }] })}>Start example</button>
+        <button onClick={() => session.completeCognitiveDrill({
+          type: 'stroop', module: 'cognitive', score: 100, accuracy: 1, avgResponseMs: 100,
+          questions: [{ prompt: 'Local color', correct: true }],
+        })}>Finish example</button>
+        <PostSessionResults session={session} onSaved={() => {}} onBack={() => {}} />
+      </>;
+    }
+    const live = render(<LiveResults />);
+    await act(async () => fireEvent.click(screen.getByText('Start example')));
+    fireEvent.click(screen.getByText('Finish example'));
+    expect(screen.getByText('100% acc · 0.1s')).toBeInTheDocument();
+    await act(async () => fireEvent.click(screen.getByText('Save Session')));
+    expect(screen.getByText('Back to Launcher')).toBeInTheDocument();
+    expect(screen.getByText('100% acc · 1.5s')).toBeInTheDocument();
+    const drillRow = screen.getByText('Stroop').closest('button');
+    expect(within(drillRow).getByText('80')).toBeInTheDocument();
+    fireEvent.click(drillRow);
+    expect(screen.getByText('Saved color')).toBeInTheDocument();
+    expect(screen.queryByText('Local color')).not.toBeInTheDocument();
+    const liveTable = live.container.querySelector('table').textContent;
+    live.unmount();
+    const history = render(<PostSessionSummary drillResults={tasks} sessionScore={80} />);
+    expect(screen.getByText('100% acc · 1.5s')).toBeInTheDocument();
+    fireEvent.click(screen.getByText('Stroop'));
+    expect(history.container.querySelector('table').textContent).toBe(liveTable);
+  });
+});

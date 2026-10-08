@@ -1,0 +1,74 @@
+import { request } from './apiCore.js';
+
+// Digital Twin - Identity & Goals
+export const getIdentityStatus = () => request('/digital-twin/identity');
+export const getCrossInsights = () => request('/digital-twin/identity/cross-insights');
+export const getChronotype = (options) => request('/digital-twin/identity/chronotype', options);
+export const getChronotypeEnergySchedule = () => request('/digital-twin/identity/chronotype/energy-schedule');
+export const deriveChronotype = () => request('/digital-twin/identity/chronotype/derive', { method: 'POST' });
+export const getLongevity = () => request('/digital-twin/identity/longevity');
+export const deriveLongevity = () => request('/digital-twin/identity/longevity/derive', { method: 'POST' });
+export const getGoals = (options) => request('/digital-twin/identity/goals', options);
+export const setBirthDate = (birthDate) => request('/digital-twin/identity/goals/birth-date', {
+  method: 'PUT',
+  body: JSON.stringify({ birthDate })
+});
+// `options` passes request-level flags through (e.g. `{ silent: true }`) for callers
+// that swallow the rejection and own the resulting error UI — see applyOrganization.js.
+export const createGoal = (data, options = {}) => request('/digital-twin/identity/goals', {
+  method: 'POST',
+  body: JSON.stringify(data),
+  ...options
+});
+export const updateGoal = (id, data, options = {}) => request(`/digital-twin/identity/goals/${id}`, {
+  method: 'PUT',
+  body: JSON.stringify(data),
+  ...options
+});
+export const deleteGoal = (id) => request(`/digital-twin/identity/goals/${id}`, { method: 'DELETE' });
+export const getGoalsTree = (options) => request('/digital-twin/identity/goals/tree', options);
+export const addGoalMilestone = (goalId, data) => request(`/digital-twin/identity/goals/${goalId}/milestones`, {
+  method: 'POST',
+  body: JSON.stringify(data)
+});
+export const completeGoalMilestone = (goalId, milestoneId) =>
+  request(`/digital-twin/identity/goals/${goalId}/milestones/${milestoneId}/complete`, { method: 'PUT' });
+export const linkGoalActivity = (goalId, data) => request(`/digital-twin/identity/goals/${goalId}/activities`, {
+  method: 'POST',
+  body: JSON.stringify(data)
+});
+export const unlinkGoalActivity = (goalId, activityName) =>
+  request(`/digital-twin/identity/goals/${goalId}/activities/${encodeURIComponent(activityName)}`, { method: 'DELETE' });
+export const addGoalProgress = (goalId, data) => request(`/digital-twin/identity/goals/${goalId}/progress`, {
+  method: 'POST',
+  body: JSON.stringify(data)
+});
+export const deleteGoalProgress = (goalId, entryId) =>
+  request(`/digital-twin/identity/goals/${goalId}/progress/${entryId}`, { method: 'DELETE' });
+
+// Goal Calendar linking
+export const linkGoalCalendar = (goalId, data) => request(`/digital-twin/identity/goals/${goalId}/calendars`, { method: 'POST', body: JSON.stringify(data) });
+export const unlinkGoalCalendar = (goalId, subcalendarId) => request(`/digital-twin/identity/goals/${goalId}/calendars/${encodeURIComponent(subcalendarId)}`, { method: 'DELETE' });
+
+// Goal Progress & Todos
+export const updateGoalProgress = (goalId, value) => request(`/digital-twin/identity/goals/${goalId}/progress`, { method: 'PUT', body: JSON.stringify({ value }) });
+export const addGoalTodo = (goalId, data) => request(`/digital-twin/identity/goals/${goalId}/todos`, { method: 'POST', body: JSON.stringify(data) });
+export const updateGoalTodo = (goalId, todoId, data) => request(`/digital-twin/identity/goals/${goalId}/todos/${todoId}`, { method: 'PUT', body: JSON.stringify(data) });
+export const deleteGoalTodo = (goalId, todoId) => request(`/digital-twin/identity/goals/${goalId}/todos/${todoId}`, { method: 'DELETE' });
+
+// Goal AI Planning & Scheduling
+export const generateGoalPhases = (goalId, options = {}) => request(`/digital-twin/identity/goals/${goalId}/generate-phases`, { method: 'POST', body: JSON.stringify(options) });
+export const acceptGoalPhases = (goalId, phases) => request(`/digital-twin/identity/goals/${goalId}/accept-phases`, { method: 'POST', body: JSON.stringify({ phases }) });
+export const decomposeGoal = (goalId, options = {}) => request(`/digital-twin/identity/goals/${goalId}/decompose`, { method: 'POST', body: JSON.stringify(options) });
+export const acceptGoalDecomposition = (goalId, milestones) => request(`/digital-twin/identity/goals/${goalId}/accept-decomposition`, { method: 'POST', body: JSON.stringify({ milestones }) });
+export const completeMilestoneTask = (goalId, milestoneId, taskId) => request(`/digital-twin/identity/goals/${goalId}/milestones/${milestoneId}/tasks/${taskId}/complete`, { method: 'PUT' });
+// `body` carries the AI provider selection ({ providerId, model }); the second
+// `options` arg passes request-level flags through (e.g. `{ silent: true }`) so
+// the Goals views, which own their own "Failed to organize goals" toast, don't
+// also get the helper's default error toast stacked on top of it.
+export const organizeGoals = (body = {}, options = {}) => request('/digital-twin/identity/goals/organize', { method: 'POST', body: JSON.stringify(body), ...options });
+export const applyGoalOrganization = (organization, options = {}) => request('/digital-twin/identity/goals/organize/apply', { method: 'POST', body: JSON.stringify({ organization }), ...options });
+export const checkInGoal = (goalId, options = {}) => request(`/digital-twin/identity/goals/${goalId}/check-in`, { method: 'POST', body: JSON.stringify(options) });
+export const scheduleGoalTimeBlocks = (goalId) => request(`/digital-twin/identity/goals/${goalId}/schedule`, { method: 'POST' });
+export const removeGoalSchedule = (goalId) => request(`/digital-twin/identity/goals/${goalId}/schedule`, { method: 'DELETE' });
+export const rescheduleGoalTimeBlocks = (goalId) => request(`/digital-twin/identity/goals/${goalId}/reschedule`, { method: 'POST' });

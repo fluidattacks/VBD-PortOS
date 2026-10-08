@@ -1,0 +1,210 @@
+// Voice config — defaults merged with data/settings.json#voice. Engine-dispatched:
+// stt.<engine> / tts.<engine> hold backend-specific options. Stored paths use `~/`
+// for portability and are expanded by `expandPath` at consumption time.
+
+import { homedir } from 'os';
+import { join } from 'path';
+import { getSettings, updateSettings } from '../settings.js';
+import { deepMerge } from '../../lib/objects.js';
+import { expandHome } from '../../lib/fileUtils.js';
+import { migrateRetiredTtsConfig } from '../../lib/voiceEngines.js';
+import { PORTS } from '../../lib/ports.js';
+
+const VOICE_HOME = join(homedir(), '.portos', 'voice');
+
+/**
+ * The local LLM backend voice uses when nothing else is configured.
+ *
+ * Ollama is the default: it ships a daemon PortOS can start and probe itself
+ * (`ollamaManager.ensureRunning`), reports per-model tool capability from
+ * /api/show rather than leaving it to an id guess, and needs no separate GUI
+ * running. LM Studio remains fully supported — set `voice.llm.provider` to
+ * 'lmstudio', which migration 392 pins for every install that was relying on
+ * the previous default.
+ *
+ * Lives here rather than in modelProvisioners.js so both that module and
+ * llm.js can read it without an import cycle (modelProvisioners imports llm).
+ */
+export const DEFAULT_VOICE_BACKEND = 'ollama';
+
+export const VOICE_DEFAULTS = Object.freeze({
+  enabled: false,
+  trigger: 'push-to-talk',
+  hotkey: 'Space',
+
+  // FaceTime control-plane configuration is machine-local.  It is deliberately
+  // nested under voice rather than the federation-facing instance profile.
+  facetime: {
+    targetHandle: '',
+    targetName: '',
+    blackHole2chLabel: 'BlackHole 2ch',
+    blackHole16chLabel: 'BlackHole 16ch',
+    // Hard ceiling on one call, so a line left open cannot run all day.
+    maxCallMinutes: 15,
+    // Escalate an unread critical notification to a phone call when no browser
+    // tab can speak it. OFF by default: enabling the FaceTime feature must not
+    // by itself make an install start ringing the user.
+    escalateCritical: false,
+    escalateAfterMinutes: 10,
+    // Answer an inbound call from the configured identity automatically. OFF
+    // by default — same reasoning as escalateCritical: enabling the feature
+    // must never by itself make the Mac start picking up calls. The watcher
+    // that acts on this also requires a call-host tab attached (see
+    // callSession.js) — this flag alone changes nothing without one.
+    autoAnswer: false,
+  },
+
+  stt: {
+    // 'web-speech' (browser-native, zero-latency, no server process needed) is the
+    // default. Falls back to 'whisper' (local whisper.cpp) for browsers without
+    // SpeechRecognition support (Firefox, older Safari) or when the user wants
+    // consistent offline STT across clients.
+    engine: 'web-speech', // 'whisper' | 'web-speech'
+    // 5562 keeps whisper inside PortOS's own 55xx port band. Avoid 8080 —
+    // IPFS, Supabase Studio, Tomcat, etc. commonly squat on it.
+    endpoint: `http://127.0.0.1:${PORTS.WHISPER}`,
+    model: 'base.en',
+    modelPath: '~/.portos/voice/models/ggml-base.en.bin',
+    language: 'en',
+    // CoreML (Apple Neural Engine) is NOT enabled by default because Homebrew's
+    // whisper-cpp formula ships without WHISPER_COREML — the `.mlmodelc` encoder
+    // companion is ignored even if downloaded. Turn on only if you've built
+    // whisper.cpp from source with `cmake -DWHISPER_COREML=1`. Metal backend
+    // (GPU) is always used and is fast enough for most utterances.
+    coreml: false,
+    // Whisper prompt bias — seeds the decoder with context so PortOS-specific
+    // terms don't get mapped to common English homophones. Empty = defaults.
+    vocabularyPrompt: '',
+  },
+
+  tts: {
+    engine: 'piper', // 'piper' | 'qwen3-tts'
+    rate: 1.0,
+    piper: {
+      voice: 'en_GB-jenny_dioco-medium',
+      voicePath: '~/.portos/voice/voices/en_GB-jenny_dioco-medium.onnx',
+      // Null = use the catalog default (set per-voice in piper-voices.js).
+      // Override here when experimenting with other VCTK speaker indices.
+      speakerId: null,
+    },
+    qwen3: {
+      modelId: 'Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign',
+      voice: 'warm-narrator',
+    },
+  },
+
+  llm: {
+    provider: DEFAULT_VOICE_BACKEND,
+    model: 'auto',
+    visionModel: 'auto',
+    // Legacy free-form system prompt. Overridden by `personality` + tool
+    // descriptions when `usePersonality` is true (default).
+    systemPrompt: 'You are the PortOS assistant. Your replies are spoken aloud — keep them short and use plain prose (no markdown or lists).',
+    usePersonality: true,
+    personality: {
+      name: 'Alfred',
+      role: 'Chief of Staff',
+      traits: ['concise', 'warm', 'proactive'],
+      speechStyle: 'casual and brief',
+      customPrompt: '',
+    },
+    // Tool-calling is OFF by default — it adds 1–2 LLM roundtrips per turn
+    // (slower) and needs a tool-use-trained model (Qwen2.5, Hermes-3, etc.)
+    // to avoid producing JSON-like gibberish in the spoken reply.
+    tools: {
+      enabled: false,
+      maxIterations: 3,
+    },
+    // Code-agent delegation — lets the voice CoS hand a coding task to a
+    // CLI/TUI agent (Claude Code, Codex, Antigravity) via the CoS task system.
+    // The conversational brain (llm.provider above) stays the fast local
+    // router; this is the heavyweight agent that does the actual edits in an
+    // isolated worktree and opens a PR. OFF by default. Empty provider/model
+    // mean "use the system default AI provider → model" (providers.json
+    // activeProvider + selectModelForTask) — exactly what a CoS task does
+    // when no override is pinned. announceOnComplete speaks the result when
+    // the task finishes (solicited, so it bypasses the proactive-enabled gate
+    // but still respects quiet hours). Requires tools.enabled + a tool-use
+    // model, same as every other voice tool.
+    codeAgent: {
+      enabled: false,
+      provider: '',
+      model: '',
+      announceOnComplete: true,
+    },
+    // Proactive speech — the CoS speaks first (alerts, briefings, reminders).
+    // OFF by default so a fresh install doesn't blurt at the user; opt in via
+    // Settings → Voice. Quiet hours suppress proactive lines; barge-in (a
+    // user-initiated utterance) cancels in-flight proactive audio through the
+    // existing voice:interrupt path.
+    proactive: {
+      enabled: false,
+      quietHours: {
+        enabled: false,
+        start: '22:00',
+        end: '07:00',
+      },
+    },
+    // Fast-resolution cascade — front-tier fast paths the CLIENT tries before
+    // the (slow) server LLM above, to cut spoken-turn latency:
+    //   tier 1  triggers   — deterministic client-side nav/command matching
+    //                        (instant, offline; e.g. "go to tasks").
+    //   tier 2  browserLlm — on-device Chrome built-in "Gemini Nano" for
+    //                        simple/conversational turns (fast, private).
+    //   tier 3  server     — the provider/model above (recommend Ollama) via
+    //                        the existing pipeline, used for tool/action turns
+    //                        and whenever the fast tiers decline/are absent.
+    // OFF by default: existing installs keep the all-server behavior until the
+    // user opts in under Settings → Voice. Tiers 1–2 run entirely in the
+    // browser and never touch a provider the user hasn't triggered, so this is
+    // consistent with the no-cold-bootstrap AI policy (Nano only runs on a real
+    // spoken/typed turn). `browser` holds the Nano generation params.
+    fastPath: {
+      enabled: false,
+      triggers: true,
+      browserLlm: true,
+      browser: {
+        temperature: 0.7,
+        topK: 3,
+      },
+    },
+  },
+
+  vad: { endOfSpeechMs: 700, minUtteranceMs: 250 },
+});
+
+// Alias kept for backward-compat with the 5 callers under server/services/voice/.
+// The canonical implementation now lives in `server/lib/fileUtils.js#expandHome`.
+export const expandPath = expandHome;
+
+// Tiny in-memory cache so hot paths (per-turn enabled check in voice sockets)
+// don't hit disk on every dispatch. Invalidated on updateVoiceConfig and
+// manually via invalidateVoiceConfigCache() from the reconcile flow.
+let cachedConfig = null;
+
+export const getVoiceConfig = async () => {
+  if (cachedConfig) return cachedConfig;
+  const settings = await getSettings();
+  cachedConfig = deepMerge(VOICE_DEFAULTS, settings.voice || {});
+  cachedConfig.tts = migrateRetiredTtsConfig(cachedConfig.tts);
+  return cachedConfig;
+};
+
+export const invalidateVoiceConfigCache = () => { cachedConfig = null; };
+
+export const updateVoiceConfig = async (patch) => {
+  const settings = await getSettings();
+  const current = deepMerge(VOICE_DEFAULTS, settings.voice || {});
+  const next = deepMerge(current, patch || {});
+  next.tts = migrateRetiredTtsConfig(next.tts);
+  if (next.tts.retiredEngine === null) delete next.tts.retiredEngine;
+  await updateSettings({ voice: next });
+  cachedConfig = next;
+  return next;
+};
+
+export const voiceHome = () => VOICE_HOME;
+export const piperVoiceTildePath = (id) => `~/.portos/voice/voices/${id}.onnx`;
+
+export const IS_WIN = process.platform === 'win32';
+export const PIPER_BIN_NAME = IS_WIN ? 'piper.exe' : 'piper';

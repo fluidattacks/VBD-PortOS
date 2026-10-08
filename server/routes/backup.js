@@ -1,0 +1,123 @@
+import { Router } from 'express';
+import { asyncHandler, ServerError } from '../lib/errorHandler.js';
+import { streamAttachment } from '../lib/streamAttachment.js';
+import {
+  validateRequest,
+  restoreRequestSchema,
+  restoreDbRequestSchema,
+  restoreDbRecoverRequestSchema,
+  snapshotDownloadQuerySchema,
+} from '../lib/validation.js';
+import * as backup from '../services/backup.js';
+import { getDatabaseRestoreRecoveryStatus, resumeDatabaseRestore } from '../services/backupRestoreRecovery.js';
+import { getSettings } from '../services/settings.js';
+import { resolveBackupConfig } from '../lib/backupConfig.js';
+
+const router = Router();
+
+// GET /api/backup/status
+router.get('/status', asyncHandler(async (req, res) => {
+  const state = await backup.getState();
+  const settings = await getSettings();
+  const nextRun = backup.getNextRunTime();
+  res.json({
+    ...state,
+    destPath: settings.backup?.destPath ?? null,
+    nextRun,
+    defaultExcludes: backup.DEFAULT_EXCLUDES,
+    // A committed database restore awaiting repair keeps the database fenced.
+    restoreRecovery: getDatabaseRestoreRecoveryStatus(),
+  });
+}));
+
+// POST /api/backup/run
+router.post('/run', asyncHandler(async (req, res) => {
+  const settings = await getSettings();
+  const destPath = settings.backup?.destPath;
+  if (!destPath) {
+    throw new ServerError('No backup destination configured in settings', { status: 400, code: 'BACKUP_NOT_CONFIGURED' });
+  }
+  const excludePaths = settings.backup?.excludePaths || [];
+  const disabledDefaultExcludes = settings.backup?.disabledDefaultExcludes || [];
+  const { retentionCount } = resolveBackupConfig(settings.backup);
+  const io = req.app.get('io');
+  const result = await backup.runBackup(destPath, io, { excludePaths, disabledDefaultExcludes, retentionCount });
+  res.json(result);
+}));
+
+// GET /api/backup/snapshots
+router.get('/snapshots', asyncHandler(async (req, res) => {
+  const settings = await getSettings();
+  const snapshots = await backup.listSnapshots(settings.backup?.destPath);
+  res.json(snapshots);
+}));
+
+// GET /api/backup/snapshots/:snapshotId/download
+router.get('/snapshots/:snapshotId/download', asyncHandler(async (req, res) => {
+  const settings = await getSettings();
+  const destPath = settings.backup?.destPath;
+  if (!destPath) {
+    throw new ServerError('No backup destination configured in settings', { status: 400, code: 'BACKUP_NOT_CONFIGURED' });
+  }
+  const { snapshotId } = req.params;
+  const { source } = validateRequest(snapshotDownloadQuerySchema, req.query);
+  const stream = source
+    ? await backup.openSnapshotStream(destPath, snapshotId, { source })
+    : await backup.openSnapshotStream(destPath, snapshotId);
+  streamAttachment(res, stream, {
+    filename: `portos-snapshot-${source ? `${source}-` : ''}${snapshotId}.tar.gz`,
+    contentType: 'application/gzip',
+    failure: new ServerError('Snapshot download failed', { status: 500, code: 'BACKUP_DOWNLOAD_FAILED' }),
+    label: `Backup snapshot ${snapshotId}`,
+  });
+}));
+
+// DELETE /api/backup/snapshots/:snapshotId
+router.delete('/snapshots/:snapshotId', asyncHandler(async (req, res) => {
+  const settings = await getSettings();
+  const destPath = settings.backup?.destPath;
+  if (!destPath) {
+    throw new ServerError('No backup destination configured in settings', { status: 400, code: 'BACKUP_NOT_CONFIGURED' });
+  }
+  const { snapshotId } = req.params;
+  const { source } = validateRequest(snapshotDownloadQuerySchema, req.query);
+  const result = await backup.deleteSnapshot(destPath, snapshotId, { source });
+  res.json(result);
+}));
+
+// POST /api/backup/restore
+router.post('/restore', asyncHandler(async (req, res) => {
+  const { snapshotId, source, subdirFilter, dryRun } = validateRequest(restoreRequestSchema, req.body);
+  const settings = await getSettings();
+  const result = await backup.restoreSnapshot(settings.backup?.destPath, snapshotId, {
+    dryRun,
+    subdirFilter,
+    ...(source ? { source } : {}),
+  });
+  res.json(result);
+}));
+
+// POST /api/backup/restore-db
+router.post('/restore-db', asyncHandler(async (req, res) => {
+  const { snapshotId, source, dryRun } = validateRequest(restoreDbRequestSchema, req.body);
+  const settings = await getSettings();
+  const destPath = settings.backup?.destPath;
+  if (!destPath) {
+    throw new ServerError('No backup destination configured in settings', { status: 400, code: 'BACKUP_NOT_CONFIGURED' });
+  }
+  const result = await backup.restorePostgres(destPath, snapshotId, {
+    dryRun,
+    ...(source ? { source } : {}),
+  });
+  res.json(result);
+}));
+
+// POST /api/backup/restore-db/recover
+// Resume the pending committed restore: resolve an unknown replay outcome from
+// its receipt, then finish schema/migration/federation repair. Never replays.
+router.post('/restore-db/recover', asyncHandler(async (req, res) => {
+  const { id } = validateRequest(restoreDbRecoverRequestSchema, req.body);
+  res.json(await resumeDatabaseRestore(id));
+}));
+
+export default router;

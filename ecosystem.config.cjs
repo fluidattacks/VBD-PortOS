@@ -1,0 +1,396 @@
+// =============================================================================
+// PM2 Ecosystem Configuration - shared constants and app definitions
+// =============================================================================
+const path = require('path');
+const LOG_DATE_FORMAT = 'YYYY-MM-DDTHH:mm:ss.SSS[Z]';
+const IS_WIN = process.platform === 'win32';
+
+// Shared env inherited by all apps (merged into each app's env)
+const BASE_ENV = {
+  NODE_ENV: 'development',
+  TZ: 'UTC'  // All log timestamps and Date operations in UTC
+};
+
+// Read a couple of machine-local settings from .env (pm2 doesn't auto-load it
+// here): PGMODE → PostgreSQL port; PORTOS_SERVER_MAX_MEMORY → the server restart
+// ceiling below; PGPASSWORD/PGUSER/PGDATABASE/PGHOST/PGPORT/PGPORT_DOCKER → the
+// same DB connection settings scripts/setup-db.js already reads from .env, so a
+// value set only in .env (not exported into the shell) still reaches the
+// running server instead of silently falling back to the `portos` defaults
+// while setup provisioned something else (#8447). An explicit process.env wins
+// over the .env file so a one-off shell override still works.
+const envFile = path.join(__dirname, '.env');
+// Parsed by the same dependency-free grammar setup uses (scripts/lib/envFile.cjs),
+// so quoted values resolve identically here and in setup (#9471).
+const { parseEnvFile } = require('./scripts/lib/envFile.cjs');
+const dotenv = parseEnvFile(envFile); // {} when .env is missing
+const envValue = (key) => dotenv[key] || null;
+const pgMode = envValue('PGMODE') || 'docker';
+const envServerMaxMemory = envValue('PORTOS_SERVER_MAX_MEMORY');
+const envPgPassword = envValue('PGPASSWORD');
+const envPgUser = envValue('PGUSER');
+const envPgDatabase = envValue('PGDATABASE');
+const envPgHost = envValue('PGHOST');
+const envPgPort = envValue('PGPORT');
+const envPgPortDocker = envValue('PGPORT_DOCKER');
+
+// Same precedence as scripts/setup-db.js: process.env → .env → default. Keep the
+// 'portos' password fallback (AGENTS.md: intentional backward-compatible
+// default) — this only changes WHERE a user-set value can come from.
+const PG_USER = process.env.PGUSER || envPgUser || 'portos';
+const PG_DATABASE = process.env.PGDATABASE || envPgDatabase || 'portos';
+const PG_PASSWORD = process.env.PGPASSWORD || envPgPassword || 'portos';
+const PG_HOST = process.env.PGHOST || envPgHost || 'localhost';
+
+// pm2 restarts portos-server when its RSS crosses this — originally a memory-leak
+// safety valve. The committed default stays modest so the guard still fires on a
+// small install (a fork on an 8 GB box), but it's overridable per-machine via
+// PORTOS_SERVER_MAX_MEMORY (.env or shell env; e.g. '32G' on a 128 GB
+// workstation) since a too-low ceiling causes spurious restarts that disrupt SSE
+// streams and long jobs. (Training is no longer collateral damage from these
+// restarts — it's spawned detached into its own process group — but fewer
+// restarts is still better.)
+const SERVER_MAX_MEMORY = process.env.PORTOS_SERVER_MAX_MEMORY || envServerMaxMemory || '4G';
+
+// Keep the Vite ceiling fixed and distinct from the server's configurable limit.
+// Restarting the development UI is low-cost, so PM2 can self-restart it before
+// CoS's default 2048 MiB per-process memory warning threshold.
+const UI_MAX_MEMORY = '1536M';
+
+// The support daemons (autofixer, its UI, the browser bridge) idle around 45 MB.
+// A ceiling an order of magnitude above that never fires in normal operation and
+// still catches a runaway.
+const HELPER_MAX_MEMORY = '512M';
+
+// The CoS runner supervises long-lived agent CLI children; the ceiling covers the
+// runner itself, not the agents (they are separate processes with their own RSS).
+const COS_MAX_MEMORY = '2G';
+
+const MEMORY_UNIT_MB = { K: 1 / 1024, M: 1, G: 1024 };
+
+/**
+ * Parse a pm2 memory spec to megabytes: '512M', '4G', or a bare '4294967296'.
+ *
+ * The bare form is BYTES — that is pm2's own rule for an unsuffixed value, and
+ * PORTOS_SERVER_MAX_MEMORY is user-set, so a machine that already spells its
+ * ceiling in bytes must still get a heap cap. Dropping to "no cap" there would
+ * leave exactly the configuration this policy exists to fix: an RSS ceiling with
+ * nothing making V8 collect beneath it.
+ *
+ * An unrecognized spec returns null so `memoryLimits` degrades to "no cap" rather
+ * than silently inventing a wrong one.
+ */
+function memorySpecToMB(spec) {
+  const match = String(spec).trim().match(/^(\d+(?:\.\d+)?)\s*([KMG])?B?$/i);
+  if (!match) return null;
+  const unitMB = match[2] ? MEMORY_UNIT_MB[match[2].toUpperCase()] : 1 / (1024 * 1024);
+  return Math.round(Number(match[1]) * unitMB);
+}
+
+/**
+ * Both memory bounds for a pm2 app: the RSS ceiling pm2 restarts at, and V8's
+ * old-space cap underneath it.
+ *
+ * WHY the cap: without an explicit one, V8 sizes the heap limit from physical
+ * memory and lands at ~4 GB on any workstation. That is at or above every ceiling
+ * below, so the process reaches `max_memory_restart` and gets KILLED before V8
+ * ever feels enough pressure to run the full compacting GC that would have
+ * reclaimed the garbage. Capping the heap under the pm2 ceiling inverts that
+ * race: V8 collects, RSS settles, and the restart stays a genuine last resort
+ * instead of the normal way memory is reclaimed — which matters because a restart
+ * drops in-flight SSE streams and long jobs.
+ *
+ * `ratio` is the gap left for the RSS that `--max-old-space-size` does NOT count:
+ * Buffers over 8 KB and ArrayBuffer backing stores are external, not old space.
+ * The default 0.75 suits a process whose bytes are mostly JS objects. Give a
+ * lower ratio to anything that moves large native buffers — portos-server runs
+ * sharp/libvips (a single 4096² RGBA `.raw().toBuffer()` is 64 MB) and decodes
+ * audio into Float32Arrays, so a heap sitting legally at its cap could still push
+ * RSS past the ceiling and get killed, i.e. the very race this exists to prevent.
+ *
+ * `node_args` rather than `NODE_OPTIONS` on purpose: NODE_OPTIONS is inherited by
+ * every child process, so it would also shrink the heap of the agent CLIs, build
+ * steps, and media tooling portos-server spawns. `node_args` applies to the
+ * interpreter pm2 launches and stops there. (pm2 also re-exports it into the
+ * app's own env, so `INHERITED_PM2_CONFIG_KEYS` in server/services/pm2.js strips
+ * it before PortOS shells out to `pm2 start` for a managed app.)
+ */
+function memoryLimits(restartSpec, ratio = 0.75) {
+  const ceilingMB = memorySpecToMB(restartSpec);
+  return {
+    max_memory_restart: restartSpec,
+    // No floor: a floor could raise the cap to or above a small user-set ceiling
+    // and invert the whole policy. ratio < 1 keeps the cap strictly below it.
+    node_args: ceilingMB ? [`--max-old-space-size=${Math.floor(ceilingMB * ratio)}`] : []
+  };
+}
+
+const PORTS = {
+  API: 5555,           // Express API server (HTTPS when Tailscale cert is active)
+  API_LOCAL: 5553,     // Loopback-only HTTP mirror of API — only binds when HTTPS is active on :API.
+                       // Lets http://localhost work without cert warnings. Override w/ PORTOS_HTTP_PORT.
+  UI: 5554,            // Vite dev server (client)
+  CDP: 5556,           // Chrome DevTools Protocol (browser automation)
+  CDP_HEALTH: 5557,    // Browser health check endpoint
+  COS: 5558,           // Chief of Staff agent runner
+  AUTOFIXER: 5559,     // Autofixer API
+  AUTOFIXER_UI: 5560,  // Autofixer UI
+  POSTGRES_DOCKER: 5561, // PostgreSQL Docker container (host port mapping)
+  WHISPER: 5562,       // Loopback whisper.cpp speech-to-text server
+  EIDOVERSE_HOST: 5563, // Optional HTTPS/WebSocket bridge to Eidoverse Worlds on :8940
+  SLOTSTREAM: 5564,    // Loopback SSD-streaming MoE runtime (never 11434 — that collides with Ollama)
+  JEV: 5566,           // Loopback openjev entailment scorer. On-demand sidecar started by services/jev.js on first score, reaped when idle.
+  LLAMA_SERVER: 5568,  // Loopback llama.cpp speculative-decoding server
+  FLEET_LLM: 18022, // Authenticated shared inference queue for dedicated hosts
+
+  VLLM_QWEN: 18020,    // Loopback vLLM Qwen3.8-27B (DFlash 2) container — started by the operator, never by PortOS
+  SGLANG_QWEN: 18021,  // Loopback SGLang Qwen3.8-27B container (Hopper/Blackwell) — started by the operator, never by PortOS
+  // Loopback listener for `tailcat forward <tc> LOCAL:5555` when adding a federated
+  // peer without a Tailscale account. Prefer 15555; if busy, PortOS picks the next free port.
+  TAILCAT_INGRESS: 5565, // Loopback-only remote API ingress for managed Tailcat serve
+  TAILCAT_FORWARD: 15555,
+  POSTGRES: pgMode === 'native' ? 5432 : 5561 // Active PostgreSQL port (unused in file mode)
+};
+
+// The override var differs per mode (native dials PGPORT, Docker dials the host
+// mapping PGPORT_DOCKER — see docker-compose.yml), so resolve whichever one
+// applies to the active pgMode; PORTS.POSTGRES (above) is already the correct
+// per-mode default when neither is set.
+// PGPORT becomes the ACTIVE port in each managed process below. Preserve the
+// original native port separately so a child reloading this config cannot
+// reinterpret an inherited Docker PGPORT as the native endpoint (#8815).
+// PORTOS_NATIVE_PGPORT is internal inherited identity, not a .env setting.
+// Expose the exact, credential-free endpoint identities to offline maintenance
+// tools. Both modes must use the same precedence as managed-process startup.
+const databaseEndpoint = (mode, port) => ({
+  mode, host: PG_HOST, port: Number(port), database: PG_DATABASE, user: PG_USER
+});
+const DATABASE_ENDPOINTS = {
+  native: databaseEndpoint('native', process.env.PORTOS_NATIVE_PGPORT || process.env.PGPORT || envPgPort || 5432),
+  docker: databaseEndpoint('docker', process.env.PGPORT_DOCKER || envPgPortDocker || PORTS.POSTGRES_DOCKER)
+};
+const PG_PORT = DATABASE_ENDPOINTS[pgMode === 'native' ? 'native' : 'docker'].port;
+
+module.exports = {
+  DATABASE_MODE: pgMode,
+  DATABASE_ENDPOINTS,
+  PORTS, // Export for other configs to reference
+
+  apps: [
+    {
+      name: 'portos-server',
+      script: 'server/start.js',
+      cwd: __dirname,
+      interpreter: 'node',
+      log_date_format: LOG_DATE_FORMAT,
+      windowsHide: IS_WIN,
+      env: {
+        ...BASE_ENV,
+        // Pin the install root explicitly so data-root resolution never derives
+        // it from the executing file's location. A server booted from inside a
+        // CoS git worktree (data/cos/worktrees/agent-*) would otherwise resolve
+        // `data/` to the worktree's nonexistent tree and crash boot migrations
+        // (#1947). Set ONLY here (not BASE_ENV) so the portos-cos runner — which
+        // spreads its env into agent CLI children — never leaks it into worktree
+        // agents; fileUtils/resolveInstallRoot also refuse a leaked pin when the
+        // executing code is itself in a worktree, as belt-and-suspenders.
+        PORTOS_DATA_ROOT: __dirname,
+        // libuv's filesystem threadpool defaults to FOUR threads, so four slow
+        // or stuck fs operations starve every other fs call in the process —
+        // including the express.static stat/read that serves the UI bundle. An
+        // evicted iCloud file can block a read indefinitely (server/lib/
+        // icloudFile.js guards those reads; this is defense-in-depth, NOT the
+        // fix), and sharp/crypto/dns.lookup draw from the same pool. 16 gives
+        // real headroom at negligible cost — idle threads are just parked.
+        UV_THREADPOOL_SIZE: '16',
+        PORT: PORTS.API,
+        PORTOS_HTTP_PORT: PORTS.API_LOCAL, // Loopback HTTP mirror when HTTPS is active
+        HOST: '0.0.0.0',
+        PGHOST: PG_HOST,
+        PGPORT: PG_PORT,
+        PORTOS_NATIVE_PGPORT: DATABASE_ENDPOINTS.native.port,
+        PGPORT_DOCKER: DATABASE_ENDPOINTS.docker.port,
+        PGUSER: PG_USER,
+        PGDATABASE: PG_DATABASE,
+        PGPASSWORD: PG_PASSWORD,
+        ...(pgMode === 'file' ? { MEMORY_BACKEND: 'file' } : {}),
+        PATH: process.env.PATH // Inherit PATH for git/node access in child processes
+      },
+      // Filewatch is OFF for portos-server. The image gen path (codex / local
+      // MLX / external) writes lots of files: the rendered PNG, a sidecar
+      // metadata JSON, atomic-renamed media-jobs.json, plus per-job temp
+      // scratch. Even with `watch: ['server']` + a broad ignore_watch list,
+      // chokidar occasionally races on the atomic rename target (write to
+      // tmp → rename onto final path) and fires a change event for a path
+      // that the ignore globs *should* have excluded. The symptom in the
+      // wild is "SIGINT received" 5–30s after an image render completes,
+      // killing in-flight jobs.
+      //
+      // Code edits are picked up by `npm run pm2:restart` in production or
+      // `npm run dev` during development. Restarting does not rebuild the
+      // client; use `npm run build` / `npm start` for production assets.
+      //
+      // To re-enable for ad-hoc dev work: flip this to `watch: ['server']`
+      // and add `'**/data/**'` (plus `'**/node_modules'`, `'**/logs/**'`,
+      // `'**/.cache/**'`, `'**/portos-stepwise-*/**'`) to `ignore_watch`.
+      watch: false,
+      // 0.60, not the 0.75 default: sharp/libvips raw buffers and decoded audio
+      // are external memory the heap cap does not count, so portos-server needs a
+      // wider external margin under the same ceiling than a plain JS service.
+      ...memoryLimits(SERVER_MAX_MEMORY, 0.60),
+      // PM2's default kill_timeout (1600ms) is shorter than the server's own
+      // GRACEFUL_SHUTDOWN_TIMEOUT_MS (10s) force-exit in server/index.js, so if
+      // shutdown ever stalls, PM2 would SIGKILL the process before its graceful
+      // handler (or its own force-exit) could run — losing the clean DB-pool close
+      // and, when the killed process is the one orchestrating a self-restart,
+      // leaving the app down. Give PM2 a ceiling just above the app's internal
+      // force-exit so the app always controls its own exit. (The graceful path now
+      // completes in ~1s — the double-close hang it used to stall on is fixed in
+      // server/index.js's shutdown() — so this ceiling is a backstop, not the norm.)
+      kill_timeout: 12000,
+      // Exponential backoff restart delay when the server exits repeatedly (e.g.
+      // when Postgres is slow to start on boot). PM2 starts at 1s, doubles after
+      // each restart, and resets on a stable run (stays up longer than min_uptime,
+      // default 1s). This prevents a crash loop that monopolizes the CPU and starves
+      // slow database startup. The DB gate (gateOnDatabase) retries for ~120s before
+      // exiting, so this delay kicks in only after that window is exhausted.
+      exp_backoff_restart_delay: 1000
+      // NOTE: do NOT set `treekill: false` here to protect long media jobs from
+      // restart-SIGINT. Tried 2026-06-14: pm2 then fails to reap the old node
+      // process on restart, so it lingers holding :5555 and the new instance
+      // EADDRINUSE-crash-loops. The right place to isolate a multi-hour trainer
+      // from pm2's parent-tree kill is the spawn side (double-fork / reparent to
+      // launchd so it leaves the ppid tree), NOT disabling treekill server-wide.
+      // Raising max_memory_restart (above) already removes the most common
+      // restart trigger; full isolation is tracked in PLAN.
+    },
+    {
+      name: 'portos-cos',
+      script: 'server/cos-runner/index.js',
+      cwd: __dirname,
+      interpreter: 'node',
+      log_date_format: LOG_DATE_FORMAT,
+      windowsHide: IS_WIN,
+      // CoS Agent Runner - isolated process for spawning Claude CLI agents
+      // Does NOT restart when portos-server restarts, preventing orphaned agents
+      // Security: Binds to localhost only - not exposed externally
+      env: {
+        ...BASE_ENV,
+        PORT: PORTS.COS,
+        HOST: '127.0.0.1',
+        // CoS agents shell out to db.sh / backup.js for DB admin and backup
+        // work — give them the same connection settings as portos-server so
+        // they agree with what setup actually provisioned (#8447).
+        PGHOST: PG_HOST,
+        PGPORT: PG_PORT,
+        PORTOS_NATIVE_PGPORT: DATABASE_ENDPOINTS.native.port,
+        PGPORT_DOCKER: DATABASE_ENDPOINTS.docker.port,
+        PGUSER: PG_USER,
+        PGDATABASE: PG_DATABASE,
+        PGPASSWORD: PG_PASSWORD
+      },
+      watch: false,
+      autorestart: true,
+      max_restarts: 5,
+      min_uptime: '30s',
+      restart_delay: 10000,
+      ...memoryLimits(COS_MAX_MEMORY),
+      // Important: This process manages long-running agent processes
+      // Keep kill_timeout high to allow graceful shutdown of agents
+      kill_timeout: 30000
+    },
+    {
+      // Selected by `npm run dev`; production startup explicitly excludes Vite.
+      name: 'portos-ui',
+      script: path.join(__dirname, 'client', 'node_modules', 'vite', 'bin', 'vite.js'),
+      cwd: path.join(__dirname, 'client'),
+      // Explicit, unlike the inferred-from-.js default the other apps could rely
+      // on: this is the one script PortOS does not own, so pin the interpreter
+      // that node_args attach to rather than let a Vite release change it.
+      interpreter: 'node',
+      log_date_format: LOG_DATE_FORMAT,
+      windowsHide: IS_WIN,
+      args: `--host 0.0.0.0 --port ${PORTS.UI}`,
+      env: {
+        ...BASE_ENV,
+        VITE_PORT: PORTS.UI
+      },
+      watch: false,
+      // Vite's dev server keeps a module graph, a transform cache, and per-client
+      // HMR bookkeeping that all grow with session length and that it never
+      // releases on its own; with the default (physical-memory-derived) heap limit
+      // it was measured at 2.7 GB after 18h. The heap cap reaches the JS half of
+      // that — Vite 8 bundles through rolldown, whose own allocations are native
+      // and counted only by the RSS ceiling, so both bounds are load-bearing here.
+      //
+      // A restart is cheap (the browser reconnects, Vite re-warms its transform
+      // cache) but not free, and this is the one app that otherwise inherits pm2's
+      // `restart_delay: 0`. The damping below turns a mis-sized ceiling into slow
+      // churn instead of a tight crash loop.
+      autorestart: true,
+      max_restarts: 10,
+      min_uptime: '60s',
+      restart_delay: 15000,
+      ...memoryLimits(UI_MAX_MEMORY)
+    },
+    {
+      name: 'portos-autofixer',
+      script: 'autofixer/server.js',
+      cwd: __dirname,
+      interpreter: 'node',
+      log_date_format: LOG_DATE_FORMAT,
+      windowsHide: IS_WIN,
+      env: {
+        ...BASE_ENV,
+        PORT: PORTS.AUTOFIXER,
+        PATH: process.env.PATH // Inherit PATH for nvm/node access in child processes
+      },
+      watch: false,
+      autorestart: true,
+      max_restarts: 10,
+      min_uptime: '10s',
+      restart_delay: 5000,
+      ...memoryLimits(HELPER_MAX_MEMORY)
+    },
+    {
+      name: 'portos-autofixer-ui',
+      script: 'autofixer/ui.js',
+      cwd: __dirname,
+      interpreter: 'node',
+      log_date_format: LOG_DATE_FORMAT,
+      windowsHide: IS_WIN,
+      env: {
+        ...BASE_ENV,
+        PORT: PORTS.AUTOFIXER_UI
+      },
+      watch: false,
+      autorestart: true,
+      max_restarts: 10,
+      min_uptime: '10s',
+      restart_delay: 5000,
+      ...memoryLimits(HELPER_MAX_MEMORY)
+    },
+    {
+      name: 'portos-browser',
+      script: 'browser/server.js',
+      cwd: __dirname,
+      interpreter: 'node',
+      log_date_format: LOG_DATE_FORMAT,
+      windowsHide: IS_WIN,
+      // Security: CDP binds to 127.0.0.1 by default (set CDP_HOST=0.0.0.0 to expose)
+      // Remote access should go through portos-server proxy with authentication
+      env: {
+        ...BASE_ENV,
+        CDP_PORT: PORTS.CDP,
+        CDP_HOST: '127.0.0.1',
+        PORT: PORTS.CDP_HEALTH
+      },
+      watch: false,
+      autorestart: true,
+      max_restarts: 10,
+      min_uptime: '10s',
+      restart_delay: 5000,
+      ...memoryLimits(HELPER_MAX_MEMORY)
+    }
+  ]
+};

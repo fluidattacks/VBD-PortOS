@@ -1,0 +1,530 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { Link } from 'react-router';
+import {
+  ClipboardCheck, Loader2, CheckCircle2, AlertCircle, AlertTriangle, Wrench,
+  ThumbsUp, X, MessageSquarePlus, ChevronRight,
+} from 'lucide-react';
+import toast from '../ui/Toast';
+import { usePipelineProgress } from '../../hooks/usePipelineProgress';
+import { severityRank } from '../../lib/editorialChecks';
+import { reviewFrameLabel, summarizeReviewProgress } from '../../lib/seriesReviewProgress';
+import {
+  startPipelineSeriesReview,
+  getPipelineSeriesReview,
+  getPipelineSeriesReviewStatus,
+  cancelPipelineSeriesReview,
+  pipelineSeriesReviewSseUrl,
+  startPipelineSeriesFix,
+  getPipelineSeriesFixStatus,
+  pipelineSeriesFixSseUrl,
+  getPipelineSeries,
+  listPipelineIssues,
+} from '../../services/api';
+import { severityColor } from './constants.js';
+
+const RUN_ENDED = new Set(['complete', 'canceled', 'error']);
+// Why a stored verdict is out of date, keyed by the server's `staleReason`
+// (#4111). `findings` is also the fallback for a pre-#4111 snapshot, whose
+// staleness could only ever come from the findings store.
+const STALE_NOTICE = {
+  findings: 'The findings changed since this review ran — re-review for an up-to-date verdict.',
+  sources: 'The manuscript, canon, or foundation changed since this review ran — re-review for an up-to-date verdict.',
+  both: 'The findings and the reviewed manuscript/canon changed since this review ran — re-review for an up-to-date verdict.',
+};
+// The fix run's terminal frames: `rejected` = the cos gate/budget refused it.
+const FIX_RUN_ENDED = new Set(['complete', 'canceled', 'error', 'rejected']);
+
+// Compact label for the per-finding fix run.
+function fixFrameLabel(f) {
+  if (!f) return 'Working…';
+  switch (f.type) {
+    case 'start': return 'Starting fixes…';
+    case 'fix:start': return `Fixing ${f.issueNumber != null ? `#${f.issueNumber} ` : ''}finding…`;
+    case 'fix:done': return 'Applied a fix…';
+    case 'fix:skip': return 'Skipped an unanchorable finding…';
+    case 'complete': return `Fixed ${f.fixed ?? 0} of ${f.total ?? 0}`;
+    case 'rejected': return 'Fixing unavailable';
+    case 'canceled': return 'Fixing canceled';
+    case 'error': return `Fixing failed — ${f.error}`;
+    default: return 'Fixing…';
+  }
+}
+
+// Group findings by the issue they'd be patched at (series-wide → null bucket,
+// rendered last). Each group is deep-linked to that issue's manuscript section.
+function groupFindings(findings) {
+  const map = new Map();
+  for (const f of Array.isArray(findings) ? findings : []) {
+    const key = Number.isInteger(f.issueNumber) ? f.issueNumber : null;
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(f);
+  }
+  return [...map.entries()]
+    .sort((a, b) => (a[0] ?? Infinity) - (b[0] ?? Infinity))
+    .map(([issueNumber, items]) => ({
+      issueNumber,
+      items: items.sort((x, y) => severityRank(x.severity) - severityRank(y.severity)),
+    }));
+}
+
+/**
+ * Holistic "Review this series" surface (#2664): one action runs the read-only
+ * review passes, renders a single verdict with findings grouped by where they'd
+ * be patched, and — via an inline confirm — drives the existing autopilot
+ * revision cycle (or per-finding fixes) to patch them. No `window.confirm`.
+ */
+export default function SeriesReviewPanel({ series, onSeriesUpdate, onIssuesUpdate }) {
+  const seriesId = series?.id;
+  const [feedback, setFeedback] = useState('');
+  const [reviewing, setReviewing] = useState(false);
+  const [starting, setStarting] = useState(false);
+  const [review, setReview] = useState(null);
+  const [fixAvail, setFixAvail] = useState(null);
+  const [fixing, setFixing] = useState(false);
+  const [fixStarting, setFixStarting] = useState(false);
+  const [confirmDismissed, setConfirmDismissed] = useState(false);
+
+  const reviewRunIdRef = useRef(null);
+  const fixRunIdRef = useRef(null);
+  // Supersession token for the post-fix series/issues re-read below.
+  const fixResultRequestRef = useRef(0);
+  // The series this panel currently represents — used to drop a late-resolving
+  // verdict response from a series the user has already switched away from.
+  const activeSeriesRef = useRef(seriesId);
+  activeSeriesRef.current = seriesId;
+  const onSeriesUpdateRef = useRef(onSeriesUpdate);
+  const onIssuesUpdateRef = useRef(onIssuesUpdate);
+  onSeriesUpdateRef.current = onSeriesUpdate;
+  onIssuesUpdateRef.current = onIssuesUpdate;
+
+  const { latest: reviewLatest, frames: reviewFrames, closed: reviewClosed } = usePipelineProgress(
+    pipelineSeriesReviewSseUrl, [seriesId], { enabled: reviewing },
+  );
+  const { latest: fixLatest, closed: fixClosed } = usePipelineProgress(
+    pipelineSeriesFixSseUrl, [seriesId], { enabled: fixing },
+  );
+
+  const loadVerdict = useCallback(async () => {
+    if (!seriesId) return;
+    const res = await getPipelineSeriesReview(seriesId, { silent: true }).catch(() => null);
+    // Drop a response that resolved after the user switched series (P2) — the
+    // request was bound to `seriesId`, so compare it against the live series.
+    if (!res || activeSeriesRef.current !== seriesId) return;
+    // Always adopt the server's verdict (including null) so switching to a series
+    // with no stored review clears the previous series' findings (P2).
+    setReview(res.review ?? null);
+    setConfirmDismissed(false);
+    if (res.fix) setFixAvail(res.fix);
+  }, [seriesId]);
+
+  // Initial load / series switch — reset transient state first (React Router
+  // reuses this component across seriesIds, so stale review/run state must not
+  // carry over), then restore the verdict + re-attach to any in-flight run.
+  useEffect(() => {
+    if (!seriesId) return undefined;
+    let canceled = false;
+    setReview(null);
+    setFeedback('');
+    setConfirmDismissed(false);
+    setReviewing(false);
+    setFixing(false);
+    reviewRunIdRef.current = null;
+    fixRunIdRef.current = null;
+    loadVerdict();
+    getPipelineSeriesReviewStatus(seriesId, { silent: true })
+      .then((s) => { if (!canceled && s?.active) setReviewing(true); })
+      .catch(() => null);
+    getPipelineSeriesFixStatus(seriesId, { silent: true })
+      .then((s) => { if (!canceled && s?.active) { setConfirmDismissed(true); setFixing(true); } })
+      .catch(() => null);
+    return () => { canceled = true; };
+  }, [seriesId, loadVerdict]);
+
+  // Review run ended — fetch the fresh verdict on success.
+  useEffect(() => {
+    if (!reviewing || !reviewLatest || !RUN_ENDED.has(reviewLatest.type)) return;
+    if (reviewRunIdRef.current && reviewLatest.runId && reviewLatest.runId !== reviewRunIdRef.current) return;
+    setReviewing(false);
+    if (reviewLatest.type === 'complete') {
+      loadVerdict();
+      toast.success(reviewLatest.verdict === 'ready' ? 'Review complete — looks ready' : 'Review complete — found issues to address');
+    } else if (reviewLatest.type === 'canceled') {
+      toast.success('Review canceled');
+    } else {
+      toast.error(reviewLatest.error || 'Review failed');
+    }
+  }, [reviewing, reviewLatest, loadVerdict]);
+
+  // Fix run ended — refresh series + issues. The applied fixes changed the
+  // manuscript + accepted the findings, so the stored verdict is now stale;
+  // clear it so the panel returns to the review action and the user re-reviews
+  // to confirm (a fresh review is an explicit LLM action, never auto-fired).
+  useEffect(() => {
+    if (!fixing || !fixLatest || !FIX_RUN_ENDED.has(fixLatest.type)) return;
+    if (fixRunIdRef.current && fixLatest.runId && fixLatest.runId !== fixRunIdRef.current) return;
+    // A request-generation ref, not a `let active` flag: `fixing` is in this
+    // effect's own dependency array, so the write below re-runs the effect
+    // immediately and a lifetime-scoped flag would be flipped by its own
+    // cleanup before the response landed. The re-run early-returns without
+    // bumping, so the in-flight request stays current and only a genuinely
+    // newer one supersedes it.
+    const req = ++fixResultRequestRef.current;
+    const forSeries = seriesId;
+    // The counter alone advances only when another fix run ends, so it cannot
+    // invalidate a read whose series the user has since switched away from —
+    // `activeSeriesRef` (already kept for the verdict read) covers that axis.
+    const current = () => req === fixResultRequestRef.current && activeSeriesRef.current === forSeries;
+    setFixing(false);
+    if (fixLatest.type === 'complete') {
+      const fixed = fixLatest.fixed ?? 0;
+      if (fixed > 0) {
+        // Fixes landed — the manuscript + findings changed, so the verdict is
+        // stale; clear it and prompt a re-review to confirm.
+        getPipelineSeries(seriesId, { silent: true }).then((s) => { if (s && current()) onSeriesUpdateRef.current?.(s); }).catch(() => null);
+        listPipelineIssues(seriesId, { silent: true }).then((is) => { if (current()) onIssuesUpdateRef.current?.(Array.isArray(is) ? is : []); }).catch(() => null);
+        setReview(null);
+        setConfirmDismissed(false);
+        toast.success(`Fixed ${fixed} of ${fixLatest.total ?? 0} — re-review to confirm${fixLatest.budgetStopped ? ' (stopped: daily budget reached)' : ''}`);
+      } else {
+        // Nothing was applied (all unanchorable / budget stopped first) — KEEP the
+        // findings visible instead of clearing them, and warn (not a success).
+        toast.warning(`No fixes could be auto-applied (${fixLatest.total ?? 0} finding(s))${fixLatest.budgetStopped ? ' — daily budget reached' : ' — patch them from each finding instead'}.`);
+      }
+    } else if (fixLatest.type === 'rejected') {
+      toast.error(fixLatest.mode === 'dry-run'
+        ? 'Fixing is preview-only right now (CoS auto-run is in dry-run) — set it to execute to apply fixes.'
+        : (fixLatest.reason || 'Autonomous fixing is disabled — set the CoS auto-run domain to execute.'));
+    } else if (fixLatest.type === 'canceled') {
+      toast.success('Fixing canceled');
+    } else {
+      toast.error(fixLatest.error || 'Fixing failed');
+    }
+  }, [fixing, fixLatest, seriesId]);
+
+  // Recover when an SSE stream closes WITHOUT a terminal frame (the runner was
+  // pruned / the endpoint 404'd before we attached) — otherwise reviewing/fixing
+  // stays true forever and the controls are stuck disabled (P2). The terminal
+  // frame, when it does arrive, is handled by the effects above; this only fires
+  // for the no-terminal-frame close.
+  useEffect(() => {
+    if (reviewing && reviewClosed && !(reviewLatest && RUN_ENDED.has(reviewLatest.type))) {
+      setReviewing(false);
+      loadVerdict();
+    }
+  }, [reviewing, reviewClosed, reviewLatest, loadVerdict]);
+  useEffect(() => {
+    if (fixing && fixClosed && !(fixLatest && FIX_RUN_ENDED.has(fixLatest.type))) {
+      setFixing(false);
+      loadVerdict();
+    }
+  }, [fixing, fixClosed, fixLatest, loadVerdict]);
+
+  const runReview = useCallback(async () => {
+    setStarting(true);
+    // Only submit feedback while the textarea is actually shown (before the first
+    // verdict). A Re-review after a verdict must NOT silently re-seed the same
+    // stale note — the LLM-routed anchor can vary run-to-run, so it wouldn't dedup.
+    const body = (!review && feedback.trim()) ? { feedback: feedback.trim() } : {};
+    const res = await startPipelineSeriesReview(seriesId, body, { silent: true })
+      .catch((err) => { toast.error(err.message || 'Could not start review'); return null; });
+    setStarting(false);
+    if (!res) return;
+    // A review with DIFFERENT options is already in flight (a second tab, or a
+    // peer-triggered run). The server refused to coalesce this one onto it
+    // (#4113) — binding to that stream would report its verdict as this
+    // request's while silently dropping this note/provider/gate. Surface it and
+    // leave the running review (and the note) alone.
+    if (res.conflict) {
+      toast.error('A different review is already running for this series — wait for it to finish, or cancel it first.');
+      return;
+    }
+    // The note has now been consumed by this run — clear it so a later re-review
+    // (after fixes clear `review`, re-showing the textarea) can't silently re-seed
+    // the same note as a fresh duplicate finding. Don't clear when the server
+    // coalesced onto an already-running review (the note wasn't actually taken).
+    if (body.feedback && !res.alreadyRunning) setFeedback('');
+    reviewRunIdRef.current = res.runId || null;
+    setReviewing(true);
+  }, [seriesId, feedback, review]);
+
+  const cancelReview = useCallback(async () => {
+    await cancelPipelineSeriesReview(seriesId, { silent: true }).catch(() => null);
+  }, [seriesId]);
+
+  const startFix = useCallback(async () => {
+    setFixStarting(true);
+    // Patch each DISPLAYED finding at its anchor via the per-finding manuscriptFix
+    // machinery (server-side, cos-execute-gated + budgeted). Not the autopilot —
+    // that only auto-resolves completeness findings, so it can't fix the
+    // editorial-check findings this review surfaced. Scope to the ids the user
+    // reviewed here, so a finding added by another run after this snapshot isn't
+    // silently auto-fixed too (P1).
+    const commentIds = (review?.findings || []).map((f) => f.commentId);
+    const res = await startPipelineSeriesFix(seriesId, { commentIds }, { silent: true })
+      .catch((err) => { toast.error(err?.message || 'Could not start fixing'); return null; });
+    setFixStarting(false);
+    if (!res) return;
+    // A fix pass over a DIFFERENT finding set is already in flight. That run
+    // WRITES the manuscript, so reporting its totals as this request's would be
+    // worse than misleading — refuse to bind and say so (#4113).
+    if (res.conflict) {
+      toast.error('A different fix pass is already running for this series — wait for it to finish, or cancel it first.');
+      return;
+    }
+    fixRunIdRef.current = res.runId || null;
+    setConfirmDismissed(true);
+    setFixing(true);
+    toast.success('Fixing started — patching findings at their anchors');
+  }, [seriesId, review]);
+
+  if (!seriesId) return null;
+
+  // The review's background passes (foundation judge, canon readiness) run
+  // CONCURRENTLY with the editorial checks (#4108), so the frames interleave —
+  // summarize the whole stream rather than labelling only the newest frame, or
+  // the headline flickers between the checks pass and a step that just settled.
+  const { headline: reviewHeadline, alsoRunning: reviewAlsoRunning } = reviewing
+    ? summarizeReviewProgress(reviewFrames)
+    : { headline: null, alsoRunning: [] };
+  const reviewLabel = reviewing ? (reviewHeadline || 'Working…') : null;
+  const groups = review ? groupFindings(review.findings) : [];
+  const hasIssues = review?.verdict === 'issues';
+  // Only the manuscript-review findings are auto-fixable; a verdict that is
+  // 'issues' solely because of foundation / canon / an incomplete run has no
+  // fixable comments, so the bulk-fix action must not be offered (P2).
+  const hasFixableFindings = (review?.findings?.length || 0) > 0;
+  const canFix = fixAvail?.canFix !== false;
+  const showConfirm = hasIssues && !confirmDismissed && !fixing && !reviewing;
+  // Name the blockers behind an 'issues' verdict with zero listed findings, so
+  // the headline never contradicts itself with "0 issue(s)" (P2).
+  const nonFindingBlockers = [];
+  if (review) {
+    if (review.foundation && Number.isFinite(review.foundation.weightedScore)
+      && review.foundation.weightedScore < (review.foundationThreshold ?? 7.5)) nonFindingBlockers.push('foundation');
+    if (review.canon && review.canon.ready === false) nonFindingBlockers.push('canon');
+    if (review.health && review.health.ready === false) nonFindingBlockers.push('health');
+    if (review.incomplete) nonFindingBlockers.push('incomplete review');
+  }
+
+  return (
+    <div className="border border-port-border rounded-lg bg-port-card/40">
+      <div className="flex items-center gap-2 flex-wrap p-3">
+        <ClipboardCheck size={15} className="text-port-accent" />
+        <span className="text-sm font-medium text-white">Review this series</span>
+        <span className="text-xs text-gray-500">runs every check, tells you what&apos;s wrong, then fixes it where best patched</span>
+
+        <div className="ml-auto flex items-center gap-2">
+          {!reviewing ? (
+            <button
+              type="button"
+              onClick={runReview}
+              disabled={starting || fixing || fixStarting}
+              title={fixing || fixStarting ? 'Fixing is in progress — wait for it to finish before re-reviewing' : undefined}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded text-sm font-medium border bg-port-bg text-port-accent border-port-border hover:border-port-accent/40 disabled:opacity-40"
+            >
+              {starting ? <Loader2 size={14} className="animate-spin" /> : <ClipboardCheck size={14} />}
+              {review ? 'Re-review' : 'Review series'}
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={cancelReview}
+              className="inline-flex items-center gap-1 px-3 py-1.5 rounded text-xs text-port-warning hover:text-white border border-port-warning/40 bg-port-bg hover:bg-port-warning/10"
+            >
+              <X size={12} /> Stop
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Optional free-text feedback */}
+      {!reviewing && !review ? (
+        <div className="px-3 pb-3 flex flex-col gap-1">
+          <label htmlFor="series-review-feedback" className="text-xs text-gray-400 flex items-center gap-1.5">
+            <MessageSquarePlus size={12} /> Anything specific you want the reviewer to look at or fix? (optional)
+          </label>
+          <textarea
+            id="series-review-feedback"
+            value={feedback}
+            onChange={(e) => setFeedback(e.target.value)}
+            rows={2}
+            maxLength={4000}
+            placeholder="e.g. Volume 1 looks complete but little actually develops — check the pacing."
+            className="w-full px-2 py-1.5 rounded text-xs bg-port-bg border border-port-border text-gray-200 resize-y"
+          />
+        </div>
+      ) : null}
+
+      {/* Live review progress */}
+      {reviewing ? (
+        <div className="px-3 pb-3 border-t border-port-border pt-2">
+          <div className="text-xs text-gray-300 flex items-center gap-2 flex-wrap">
+            <Loader2 size={12} className="animate-spin text-port-accent" />
+            {reviewLabel}
+          </div>
+          {/* The passes running alongside the headline step, so a long foundation
+              judge stays visible while the checks pass owns the line above. */}
+          {reviewAlsoRunning.length ? (
+            <div className="mt-1 text-[11px] text-gray-500">
+              also running: {reviewAlsoRunning.join(' · ')}
+            </div>
+          ) : null}
+          {reviewFrames?.length ? (
+            <div className="mt-2 max-h-24 overflow-y-auto text-[11px] text-gray-500 space-y-0.5">
+              {reviewFrames.slice(-6).map((f, i) => <div key={i}>{reviewFrameLabel(f)}</div>)}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+
+      {/* Verdict + findings */}
+      {review && !reviewing ? (
+        <div className="px-3 pb-3 border-t border-port-border pt-2 space-y-3">
+          {/* Headline verdict */}
+          <div className="flex items-center gap-2 text-sm">
+            {review.verdict === 'ready' ? (
+              <><CheckCircle2 size={15} className="text-port-success" /><span className="text-port-success">Looks ready to move forward.</span></>
+            ) : (
+              <><AlertTriangle size={15} className="text-port-warning" /><span className="text-port-warning">
+                {review.findingCount > 0
+                  ? `${review.findingCount} issue(s) to address before moving forward.`
+                  : (nonFindingBlockers.length
+                    ? `Blocked by ${nonFindingBlockers.join(', ')} — address before moving forward.`
+                    : 'Not ready to move forward yet.')}
+              </span></>
+            )}
+          </div>
+
+          {/* Stale banner — either the findings changed since this verdict (e.g. a
+              finding was fixed/dismissed via "Fix here") or the reviewed sources
+              themselves did (manuscript/canon/foundation edits), so it's out of date. */}
+          {review.stale ? (
+            <p className="text-[11px] text-port-warning flex items-center gap-1.5">
+              <AlertTriangle size={12} />
+              {STALE_NOTICE[review.staleReason] || STALE_NOTICE.findings}
+            </p>
+          ) : null}
+
+          {/* Signal chips */}
+          <div className="flex flex-wrap gap-2 text-[11px]">
+            {review.foundation && Number.isFinite(review.foundation.weightedScore) ? (
+              <span className="px-2 py-0.5 rounded border border-port-border bg-port-bg text-gray-300" title={review.foundation.oneLineVerdict || ''}>
+                Foundation {review.foundation.weightedScore}/10{review.foundation.weakest ? ` · next target: ${review.foundation.weakest}` : ''}
+              </span>
+            ) : null}
+            {review.health && Number.isFinite(review.health.score) ? (
+              <span className={`px-2 py-0.5 rounded border ${review.health.ready ? 'border-port-success/40 text-port-success' : 'border-port-warning/40 text-port-warning'} bg-port-bg`}>
+                Health {review.health.score}/100{review.health.ready ? ' · clean' : ''}
+              </span>
+            ) : null}
+            {review.canon ? (
+              <span className={`px-2 py-0.5 rounded border ${review.canon.ready ? 'border-port-success/40 text-port-success' : 'border-port-warning/40 text-port-warning'} bg-port-bg`}>
+                Canon {review.canon.ready ? 'described' : `${review.canon.undescribed?.length || 0} undescribed`}
+              </span>
+            ) : null}
+          </div>
+
+          {/* Incomplete-review warning — a stage errored / never ran, so the
+              verdict can't be trusted as "ready" (P2). */}
+          {review.incomplete ? (
+            <p className="text-[11px] text-port-warning flex items-center gap-1.5">
+              <AlertTriangle size={12} />
+              {review.checksErrored > 0
+                ? `${review.checksErrored} editorial check(s) errored (e.g. a provider was unavailable) — `
+                : `Some review steps${review.failedStages?.length ? ` (${review.failedStages.join(', ')})` : ''} did not complete — `}
+              this review is incomplete; re-run before trusting it.
+            </p>
+          ) : null}
+
+          {/* Findings grouped by where they'd be patched */}
+          {groups.length ? (
+            <div className="space-y-2">
+              {groups.map((g) => (
+                <div key={g.issueNumber ?? 'series'} className="text-xs">
+                  <div className="uppercase tracking-wider text-gray-500 mb-1">
+                    {g.issueNumber != null ? (
+                      <Link to={`/pipeline/series/${seriesId}/manuscript/${g.issueNumber}`} className="text-port-accent hover:underline">
+                        #{g.issueNumber} →
+                      </Link>
+                    ) : 'Series-wide'}
+                  </div>
+                  <ul className="space-y-1">
+                    {g.items.map((f) => (
+                      <li key={f.commentId} className={`p-2 rounded border ${severityColor(f.severity)}`}>
+                        <div className="flex items-center gap-2">
+                          <AlertCircle size={11} />
+                          <span className="uppercase tracking-wider font-semibold text-[10px]">{f.severity}</span>
+                          {f.checkId ? <span className="text-gray-500 text-[10px]">{f.checkId}</span> : null}
+                          <Link
+                            to={`/pipeline/findings/${f.commentId}`}
+                            className="ml-auto inline-flex items-center gap-0.5 text-port-accent hover:underline text-[10px]"
+                            title="Open this finding in the manuscript editor to generate and accept a fix"
+                          >
+                            Fix here <ChevronRight size={10} />
+                          </Link>
+                        </div>
+                        <p className="text-gray-200 mt-0.5">{f.summary}</p>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ))}
+            </div>
+          ) : null}
+
+          {/* Inline confirm — "good to move forward?" (no window.confirm) */}
+          {showConfirm ? (
+            <div className="rounded border border-port-border bg-port-bg p-2 flex items-center gap-2 flex-wrap">
+              <span className="text-xs text-gray-300">Is the story so far good to move forward?</span>
+              <div className="ml-auto flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setConfirmDismissed(true)}
+                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded text-xs text-gray-300 hover:text-white border border-port-border hover:border-port-success/40"
+                >
+                  <ThumbsUp size={12} /> Looks good
+                </button>
+                {/* Bulk-fix is only meaningful when there are auto-fixable
+                    manuscript findings; a verdict blocked only by foundation /
+                    canon / an incomplete run has none, so offer only "Looks good". */}
+                {hasFixableFindings ? (
+                  <button
+                    type="button"
+                    onClick={startFix}
+                    disabled={fixStarting || !canFix}
+                    title={canFix ? 'Patch each finding at its anchor via the per-finding manuscript fixer' : 'Auto-fixing needs the CoS auto-run domain set to execute'}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded text-xs font-medium text-port-accent border border-port-border bg-port-bg hover:border-port-accent/40 disabled:opacity-40"
+                  >
+                    {fixStarting ? <Loader2 size={12} className="animate-spin" /> : <Wrench size={12} />} Fix these issues
+                  </button>
+                ) : null}
+              </div>
+              {hasFixableFindings && !canFix ? (
+                <p className="w-full text-[11px] text-gray-500 mt-1">
+                  {fixAvail?.mode === 'dry-run'
+                    ? 'Auto-fixing is preview-only right now (CoS auto-run is in dry-run — it makes no changes). Set it to execute, or open each finding above and fix it manually.'
+                    : 'Auto-fixing is off (CoS auto-run domain is disabled). You can still open each finding above and fix it manually.'}
+                </p>
+              ) : null}
+              {!hasFixableFindings ? (
+                <p className="w-full text-[11px] text-gray-500 mt-1">
+                  These blockers (foundation, canon, or an incomplete run) aren&apos;t auto-fixable here — address them from their own pages, then re-review.
+                </p>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+
+      {/* Fix run progress */}
+      {fixing ? (
+        <div className="px-3 pb-3 border-t border-port-border pt-2">
+          <div className="text-xs text-gray-300 flex items-center gap-2">
+            <Loader2 size={12} className="animate-spin text-port-accent" />
+            {fixFrameLabel(fixLatest)}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}

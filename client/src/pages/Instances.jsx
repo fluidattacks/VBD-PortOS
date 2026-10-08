@@ -1,0 +1,1774 @@
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import {
+  Network, Plus, Trash2, RefreshCw, Edit3, Check, X,
+  Wifi, WifiOff, CircleDot,
+  Cpu, HardDrive, Activity, Bot, MonitorSmartphone, Tag,
+  ArrowUpRight, ArrowDownLeft, ArrowLeftRight,
+  Database, Brain, CheckCircle2, AlertCircle, Clock,
+  RefreshCcw, Timer,
+  Target, Sword, Fingerprint, HeartPulse, ChevronDown, ChevronRight,
+  Lock, Globe, Sparkles, Film, Images, Library, BookOpen, FilePen, Music, Music2, Disc3, Clapperboard, Palette, BookText, FolderTree, Video, Waypoints, Gauge, Spade,
+  RadioTower, Route
+} from 'lucide-react';
+import { useSearchParams } from 'react-router';
+import Drawer from '../components/Drawer';
+import useDrawerTab from '../hooks/useDrawerTab';
+import { useSocketSubscription } from '../hooks/useSocketSubscription';
+import toast from '../components/ui/Toast';
+import Pill from '../components/ui/Pill';
+import ConfirmButtonPair from '../components/ui/ConfirmButtonPair';
+import EmptyState from '../components/EmptyState';
+import socket from '../services/socket';
+import {
+  getInstances, updateSelfInstance, addPeer, addTailcatPeer, updatePeer,
+  removePeer, connectPeer, reciprocatePeer, probePeer, syncPeer, getTailnetInfo,
+  getNetworkExposure,
+  listPeerSubscriptions,
+  getPeerFullSyncCoverage,
+  getBrainParityReports,
+  retryTailcatForward, forgetTailcatForward,
+  startTailcatServe,
+} from '../services/api';
+import PeerSyncSecretEditor from '../components/instances/PeerSyncSecretEditor';
+import PeerAppsList from '../components/instances/PeerAppsList';
+import PeerAgentsSection from '../components/instances/PeerAgentsSection';
+import { SchemaGapBadge } from '../components/instances/SchemaGapBadge';
+import { DEFAULT_PEER_PORT, DEFAULT_TAILCAT_LOCAL_PORT, DEFAULT_TAILCAT_REMOTE_PORT } from '../lib/ports.js';
+import PeerMediaProviderPanel from '../components/instances/PeerMediaProviderPanel';
+import PeerAdministrationPanel from '../components/instances/PeerAdministrationPanel';
+import UnattendedRenderRouting from '../components/instances/UnattendedRenderRouting';
+import BrainParityPanel from '../components/instances/BrainParityPanel';
+import BrainParitySchedule from '../components/instances/BrainParitySchedule';
+import TailnetHelpBanner from '../components/instances/TailnetHelpBanner';
+import TailcatForwardsPanel from '../components/instances/TailcatForwardsPanel';
+import TailcatServePanel from '../components/instances/TailcatServePanel';
+import { TailcatServeProvider, useTailcatServe } from '../components/instances/TailcatServeProvider';
+import TailcatAddress from '../components/instances/TailcatAddress';
+import TailcatForwardStatus from '../components/instances/TailcatForwardStatus';
+import { timeAgo, timeUntil } from '../utils/formatters';
+import { directionalCounts, describeDirectional } from '../lib/syncCounts';
+import { pluralize } from '../lib/textUtils';
+import PageSkeleton from '../components/ui/PageSkeleton';
+
+const STATUS_COLORS = {
+  online: 'text-port-success',
+  offline: 'text-port-error',
+  unknown: 'text-gray-500'
+};
+
+const STATUS_ICONS = {
+  online: Wifi,
+  offline: WifiOff,
+  unknown: CircleDot
+};
+
+function HealthSummary({ health, version }) {
+  if (!health) return <span className="text-gray-500 text-xs">No data</span>;
+  return (
+    <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
+      {version && (
+        <div className="flex items-center gap-1.5 text-gray-400 col-span-2">
+          <Tag size={12} />
+          <span>v{version}</span>
+        </div>
+      )}
+      <div className="flex items-center gap-1.5 text-gray-400">
+        <HardDrive size={12} />
+        <span>Mem {health.system?.memory?.usagePercent ?? '?'}%</span>
+      </div>
+      <div className="flex items-center gap-1.5 text-gray-400">
+        <Cpu size={12} />
+        <span>CPU {health.system?.cpu?.usagePercent ?? '?'}%</span>
+      </div>
+      <div className="flex items-center gap-1.5 text-gray-400">
+        <Activity size={12} />
+        <span>Up {health.system?.uptimeFormatted ?? '?'}</span>
+      </div>
+      <div className="flex items-center gap-1.5 text-gray-400">
+        <MonitorSmartphone size={12} />
+        <span>{health.apps?.total ?? '?'} apps</span>
+      </div>
+      {health.cos && (
+        <div className="flex items-center gap-1.5 text-gray-400 col-span-2">
+          <Bot size={12} />
+          {/* `queuedTasks: null` means the pending list could not be read, not that
+              nothing is waiting — render it as unknown rather than a confident zero. */}
+          <span>{health.cos.activeAgents ?? 0} agents, {health.cos.queuedTasks ?? '?'} queued</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SelfCard({ self, onUpdate, syncStatus, tailnetInfo, editing, setEditing, name, setName }) {
+
+  const startEdit = () => {
+    setName(self?.name || '');
+    setEditing(true);
+  };
+
+  const saveName = async () => {
+    if (!name.trim()) return;
+    const result = await updateSelfInstance({ name: name.trim() }).catch(() => null);
+    if (!result) return;
+    document.title = `PortOS: ${name.trim()}`;
+    onUpdate();
+    setEditing(false);
+    toast.success('Instance name updated');
+  };
+
+  const defaultFullSync = self?.defaultPeerFullSync === true;
+  const toggleDefaultFullSync = async () => {
+    const result = await updateSelfInstance({ defaultPeerFullSync: !defaultFullSync }).catch(() => null);
+    if (!result) return;
+    onUpdate();
+    toast.success(`New peers will ${!defaultFullSync ? 'default to full mirror' : 'start with no categories'}`);
+  };
+
+  if (!self) return null;
+
+  return (
+    <div className="bg-port-card border border-port-border rounded-xl p-5">
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="text-sm font-medium text-gray-400 uppercase tracking-wider">This Instance</h3>
+        <Network size={16} className="text-port-accent" />
+      </div>
+      <div className="space-y-2">
+        <div className="flex items-center gap-2">
+          {editing ? (
+            <div className="flex items-center gap-2 flex-1">
+              <input
+                aria-label="Instance name"
+                value={name}
+                onChange={e => setName(e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && saveName()}
+                className="flex-1 bg-port-bg border border-port-border rounded px-2 py-1 text-sm text-white focus:outline-hidden focus:border-port-accent"
+                autoFocus
+              />
+              <button onClick={saveName} aria-label="Save name" className="text-port-success hover:text-port-success/80">
+                <Check size={16} />
+              </button>
+              <button onClick={() => setEditing(false)} aria-label="Cancel" className="text-gray-500 hover:text-white">
+                <X size={16} />
+              </button>
+            </div>
+          ) : (
+            <>
+              <span className="text-white font-semibold text-lg">{self.name}</span>
+              <button onClick={startEdit} aria-label="Edit" className="text-gray-500 hover:text-white">
+                <Edit3 size={14} />
+              </button>
+            </>
+          )}
+        </div>
+        <p className="text-xs text-gray-500 font-mono">{self.instanceId}</p>
+        {tailnetInfo?.self ? (
+          <div className="flex items-center gap-1.5 text-[11px] mt-1" title="This instance's Tailscale MagicDNS name — peers can reach you over HTTPS at this name">
+            <Globe size={11} className="text-port-accent" />
+            <span className="font-mono text-port-accent">{tailnetInfo.self}</span>
+            <span className="text-gray-600">·</span>
+            <span className="text-gray-500">tailnet DNS</span>
+          </div>
+        ) : tailnetInfo === null ? null : (
+          <div className="flex items-center gap-1.5 text-[11px] mt-1 text-gray-500" title="No MagicDNS name detected for this instance">
+            <Globe size={11} />
+            <span>No tailnet DNS — peers will reach you by IP</span>
+          </div>
+        )}
+        <button
+          onClick={toggleDefaultFullSync}
+          className="mt-2 pt-2 border-t border-port-border/50 flex items-start gap-2 w-full text-left group"
+          title="When on, peers you add will start in full-mirror mode automatically"
+        >
+          <div className={`w-3 h-3 mt-0.5 rounded-sm border flex-shrink-0 flex items-center justify-center transition-colors ${
+            defaultFullSync ? 'bg-port-accent border-port-accent' : 'border-gray-600 bg-transparent'
+          }`}>
+            {defaultFullSync && <Check size={8} className="text-white" />}
+          </div>
+          <Globe size={12} className={`mt-0.5 ${defaultFullSync ? 'text-port-accent' : 'text-gray-500'}`} />
+          <div className="flex-1 min-w-0">
+            <span className={`text-xs ${defaultFullSync ? 'text-white' : 'text-gray-400'} group-hover:text-gray-300`}>Default new peers to full mirror</span>
+            <p className="text-[10px] text-gray-600 leading-snug">Applies to peers added from now on; existing peers are unchanged.</p>
+          </div>
+        </button>
+        {syncStatus?.local && (
+          <div className="mt-2 pt-2 border-t border-port-border/50 grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-gray-400">
+            <span className="flex items-center gap-1.5">
+              <Brain size={12} /> Brain seq: {syncStatus.local.brainSeq}
+            </span>
+            <span className="flex items-center gap-1.5">
+              <Database size={12} /> Memory seq: {syncStatus.local.memorySeq}
+            </span>
+            {SNAPSHOT_CATEGORIES.map(({ key, label, icon: Icon }) => {
+                const hasChecksum = !!syncStatus.local.checksums?.[key];
+                return (
+                  <span key={key} className="flex items-center gap-1.5">
+                    <Icon size={12} />
+                    <span>{label}:</span>
+                    {hasChecksum ? (
+                      <CheckCircle2 size={11} className="text-port-success" />
+                    ) : (
+                      <Clock size={11} className="text-gray-600" />
+                    )}
+                  </span>
+                );
+              })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Exported for focused tests (the port input's placeholder must advertise the
+// same default the form actually submits — see Instances.test.jsx).
+export function AddPeerForm({ onAdd, addressRef, drawer }) {
+  const [mode, setMode] = useState('classic'); // 'classic' | 'tailcat'
+  // Dial polarity for Tailcat: we dial their serve, or they dial ours.
+  const [dialDirection, setDialDirection] = useState('dial-them'); // 'dial-them' | 'they-dial-us'
+  const [address, setAddress] = useState('');
+  const [tcAddress, setTcAddress] = useState('');
+  const [tailcatRemotePort, setTailcatRemotePort] = useState(String(DEFAULT_TAILCAT_REMOTE_PORT));
+  const [tailcatHttps, setTailcatHttps] = useState(false);
+  const [port, setPort] = useState(String(DEFAULT_PEER_PORT));
+  const [name, setName] = useState('');
+  const [showAuth, setShowAuth] = useState(false);
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [adding, setAdding] = useState(false);
+  const { status: serveStatus, busy: serveBusy, run: runServe } = useTailcatServe();
+
+  // This component stays mounted above its Drawer, retaining drafts on close.
+  useEffect(() => {
+    if (drawer?.open) addressRef?.current?.focus();
+  }, [drawer?.open, addressRef]);
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (mode === 'tailcat') {
+      if (dialDirection === 'they-dial-us') return; // serve path uses its own buttons
+      if (!tcAddress.trim()) return;
+      setAdding(true);
+      const data = { tcAddress: tcAddress.trim(), remotePort: Number(tailcatRemotePort) };
+      if (tailcatHttps) data.protocol = 'https';
+      if (name.trim()) data.name = name.trim();
+      if (password) data.auth = { username: username.trim(), password };
+      const result = await addTailcatPeer(data).catch(() => null);
+      setAdding(false);
+      if (!result) return;
+      setTcAddress('');
+      setName('');
+      setUsername('');
+      setPassword('');
+      setShowAuth(false);
+      onAdd();
+      toast.success(`Peer added via tailcat (local :${result.port || DEFAULT_TAILCAT_LOCAL_PORT})`);
+      return;
+    }
+    if (!address.trim()) return;
+    setAdding(true);
+    const data = { address: address.trim(), port: parseInt(port, 10) || DEFAULT_PEER_PORT };
+    if (name.trim()) data.name = name.trim();
+    // Only attach credentials when a password was entered — username alone
+    // (or neither) is treated as "no auth" by the server's sanitizer.
+    if (password) data.auth = { username: username.trim(), password };
+    const result = await addPeer(data).catch(() => null);
+    setAdding(false);
+    if (!result) return;
+    setAddress('');
+    setPort(String(DEFAULT_PEER_PORT));
+    setName('');
+    setUsername('');
+    setPassword('');
+    setShowAuth(false);
+    onAdd();
+    toast.success('Peer added');
+  };
+
+  const ensureOurServe = async () => {
+    const result = await runServe(() => startTailcatServe({}), 'Tailcat serve is running — copy the address for the other node');
+    if (result) onAdd?.();
+  };
+
+  const canSubmit = mode === 'tailcat'
+    ? (dialDirection === 'dial-them' && !!tcAddress.trim())
+    : !!address.trim();
+
+  const form = (
+    <form onSubmit={handleSubmit} className="bg-port-card border border-port-border rounded-xl p-5">
+      <h3 className="text-sm font-medium text-gray-400 uppercase tracking-wider mb-3 flex items-center gap-2">
+        <Plus size={14} /> Add Peer
+      </h3>
+      <div className="flex flex-wrap gap-2 mb-3">
+        <button
+          type="button"
+          aria-pressed={mode === 'classic'}
+          disabled={adding || serveBusy}
+          onClick={() => setMode('classic')}
+          className={`text-xs px-2.5 py-1 rounded border transition-colors ${mode === 'classic' ? 'border-port-accent text-white bg-port-accent/20' : 'border-port-border text-gray-500 hover:text-gray-300'}`}
+        >
+          Host / port
+        </button>
+        <button
+          type="button"
+          aria-pressed={mode === 'tailcat'}
+          disabled={adding || serveBusy}
+          onClick={() => setMode('tailcat')}
+          className={`text-xs px-2.5 py-1 rounded border transition-colors ${mode === 'tailcat' ? 'border-port-accent text-white bg-port-accent/20' : 'border-port-border text-gray-500 hover:text-gray-300'}`}
+        >
+          Tailcat
+        </button>
+      </div>
+      {mode === 'tailcat' && (
+        <div className="flex flex-wrap gap-2 mb-3" role="group" aria-label="Tailcat dial direction">
+          <button
+            type="button"
+            aria-pressed={dialDirection === 'dial-them'}
+            disabled={adding || serveBusy}
+            onClick={() => setDialDirection('dial-them')}
+            className={`text-xs px-2.5 py-1 rounded border transition-colors ${dialDirection === 'dial-them' ? 'border-port-accent text-white bg-port-accent/20' : 'border-port-border text-gray-500 hover:text-gray-300'}`}
+          >
+            Dial them
+          </button>
+          <button
+            type="button"
+            aria-pressed={dialDirection === 'they-dial-us'}
+            disabled={adding || serveBusy}
+            onClick={() => setDialDirection('they-dial-us')}
+            className={`text-xs px-2.5 py-1 rounded border transition-colors ${dialDirection === 'they-dial-us' ? 'border-port-accent text-white bg-port-accent/20' : 'border-port-border text-gray-500 hover:text-gray-300'}`}
+          >
+            They dial us
+          </button>
+        </div>
+      )}
+      {mode === 'tailcat' && dialDirection === 'dial-them' ? (
+        <div className="flex flex-wrap gap-2">
+          <input
+            ref={addressRef}
+            aria-label="Tailcat address"
+            value={tcAddress}
+            onChange={e => setTcAddress(e.target.value)}
+            placeholder="tcEXAMPLE…"
+            required
+            className="bg-port-bg border border-port-border rounded px-3 py-2 text-sm text-white placeholder-gray-600 focus:outline-hidden focus:border-port-accent flex-1 min-w-[200px] font-mono"
+          />
+          <input type="number" aria-label="Remote Tailcat port" min="1" max="65535" required
+            value={tailcatRemotePort} onChange={(event) => setTailcatRemotePort(event.target.value)}
+            title="Use the port shown beside the remote serve address; older manually served peers may use 5555"
+            className="w-24 bg-port-bg border border-port-border rounded px-3 py-2 text-sm" />
+          <input
+            aria-label="Peer name"
+            value={name}
+            onChange={e => setName(e.target.value)}
+            placeholder="Name (optional)"
+            className="bg-port-bg border border-port-border rounded px-3 py-2 text-sm text-white placeholder-gray-600 focus:outline-hidden focus:border-port-accent flex-1 min-w-[120px]"
+          />
+          <button
+            type="submit"
+            disabled={adding || !canSubmit}
+            className="bg-port-accent hover:bg-port-accent/80 disabled:opacity-50 text-white px-4 py-2 rounded text-sm font-medium transition-colors"
+          >
+            {adding ? 'Connecting...' : 'Add via tailcat'}
+          </button>
+        </div>
+      ) : mode === 'tailcat' && dialDirection === 'they-dial-us' ? (
+        <div className="space-y-3">
+          <p className="text-[11px] text-gray-500 leading-snug">
+            Start serve on this node, copy our <span className="font-mono">tc…</span> address,
+            and paste it into the <em>other</em> PortOS as <strong>Dial them</strong>
+            using remote port <strong>{serveStatus?.localPort || DEFAULT_TAILCAT_REMOTE_PORT}</strong>.
+            Use this when the other machine is a better outbound initiator
+            (client firewall / Little Snitch often blocks home dials).
+          </p>
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              disabled={serveBusy || serveStatus?.live}
+              onClick={ensureOurServe}
+              className="bg-port-accent hover:bg-port-accent/80 disabled:opacity-50 text-white px-4 py-2 rounded text-sm font-medium transition-colors"
+            >
+              {serveBusy ? 'Starting...' : (serveStatus?.live ? 'Serve running' : 'Start serve')}
+            </button>
+          </div>
+          <TailcatAddress address={serveStatus?.tcAddress} preview={serveStatus?.tcAddressRedacted}
+            disabled={serveBusy} label="Copy our address" />
+        </div>
+      ) : (
+      <div className="flex flex-wrap gap-2">
+        <input
+          ref={addressRef}
+          aria-label="Peer address"
+          value={address}
+          onChange={e => setAddress(e.target.value)}
+          placeholder="100.64.x.x"
+          pattern="^((25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(25[0-5]|2[0-4]\d|[01]?\d\d?)$"
+          required
+          className="bg-port-bg border border-port-border rounded px-3 py-2 text-sm text-white placeholder-gray-600 focus:outline-hidden focus:border-port-accent flex-1 min-w-[140px]"
+        />
+        <input
+          aria-label="Peer port"
+          value={port}
+          onChange={e => setPort(e.target.value)}
+          placeholder={String(DEFAULT_PEER_PORT)}
+          type="number"
+          min="1"
+          max="65535"
+          className="bg-port-bg border border-port-border rounded px-3 py-2 text-sm text-white placeholder-gray-600 focus:outline-hidden focus:border-port-accent w-20"
+        />
+        <input
+          aria-label="Peer name"
+          value={name}
+          onChange={e => setName(e.target.value)}
+          placeholder="Name (optional)"
+          className="bg-port-bg border border-port-border rounded px-3 py-2 text-sm text-white placeholder-gray-600 focus:outline-hidden focus:border-port-accent flex-1 min-w-[120px]"
+        />
+        <button
+          type="submit"
+          disabled={adding || !canSubmit}
+          className="bg-port-accent hover:bg-port-accent/80 disabled:opacity-50 text-white px-4 py-2 rounded text-sm font-medium transition-colors"
+        >
+          {adding ? 'Adding...' : 'Add'}
+        </button>
+      </div>
+      )}
+      {mode === 'tailcat' && dialDirection === 'dial-them' && (
+        <>
+          <label htmlFor="tailcat-https" className="flex items-center gap-2 text-sm text-gray-400 mt-3">
+            <input id="tailcat-https" type="checkbox" checked={tailcatHttps}
+              onChange={e => setTailcatHttps(e.target.checked)} disabled={adding} />
+            Remote PortOS uses HTTPS
+          </label>
+          <p className="text-[11px] text-gray-500 mt-2 leading-snug">
+            Forwards <span className="font-mono text-gray-400">127.0.0.1:{DEFAULT_TAILCAT_LOCAL_PORT}</span>
+            {' '}→ remote <span className="font-mono text-gray-400">:5555</span> via tailcat
+            (next free port if {DEFAULT_TAILCAT_LOCAL_PORT} is busy). No Tailscale account required.
+            Tailcat is installed with Homebrew (or Go) if needed.
+          </p>
+        </>
+      )}
+      <div className="mt-2">
+        <button
+          type="button"
+          onClick={() => setShowAuth(v => !v)}
+          className="inline-flex items-center gap-1 text-[11px] text-gray-500 hover:text-gray-300 transition-colors"
+        >
+          <Lock size={11} />
+          {showAuth ? 'Hide credentials' : 'Add credentials (peer behind an auth proxy)'}
+        </button>
+        {showAuth && (
+          <div className="flex flex-wrap gap-2 mt-2">
+            <input
+              aria-label="Peer username"
+              value={username}
+              onChange={e => setUsername(e.target.value)}
+              placeholder="Username (optional)"
+              autoComplete="off"
+              className="bg-port-bg border border-port-border rounded px-3 py-2 text-sm text-white placeholder-gray-600 focus:outline-hidden focus:border-port-accent flex-1 min-w-[120px]"
+            />
+            <input
+              aria-label="Peer password"
+              value={password}
+              onChange={e => setPassword(e.target.value)}
+              placeholder="Password"
+              type="password"
+              autoComplete="new-password"
+              className="bg-port-bg border border-port-border rounded px-3 py-2 text-sm text-white placeholder-gray-600 focus:outline-hidden focus:border-port-accent flex-1 min-w-[120px]"
+            />
+          </div>
+        )}
+      </div>
+    </form>
+  );
+  return drawer
+    ? <Drawer {...drawer} title="Add peer" closeLabel="Close add peer">{form}</Drawer>
+    : form;
+}
+
+function DirectionBadge({ directions = [] }) {
+  const hasInbound = directions.includes('inbound');
+  const hasOutbound = directions.includes('outbound');
+
+  if (hasInbound && hasOutbound) {
+    return (
+      <Pill tone="success" size="xs" bordered={false} icon={ArrowLeftRight} title="Bidirectional — we added them and they added us">
+        mutual
+      </Pill>
+    );
+  }
+  if (hasOutbound) {
+    return (
+      <Pill tone="accent" size="xs" bordered={false} icon={ArrowUpRight} title="Outbound — we added this peer">
+        outbound
+      </Pill>
+    );
+  }
+  if (hasInbound) {
+    return (
+      <Pill tone="warning" size="xs" bordered={false} icon={ArrowDownLeft} title="Inbound — this peer added us">
+        inbound
+      </Pill>
+    );
+  }
+  return null;
+}
+
+function SyncStatusBadge({ label, icon: Icon, localSeq, peerSeq, cursorSeq, peerCursorForUs, syncing }) {
+  // cursorSeq        = how far we've pulled from them (our cursor for their data)
+  // localSeq         = our local max seq for this data type
+  // peerSeq          = their max seq for this data type (their sync-status endpoint)
+  // peerCursorForUs  = how far THEY've pulled from us (their cursor into our data)
+  //
+  // Two directions, both in plain language (raw seqs live in the tooltip):
+  //   toPull = peerSeq - cursorSeq         (their items we haven't pulled)
+  //   toPush = localSeq - peerCursorForUs  (our items they haven't pulled)
+  const { toPull, toPush } = directionalCounts({
+    localMax: localSeq,
+    peerMax: peerSeq,
+    ourCursor: cursorSeq,
+    peerCursorForUs,
+  });
+  const { state, text } = describeDirectional({ toPull, toPush });
+
+  // Nothing known at all (no probe yet, no cursor) → render nothing.
+  if (peerSeq == null && cursorSeq == null && peerCursorForUs == null && localSeq == null) return null;
+
+  const StateIcon = syncing ? RefreshCw : state === 'synced' ? CheckCircle2 : state === 'behind' ? AlertCircle : Clock;
+  const iconClass = syncing
+    ? 'text-port-accent animate-spin'
+    : state === 'synced' ? 'text-port-success' : state === 'behind' ? 'text-port-warning' : 'text-gray-500';
+  const textClass = syncing
+    ? 'text-port-accent'
+    : state === 'synced' ? 'text-port-success' : state === 'behind' ? 'text-port-warning' : 'text-gray-400';
+
+  // Raw sequences retained for debugging in the tooltip.
+  const tooltip = `Pulled ${cursorSeq ?? 0} of their ${peerSeq ?? '?'} · `
+    + `they pulled ${peerCursorForUs ?? '?'} of our ${localSeq ?? '?'}`;
+
+  return (
+    <div className="flex items-center gap-1.5 text-xs">
+      <Icon size={12} className="text-gray-500" />
+      <span className="text-gray-500">{label}:</span>
+      <span className="flex items-center gap-1" title={tooltip}>
+        <StateIcon size={11} className={iconClass} />
+        <span className={textClass}>{syncing ? 'syncing…' : text}</span>
+      </span>
+    </div>
+  );
+}
+
+// Sync category metadata for UI display
+const SYNC_CATEGORY_META = [
+  { key: 'brain', label: 'Brain', icon: Brain, description: 'People, projects, ideas, admin, memories, links' },
+  { key: 'memory', label: 'Memory', icon: Database, description: 'CoS agent memories (PostgreSQL)' },
+  { key: 'goals', label: 'Goals', icon: Target, description: 'Life goals, milestones, progress tracking' },
+  { key: 'character', label: 'Character', icon: Sword, description: 'XP, HP, level, events, character sheet' },
+  { key: 'digitalTwin', label: 'Digital Twin', icon: Fingerprint, description: 'Identity, taste, documents, autobiography, social accounts, personality traits, chronotype, longevity, feedback' },
+  { key: 'meatspace', label: 'Meatspace', icon: HeartPulse, description: 'Daily logs, blood tests, body metrics, eyes' },
+  { key: 'universe', label: 'Universe', icon: Sparkles, description: 'Universe Builder canon: characters, places, objects' },
+  { key: 'pipeline', label: 'Pipeline', icon: Film, description: 'Series + issues record state (no image/video blobs)' },
+  { key: 'mediaCollections', label: 'Media Collections', icon: Images, description: 'Per-universe/series image + video buckets, including the video metadata they need to render' },
+  { key: 'storyBuilder', label: 'Story Builder', icon: BookOpen, description: 'Resumable Story Builder sessions you marked for cross-machine sync' },
+  { key: 'usage', label: 'AI Usage Metrics', icon: Gauge, description: 'On by default. Aggregate AI usage counters — providers, models, token counts, estimated spend — so the Usage page totals your whole federation. No prompts, transcripts, or record contents. Turning it off stops PULLING this peer\u2019s usage; disable the peer to stop every direction.' },
+  { key: 'fableLoom', label: 'FableLoom', icon: Waypoints, description: 'Branching stories, series plans, episode graphs, and rendered scene references' },
+  { key: 'authors', label: 'Authors', icon: FilePen, description: 'Author personas + headshots used as series bylines (PostgreSQL)' },
+  { key: 'artists', label: 'Artists', icon: Music, description: 'Music artist personas + portraits (PostgreSQL)' },
+  { key: 'albums', label: 'Albums', icon: Disc3, description: 'Music albums + cover art and ordered track lists (PostgreSQL)' },
+  { key: 'tracks', label: 'Tracks', icon: Music2, description: 'Music tracks + attached audio files (PostgreSQL)' },
+  { key: 'creativeDirectorProjects', label: 'Creative Director', icon: Clapperboard, description: 'Creative Director projects: treatment, scenes, runs (PostgreSQL)' },
+  { key: 'moodBoards', label: 'Mood Boards', icon: Palette, description: 'Mood boards: pinned image + text references (PostgreSQL)' },
+  { key: 'writersRoomWorks', label: 'Writers Room', icon: BookText, description: 'Writers Room works: manuscripts + draft versions + prose bodies (PostgreSQL)' },
+  { key: 'writersRoomFolders', label: 'Writers Room Folders', icon: FolderTree, description: 'Writers Room library folders: names + nesting (PostgreSQL)' },
+  { key: 'writersRoomExercises', label: 'Writers Room Sprints', icon: Timer, description: 'Writers Room writing-sprint sessions + appended prose (PostgreSQL)' },
+  { key: 'musicVideoProjects', label: 'Music Video', icon: Video, description: 'Music Video projects: director board + beat-aligned scenes (PostgreSQL)' },
+  { key: 'creativeCommissions', label: 'Commissions', icon: Target, description: 'Creative Commission briefs (name + intent + genre + generation settings) — the schedule + run history stay machine-local (PostgreSQL)' },
+  { key: 'commissionFeedback', label: 'Commission Feedback', icon: Target, description: 'Creative Commission taste reactions that steer the next run — the schedule stays machine-local (PostgreSQL)' },
+  { key: 'decks', label: 'Decks', icon: Spade, description: 'Card decks: style guide, samples, per-card prompts + rendered card art — the image/LLM pins stay machine-local (PostgreSQL)' },
+  { key: 'catalog', label: 'Catalog', icon: Library, description: 'Creative ingredients catalog: orphan ingredients + ref links (PostgreSQL)' }
+];
+
+// Snapshot categories — exclude the per-record / delta-based categories that
+// have no 60s snapshot checksum: brain + memory (delta), catalog, and creative
+// record kinds handled by the per-record peer-push pipeline.
+const NON_SNAPSHOT_KEYS = new Set(['brain', 'memory', 'catalog', 'authors', 'artists', 'albums', 'tracks', 'creativeDirectorProjects', 'moodBoards', 'fableLoom', 'writersRoomWorks', 'writersRoomFolders', 'writersRoomExercises', 'musicVideoProjects', 'commissionFeedback', 'creativeCommissions', 'decks']);
+const SNAPSHOT_CATEGORIES = SYNC_CATEGORY_META.filter(m => !NON_SNAPSHOT_KEYS.has(m.key));
+
+// Video-history rows have no toggle of their own: they are the metadata half of
+// Media Collections, so that one switch drives both keys (server-side
+// `mediaCollections` already implies `videoHistory`; a legacy peer with only
+// `videoHistory` on reads as on here, and turning the row off clears both).
+const MEDIA_COLLECTION_KEYS = ['mediaCollections', 'videoHistory'];
+const isCategoryOn = (categories, key) => (key === 'mediaCollections'
+  ? MEDIA_COLLECTION_KEYS.some(k => categories[k])
+  : Boolean(categories[key]));
+
+// How bytes for a synced Media Collection reach this machine. Mirrors the
+// server's MEDIA_SYNC_MODES (services/instances.js).
+const MEDIA_SYNC_MODE_OPTIONS = [
+  { value: 'copy', label: 'Copy', description: 'Download every image/video onto this machine (uses local disk, works offline)' },
+  { value: 'host', label: 'Host on peer', description: 'Keep references only and stream files from the peer on demand (no local copy)' },
+];
+
+// Indicator backed by REAL coverage diffing (record IDs vs confirmed pushes),
+// not the BIGSERIAL cursors — so "fully mirrored" never lies. Refetches on mount
+// and whenever `refreshKey` changes; the caller passes peer.lastSeen, so it
+// refreshes on each probe tick — cheap for a single-user box and lets the
+// "N pending" count tick down live as the initial back-subscribe converges.
+function FullSyncCoverageBadge({ peerId, peerInstanceId, refreshKey }) {
+  const [coverage, setCoverage] = useState(null);
+  const [loaded, setLoaded] = useState(false);
+  useEffect(() => {
+    if (!peerInstanceId) { setCoverage(null); setLoaded(true); return; }
+    let cancelled = false;
+    setLoaded(false);
+    getPeerFullSyncCoverage(peerId, { silent: true })
+      .then((r) => { if (!cancelled) setCoverage(r); })
+      .catch(() => { if (!cancelled) setCoverage(null); })
+      .finally(() => { if (!cancelled) setLoaded(true); });
+    return () => { cancelled = true; };
+  }, [peerId, peerInstanceId, refreshKey]);
+
+  if (!peerInstanceId) {
+    return <span className="text-[10px] text-gray-600">awaiting first connection…</span>;
+  }
+  if (!loaded) {
+    return <span className="text-[10px] text-gray-600">checking coverage…</span>;
+  }
+  if (!coverage || coverage.available === false || coverage.partial === true) {
+    return (
+      <span className="flex items-center gap-1 text-[10px] text-port-warning" title="Coverage could not be verified. Any available counts are partial; retry on the next refresh.">
+        <AlertCircle size={11} /> Coverage unavailable
+      </span>
+    );
+  }
+  if (coverage.fullyMirrored) {
+    return (
+      <span className="flex items-center gap-1 text-[10px] text-port-success" title={`All ${pluralize(coverage.total, 'record')} confirmed delivered to this peer`}>
+        <CheckCircle2 size={11} /> Fully mirrored · {pluralize(coverage.total, 'record')}
+      </span>
+    );
+  }
+  return (
+    <span className="flex items-center gap-1 text-[10px] text-port-warning" title={`${coverage.pending} of ${pluralize(coverage.total, 'record')} not yet confirmed delivered`}>
+      <Clock size={11} /> {coverage.pending} pending · {coverage.confirmed}/{coverage.total} mirrored
+    </span>
+  );
+}
+
+function SyncCategoriesPanel({ peer, onRefresh }) {
+  const [expanded, setExpanded] = useState(false);
+  const categories = peer.syncCategories || {};
+  const fullSync = peer.fullSync === true;
+  // A full-sync peer mirrors every category — present them as locked-on.
+  const enabledCount = fullSync ? SYNC_CATEGORY_META.length : SYNC_CATEGORY_META.filter(({ key }) => isCategoryOn(categories, key)).length;
+  const mediaSyncMode = peer.mediaSyncMode === 'host' ? 'host' : 'copy';
+
+  const toggleFullSync = async () => {
+    await updatePeer(peer.id, { fullSync: !fullSync }).catch(() => null);
+    onRefresh();
+  };
+
+  // `syncEnabled` is NOT sent: the server derives it from the resulting category
+  // map, excluding the default-ON ones. Deriving it here would read `usage: true`
+  // as "something is enabled" and widen the peer's outbound push consent.
+  const toggleCategory = async (key) => {
+    if (fullSync) return; // categories are locked-on under full mirror
+    const next = !isCategoryOn(categories, key);
+    const keys = key === 'mediaCollections' ? MEDIA_COLLECTION_KEYS : [key];
+    await updatePeer(peer.id, { syncCategories: Object.fromEntries(keys.map(k => [k, next])) }).catch(() => null);
+    onRefresh();
+  };
+
+  const changeMediaSyncMode = async (mode) => {
+    if (mode === mediaSyncMode) return;
+    await updatePeer(peer.id, { mediaSyncMode: mode }).catch(() => null);
+    onRefresh();
+  };
+
+  const toggleAll = async (enable) => {
+    const updated = {};
+    for (const { key } of SYNC_CATEGORY_META) {
+      updated[key] = enable;
+    }
+    updated.videoHistory = enable;
+    await updatePeer(peer.id, { syncCategories: updated }).catch(() => null);
+    onRefresh();
+  };
+
+  // Explicitly push our current category map to the peer so it enables the same
+  // toward us. Toggling already auto-reciprocates; this is the catch-up button
+  // for peers configured one-directionally before auto-reciprocate existed, or
+  // when the peer was offline during an earlier toggle.
+  const makeMutual = async () => {
+    const result = await reciprocatePeer(peer.id, { silent: true }).catch(() => null);
+    if (result?.ok) toast.success(`Asked ${peer.name} to sync the same categories back`);
+    else toast.error(`Couldn't reach ${peer.name} to make sync mutual — try again when it's online`);
+    onRefresh();
+  };
+
+  return (
+    <div className="mt-2 pt-2 border-t border-port-border/50">
+      <button
+        onClick={() => setExpanded(!expanded)}
+        className="flex items-center gap-1.5 w-full text-left group"
+      >
+        {expanded ? <ChevronDown size={12} className="text-gray-500" /> : <ChevronRight size={12} className="text-gray-500" />}
+        <RefreshCcw size={12} className={enabledCount > 0 ? 'text-port-accent' : 'text-gray-500'} />
+        <span className="text-[10px] text-gray-500 uppercase tracking-wider font-medium group-hover:text-gray-400 transition-colors">
+          Sync Categories
+        </span>
+        <span className={`text-[10px] ml-auto ${enabledCount > 0 ? 'text-port-accent' : 'text-gray-600'}`}>
+          {enabledCount}/{SYNC_CATEGORY_META.length}
+        </span>
+      </button>
+
+      {expanded && (
+        <div className="mt-2 space-y-1">
+          {/* Full mirror toggle — when on, every current + future category is
+              implied and all subscribable records back-subscribe to this peer. */}
+          <button
+            onClick={toggleFullSync}
+            className={`flex items-start gap-2 w-full px-2 py-1.5 rounded border transition-colors text-left mb-1.5 ${
+              fullSync ? 'border-port-accent/60 bg-port-accent/10' : 'border-port-border hover:bg-port-bg/50'
+            }`}
+          >
+            <div className={`w-3 h-3 mt-0.5 rounded-sm border flex-shrink-0 flex items-center justify-center transition-colors ${
+              fullSync ? 'bg-port-accent border-port-accent' : 'border-gray-600 bg-transparent'
+            }`}>
+              {fullSync && <Check size={8} className="text-white" />}
+            </div>
+            <Globe size={12} className={`mt-0.5 ${fullSync ? 'text-port-accent' : 'text-gray-500'}`} />
+            <div className="flex-1 min-w-0">
+              <span className={`text-xs font-medium ${fullSync ? 'text-white' : 'text-gray-300'}`}>Full mirror</span>
+              <p className="text-[10px] text-gray-600 leading-snug">
+                Mirror everything to {peer.name || 'this peer'} — every category, all existing
+                records, and any new category added in a future version. Reciprocated automatically.
+              </p>
+              {fullSync && (
+                <div className="mt-1">
+                  <FullSyncCoverageBadge peerId={peer.id} peerInstanceId={peer.instanceId} refreshKey={peer.lastSeen} />
+                </div>
+              )}
+            </div>
+          </button>
+          <p className="text-[10px] text-gray-600 mb-1.5 leading-snug">
+            {fullSync
+              ? 'Categories are locked on while full mirror is enabled. Turn it off to choose categories individually.'
+              : <>Enabling a category syncs it both ways — we ask {peer.name || 'the peer'} to sync the same back automatically.</>}
+          </p>
+          <div className="flex items-center justify-end gap-2 mb-1.5">
+            {/* Available whenever we know the peer's identity — NOT gated on
+                enabledCount. The worst stale case is disabling the LAST category
+                while the peer is offline: the peer keeps its now-stale enabled
+                set, and the reciprocate endpoint pushes our all-false map to
+                clear it. Gating on enabledCount>0 would hide the control exactly
+                when it's needed. */}
+            {peer.instanceId && (
+              <button
+                onClick={makeMutual}
+                className="flex items-center gap-1 mr-auto text-[10px] text-gray-500 hover:text-port-accent transition-colors"
+                title="Push the current categories to this peer so it syncs them back (use if it was offline during a change)"
+              >
+                <ArrowLeftRight size={10} />
+                Make mutual
+              </button>
+            )}
+            {/* Enable/Disable-all are moot under full mirror (categories locked on). */}
+            {!fullSync && (
+              <>
+                <button
+                  onClick={() => toggleAll(true)}
+                  className="text-[10px] text-port-accent hover:text-port-accent/80 transition-colors"
+                >
+                  Enable all
+                </button>
+                <button
+                  onClick={() => toggleAll(false)}
+                  className="text-[10px] text-gray-500 hover:text-gray-400 transition-colors"
+                >
+                  Disable all
+                </button>
+              </>
+            )}
+          </div>
+          {SYNC_CATEGORY_META.map(({ key, label, icon: Icon, description }) => {
+            // Under full mirror every category reads as on and is non-interactive.
+            const on = fullSync || isCategoryOn(categories, key);
+            return (
+            <div key={key}>
+            <button
+              onClick={() => toggleCategory(key)}
+              disabled={fullSync}
+              title={fullSync ? 'Locked on by full mirror' : undefined}
+              className={`flex items-center gap-2 w-full px-2 py-1.5 rounded text-left transition-colors ${fullSync ? 'opacity-70 cursor-default' : 'hover:bg-port-bg/50'}`}
+            >
+              <div className={`w-3 h-3 rounded-sm border flex-shrink-0 flex items-center justify-center transition-colors ${
+                on
+                  ? 'bg-port-accent border-port-accent'
+                  : 'border-gray-600 bg-transparent'
+              }`}>
+                {on && (fullSync ? <Lock size={7} className="text-white" /> : <Check size={8} className="text-white" />)}
+              </div>
+              <Icon size={12} className={on ? 'text-port-accent' : 'text-gray-500'} />
+              <div className="flex-1 min-w-0">
+                <span className={`text-xs ${on ? 'text-white' : 'text-gray-400'}`}>{label}</span>
+                <p className="text-[10px] text-gray-600 truncate">{description}</p>
+              </div>
+            </button>
+            {key === 'mediaCollections' && on && (
+              <fieldset className="ml-7 mt-1 mb-1.5" aria-label="Media Collections sync method">
+                <legend className="sr-only">Media Collections sync method</legend>
+                <div className="flex flex-wrap gap-1.5">
+                  {MEDIA_SYNC_MODE_OPTIONS.map(option => (
+                    <button
+                      key={option.value}
+                      type="button"
+                      onClick={() => changeMediaSyncMode(option.value)}
+                      aria-pressed={mediaSyncMode === option.value}
+                      title={option.description}
+                      className={`px-2 py-1 min-h-[28px] rounded text-[10px] border transition-colors ${
+                        mediaSyncMode === option.value
+                          ? 'border-port-accent bg-port-accent/20 text-port-accent'
+                          : 'border-port-border text-gray-400 hover:bg-port-bg/50'
+                      }`}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+                <p className="text-[10px] text-gray-600 mt-1">
+                  {MEDIA_SYNC_MODE_OPTIONS.find(o => o.value === mediaSyncMode).description}
+                  {fullSync ? '. Full mirror still copies the whole media library.' : '.'}
+                </p>
+              </fieldset>
+            )}
+            </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SnapshotSyncBadge({ label, icon: Icon, cursorChecksum, remoteChecksum, syncing = false }) {
+  const synced = cursorChecksum && remoteChecksum && cursorChecksum === remoteChecksum;
+  const behind = cursorChecksum && remoteChecksum && cursorChecksum !== remoteChecksum;
+
+  return (
+    <div className="flex items-center gap-1.5 text-xs">
+      <Icon size={12} className="text-gray-500" />
+      <span className="text-gray-500">{label}:</span>
+      {syncing ? (
+        <>
+          <RefreshCw size={11} className="text-port-accent animate-spin" />
+          <span className="text-port-accent">syncing…</span>
+        </>
+      ) : synced ? (
+        <>
+          <CheckCircle2 size={11} className="text-port-success" />
+          <span className="text-port-success">synced</span>
+        </>
+      ) : behind ? (
+        <>
+          <AlertCircle size={11} className="text-port-warning" />
+          <span className="text-port-warning">behind</span>
+        </>
+      ) : (
+        <>
+          <Clock size={11} className="text-gray-500" />
+          <span className="text-gray-400">pending</span>
+        </>
+      )}
+    </div>
+  );
+}
+
+function SyncStatusSection({ peer, syncStatus, syncing = false }) {
+  if (!syncStatus || !peer.instanceId) return null;
+
+  const cursor = syncStatus.cursors?.[peer.instanceId];
+  const remoteSyncSeqs = peer.remoteSyncSeqs;
+  // A full-sync peer mirrors every category, so the snapshot sync status should
+  // surface them all on (its stored syncCategories map can be all-false
+  // underneath). Mirror the server's allSyncCategoriesOn semantics here.
+  const categories = peer.fullSync === true
+    ? Object.fromEntries(SYNC_CATEGORY_META.map(m => [m.key, true]))
+    : (peer.syncCategories || {});
+  // The peer's cursor into OUR data (how far it has pulled from us) — the
+  // push-frontier toward this peer. Present only when our probe passed `forPeer`
+  // and the peer is new enough to report it; absent → push count is "unknown".
+  const peerCursorForUs = remoteSyncSeqs?.cursorForYou ?? null;
+
+  // No sync data available at all
+  if (!cursor && !remoteSyncSeqs) return null;
+
+  // Only show delta-based status for enabled categories
+  const showBrain = categories.brain;
+  const showMemory = categories.memory;
+
+  // Show snapshot category sync status for all enabled snapshot categories
+  const cursorChecksums = cursor?.checksums || {};
+  const remoteChecksums = remoteSyncSeqs?.checksums || {};
+
+  const enabledSnapshots = SNAPSHOT_CATEGORIES
+    .map(m => m.key)
+    .filter(cat => categories[cat]);
+
+  if (!showBrain && !showMemory && enabledSnapshots.length === 0) return null;
+
+  return (
+    <div className="mt-2 pt-2 border-t border-port-border/50">
+      <div className="flex items-center gap-1.5 mb-1.5">
+        <Database size={12} className="text-gray-500" />
+        <span className="text-[10px] text-gray-500 uppercase tracking-wider font-medium">Sync Status</span>
+        {cursor?.lastSyncAt && (
+          <span className="text-[10px] text-gray-600 ml-auto">{timeAgo(cursor.lastSyncAt)}</span>
+        )}
+      </div>
+      {/* A cycle in which every category failed leaves lastSyncAt at its old
+          value and records why (#7943) — without this the card read "synced N
+          seconds ago" while cross-machine sync had been broken for weeks. */}
+      {cursor?.lastSyncError && (
+        <div role="status" className="flex items-start gap-1.5 mb-1.5 text-[10px] text-port-error" title={cursor.lastSyncError}>
+          <AlertCircle size={12} className="shrink-0 mt-px" />
+          <span className="truncate">Last sync failed: {cursor.lastSyncError}</span>
+        </div>
+      )}
+      <div className="grid grid-cols-2 gap-x-3 gap-y-0.5">
+        {showBrain && (
+          <SyncStatusBadge
+            label="Brain"
+            icon={Brain}
+            localSeq={syncStatus.local?.brainSeq}
+            peerSeq={remoteSyncSeqs?.brainSeq}
+            cursorSeq={cursor?.brainSeq}
+            peerCursorForUs={peerCursorForUs?.brainSeq}
+            syncing={syncing}
+          />
+        )}
+        {showMemory && (
+          <SyncStatusBadge
+            label="Memory"
+            icon={Database}
+            localSeq={syncStatus.local?.memorySeq}
+            peerSeq={remoteSyncSeqs?.memorySeq}
+            cursorSeq={cursor?.memorySeq}
+            peerCursorForUs={peerCursorForUs?.memorySeq}
+            syncing={syncing}
+          />
+        )}
+        {enabledSnapshots.map(cat => {
+          const meta = SYNC_CATEGORY_META.find(m => m.key === cat);
+          if (!meta) return null;
+          return (
+            <SnapshotSyncBadge
+              key={cat}
+              label={meta.label}
+              icon={meta.icon}
+              cursorChecksum={cursorChecksums[cat]}
+              remoteChecksum={remoteChecksums[cat]}
+              syncing={syncing}
+            />
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function PeerHostEditor({ peer, onRefresh, tailnetInfo }) {
+  const [editing, setEditing] = useState(false);
+  const [value, setValue] = useState('');
+  const [saving, setSaving] = useState(false);
+
+  // Auto-detected DNS suggestion from the local tailscale status map:
+  // match the peer by IP first (authoritative), fall back to composing
+  // <hostname>.<tailnet-suffix> when the peer's hostname is a valid DNS label.
+  const hostname = peer.lastHealth?.hostname;
+  const suggestion = useMemo(() => {
+    if (!tailnetInfo?.suffix) return null;
+    const byIp = tailnetInfo.peers?.find(p => p.ips?.includes(peer.address));
+    if (byIp?.dnsName) return byIp.dnsName;
+    if (hostname && /^[a-z0-9][a-z0-9-]*$/i.test(hostname)) {
+      return `${hostname}.${tailnetInfo.suffix}`.toLowerCase();
+    }
+    return null;
+  }, [tailnetInfo, peer.address, hostname]);
+
+  const startEdit = () => {
+    setValue(peer.host || suggestion || '');
+    setEditing(true);
+  };
+
+  const save = async () => {
+    setSaving(true);
+    const payload = { host: value.trim() === '' ? null : value.trim() };
+    const result = await updatePeer(peer.id, payload).catch(() => null);
+    setSaving(false);
+    if (!result) return;
+    onRefresh();
+    setEditing(false);
+    toast.success(payload.host ? `Host set to ${payload.host}` : 'Host cleared — reverting to IP');
+  };
+
+  const applySuggestion = () => setValue(suggestion);
+
+  if (editing) {
+    return (
+      <div className="mt-1 flex items-center gap-1 flex-wrap">
+        <input
+          aria-label="Peer hostname"
+          value={value}
+          onChange={e => setValue(e.target.value)}
+          onKeyDown={e => e.key === 'Enter' && save()}
+          placeholder="host.tailnet.ts.net (empty to clear)"
+          className="bg-port-bg border border-port-border rounded px-2 py-0.5 text-xs text-white font-mono focus:outline-hidden focus:border-port-accent flex-1 min-w-[180px]"
+          autoFocus
+        />
+        <button onClick={save} disabled={saving} aria-label="Save hostname" className="text-port-success hover:text-port-success/80 disabled:opacity-50"><Check size={14} /></button>
+        <button onClick={() => setEditing(false)} aria-label="Cancel" className="text-gray-500 hover:text-white"><X size={14} /></button>
+        {suggestion && suggestion !== value && (
+          <button
+            onClick={applySuggestion}
+            className="text-[10px] text-port-accent hover:text-port-accent/80 underline"
+            title={`Use detected DNS: ${suggestion}`}
+          >
+            use {suggestion}
+          </button>
+        )}
+      </div>
+    );
+  }
+
+  const clearHost = async () => {
+    setSaving(true);
+    const result = await updatePeer(peer.id, { host: null }).catch(() => null);
+    setSaving(false);
+    if (!result) return;
+    onRefresh();
+    toast.success('Reverted to IP — federation hop will use http://<ip>');
+  };
+
+  return (
+    <div className="mt-0.5 flex items-center gap-1.5 flex-wrap">
+      {peer.host ? (
+        <Pill tone="success" size="xs" bordered={false} mono icon={Wifi} title="Requests to this peer use https://<host>">
+          https://{peer.host}
+        </Pill>
+      ) : (
+        <Pill tone="bare" size="xs" bordered={false} mono className="text-gray-500 bg-port-bg" title="Requests use http://<ip> (no DNS set)">
+          http only
+        </Pill>
+      )}
+      <button
+        onClick={startEdit}
+        className="text-[10px] text-gray-500 hover:text-white underline"
+        title={suggestion ? `Auto-detected: ${suggestion}` : 'Set a Tailscale DNS name for HTTPS'}
+      >
+        {peer.host ? 'edit' : (suggestion ? `use ${suggestion}` : 'set DNS')}
+      </button>
+      {peer.host && (
+        <button
+          onClick={clearHost}
+          disabled={saving}
+          className="text-[10px] text-gray-500 hover:text-white underline disabled:opacity-50"
+          title="Switch this hop back to http://<ip>"
+        >
+          use IP only
+        </button>
+      )}
+    </div>
+  );
+}
+
+function PeerAuthEditor({ peer, onRefresh }) {
+  const [editing, setEditing] = useState(false);
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [saving, setSaving] = useState(false);
+
+  const hasAuth = !!peer.auth;
+
+  const startEdit = () => {
+    // Prefill the (non-secret) username; the password is never sent to the
+    // browser (server redacts it to a hasPassword marker), so it must be
+    // re-entered to save — saving replaces the whole credential server-side.
+    setUsername(peer.auth?.username || '');
+    setPassword('');
+    setEditing(true);
+  };
+
+  const save = async () => {
+    if (!password) return; // a password is required to store a credential
+    setSaving(true);
+    const result = await updatePeer(peer.id, { auth: { username: username.trim(), password } }).catch(() => null);
+    setSaving(false);
+    if (!result) return;
+    onRefresh();
+    setEditing(false);
+    toast.success('Peer credential saved');
+  };
+
+  const clear = async () => {
+    setSaving(true);
+    const result = await updatePeer(peer.id, { auth: null }).catch(() => null);
+    setSaving(false);
+    if (!result) return;
+    onRefresh();
+    setEditing(false);
+    toast.success('Peer credential cleared');
+  };
+
+  if (editing) {
+    return (
+      <div className="mt-1 flex items-center gap-1 flex-wrap">
+        <input
+          aria-label="Peer username"
+          value={username}
+          onChange={e => setUsername(e.target.value)}
+          placeholder="user (optional)"
+          autoComplete="off"
+          className="bg-port-bg border border-port-border rounded px-2 py-0.5 text-xs text-white focus:outline-hidden focus:border-port-accent w-28"
+        />
+        <input
+          aria-label="Peer password"
+          value={password}
+          onChange={e => setPassword(e.target.value)}
+          onKeyDown={e => e.key === 'Enter' && save()}
+          placeholder={hasAuth ? 're-enter password to update' : 'password'}
+          type="password"
+          autoComplete="new-password"
+          className="bg-port-bg border border-port-border rounded px-2 py-0.5 text-xs text-white focus:outline-hidden focus:border-port-accent flex-1 min-w-[120px]"
+          autoFocus
+        />
+        <button onClick={save} disabled={saving || !password} aria-label="Save credentials" className="text-port-success hover:text-port-success/80 disabled:opacity-50"><Check size={14} /></button>
+        <button onClick={() => setEditing(false)} aria-label="Cancel" className="text-gray-500 hover:text-white"><X size={14} /></button>
+        {hasAuth && (
+          <button onClick={clear} disabled={saving} className="text-[10px] text-gray-500 hover:text-port-error underline disabled:opacity-50">remove</button>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className="mt-0.5 flex items-center gap-1.5 flex-wrap">
+      {hasAuth ? (
+        <Pill tone="success" size="xs" bordered={false} icon={Lock} title="Outbound requests to this peer send an HTTP Basic credential">
+          credential set{peer.auth?.username ? ` · ${peer.auth.username}` : ''}
+        </Pill>
+      ) : peer.authRequired ? (
+        <Pill tone="warning" size="xs" bordered={false} icon={Lock} title="Peer returned 401/403 — it's behind an auth proxy and needs a credential">
+          auth required
+        </Pill>
+      ) : null}
+      <button
+        onClick={startEdit}
+        className={`text-[10px] underline ${peer.authRequired && !hasAuth ? 'text-port-warning hover:text-port-warning/80' : 'text-gray-500 hover:text-white'}`}
+        title="Set an HTTP Basic username/password for a peer behind an auth proxy"
+      >
+        {hasAuth ? 'edit credential' : 'set credential'}
+      </button>
+    </div>
+  );
+}
+
+function ProbeDiagnostics({ peer, probing, onProbe }) {
+  const last = peer.lastProbe;
+  return (
+    <div className="mt-2 rounded-lg border border-port-border bg-port-bg/60 p-2.5">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-[11px] uppercase tracking-wider text-gray-500">Health check</span>
+        <button
+          type="button"
+          onClick={onProbe}
+          disabled={probing}
+          className="inline-flex items-center gap-1 text-[11px] text-port-accent hover:text-white disabled:opacity-50 border border-port-accent/40 rounded px-2 py-1 transition-colors"
+          title="Force an immediate health/details probe"
+        >
+          <RefreshCw size={11} className={probing ? 'animate-spin' : ''} />
+          {probing ? 'Checking…' : 'Check now'}
+        </button>
+      </div>
+      {last ? (
+        <p className={`mt-1.5 text-[11px] leading-snug break-words ${last.ok ? 'text-port-success' : 'text-port-warning'}`}>
+          {last.ok ? 'ok' : (last.class || 'failed')}
+          {last.httpStatus != null && ` · HTTP ${last.httpStatus}`}
+          {last.latencyMs != null && ` · ${last.latencyMs}ms`}
+          {last.at && ` · ${timeAgo(last.at)}`}
+          {!last.ok && last.message && (
+            <span className="block text-gray-400 mt-0.5">{last.message}</span>
+          )}
+          {peer.consecutiveFailures > 0 && peer.nextProbeAt && (
+            <span className="block text-gray-500 mt-0.5">
+              next probe {timeUntil(peer.nextProbeAt) ?? '—'}
+            </span>
+          )}
+        </p>
+      ) : (
+        <p className="mt-1.5 text-[11px] text-gray-500">No probe result yet — run a health check.</p>
+      )}
+    </div>
+  );
+}
+
+export function PeerCard({ peer, onRefresh, syncStatus, tailnetInfo, parityReport }) {
+  const [editingName, setEditingName] = useState(false);
+  const [name, setName] = useState('');
+  const [probing, setProbing] = useState(false);
+  const [forwardBusy, setForwardBusy] = useState(false);
+  const [connecting, setConnecting] = useState(false);
+  const [confirmRemove, setConfirmRemove] = useState(false);
+  // Outbound subscriptions inform per-record schema compatibility.
+  const [peerSubs, setPeerSubs] = useState([]);
+  // Live sync activity, driven by the `sync:progress` socket event. `syncing`
+  // is true between this peer's `start` and `complete`; while it's true every
+  // enabled category badge shows "syncing…". On `complete` it clears and the
+  // parent's peers refetch settles the card to the new directional summary.
+  const [syncing, setSyncing] = useState(false);
+
+  useEffect(() => {
+    if (!peer.instanceId) return;
+    const handleProgress = (payload) => {
+      if (payload?.peerId !== peer.instanceId) return;
+      if (payload.phase === 'start') {
+        setSyncing(true);
+      } else if (payload.phase === 'complete') {
+        setSyncing(false);
+        // Pull the freshest cursors/seqs so the card settles to the new
+        // directional summary. Only when records actually moved — otherwise the
+        // 60s background `syncAllPeers` cycle would fire a full page refetch per
+        // peer on every idle tick (a refetch herd). The manual "Sync now" path
+        // (`handleSync`) does its own authoritative refetch on the awaited POST,
+        // so a no-op manual sync still settles; this branch covers the
+        // records-moved case for both manual and background syncs.
+        // A failed cycle applies nothing, so the totalApplied gate alone would
+        // never pull the new `lastSyncError` onto the card (#7943).
+        if (payload.totalApplied > 0 || payload.error) onRefresh();
+      }
+      // `applied` events are informational (and drive the server-side log) —
+      // the global `syncing` flag already animates every badge, so the client
+      // needn't track per-category granularity.
+    };
+    socket.on('sync:progress', handleProgress);
+    return () => socket.off('sync:progress', handleProgress);
+  }, [peer.instanceId, onRefresh]);
+
+  useEffect(() => {
+    if (!peer.instanceId) {
+      setPeerSubs([]);
+      return;
+    }
+    let cancelled = false;
+    const refetch = () => listPeerSubscriptions({ peerId: peer.instanceId }, { silent: true })
+      .then((r) => {
+        if (!cancelled) setPeerSubs(r?.subscriptions || []);
+      })
+      .catch(() => {
+        if (!cancelled) setPeerSubs([]);
+      });
+    refetch();
+    // When a per-record schema block is persisted server-side, the
+    // subscription's `blockedBySchema` field changes inside
+    // peer_subscriptions.json. The parent Instances component already
+    // refetches `peers` on this event, but its refresh doesn't re-run this
+    // card's `peerSubs` effect (deps are `peer.instanceId` only). Without
+    // a local subscription here, SchemaGapBadge keeps rendering the stale
+    // `blockedBySchema` value until a full page reload.
+    // The event carries `peerId` so only the affected card refetches —
+    // every card listens, but skips events for other peers.
+    const handleSchemaSubChange = (payload) => {
+      if (payload?.peerId && payload.peerId !== peer.instanceId) return;
+      refetch();
+    };
+    socket.on('peerSync:subscription-blocked', handleSchemaSubChange);
+    socket.on('peerSync:subscription-unblocked', handleSchemaSubChange);
+    // An incoming push from this peer auto-created a reverse subscription
+    // back to it (`maybeCreateReverseSubscription`). The new row lives in
+    // peer_subscriptions.json but this card cached `peerSubs` on mount, so
+    // refetch this peer's subs to surface the adopted-from-reverse sub
+    // without a manual page reload. Carries `peerId`, so the same filter
+    // keeps every other card from refetching needlessly.
+    socket.on('peerSync:subscription:created', handleSchemaSubChange);
+    return () => {
+      cancelled = true;
+      socket.off('peerSync:subscription-blocked', handleSchemaSubChange);
+      socket.off('peerSync:subscription-unblocked', handleSchemaSubChange);
+      socket.off('peerSync:subscription:created', handleSchemaSubChange);
+    };
+  }, [peer.instanceId]);
+
+  const StatusIcon = STATUS_ICONS[peer.status] || CircleDot;
+  const isInboundOnly = peer.directions?.includes('inbound') && !peer.directions?.includes('outbound');
+  const peerLabel = peer.name || peer.address;
+
+  const handleConnect = async () => {
+    setConnecting(true);
+    const result = await connectPeer(peer.id).catch(() => null);
+    setConnecting(false);
+    if (!result) return;
+    onRefresh();
+    toast.success(`Connected to ${peer.name}`);
+  };
+
+  const handleProbe = async () => {
+    setProbing(true);
+    const result = await probePeer(peer.id).catch(() => null);
+    onRefresh();
+    setProbing(false);
+    if (!result) {
+      toast.error(`Health check failed for ${peer.name}`);
+      return;
+    }
+    if (result.status === 'online') {
+      const ms = result.lastProbe?.latencyMs;
+      toast.success(`Health check ok${ms != null ? ` (${ms}ms)` : ''}`);
+    } else {
+      const detail = result.lastProbe?.message || result.lastProbe?.class || 'offline';
+      toast.error(`Health check: ${detail}`);
+    }
+  };
+
+  const handleForwardRetry = async (remotePort, tcAddress) => {
+    const forwardId = peer.tailcatForward?.id;
+    if (!forwardId) return;
+    setForwardBusy(true);
+    const updated = await retryTailcatForward(forwardId, { ...(remotePort ? { remotePort } : {}), ...(tcAddress ? { tcAddress } : {}) }).catch(() => null);
+    setForwardBusy(false);
+    onRefresh();
+    if (!updated) return;
+    toast.success(`Tailcat forward restarted on 127.0.0.1:${updated.port}`);
+  };
+
+  const handleForwardForget = async () => {
+    const forwardId = peer.tailcatForward?.id;
+    if (!forwardId) return;
+    setForwardBusy(true);
+    const removed = await forgetTailcatForward(forwardId).catch(() => null);
+    setForwardBusy(false);
+    if (!removed) return;
+    onRefresh();
+    toast.success('Tailcat forward and peer removed');
+  };
+
+  const handleSync = async () => {
+    // Optimistically flip the card into its syncing state — the server's
+    // `sync:progress` start event will confirm it, but this gives instant
+    // feedback even before the socket round-trips. The custom catch owns the
+    // error UI, so request() must stay silent to avoid a double toast.
+    setSyncing(true);
+    const result = await syncPeer(peer.id, { silent: true }).catch(() => null);
+    // The POST awaits the full sync server-side, so its resolution IS the
+    // authoritative completion for a manual sync — clear the spinner here
+    // rather than relying solely on the fire-and-forget `complete` socket
+    // event, which a transient socket disconnect could drop and leave the card
+    // stuck. The refetch itself is owned by the `complete` handler (gated on
+    // records-moved); a no-op manual sync changes nothing worth refetching.
+    setSyncing(false);
+    if (!result) {
+      toast.error(`Couldn't sync with ${peer.name} — is it online?`);
+    }
+  };
+
+  const handleRemove = async () => {
+    const result = await removePeer(peer.id).catch(() => null);
+    if (!result) return;
+    onRefresh();
+    toast.success('Peer removed');
+  };
+
+  const handleToggle = async () => {
+    await updatePeer(peer.id, { enabled: !peer.enabled }).catch(() => null);
+    onRefresh();
+  };
+
+  const saveName = async () => {
+    if (!name.trim()) return;
+    const result = await updatePeer(peer.id, { name: name.trim() }).catch(() => null);
+    if (!result) return;
+    onRefresh();
+    setEditingName(false);
+  };
+
+  return (
+    <div className={`bg-port-card border border-port-border rounded-xl p-5 transition-opacity ${!peer.enabled ? 'opacity-50' : ''}`}>
+      <div className="flex flex-wrap items-start justify-between gap-2 mb-3">
+        <div className="flex items-center gap-2">
+          <StatusIcon size={16} className={STATUS_COLORS[peer.status]} />
+          {editingName ? (
+            <div className="flex items-center gap-1">
+              <input
+                aria-label="Peer name"
+                value={name}
+                onChange={e => setName(e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && saveName()}
+                className="bg-port-bg border border-port-border rounded px-2 py-0.5 text-sm text-white focus:outline-hidden focus:border-port-accent w-32"
+                autoFocus
+              />
+              <button onClick={saveName} aria-label="Save name" className="text-port-success hover:text-port-success/80"><Check size={14} /></button>
+              <button onClick={() => setEditingName(false)} aria-label="Cancel" className="text-gray-500 hover:text-white"><X size={14} /></button>
+            </div>
+          ) : (
+            <div className="flex items-center gap-1.5">
+              <span className="text-white font-medium">{peer.name}</span>
+              <button onClick={() => { setName(peer.name); setEditingName(true); }} aria-label="Edit" className="text-gray-600 hover:text-white">
+                <Edit3 size={12} />
+              </button>
+            </div>
+          )}
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={handleSync}
+            disabled={syncing || peer.status !== 'online'}
+            className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center p-1.5 text-gray-500 hover:text-port-accent transition-colors disabled:opacity-40 disabled:hover:text-gray-500"
+            title={peer.status === 'online' ? 'Sync now' : 'Peer offline — cannot sync'}
+            aria-label={peer.status === 'online' ? 'Sync now' : 'Peer offline — cannot sync'}
+          >
+            <RefreshCcw size={14} className={syncing ? 'animate-spin text-port-accent' : ''} />
+          </button>
+          <button
+            onClick={handleProbe}
+            disabled={probing}
+            className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center p-1.5 text-gray-500 hover:text-white transition-colors disabled:opacity-50"
+            title="Probe now" aria-label="Probe now"
+          >
+            <RefreshCw size={14} className={probing ? 'animate-spin' : ''} />
+          </button>
+          <button
+            onClick={handleToggle}
+            className={`p-1.5 transition-colors text-xs font-mono ${peer.enabled ? 'text-port-success hover:text-port-success/80' : 'text-gray-600 hover:text-white'}`}
+            title={peer.enabled ? 'Disable polling' : 'Enable polling'}
+          >
+            {peer.enabled ? 'ON' : 'OFF'}
+          </button>
+          {confirmRemove ? (
+            <ConfirmButtonPair
+              prompt={`Remove peer "${peerLabel}"?`}
+              confirmText="Remove"
+              confirmIcon={Trash2}
+              cancelText="Cancel"
+              ariaLabel={`Confirm removing peer ${peerLabel}`}
+              confirmAriaLabel={`Confirm removing peer ${peerLabel}`}
+              cancelAriaLabel={`Cancel removing peer ${peerLabel}`}
+              largeTouchTargets
+              onConfirm={handleRemove}
+              onCancel={() => setConfirmRemove(false)}
+            />
+          ) : (
+            <button
+              onClick={() => setConfirmRemove(true)}
+              className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center p-1.5 text-gray-600 hover:text-port-error transition-colors"
+              title="Remove peer" aria-label="Remove peer"
+            >
+              <Trash2 size={14} />
+            </button>
+          )}
+        </div>
+      </div>
+
+      <div className="mb-3">
+        <div className="flex items-center gap-2 flex-wrap">
+          <p className="text-xs text-gray-500 font-mono">{peer.address}:{peer.port}</p>
+          {peer.transport === 'tailcat' && (
+            <Pill tone="accent" size="xs" bordered={false} title="Reachable via local tailcat forward (no Tailscale account)">
+              tailcat
+            </Pill>
+          )}
+          <DirectionBadge directions={peer.directions} />
+          {isInboundOnly && (
+            <button
+              onClick={handleConnect}
+              disabled={connecting}
+              className="inline-flex items-center gap-1 text-[10px] text-port-accent bg-port-accent/10 hover:bg-port-accent/20 rounded px-1.5 py-0.5 transition-colors disabled:opacity-50"
+              title="Connect back to make this mutual"
+            >
+              <ArrowLeftRight size={10} />
+              {connecting ? 'Connecting...' : 'Connect'}
+            </button>
+          )}
+        </div>
+        <PeerHostEditor peer={peer} onRefresh={onRefresh} tailnetInfo={tailnetInfo} />
+        <PeerAuthEditor peer={peer} onRefresh={onRefresh} />
+        <PeerSyncSecretEditor peer={peer} onRefresh={onRefresh} />
+      </div>
+
+      {peer.transport === 'tailcat' && (
+        <div className="mb-2">
+          <div className="text-[11px] uppercase tracking-wider text-gray-500 mb-1">Tailcat forward</div>
+          <TailcatForwardStatus
+            forward={peer.tailcatForward}
+            busy={forwardBusy}
+            onRetry={peer.tailcatForward?.id ? handleForwardRetry : undefined}
+            onForget={peer.tailcatForward?.id ? handleForwardForget : undefined}
+            compact
+          />
+        </div>
+      )}
+
+      <HealthSummary health={peer.lastHealth} version={peer.version} />
+
+      <ProbeDiagnostics peer={peer} probing={probing} onProbe={handleProbe} />
+
+      <div className="mt-2 text-xs text-gray-600">
+        Last seen: {timeAgo(peer.lastSeen)}
+      </div>
+
+      {peer.consecutiveFailures > 0 && (
+        <div className="mt-1 flex items-center gap-1.5 text-xs text-port-warning">
+          <Timer size={12} />
+          <span>
+            {peer.consecutiveFailures} consecutive failure{peer.consecutiveFailures !== 1 ? 's' : ''}
+            {peer.nextProbeAt && ` · next probe ${timeUntil(peer.nextProbeAt) ?? '—'}`}
+          </span>
+        </div>
+      )}
+
+      <SchemaGapBadge peer={peer} peerSubs={peerSubs} />
+
+      <PeerMediaProviderPanel peer={peer} onRefresh={onRefresh} />
+      <PeerAdministrationPanel peer={peer} />
+
+      <SyncCategoriesPanel peer={peer} onRefresh={onRefresh} />
+
+      <SyncStatusSection peer={peer} syncStatus={syncStatus} syncing={syncing} />
+
+      <BrainParityPanel peer={peer} report={parityReport} />
+
+      <PeerAppsList apps={peer.lastApps} peerAddress={peer.address} peerHost={peer.host} />
+      {peer.status === 'online' && (
+        <PeerAgentsSection peerId={peer.id} peerName={peer.name} />
+      )}
+    </div>
+  );
+}
+
+export default function Instances() {
+  return <TailcatServeProvider><InstancesContent /></TailcatServeProvider>;
+}
+
+function InstancesContent() {
+  const peerAddressRef = useRef(null);
+  const [searchParams, setSearchParams] = useSearchParams();
+  const drawer = searchParams.get('connection');
+  const [settingsTab, setSettingsTab] = useDrawerTab('connectionTab', 'instance', ['instance', 'network', 'relay', 'routing']);
+  const [editingSelf, setEditingSelf] = useState(false);
+  const [selfName, setSelfName] = useState('');
+  const { status: serveStatus } = useTailcatServe();
+  const openDrawer = (value, tab) => {
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      if (value) next.set('connection', value);
+      else next.delete('connection');
+      if (tab) next.set('connectionTab', tab);
+      return next;
+    }, { replace: true });
+  };
+  const [self, setSelf] = useState(null);
+  const [peers, setPeers] = useState([]);
+  const [syncStatus, setSyncStatus] = useState(null);
+  const [tailnetInfo, setTailnetInfo] = useState(null);
+  const [networkExposure, setNetworkExposure] = useState(null);
+  // Last stored brain-parity audit per peer, keyed by peer instanceId. Read
+  // once here rather than per card: it's a single local-file read, and every
+  // card needs a slice of it. Running a check is on-demand per card.
+  const [parityReports, setParityReports] = useState({});
+  const [loading, setLoading] = useState(true);
+  const [snapshotError, setSnapshotError] = useState(false);
+  const [snapshotLoaded, setSnapshotLoaded] = useState(false);
+  const [snapshotLoading, setSnapshotLoading] = useState(false);
+  const snapshotRequest = useRef(0);
+
+  const fetchData = useCallback(async () => {
+    const request = ++snapshotRequest.current;
+    setSnapshotLoading(true);
+    const data = await getInstances({ silent: true }).catch(() => null);
+    if (request !== snapshotRequest.current) return;
+    setSnapshotLoading(false);
+    setSnapshotError(!data);
+    if (data) {
+      setSelf(data.self);
+      setPeers(data.peers);
+      setSyncStatus(data.syncStatus ?? null);
+      setSnapshotLoaded(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    // Kick off these reads in parallel — the tailnet map and exposure snapshot
+    // are independent of peer state, and fetching them sequentially added
+    // ~100-500ms to first paint on machines where `tailscale status --json`
+    // is slow to respond.
+    let active = true;
+    Promise.all([
+      fetchData(),
+      getTailnetInfo().then((info) => { if (active) setTailnetInfo(info); }).catch(() => { if (active) setTailnetInfo(null); }),
+      getNetworkExposure({ silent: true }).then((e) => { if (active) setNetworkExposure(e); }).catch(() => { if (active) setNetworkExposure(null); }),
+      // Stored results only — the audit itself never runs on page load.
+      getBrainParityReports({ silent: true })
+        .then((data) => { if (active) setParityReports(data?.reports ?? {}); })
+        .catch(() => { if (active) setParityReports({}); })
+    ]).finally(() => { if (active) setLoading(false); });
+
+    const handlePeersUpdated = (updatedPeers) => {
+      setPeers(updatedPeers);
+    };
+    socket.on('instances:peers:updated', handlePeersUpdated);
+    // NOTE: `peerSync:subscription-blocked/unblocked` is intentionally NOT
+    // handled here. Those events only mutate per-record subscription state
+    // (`blockedBySchema`), which each PeerCard refetches for its own peer via
+    // its peerSubs effect. A page-level fetchData() on every such event would
+    // refetch all peers + syncStatus for a change that touches only one card.
+
+    return () => {
+      active = false;
+      snapshotRequest.current += 1;
+      socket.off('instances:peers:updated', handlePeersUpdated);
+    };
+  }, [fetchData]);
+
+  // Namespace subscription, separate from the effect above so a reconnect's
+  // refetch doesn't re-run (and re-race) the tailnet/exposure/parity-report
+  // reads that only belong on mount. Re-emits `instances:subscribe` on every
+  // socket reconnect and refetches peers/syncStatus, since the server's
+  // per-socket subscriber Set is empty on the reconnected socket.
+  useSocketSubscription('instances', { onResubscribe: fetchData });
+
+  if (loading) {
+    return (
+      <PageSkeleton
+        label="Loading instances"
+        headerRowClass="flex items-center gap-3"
+        titleWidthClass="w-40"
+        showAction={false}
+        layout="grid"
+        gridColsClass="md:grid-cols-2"
+        cards={4}
+      />
+    );
+  }
+
+  // Keep state owners above the remounting drawer tabs. The same snapshot
+  // drives attention summaries and recovery controls, including with no peers.
+  return (
+    <TailcatForwardsPanel onChange={fetchData} peerIds={peers.map((peer) => peer.id)}
+      renderPanel={(forwardsPanel, orphanCount) => (
+        <UnattendedRenderRouting peers={peers} renderPanel={(routingPanel, routeAttention) => (
+          <div className="space-y-4">
+            <div className="flex items-center gap-3">
+              <Network size={24} className="text-port-accent" />
+              <h1 className="text-2xl font-bold text-white">Instances</h1>
+              <span className="text-sm text-gray-500">PortOS Federation</span>
+            </div>
+
+            <div className="flex flex-wrap gap-2">
+              <button type="button" onClick={() => openDrawer('add')}
+                className="min-h-[44px] inline-flex items-center gap-1 rounded-lg bg-port-accent px-3 text-sm text-white">
+                <Plus size={16} /> Add peer
+              </button>
+              <button type="button" onClick={() => openDrawer('settings')}
+                className="min-h-[44px] rounded-lg border border-port-border px-3 text-sm text-gray-300 hover:text-white">
+                Connection settings
+              </button>
+            </div>
+            <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-gray-400">
+              <span className="break-words min-w-0">{self?.name || 'This instance'}</span>
+              <span>{networkExposure?.setup?.complete ? 'Tailscale HTTPS ready' : 'Network setup available'}</span>
+              <span>{peers.filter((peer) => peer.status === 'online').length} / {peers.length} peers online</span>
+            </div>
+            {snapshotError && (
+              <div role="alert" className="rounded-lg border border-port-warning/40 p-3 text-sm text-port-warning">
+                <p>{snapshotLoaded ? 'Instance snapshot unavailable. Showing last loaded data.' : 'Instance snapshot unavailable. Peer and instance settings could not be loaded.'}</p>
+                <button type="button" onClick={fetchData} disabled={snapshotLoading}
+                  className="mt-2 min-h-[44px] rounded-lg border border-port-border px-3 disabled:opacity-50">
+                  {snapshotLoading ? 'Retrying snapshot…' : 'Retry snapshot'}
+                </button>
+              </div>
+            )}
+            {(orphanCount > 0 || serveStatus?.status === 'failed') && (
+              <button type="button" onClick={() => openDrawer('settings', 'relay')}
+                className="block w-full rounded-lg border border-port-warning/40 p-3 text-left text-sm text-port-warning">
+                Tailcat needs attention — review forwards and serve
+              </button>
+            )}
+            {routeAttention && (
+              <button type="button" onClick={() => openDrawer('settings', 'routing')}
+                className="block w-full rounded-lg border border-port-warning/40 p-3 text-left text-sm text-port-warning">
+                Unattended render routing needs attention — review routes
+              </button>
+            )}
+
+            {peers.length > 0 && (
+              <div>
+                <h2 className="text-sm font-medium text-gray-400 uppercase tracking-wider mb-3">
+                  Peers ({peers.length})
+                </h2>
+                <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+                  {peers.map(peer => (
+                    // Reports key on instanceId (the stable federation identity), but
+                    // a peer audited before it was ever probed files under its local
+                    // registry id — mirror that fallback here or its report reads as
+                    // "not checked".
+                    <PeerCard
+                      key={peer.id}
+                      peer={peer}
+                      onRefresh={fetchData}
+                      syncStatus={syncStatus}
+                      tailnetInfo={tailnetInfo}
+                      parityReport={parityReports[peer.instanceId] ?? parityReports[peer.id] ?? null}
+                    />
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {snapshotLoaded && !snapshotError && peers.length === 0 && (
+              <EmptyState
+                icon={Network}
+                title="No peers registered yet"
+                message="Add another PortOS instance by its Tailscale IP address to federate records between your machines."
+                actionLabel="Add your first peer"
+                onAction={() => openDrawer('add')}
+              />
+            )}
+            <AddPeerForm onAdd={fetchData} addressRef={peerAddressRef}
+              drawer={{ open: drawer === 'add', onClose: () => openDrawer(null) }} />
+            <Drawer open={drawer === 'settings'} onClose={() => openDrawer(null)}
+              title="Connection settings" size="md"
+              tabs={[
+                { id: 'instance', label: 'This instance', icon: MonitorSmartphone },
+                { id: 'network', label: 'Network', icon: Network },
+                { id: 'relay', label: 'Tailcat', icon: RadioTower },
+                { id: 'routing', label: 'Render routes', icon: Route },
+              ]}
+              activeTab={settingsTab} onTabChange={setSettingsTab}>
+              {settingsTab === 'instance' && (
+                <div className="space-y-4">
+                  {!self && (
+                    <div className="rounded-lg border border-port-warning/40 p-3 text-sm text-port-warning">
+                      <p>This instance settings are unavailable until the instance snapshot loads.</p>
+                      <button type="button" onClick={fetchData} disabled={snapshotLoading}
+                        className="mt-2 min-h-[44px] rounded-lg border border-port-border px-3 disabled:opacity-50">
+                        {snapshotLoading ? 'Retrying snapshot…' : 'Retry instance settings'}
+                      </button>
+                    </div>
+                  )}
+                  <SelfCard self={self} onUpdate={fetchData} syncStatus={syncStatus} tailnetInfo={tailnetInfo}
+                    editing={editingSelf} setEditing={setEditingSelf} name={selfName} setName={setSelfName} />
+                  <BrainParitySchedule />
+                </div>
+              )}
+              {settingsTab === 'network' && <TailnetHelpBanner tailnetInfo={tailnetInfo} networkExposure={networkExposure} />}
+              {settingsTab === 'relay' && (
+                <div className="space-y-4">
+                  <TailcatServePanel onChange={fetchData} />
+                  {forwardsPanel}
+                </div>
+              )}
+              {settingsTab === 'routing' && (routingPanel || <p className="text-sm text-gray-400">No render routes configured. Enable a Tailscale peer as a media provider to add one.</p>)}
+            </Drawer>
+          </div>
+        )} />
+      )} />
+  );
+}

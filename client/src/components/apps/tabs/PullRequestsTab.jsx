@@ -1,0 +1,909 @@
+import { useState, useEffect, useCallback, useMemo, useRef, useId } from 'react';
+import { Link } from 'react-router';
+import {
+  AlertTriangle, Bot, CheckCircle2, ClipboardCheck, ExternalLink, FileSearch, GitBranch, GitMerge,
+  GitPullRequest, Info, RefreshCw, Rocket, ScanSearch, Search, ShieldAlert, User
+} from 'lucide-react';
+import BrailleSpinner from '../../BrailleSpinner';
+import Banner from '../../ui/Banner';
+import CollapsibleSection from '../../ui/CollapsibleSection';
+import ConfirmButtonPair from '../../ui/ConfirmButtonPair';
+import Pill from '../../ui/Pill';
+import toast from '../../ui/Toast';
+import ProviderModelSelector from '../../ProviderModelSelector';
+import ReviewerPicker from '../../cos/ReviewerPicker';
+import { PR_REVIEW_MODES, PR_REVIEW_MODE_OPTIONS, DEFAULT_PR_REVIEW_MODE, prReviewModeOption, REVIEWER_LIST_OVERRIDE_KEYS } from '../../cos/constants';
+import ScopeAdherenceCheck from '../ScopeAdherenceCheck';
+import { useConfirmDelete } from '../../../hooks/useConfirmDelete';
+import { useCosTaskUpdates } from '../../../hooks/useCosTaskUpdates';
+import useRunWithPicker from '../../../hooks/useRunWithPicker';
+import useReviewerModelOptions from '../../../hooks/useReviewerModelOptions';
+import { CodeReviewDefaultsProvider, useCodeReviewDefaults } from '../../../hooks/useCodeReviewDefaults';
+import { reviewerModelsFromDefaults, reviewerEffortsFromDefaults } from '../../../lib/reviewerModels';
+import * as api from '../../../services/api';
+import { timeAgo } from '../../../utils/formatters';
+import RunActionButton from './RunActionButton';
+
+const FORGE_LABEL = { github: 'GitHub', gitlab: 'GitLab' };
+
+const ACTION_STATUS_RANK = { queuing: 0, queued: 1, active: 2, completed: 3, blocked: 3, failed: 3 };
+const ACTION_STATUS_LABEL = {
+  queued: 'Queued — view',
+  active: 'Active — view',
+  completed: 'Completed — view',
+  blocked: 'Blocked — view',
+};
+
+const actionStatusForTask = status => ({
+  pending: 'queued',
+  in_progress: 'active',
+  completed: 'completed',
+  blocked: 'blocked',
+  failed: 'failed',
+}[status] || null);
+
+// The three per-row agent actions. They share every piece of state machinery —
+// only the CoS task that backs each one differs, so the kind is data rather
+// than a duplicated block of hooks.
+//   resolve   — the review-loop follow-up that fixes and merges the branch.
+//   review    — `pr-reviewer` narrowed to this one request.
+//   doReview  — the bundled `/do:review` workflow, review-only, on any GitHub row.
+// `field` is where the GET response carries this kind's server-side state, and
+// `queued` reads the same record out of the POST response (defaulting to the
+// same `field`). `eligibleField` is the server's own per-row verdict on whether
+// the action can run — absent means "always offered". `matches` is the
+// LATE-BINDING rule: a click knows its PR number before the server has a task
+// id, so a socket update is claimed by the row it names.
+//
+// `body` is what the click POSTs, built from the panel above the list. It is
+// per-kind because the three actions consume the panel differently, and that
+// difference is a real contract rather than a styling choice: `resolve` and
+// `doReview` are agents PortOS composes here, so they take the whole panel;
+// `review` hands its run to the `pr-reviewer` SCHEDULED task, whose providers
+// live on its own stages and whose review roster is that pipeline's, not this
+// panel's — so it takes only the provider pin, and only when the user opts in.
+//
+// `call` stays a lambda around each api function rather than a reference to it:
+// a reference is READ at module evaluation, and several suites that reach this
+// module transitively mock `services/api` with only the exports they use — so a
+// bare `call: api.resolveAppPullRequest` fails their import with "no export is
+// defined on the mock" before a single test runs.
+const wholePanelBody = ({ providerSettings, reviewSettings }) => ({ ...providerSettings, ...reviewSettings });
+
+const ACTION_KINDS = {
+  resolve: {
+    label: 'Resolve & merge',
+    verb: 'resolve and merge',
+    Icon: Rocket,
+    field: 'agentAction',
+    // The only kind whose POST answers with a bare `task` rather than a record
+    // named after its field.
+    queued: result => result.task && { taskId: result.task.id, status: result.task.status },
+    body: wholePanelBody,
+    call: (appId, number, body) => api.resolveAppPullRequest(appId, number, body),
+    title: (forgeLabel, number, appName) =>
+      `Start a CoS agent now to resolve and merge ${forgeLabel} request #${number} for ${appName}`,
+    matches: (task, appId, number) => task.metadata?.app === appId
+      && Number(task.metadata?.reviewLoopPRNumber) === number,
+  },
+  review: {
+    label: 'PR review',
+    verb: 'run the pr-reviewer task against',
+    Icon: ScanSearch,
+    field: 'reviewAction',
+    eligibleField: 'reviewEligible',
+    // The one action that follows its own saved stage providers unless the user
+    // explicitly opts the page-level pin in.
+    body: ({ providerSettings, applyRunWithToPrReview }) =>
+      (applyRunWithToPrReview ? providerSettings : {}),
+    call: (appId, number, body) => api.reviewAppPullRequest(appId, number, body),
+    title: (forgeLabel, number, appName) =>
+      `Run the pr-reviewer scheduled task against ${forgeLabel} request #${number} for ${appName}`,
+    matches: (task, appId, number) => task.metadata?.app === appId
+      && task.metadata?.analysisType === 'pr-reviewer'
+      && Number(task.metadata?.targetPullRequest) === number,
+  },
+  doReview: {
+    label: 'Do:Review',
+    verb: 'run /do:review against',
+    Icon: FileSearch,
+    field: 'doReviewAction',
+    eligibleField: 'doReviewEligible',
+    body: wholePanelBody,
+    call: (appId, number, body) => api.doReviewAppPullRequest(appId, number, body),
+    title: (forgeLabel, number, appName) =>
+      `Run the /do:review workflow against ${forgeLabel} request #${number} for ${appName} and post an inline review`,
+    // Shares `targetPullRequest` with the pr-reviewer match above — one
+    // vocabulary for "this task targets PR #N" — and is told apart by the
+    // slashdo command it carries.
+    matches: (task, appId, number) => task.metadata?.app === appId
+      && task.metadata?.slashdoCommand === 'review'
+      && Number(task.metadata?.targetPullRequest) === number,
+  },
+};
+const KIND_IDS = Object.keys(ACTION_KINDS);
+
+// The reviewer fields the run-settings panel may pin. `ReviewerPicker` emits a
+// partial against its baseline, and that partial can also carry the run flags
+// (`stopMode` / `reviewerApplies`) this panel deliberately does not offer — so
+// narrow it to the keys that actually change the resolved roster. That list is
+// `REVIEWER_LIST_OVERRIDE_KEYS` rather than a local copy: the server mirrors it
+// (`reviewerConfig.test.js` pins the two against each other), so a seventh
+// pinnable field reaches this filter with everything else instead of being
+// silently dropped on the way to the request. A partial with nothing left in it
+// is `null`: no override at all, which is what leaves the server resolving the
+// Code Review Defaults at spawn time.
+function pickReviewerOverride(next) {
+  const picked = Object.fromEntries(
+    REVIEWER_LIST_OVERRIDE_KEYS.filter(key => next?.[key] !== undefined).map(key => [key, next[key]]),
+  );
+  return Object.keys(picked).length ? picked : null;
+}
+
+/**
+ * The reviewer roster a delegated run uses, seeded from the install's Code
+ * Review Defaults and edited as a partial against them.
+ *
+ * Its own component, and its own `CodeReviewDefaultsProvider`, so that BOTH of
+ * its fetches are paid only by a user who opened the disclosure. That matters
+ * for one of them specifically: `useReviewerModelOptions` reads
+ * `/api/local-llm/status`, which is uncached and spawns `ollama --version` and
+ * `lms version` plus a forced LM Studio model list — a real cost to charge every
+ * visit to a tab whose common path is pressing Merge. The parent keeps it
+ * mounted once opened, so a second open costs nothing.
+ */
+function ReviewerOverrideBody({ override, onChange }) {
+  const codeReviewDefaults = useCodeReviewDefaults();
+  const reviewerModelOptions = useReviewerModelOptions();
+  // The defaults carry per-reviewer pins as `<reviewer>Model` / `<reviewer>Effort`
+  // scalars; the picker takes them as token-keyed maps.
+  const seeded = useMemo(() => ({
+    ...codeReviewDefaults,
+    reviewerModels: reviewerModelsFromDefaults(codeReviewDefaults),
+    reviewerEfforts: reviewerEffortsFromDefaults(codeReviewDefaults),
+  }), [codeReviewDefaults]);
+
+  return (
+    <>
+      <ReviewerPicker
+        {...seeded}
+        {...override}
+        defaults={seeded}
+        modelOptions={reviewerModelOptions}
+        showRunFlags={false}
+        onChange={next => onChange(pickReviewerOverride(next))}
+      />
+      <p className="text-xs text-gray-500">
+        Applies to Resolve &amp; merge and Do:Review. Left untouched, both resolve the install&apos;s Code Review Defaults when the agent starts.
+      </p>
+      {override && (
+        <button type="button" onClick={() => onChange(null)} className="text-xs text-port-accent hover:underline">
+          Use configured reviewers
+        </button>
+      )}
+    </>
+  );
+}
+
+// The defaults live in context, and this is the only consumer on the page — so
+// the provider is mounted with the picker rather than around the whole tab, which
+// is what keeps its fetch on the same lazy path as the model-options probe above.
+function ReviewerOverride(props) {
+  return (
+    <CodeReviewDefaultsProvider>
+      <ReviewerOverrideBody {...props} />
+    </CodeReviewDefaultsProvider>
+  );
+}
+
+// The direct merge's methods, in the order the forges list them.
+const MERGE_METHOD_LABELS = { merge: 'Merge commit', squash: 'Squash', rebase: 'Rebase' };
+const DEFAULT_MERGE_METHOD = 'merge';
+
+/**
+ * The one row action that runs no agent. Armed into an inline confirm rather
+ * than merging on the first click: the forge merge is irreversible, and the
+ * method and branch deletion are choices the user should see before it happens.
+ */
+function MergeAction({
+  pullRequest, idPrefix, title, armed, merging, method, onMethodChange,
+  deleteBranch, onDeleteBranchChange, onArm, onCancel, onConfirm,
+}) {
+  if (!armed) {
+    return (
+      <button
+        type="button"
+        onClick={onArm}
+        title={title}
+        className="px-3 py-1.5 bg-port-border hover:bg-port-border/80 text-white border border-port-border rounded-lg text-xs flex items-center gap-1.5 whitespace-nowrap transition-colors"
+      >
+        <GitMerge size={14} /> Merge
+      </button>
+    );
+  }
+  return (
+    <div className="flex flex-wrap items-center gap-2 px-2 py-1.5 bg-port-bg border border-port-border rounded-lg">
+      <label htmlFor={`${idPrefix}-method-${pullRequest.number}`} className="sr-only">
+        Merge method for #{pullRequest.number}
+      </label>
+      <select
+        id={`${idPrefix}-method-${pullRequest.number}`}
+        value={method}
+        onChange={event => onMethodChange(event.target.value)}
+        className="px-2 py-1 bg-port-card border border-port-border rounded-lg text-white text-xs focus:border-port-accent focus:outline-hidden"
+      >
+        {Object.entries(MERGE_METHOD_LABELS).map(([value, methodLabel]) => (
+          <option key={value} value={value}>{methodLabel}</option>
+        ))}
+      </select>
+      <input
+        id={`${idPrefix}-delete-${pullRequest.number}`}
+        type="checkbox"
+        checked={deleteBranch}
+        onChange={event => onDeleteBranchChange(event.target.checked)}
+      />
+      <label htmlFor={`${idPrefix}-delete-${pullRequest.number}`} className="text-xs text-gray-400">
+        Delete branch
+      </label>
+      <ConfirmButtonPair
+        tone="success"
+        confirmText={`Merge #${pullRequest.number}`}
+        confirmIcon={GitMerge}
+        busy={merging}
+        busyText="Merging…"
+        ariaLabel={`Confirm merging #${pullRequest.number}`}
+        onConfirm={onConfirm}
+        onCancel={onCancel}
+      />
+    </div>
+  );
+}
+
+const actionRecord = (kind, result) =>
+  (ACTION_KINDS[kind].queued || (r => r[ACTION_KINDS[kind].field]))(result);
+const emptyActions = () => Object.fromEntries(KIND_IDS.map(kind => [kind, {}]));
+
+const EMPTY_REASONS = {
+  'no-repo-path': 'This app has no repo path configured.',
+  'unsupported-forge': 'This app\'s git origin is not a GitHub or GitLab repository, so there are no PRs/MRs to list.',
+  'no-open-pull-requests': 'No open pull requests or merge requests.',
+};
+
+const PASSING_CHECKS = new Set(['SUCCESS', 'PASSED', 'NEUTRAL', 'SKIPPED', 'COMPLETED']);
+const FAILING_CHECKS = new Set(['FAILURE', 'FAILED', 'ERROR', 'CANCELLED', 'CANCELED', 'TIMED_OUT', 'ACTION_REQUIRED']);
+
+function checkSummary(pullRequest) {
+  const checks = Array.isArray(pullRequest.checks) ? pullRequest.checks : [];
+  if (checks.some(check => FAILING_CHECKS.has(String(check.status || '').toUpperCase()))) {
+    return { label: 'Checks failing', tone: 'error', icon: ShieldAlert };
+  }
+  if (!checks.length || checks.some(check => !PASSING_CHECKS.has(String(check.status || '').toUpperCase()))) {
+    return { label: checks.length ? 'Checks pending' : 'Checks pending · none reported', tone: 'warning', icon: RefreshCw };
+  }
+  return { label: 'Checks passing', tone: 'success', icon: CheckCircle2 };
+}
+
+function reviewSummary(pullRequest) {
+  switch (String(pullRequest.reviewDecision || '').toUpperCase()) {
+    case 'APPROVED':
+      return { label: 'Approved', tone: 'success' };
+    case 'CHANGES_REQUESTED':
+      return { label: 'Changes requested', tone: 'error' };
+    case 'REVIEW_REQUIRED':
+      return { label: 'Review required', tone: 'warning' };
+    default:
+      return { label: 'Review pending', tone: 'muted' };
+  }
+}
+
+function mergeSummary(pullRequest) {
+  const status = String(pullRequest.mergeStateStatus || pullRequest.mergeable || '').toUpperCase();
+  if (['CLEAN', 'MERGEABLE', 'CAN_BE_MERGED'].includes(status)) {
+    return { label: 'Mergeable', tone: 'success' };
+  }
+  if (['DIRTY', 'CONFLICTING', 'CANNOT_BE_MERGED'].includes(status)) {
+    return { label: 'Conflicts', tone: 'error' };
+  }
+  if (['BLOCKED', 'CANNOT_BE_MERGED_RESTRICTED'].includes(status)) {
+    return { label: 'Merge blocked', tone: 'warning' };
+  }
+  if (status === 'BEHIND') return { label: 'Behind base', tone: 'warning' };
+  return { label: 'Mergeability pending', tone: 'muted' };
+}
+
+function actionStatusFromRecord(record) {
+  return record ? actionStatusForTask(record.status) : null;
+}
+
+function actionRank(status) {
+  return ACTION_STATUS_RANK[status] ?? -1;
+}
+
+/**
+ * Open PRs/MRs for a managed app. Each row includes the forge's review/check
+ * state and can queue the same PortOS review-loop agent used by PR cleanup.
+ */
+export default function PullRequestsTab({ appId, appName }) {
+  const searchId = useId();
+  const mergeId = useId();
+  const reviewModeId = useId();
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [query, setQuery] = useState('');
+  const [actions, setActions] = useState(emptyActions);
+  const actionsRef = useRef(emptyActions());
+  const requestRef = useRef(0);
+  // Direct merge: no CoS task backs it, so it needs none of the action
+  // machinery above — only the shared single-row confirm state, an in-flight
+  // flag, and the two knobs the confirm row exposes (kept across rows as a
+  // session default).
+  const {
+    isConfirming, requestDelete: requestMerge, cancelDelete: cancelMerge,
+  } = useConfirmDelete();
+  const [merging, setMerging] = useState(false);
+  const [mergeMethod, setMergeMethod] = useState(DEFAULT_MERGE_METHOD);
+  const [deleteBranchOnMerge, setDeleteBranchOnMerge] = useState(true);
+
+  // Resolve & merge and Do:Review default to the active provider. PR review
+  // follows its own scheduled stages unless the user explicitly opts this pin in.
+  // Auto remains available for server-side routing. Mirrors the Issues
+  // tab's "Run with" picker: a session convenience, never persisted.
+  const picker = useRunWithPicker();
+  const [applyRunWithToPrReview, setApplyRunWithToPrReview] = useState(false);
+
+  // WHO reviews, for the two actions PortOS composes here. `delegated` keeps the
+  // historical behavior (the agent orchestrates the install's reviewer roster);
+  // `self` collapses the review onto the Run with provider, which is the cheaper
+  // answer whenever that provider is already the model you wanted the review
+  // from. Session state, like everything else in this panel.
+  const [reviewMode, setReviewMode] = useState(DEFAULT_PR_REVIEW_MODE);
+  // What this run changes about the reviewer roster, as the PARTIAL the picker
+  // emits against its baseline — or `null` for "nothing, use whatever the
+  // install's Code Review Defaults resolve to". A partial rather than a seeded
+  // copy is what gates SENDING the fields: an untouched picker must leave the
+  // server reading the defaults at spawn time rather than freezing whatever this
+  // tab happened to render, and per-FIELD precedence then means pinning only the
+  // reviewers still takes the usernames and pins from the defaults. Editing a
+  // field back to its default drops it from the partial, so the override empties
+  // itself out the same way the reset button does.
+  const [reviewOverride, setReviewOverride] = useState(null);
+  // Whether the override picker has ever been opened. It owns two fetches — one
+  // of which probes the local-LLM backends and spawns `ollama`/`lms` — so it is
+  // mounted on the first open rather than with the tab, and then KEPT mounted so
+  // reopening does not pay for them again. See `ReviewerOverride` below.
+  const [overrideOpen, setOverrideOpen] = useState(false);
+  const [overrideMounted, setOverrideMounted] = useState(false);
+  const selfReview = reviewMode === PR_REVIEW_MODES.SELF;
+
+  // One writer for the whole `{ kind: { number: action } }` bag so the ref the
+  // socket handler reads and the state React renders can never disagree.
+  const replaceActions = useCallback(updater => {
+    const next = updater(actionsRef.current);
+    actionsRef.current = next;
+    setActions(next);
+  }, []);
+
+  const setAction = useCallback((kind, number, action) => {
+    replaceActions(previous => ({
+      ...previous,
+      [kind]: action
+        ? { ...previous[kind], [number]: action }
+        : Object.fromEntries(Object.entries(previous[kind]).filter(([key]) => Number(key) !== number)),
+    }));
+  }, [replaceActions]);
+
+  useEffect(() => {
+    actionsRef.current = emptyActions();
+    setActions(emptyActions());
+  }, [appId]);
+
+  const applyTaskUpdate = useCallback(task => {
+    if (!task?.id) return;
+    // A task that names a SUCCESSOR finished by starting something else, so it
+    // is not this row's completion. The preflight card (#7258) is the case that
+    // exists today: it closes the instant the review agent task is created.
+    // Rebinding the row onto the successor keeps the action live — reading the
+    // card's own `completed` would park the row at "Completed" and then ignore
+    // every update the real review task emits, because a row binds to one task
+    // id for good.
+    const handedOff = task.metadata?.preflightResultTaskId || null;
+    const nextStatus = task.metadata?.preflightFailure
+      ? 'failed'
+      : handedOff ? 'active' : actionStatusForTask(task.status);
+    if (!nextStatus) return;
+
+    replaceActions(current => {
+      let changed = false;
+      const next = { ...current };
+      for (const kind of KIND_IDS) {
+        const updated = { ...current[kind] };
+        for (const [number, action] of Object.entries(current[kind])) {
+          const matches = action.taskId === task.id
+            || (!action.taskId && ACTION_KINDS[kind].matches(task, appId, Number(number)));
+          if (!matches || actionRank(nextStatus) < actionRank(action.status)) continue;
+          // A hand-off re-points the row at the review task the card started;
+          // every other update keeps whatever id the row already bound.
+          updated[number] = {
+            ...action,
+            taskId: handedOff || action.taskId || task.id,
+            status: nextStatus,
+            error: task.metadata?.note,
+          };
+          changed = true;
+        }
+        next[kind] = updated;
+      }
+      return changed ? next : current;
+    });
+  }, [appId, replaceActions]);
+
+  useCosTaskUpdates(applyTaskUpdate);
+
+  const load = useCallback(async () => {
+    const generation = requestRef.current + 1;
+    requestRef.current = generation;
+    const isCurrent = () => requestRef.current === generation;
+
+    setLoading(true);
+    setError('');
+    const result = await api.getAppPullRequests(appId).catch(err => {
+      if (isCurrent()) setError(err?.message || 'Failed to load pull requests');
+      return null;
+    });
+    if (!isCurrent()) return;
+    setLoading(false);
+    if (!result) return;
+
+    setData(result);
+    replaceActions(previous => {
+      const next = { ...previous };
+      for (const kind of KIND_IDS) {
+        const merged = { ...previous[kind] };
+        for (const pullRequest of result.pullRequests || []) {
+          const record = pullRequest[ACTION_KINDS[kind].field];
+          const serverAction = actionStatusFromRecord(record);
+          if (!serverAction) continue;
+          const current = merged[pullRequest.number];
+          if (!current || actionRank(serverAction) >= actionRank(current.status)) {
+            merged[pullRequest.number] = {
+              ...(current || {}),
+              taskId: current?.taskId || record.taskId || null,
+              status: serverAction,
+              error: record.error,
+            };
+          }
+        }
+        next[kind] = merged;
+      }
+      return next;
+    });
+  }, [appId, replaceActions]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const filteredPullRequests = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return data?.pullRequests || [];
+    return (data?.pullRequests || []).filter(pullRequest => [
+      pullRequest.number,
+      pullRequest.title,
+      pullRequest.author,
+      pullRequest.headBranch,
+      pullRequest.baseBranch,
+      ...(pullRequest.labels || []),
+    ].some(value => String(value || '').toLowerCase().includes(q)));
+  }, [data, query]);
+
+  const total = data?.pullRequests?.length ?? 0;
+  const forgeLabel = FORGE_LABEL[data?.forge] || 'Forge';
+  const requestNoun = data?.forge === 'gitlab' ? 'merge requests' : 'pull requests';
+  const unavailable = data?.transient === true;
+
+  // Submit the visible session selection; clearing Auto restores server routing.
+  const providerSettings = picker.pin;
+
+  // This run's review settings. The mode always rides along (the server needs an
+  // explicit answer, and its own default is `delegated` either way); the roster
+  // only does when the user actually edited the picker, and never under
+  // self-review, where there is no roster to override.
+  const reviewSettings = {
+    reviewMode,
+    ...(selfReview ? {} : (reviewOverride || {})),
+  };
+
+  // Every row action queues a CoS task and then tracks it identically: optimistic
+  // `queuing`, roll back on failure, and never let a stale response downgrade a
+  // status a socket update already advanced.
+  const queueAction = async (kind, pullRequest) => {
+    const { number } = pullRequest;
+    const { verb, call, body } = ACTION_KINDS[kind];
+    setAction(kind, number, { status: 'queuing', taskId: null });
+    const result = await call(appId, number, body({ providerSettings, reviewSettings, applyRunWithToPrReview }))
+      .catch(err => {
+        toast.error(err?.message || `Failed to queue an agent for #${number}`);
+        return null;
+      });
+    if (!result) {
+      setAction(kind, number, null);
+      return;
+    }
+
+    const record = actionRecord(kind, result);
+    const taskStatus = actionStatusFromRecord(record) || 'queued';
+    replaceActions(previous => {
+      const current = previous[kind][number];
+      const status = actionRank(taskStatus) >= actionRank(current?.status) ? taskStatus : current?.status;
+      return {
+        ...previous,
+        [kind]: {
+          ...previous[kind],
+          [number]: {
+            ...(current || {}),
+            taskId: current?.taskId || record?.taskId || null,
+            status,
+          },
+        },
+      };
+    });
+    // A duplicate is a success: something is already on it. Otherwise the toast
+    // reports whether an agent actually STARTED — an action that only persisted
+    // a task (no agent slots, daemon stopped) is not a failure, but it is not a
+    // success claim either, so it gets the neutral toast. `started` is absent for
+    // the one queue-only action, which leaves it on the success path.
+    const target = `${forgeLabel} #${number}`;
+    if (result.duplicate === true) {
+      toast.success(`An agent is already queued to ${verb} ${target}`);
+    } else if (result.started === false) {
+      toast(`Queued an agent to ${verb} ${target}${result.queueReason ? ` — ${result.queueReason}` : ''}`);
+    } else {
+      toast.success(`${result.started ? 'Started' : 'Queued'} an agent to ${verb} ${target}`);
+    }
+  };
+
+  // The one action that runs no agent: merge the request on the forge and drop
+  // it from the list. A failure deliberately leaves the confirm row open — a
+  // method the project forbids is answered by picking another one, not by
+  // starting over.
+  const confirmMerge = async pullRequest => {
+    const { number } = pullRequest;
+    setMerging(true);
+    const result = await api.mergeAppPullRequest(appId, number, {
+      method: mergeMethod,
+      deleteBranch: deleteBranchOnMerge,
+    }).catch(err => {
+      toast.error(err?.message || `Failed to merge #${number}`);
+      return null;
+    });
+    setMerging(false);
+    if (!result) return;
+
+    cancelMerge();
+    // `deletedBranch` is the server's answer, not the request: it refuses to
+    // delete a long-lived head however the checkbox was left.
+    const branchNote = result.deletedBranch
+      ? ' and deleted its branch'
+      : (deleteBranchOnMerge ? ` — kept ${pullRequest.headBranch || 'the source branch'}` : '');
+    toast.success(`Merged ${forgeLabel} #${number}${branchNote}`);
+    // Drop the row now rather than waiting out the forge round trip the reload
+    // costs. The reload still runs: landing a commit on the base branch changes
+    // the mergeability and check state of every other open row.
+    setData(current => current && {
+      ...current,
+      pullRequests: (current.pullRequests || []).filter(candidate => candidate.number !== number),
+    });
+    load();
+  };
+
+  // Which actions this row offers. Each kind names the server's own per-row
+  // verdict (`eligibleField`) rather than the tab re-deriving one: two copies of
+  // an eligibility rule drift, and the button would then promise an action the
+  // route answers with 409. A kind with no `eligibleField` is always offered.
+  const rowActionsFor = pullRequest => KIND_IDS.filter(kind => {
+    const { eligibleField } = ACTION_KINDS[kind];
+    return !eligibleField || pullRequest[eligibleField];
+  });
+
+  const offersKind = kind => (data?.pullRequests || []).some(pullRequest => rowActionsFor(pullRequest).includes(kind));
+
+  if (loading && !data) return <BrailleSpinner text="Loading pull requests" />;
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center gap-3">
+        <h3 className="text-lg font-semibold text-white">
+          {forgeLabel} PRs / MRs
+          {data?.fullName && <span className="ml-2 text-xs font-mono text-gray-500">{data.fullName}</span>}
+        </h3>
+        {total > 0 && (
+          <span className="text-xs text-gray-500">
+            {filteredPullRequests.length === total ? `${total} open` : `${filteredPullRequests.length} of ${total} open`}
+          </span>
+        )}
+        <div className="relative ml-auto">
+          <label htmlFor={searchId} className="sr-only">Filter pull requests</label>
+          <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-500" />
+          <input
+            id={searchId}
+            type="search"
+            value={query}
+            onChange={event => setQuery(event.target.value)}
+            placeholder="Filter by title, branch, author…"
+            className="w-full sm:w-72 pl-8 pr-3 py-1.5 bg-port-bg border border-port-border rounded-lg text-white text-sm focus:border-port-accent focus:outline-hidden"
+          />
+        </div>
+        <button
+          type="button"
+          onClick={load}
+          disabled={loading}
+          className="px-3 py-1.5 bg-port-border hover:bg-port-border/80 text-white rounded-lg text-xs flex items-center gap-1 disabled:opacity-50"
+        >
+          <RefreshCw size={14} className={loading ? 'animate-spin' : ''} /> Refresh
+        </button>
+      </div>
+
+      {/* Reference text, not a control — collapsed by default so the run
+          settings and the request list both stay above the fold. It used to be
+          four permanently-expanded paragraphs, which pushed the first row off a
+          laptop screen for an explanation you read once. */}
+      <CollapsibleSection
+        icon={Info}
+        label="What each action does"
+        size="bar"
+        id="pull-request-action-help"
+        className="px-3 py-1 bg-port-card border border-port-border rounded-lg"
+        bodyClassName="pb-2 space-y-1 text-xs text-gray-500"
+      >
+        <p>
+          Merge lands the request on the forge immediately — no agent, no review, no model spend. Pick the merge method and whether to delete the source branch, then confirm. A long-lived source branch (a <span className="font-mono">main → release</span> request) is never deleted.
+        </p>
+        <p>
+          Resolve and merge starts a PortOS agent right away to inspect feedback, fix the branch, wait for checks, and merge when the forge allows it. It reviews the change under the Code review setting below.
+        </p>
+        {offersKind('review') && (
+          <p>
+            PR review points the <span className="font-mono">pr-reviewer</span> scheduled task at this one request instead of letting it sweep every open contributor PR. It appears only on requests it can review — opened by someone else against the default branch — and uses the providers saved on its review stages, so the Code review setting below does not apply to it. The security scan must pass before either review stage runs.
+          </p>
+        )}
+        {offersKind('doReview') && (
+          <p>
+            Do:Review runs the <span className="font-mono">/do:review</span> workflow against one request and posts the findings as an inline review. It is review-only — nothing is committed, pushed, or merged — and it is offered on every open request, including the code-contributor PRs the pr-reviewer task skips.
+          </p>
+        )}
+      </CollapsibleSection>
+
+      <div className="space-y-3 px-3 py-2 bg-port-card border border-port-border rounded-lg">
+        <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+          <span className="flex items-center gap-1.5 text-xs text-gray-500 uppercase tracking-wide shrink-0">
+            <Bot size={14} /> Run with
+          </span>
+          <div className="flex-1">
+            <ProviderModelSelector
+              {...picker.selectorProps}
+              compact
+            />
+          </div>
+        </div>
+
+        <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+          <label htmlFor={reviewModeId} className="flex items-center gap-1.5 text-xs text-gray-500 uppercase tracking-wide shrink-0">
+            <ClipboardCheck size={14} /> Code review
+          </label>
+          <div className="flex-1 flex flex-wrap items-center gap-2">
+            <select
+              id={reviewModeId}
+              value={reviewMode}
+              onChange={event => setReviewMode(event.target.value)}
+              className="px-2.5 py-1.5 bg-port-bg border border-port-border rounded-lg text-xs text-white focus:border-port-accent focus:outline-hidden"
+            >
+              {PR_REVIEW_MODE_OPTIONS.map(option => (
+                <option key={option.value} value={option.value}>{option.label}</option>
+              ))}
+            </select>
+            <span className="text-xs text-gray-500">{prReviewModeOption(reviewMode)?.description}</span>
+          </div>
+        </div>
+
+        {/* Only a delegated run HAS a roster, so the override is hidden — not
+            disabled — under self-review: a picker whose every edit is discarded
+            reads as a setting that is being ignored. */}
+        {!selfReview && (
+          <CollapsibleSection
+            label={`Reviewer override${reviewOverride ? ' (active)' : ''}`}
+            size="md"
+            id="pull-request-reviewer-override"
+            bodyClassName="pt-2 space-y-2"
+            open={overrideOpen}
+            onOpenChange={next => { setOverrideOpen(next); if (next) setOverrideMounted(true); }}
+            // Only after the first open: before that the body is unmounted (and
+            // its fetches unspent); after it, hiding rather than unmounting is
+            // what keeps a reopen from refetching.
+            keepMounted={overrideMounted}
+          >
+            {overrideMounted && <ReviewerOverride override={reviewOverride} onChange={setReviewOverride} />}
+          </CollapsibleSection>
+        )}
+
+        {offersKind('review') && (
+          <div className="text-xs text-gray-400">
+            <input id="apply-run-with-to-pr-review" type="checkbox" checked={applyRunWithToPrReview}
+              onChange={event => setApplyRunWithToPrReview(event.target.checked)} className="mr-2" />
+            <label htmlFor="apply-run-with-to-pr-review">Also run PR review on the Run with provider</label>
+            <p className="mt-1">
+              Off by default: PR review is a <span className="font-mono">pr-reviewer</span> run, and that task keeps the providers saved on its own stages. Tick this to point its scan and review stages at the provider chosen above instead. Resolve &amp; merge and Do:Review always use it.
+            </p>
+          </div>
+        )}
+      </div>
+
+      {error && (
+        <Banner tone="error" size="md" icon={AlertTriangle}>
+          Couldn&apos;t load pull requests — {error}
+        </Banner>
+      )}
+
+      {!error && unavailable && (
+        <Banner tone="warning" size="md" icon={AlertTriangle}>
+          {data.headline || `Couldn't reach ${forgeLabel}`} ({data.reason})
+          {data.remedy ? ` — ${data.remedy}.` : ''}
+        </Banner>
+      )}
+
+      {!error && !unavailable && total === 0 && (
+        <div className="px-3 py-2 text-sm text-gray-500 bg-port-card border border-port-border rounded-lg">
+          {EMPTY_REASONS[data?.reason] ?? EMPTY_REASONS['no-open-pull-requests']}
+        </div>
+      )}
+
+      {filteredPullRequests.length === 0 && total > 0 && (
+        <div className="px-3 py-2 text-sm text-gray-500 bg-port-card border border-port-border rounded-lg">
+          No open {requestNoun} match &ldquo;{query}&rdquo;.
+        </div>
+      )}
+
+      {filteredPullRequests.length > 0 && (
+        <div className="border border-port-border rounded-lg divide-y divide-port-border overflow-hidden">
+          {filteredPullRequests.map(pullRequest => {
+            const review = reviewSummary(pullRequest);
+            const checks = checkSummary(pullRequest);
+            const merge = mergeSummary(pullRequest);
+            const openStatus = pullRequest.isDraft
+              ? { label: 'Draft', tone: 'warning' }
+              : { label: 'Open', tone: 'success' };
+
+            return (
+              <div key={pullRequest.number} className="bg-port-card p-3">
+                <div className="flex flex-col lg:flex-row lg:items-start gap-3">
+                  <div className="flex-1 min-w-0">
+                    <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+                      <GitPullRequest size={15} className="text-port-accent shrink-0 self-center" />
+                      <span className="text-xs font-mono text-gray-500">#{pullRequest.number}</span>
+                      {pullRequest.url ? (
+                        <a
+                          href={pullRequest.url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="text-sm text-white hover:text-port-accent transition-colors break-words"
+                        >
+                          {pullRequest.title || '(untitled)'}
+                        </a>
+                      ) : (
+                        <span className="text-sm text-white break-words">{pullRequest.title || '(untitled)'}</span>
+                      )}
+                      {pullRequest.url && (
+                        <a
+                          href={pullRequest.url}
+                          target="_blank"
+                          rel="noreferrer"
+                          aria-label={`Open ${forgeLabel} request ${pullRequest.number}`}
+                          className="text-gray-500 hover:text-port-accent transition-colors self-center"
+                        >
+                          <ExternalLink size={12} />
+                        </a>
+                      )}
+                      <Pill tone={openStatus.tone} size="xs">{openStatus.label}</Pill>
+                    </div>
+
+                    <div className="flex flex-wrap gap-1.5 mt-2">
+                      <Pill tone={review.tone} size="xs">{review.label}</Pill>
+                      <Pill tone={checks.tone} size="xs" icon={checks.icon}>{checks.label}</Pill>
+                      <Pill tone={merge.tone} size="xs" icon={merge.tone === 'success' ? GitMerge : undefined}>{merge.label}</Pill>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-2 text-xs text-gray-500">
+                      {pullRequest.author && <span className="flex items-center gap-1"><User size={12} /> {pullRequest.author}</span>}
+                      {(pullRequest.headBranch || pullRequest.baseBranch) && (
+                        <span className="flex items-center gap-1 font-mono">
+                          <GitBranch size={12} /> {pullRequest.headBranch || '?'} → {pullRequest.baseBranch || '?'}
+                        </span>
+                      )}
+                      {pullRequest.updatedAt && <span>updated {timeAgo(pullRequest.updatedAt)}</span>}
+                    </div>
+
+                    {/* Advisory only — never gates the merge button beside it.
+                        Title alone: this listing carries no PR description,
+                        and branch names here are `claim/issue-N` /
+                        `cos/<task>/<agent>`, which would feed the code-side
+                        retrieval view pure noise rather than vocabulary. */}
+                    <ScopeAdherenceCheck appId={appId} kind="pr" title={pullRequest.title || ''} />
+                  </div>
+
+                  <div className="shrink-0 lg:pt-0.5 flex flex-wrap items-start justify-end gap-2">
+                    {rowActionsFor(pullRequest).map(kind => {
+                      const { label, Icon, title } = ACTION_KINDS[kind];
+                      const action = actions[kind][pullRequest.number];
+                      const actionStatus = action?.status;
+                      // The task record this row's run is tracked by, once it has
+                      // one. The preflight card gives it a task id immediately,
+                      // and that card is where the live pre-agent checks are
+                      // shown — the old link went unconditionally to the Agents
+                      // page, so "Queued — view" landed on a page with nothing on
+                      // it until an agent actually spawned.
+                      const taskHref = action?.taskId
+                        ? `/cos/tasks?task=${encodeURIComponent(action.taskId)}&source=internal`
+                        : null;
+                      if (actionStatus === 'failed') {
+                        return (
+                          <div key={kind} className="max-w-md text-xs text-port-error space-y-2" role="alert">
+                            <p>{action.error || `${label} failed. View the failure record for details.`}</p>
+                            <div className="flex flex-wrap gap-3">
+                              <Link className="underline" to={taskHref}>View failure record</Link>
+                              {/* Only pr-reviewer's preflight can fail on the model-abuse scan. */}
+                              {kind === 'review' && <Link className="underline" to="/models/llms/abuse">Abuse Guard setup</Link>}
+                              <button type="button" className="underline" onClick={() => queueAction(kind, pullRequest)}>Retry {label}</button>
+                            </div>
+                          </div>
+                        );
+                      }
+                      if (actionStatus && actionStatus !== 'queuing') {
+                        return (
+                          <Link
+                            key={kind}
+                            to={taskHref || '/cos/agents'}
+                            className="px-3 py-1.5 bg-port-success/20 text-port-success hover:bg-port-success/30 border border-port-border rounded-lg text-xs flex items-center gap-1.5 whitespace-nowrap transition-colors"
+                          >
+                            <Icon size={14} /> {label}: {ACTION_STATUS_LABEL[actionStatus] || 'Queued — view'}
+                          </Link>
+                        );
+                      }
+                      return (
+                        <RunActionButton
+                          key={kind}
+                          onClick={() => queueAction(kind, pullRequest)}
+                          disabled={actionStatus === 'queuing'}
+                          busy={actionStatus === 'queuing'}
+                          title={title(forgeLabel, pullRequest.number, appName)}
+                          icon={Icon}
+                          className="px-3 py-1.5 bg-port-accent/20 text-port-accent enabled:hover:bg-port-accent/30 border border-port-border rounded-lg text-xs whitespace-nowrap"
+                        >
+                          {label}
+                        </RunActionButton>
+                      );
+                    })}
+
+                    {pullRequest.mergeEligible && (
+                      <MergeAction
+                        pullRequest={pullRequest}
+                        idPrefix={mergeId}
+                        title={`Merge ${forgeLabel} request #${pullRequest.number} for ${appName} now, without an agent`}
+                        armed={isConfirming(pullRequest.number)}
+                        merging={merging}
+                        method={mergeMethod}
+                        onMethodChange={setMergeMethod}
+                        deleteBranch={deleteBranchOnMerge}
+                        onDeleteBranchChange={setDeleteBranchOnMerge}
+                        onArm={() => requestMerge(pullRequest.number)}
+                        onCancel={cancelMerge}
+                        onConfirm={() => confirmMerge(pullRequest)}
+                      />
+                    )}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}

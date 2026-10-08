@@ -1,0 +1,493 @@
+/**
+ * Media asset index — PostgreSQL row I/O + reconcile (#1000).
+ *
+ * Writes the `media_assets` table. This table is a DERIVED index over media
+ * that lives on disk, so the write surface is small:
+ *   - upsertAsset(row)         — index/refresh one asset (the live hook + reconcile)
+ *   - removeAsset(mediaKey)    — drop one asset's row. Driven by the live delete
+ *                                hooks (index.js unindexImage/unindexVideo), so a
+ *                                row dies with its file rather than lingering
+ *                                until the next boot (#2738).
+ *   - reconcileMediaAssets()   — full sweep: upsert every on-disk asset, prune
+ *                                rows whose backing file is gone. Idempotent and
+ *                                cheap to re-run; called at boot. Still the
+ *                                backstop for OUT-OF-BAND removals (a file
+ *                                deleted off-disk never runs a delete hook).
+ *   - listAssets(...)          — bounded gallery reads; legacy callers may
+ *                                still request an unbounded array
+ *
+ * The image + video disk readers are dynamically imported inside reconcile so
+ * importing this module (e.g. for upsertAsset from a generation hook) never
+ * pulls in the heavy media-gen stack, and so tests can run the SQL paths
+ * without it.
+ */
+
+import { readFile, readdir, stat } from 'fs/promises';
+import { join } from 'path';
+import { query, withTransaction } from '../../lib/db.js';
+import { dedupeByKey } from '../../lib/arrayUtils.js';
+import { createFileWriteQueue } from '../../lib/fileWriteQueue.js';
+
+// Queue the complete source-read → mirror-write flow, not merely SQL, so an
+// old completion hook cannot overwrite a restore's newer reconstruction.
+export const queueMediaIndexRefresh = createFileWriteQueue();
+import {
+  imageToRow, videoToRow, compactGalleryRecord, compactSource, compactSourceToRow,
+  COMPACT_SOURCE_FIELDS, COMPACT_PREVIEW_KEY, COMPACT_PROMPT_CHARS,
+} from './logic.js';
+
+function rowToAsset(row) {
+  if (!row) return null;
+  // `data` already carries the full metadata record; return it verbatim so
+  // consumers see the same shape the gallery/history gave.
+  return row.data;
+}
+
+const UPSERT_CONFLICT = `ON CONFLICT (media_key) DO UPDATE SET
+       kind = EXCLUDED.kind,
+       ref = EXCLUDED.ref,
+       data = EXCLUDED.data,
+       created_at = EXCLUDED.created_at,
+       indexed_at = NOW()`;
+
+/** Upsert one index row. `row` is the shape produced by logic.js. */
+export async function upsertAsset(row) {
+  if (!row) return;
+  await query(
+    `INSERT INTO media_assets (media_key, kind, ref, data, created_at, indexed_at)
+     VALUES ($1, $2, $3, $4::jsonb, $5, NOW())
+     ${UPSERT_CONFLICT}`,
+    [row.mediaKey, row.kind, row.ref, JSON.stringify(row.data), row.createdAt],
+  );
+}
+
+// Upsert many rows in chunked multi-row INSERTs so reconcile (which runs every
+// boot over the whole gallery) is a handful of round-trips, not one-per-asset.
+const UPSERT_CHUNK = 500;
+async function upsertAssets(rows, runQuery = query) {
+  // Collapse duplicate media_keys BEFORE chunking (see `dedupeByKey` for why a
+  // multi-row upsert cannot carry a repeated conflict key). Untreated, one throw
+  // aborted the WHOLE reconcile — a single duplicated gallery filename or
+  // repeated video-history id froze the entire index and turned boot's
+  // catalog-migration step red. Disk is the authority and it can honestly hand
+  // us the same ref twice (a re-appended history entry, a filename two scans
+  // both list); that is data to absorb, not an error to propagate.
+  const deduped = dedupeByKey(rows, (row) => row.mediaKey);
+  for (let i = 0; i < deduped.length; i += UPSERT_CHUNK) {
+    const chunk = deduped.slice(i, i + UPSERT_CHUNK);
+    const values = [];
+    const params = [];
+    chunk.forEach((row, j) => {
+      const b = j * 5;
+      // NOW() for indexed_at is a literal, not a param.
+      values.push(`($${b + 1}, $${b + 2}, $${b + 3}, $${b + 4}::jsonb, $${b + 5}, NOW())`);
+      params.push(row.mediaKey, row.kind, row.ref, JSON.stringify(row.data), row.createdAt);
+    });
+    await runQuery(
+      `INSERT INTO media_assets (media_key, kind, ref, data, created_at, indexed_at)
+       VALUES ${values.join(', ')}
+       ${UPSERT_CONFLICT}`,
+      params,
+    );
+  }
+  return deduped.length;
+}
+
+/** Remove one index row by media_key. */
+export async function removeAsset(mediaKey) {
+  if (typeof mediaKey !== 'string' || !mediaKey) return;
+  await query(`DELETE FROM media_assets WHERE media_key = $1`, [mediaKey]);
+}
+
+// Parameters stay bound, including literal substring search (percent and underscore
+// in a prompt are not SQL wildcards). Count and page share exactly one predicate.
+function assetFilter({ kind, q = '', hidden, filename, cleanedFrom, mediaKeys, excludeKeys, universeId, entryCategory, entryKind, cover } = {}, params = []) {
+  const clauses = [];
+  if (kind) { params.push(kind); clauses.push(`kind = $${params.length}`); }
+  if (hidden !== undefined) {
+    clauses.push(hidden ? `data->>'hidden' = 'true'` : `COALESCE(data->>'hidden', 'false') <> 'true'`);
+  }
+  if (filename !== undefined) {
+    params.push(filename);
+    clauses.push(`(ref = $${params.length} OR data->>'filename' = $${params.length})`);
+  }
+  if (mediaKeys !== undefined) {
+    params.push(mediaKeys);
+    clauses.push(`media_key = ANY($${params.length}::text[])`);
+  }
+  if (excludeKeys !== undefined) {
+    params.push(excludeKeys);
+    clauses.push(`NOT (media_key = ANY($${params.length}::text[]))`);
+  }
+  // `cleanedFrom` is the variant-lineage reverse lookup: given an original
+  // filename it returns every cleaned/regenerated/de-watermarked copy that
+  // points back at it. Same jsonb-scalar shape as the universe filters below.
+  for (const [field, value] of Object.entries({ cleanedFrom, universeId, entryCategory, entryKind })) {
+    if (value !== undefined) {
+      params.push(value);
+      clauses.push(`data->>'${field}' = $${params.length}`);
+    }
+  }
+  if (cover) clauses.push("(kind = 'image' OR NULLIF(data->>'thumbnail', '') IS NOT NULL)");
+  for (const token of q.trim().toLowerCase().split(/\s+/).filter(Boolean)) {
+    params.push(token);
+    clauses.push(`strpos(lower(concat_ws(' ', data::text, kind,
+      (data->>'width') || 'x' || (data->>'height'),
+      CASE WHEN data->>'extractedFromVideoId' IS NOT NULL THEN 'extracted frame' END,
+      CASE WHEN data->>'stitchedFrom' IS NOT NULL THEN 'stitched' END,
+      CASE WHEN data->>'upscaledFrom' IS NOT NULL THEN 'upscaled 2x' END)), $${params.length}) > 0`);
+  }
+  return { params, where: clauses.length ? ` WHERE ${clauses.join(' AND ')}` : '' };
+}
+
+// The characters String.prototype.trim() removes, as a regex bracket body, so
+// the SQL "non-blank prompt" test agrees with logic.js (an all-whitespace
+// prompt falls back to metadata.prompt in both).
+const JS_TRIM_CLASS = String.raw`\t\n\v\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff`;
+const SOURCE_KEYS = COMPACT_SOURCE_FIELDS.map(field => `'${field}'`).join(', ');
+
+/**
+ * SQL twin of logic.js compactSource() for an indexed record, in one pass over
+ * its keys so the stored JSONB is decoded once: present keys only (an explicit
+ * JSON null survives, an absent key stays absent) plus the bounded preview
+ * source — prompt, else metadata.prompt. left() counts code points, never
+ * fewer than the UTF-16 units the JS preview cuts at, so the final preview is
+ * identical to one cut from the full prompt. Index rows are always objects
+ * (logic.js imageToRow), which jsonb_each requires.
+ */
+function compactSourceSql(column) {
+  const preview = (key, json) => `min(left(${json} #>> '{}', ${COMPACT_PROMPT_CHARS + 1})) FILTER (WHERE field.key = '${key}'
+      AND jsonb_typeof(${json}) = 'string' AND (${json} #>> '{}') ~ '[^${JS_TRIM_CLASS}]')`;
+  return `(SELECT COALESCE(jsonb_object_agg(field.key, field.value) FILTER (WHERE field.key IN (${SOURCE_KEYS})), '{}'::jsonb)
+      || jsonb_strip_nulls(jsonb_build_object('${COMPACT_PREVIEW_KEY}',
+        COALESCE(${preview('prompt', 'field.value')}, ${preview('metadata', "(field.value -> 'prompt')")})))
+    FROM jsonb_each(${column}) AS field)`;
+}
+
+// Compact rows are projected before SQL only without a search: search matches
+// words anywhere in the full stored metadata, beyond any preview.
+const projectsCompact = (compact, q = '') => Boolean(compact) && !String(q).trim();
+
+// Final row shape for a reader: full records, compact rows cut from full
+// records (search), or compact rows from a projected source (internal keys dropped).
+const rowShape = (compact, projected) => !compact ? data => data
+  : projected ? compactSourceToRow : compactGalleryRecord;
+
+// Videos stay authoritative in video-history: prompt/visibility edits and uploads
+// do not all refresh the derived index. Mixed pages join that snapshot in SQL,
+// rather than using stale video rows or downloading either full list to the client.
+// A compact source (#9676) carries only card/filter fields of either kind, so
+// neither the bound parameter nor the materialized CTE holds full detail bodies.
+function assetSource(params, videos, { materialized = false, compact = false } = {}) {
+  const data = compact ? `${compactSourceSql('data')} AS data` : 'data';
+  if (videos === undefined) return { cte: '', table: 'media_assets', data };
+  params.push(JSON.stringify(videos.map(video => ({ data: compact ? compactSource(video) : video,
+    createdAt: Number.isFinite(Date.parse(video.createdAt)) ? new Date(video.createdAt).toISOString() : new Date(0).toISOString() }))));
+  return {
+    data: 'data',
+    cte: `WITH gallery_assets AS ${materialized ? 'MATERIALIZED ' : ''}(
+      SELECT media_key, kind, ref, ${data}, created_at FROM media_assets WHERE kind = 'image'
+      UNION ALL
+      SELECT 'video:' || (value->'data'->>'id'), 'video', value->'data'->>'id', value->'data',
+        (value->>'createdAt')::timestamptz
+      FROM jsonb_array_elements($${params.length}::jsonb)
+    ) `,
+    table: 'gallery_assets',
+  };
+}
+
+/** List index rows. Omitting limit retains the legacy array contract. */
+export async function listAssets({ limit, offset = 0, videos, typed = false, orderedKeys, compact = false, ...filters } = {}) {
+  const projected = projectsCompact(compact, filters.q);
+  const { params, where } = assetFilter(filters);
+  const { cte, table, data } = assetSource(params, videos, { compact: projected });
+  let order = 'created_at DESC, media_key ASC';
+  if (orderedKeys) {
+    params.push(orderedKeys);
+    order = `array_position($${params.length}::text[], media_key), media_key ASC`;
+  }
+  let paging = '';
+  if (limit !== undefined) {
+    params.push(limit, offset);
+    paging = ` LIMIT $${params.length - 1} OFFSET $${params.length}`;
+  }
+  const result = await query(
+    `${cte}SELECT ${typed ? 'kind, ' : ''}${data} FROM ${table}${where} ORDER BY ${order}${paging}`, params,
+  );
+  const shape = rowShape(compact, projected);
+  return result.rows.map(row => typed ? { kind: row.kind, data: shape(row.data) } : shape(rowToAsset(row)));
+}
+
+/** Count matching rows without materializing their JSONB payloads. */
+export async function countAssets({ videos, compact = false, ...filters } = {}) {
+  const { params, where } = assetFilter(filters);
+  const { cte, table } = assetSource(params, videos, { compact: projectsCompact(compact, filters.q) });
+  const result = await query(`${cte}SELECT COUNT(*) AS count FROM ${table}${where}`, params);
+  return parseInt(result.rows[0].count, 10);
+}
+
+/** One snapshot expansion serves the mixed page and every summary count. */
+export async function listMixedGalleryPage({
+  videos = [], limit = 60, offset = 0, orderedKeys, cover, countMediaKeys, compact = false, ...filters
+} = {}) {
+  const params = [];
+  const projected = projectsCompact(compact, filters.q);
+  const { cte, table } = assetSource(params, videos, { materialized: true, compact: projected });
+  const predicate = options => assetFilter(options, params).where.slice(' WHERE '.length) || 'TRUE';
+  const totalFilter = predicate(filters);
+  const hiddenFilter = predicate({ ...filters, hidden: true });
+  // Chips follow search/collection/visibility, before kind and favorites.
+  const facetFilter = predicate({ ...filters, kind: undefined, mediaKeys: countMediaKeys });
+  const pageFilter = predicate({ ...filters, cover });
+  let order = 'created_at DESC, media_key ASC';
+  if (orderedKeys) {
+    params.push(orderedKeys);
+    order = `array_position($${params.length}::text[], media_key), media_key ASC`;
+  }
+  params.push(limit, offset);
+  const result = await query(`${cte}, gallery_page AS (
+      SELECT * FROM ${table} WHERE ${pageFilter}
+      ORDER BY ${order} LIMIT $${params.length - 1} OFFSET $${params.length}
+    )
+    SELECT
+      (SELECT COALESCE(jsonb_agg(jsonb_build_object('kind', kind, 'data', data)
+        ORDER BY ${order}), '[]'::jsonb) FROM gallery_page) AS items,
+      COUNT(*) FILTER (WHERE ${totalFilter}) AS total,
+      COUNT(*) FILTER (WHERE ${hiddenFilter}) AS "hiddenTotal",
+      COUNT(*) FILTER (WHERE (${facetFilter}) AND kind = 'image') AS image,
+      COUNT(*) FILTER (WHERE (${facetFilter}) AND kind = 'video') AS video
+    FROM ${table}`, params);
+  const row = result.rows[0];
+  const image = Number(row.image);
+  const video = Number(row.video);
+  const shape = rowShape(compact, projected);
+  return { items: row.items.map(item => ({ kind: item.kind, data: shape(item.data) })), total: Number(row.total), hiddenTotal: Number(row.hiddenTotal),
+    counts: { image, video, all: image + video } };
+}
+
+/** Batch cover selection: membership ordinals retain stable added-at ordering.
+ * Only addressing fields cross the video-history boundary; prompts never enter SQL.
+ * Hidden assets remain eligible here, just as on the collection grid.
+ */
+export async function collectionCovers(collections, videos) {
+  const videoRows = videos.map(({ id, filename, createdAt, hidden, thumbnail }) => ({
+    id, filename, hidden, thumbnail,
+    createdAt: Number.isFinite(Date.parse(createdAt)) ? new Date(createdAt).toISOString() : new Date(0).toISOString(),
+  }));
+  const result = await query(`WITH collections AS MATERIALIZED (
+      SELECT * FROM jsonb_to_recordset($1::jsonb) AS c(id text, "coverKey" text, keys jsonb)
+    ), memberships AS MATERIALIZED (
+      SELECT c.id, c."coverKey", k.key, k.ordinal
+      FROM collections c CROSS JOIN LATERAL jsonb_array_elements_text(c.keys) WITH ORDINALITY AS k(key, ordinal)
+    ), assets AS MATERIALIZED (
+      SELECT media_key, kind, ref, data->>'filename' AS filename, created_at,
+        COALESCE(NULLIF(data->>'path', ''), '/data/images/' || (data->>'filename')) AS cover
+      FROM media_assets WHERE kind = 'image'
+      UNION ALL
+      SELECT 'video:' || v.id, 'video', v.id, v.filename, v."createdAt"::timestamptz,
+        '/data/video-thumbnails/' || NULLIF(v.thumbnail, '')
+      FROM jsonb_to_recordset($2::jsonb) AS v(id text, filename text, "createdAt" text, thumbnail text)
+    ), covers AS (
+      SELECT DISTINCT ON (m.id) m.id, a.cover
+      FROM memberships m JOIN assets a ON a.media_key = m.key
+      WHERE a.kind = 'image' OR a.cover IS NOT NULL
+      ORDER BY m.id,
+        (CASE WHEN a.kind = CASE WHEN m."coverKey" LIKE 'image:%' THEN 'image' ELSE 'video' END
+          AND (a.ref = substring(m."coverKey" FROM length(a.kind) + 2)
+            OR a.filename = substring(m."coverKey" FROM length(a.kind) + 2)) THEN 0 ELSE 1 END),
+        m.ordinal, a.media_key
+    ), unsorted AS MATERIALIZED (
+      SELECT a.* FROM assets a WHERE NOT EXISTS (SELECT 1 FROM memberships m WHERE m.key = a.media_key)
+    )
+    SELECT c.id, covers.cover, NULL::bigint AS image, NULL::bigint AS video
+    FROM collections c LEFT JOIN covers ON covers.id = c.id
+    UNION ALL
+    SELECT 'unsorted',
+      (SELECT cover FROM unsorted WHERE kind = 'image' OR cover IS NOT NULL ORDER BY created_at DESC, media_key ASC LIMIT 1),
+      COUNT(*) FILTER (WHERE kind = 'image'), COUNT(*) FILTER (WHERE kind = 'video')
+    FROM unsorted`, [JSON.stringify(collections), JSON.stringify(videoRows)]);
+  return result.rows;
+}
+
+/** Picker membership only needs existence, never covers, counts or video history. */
+export async function visibleImageCollections(collections) {
+  const memberships = collections.flatMap(collection => (collection.items || [])
+    .filter(item => item.kind === 'image').map(item => ({ id: collection.id, key: `image:${item.ref}` })));
+  const result = await query(`SELECT DISTINCT m.id
+    FROM jsonb_to_recordset($1::jsonb) AS m(id text, key text)
+    JOIN media_assets a ON a.media_key = m.key
+    WHERE a.kind = 'image' AND COALESCE(a.data->>'hidden', 'false') <> 'true'`, [JSON.stringify(memberships)]);
+  const populated = new Set(result.rows.map(row => row.id));
+  return collections.filter(collection => populated.has(collection.id)).map(({ id, name }) => ({ id, name }));
+}
+
+/** Compact global picker options, independent of the loaded page/search. */
+export async function galleryFacets() {
+  const fields = ['universeId', 'universeName', 'entryCategory', 'entryKind'];
+  const result = await query(`SELECT DISTINCT ${fields.map(field =>
+    `CASE WHEN jsonb_typeof(data->'${field}') = 'string' THEN data->>'${field}' END AS "${field}"`).join(', ')}
+    FROM media_assets WHERE kind = 'image' AND COALESCE(data->>'hidden', 'false') <> 'true'`);
+  return result.rows;
+}
+
+// Strict video-history reader for reconcile. The live store's loadHistory()
+// (readJSONFile w/ [] default) intentionally collapses a MISSING file AND a
+// corrupt/unreadable one to [] — fine for the live store, but catastrophic for
+// reconcile's prune: "corrupt history" would look like "no videos exist" and
+// wipe every video row whose file is still on disk. This reader distinguishes
+// the two: file absent → genuinely empty (ok); present-but-unparseable → failure
+// (not ok), so the caller skips pruning videos. Returns { ok, list }.
+export async function readVideoHistoryStrict(historyPath) {
+  // Only reconcile needs filesystem paths; indexed list reads do not. Keep the
+  // facade specifier so existing test path overrides still intercept it.
+  historyPath ??= join((await import('../../lib/fileUtils.js')).PATHS.data, 'video-history.json');
+  // Read with explicit error-code handling — NOT tryReadFile/readJSONFile, which
+  // both collapse "missing" and "unreadable" to the same value. Only a genuine
+  // ENOENT (file never written) counts as trusted-empty; an EACCES/EIO/transient
+  // failure must be a non-ok read so the caller skips pruning videos.
+  let raw;
+  try {
+    raw = await readFile(historyPath, 'utf-8');
+  } catch (err) {
+    if (err.code === 'ENOENT') return { ok: true, list: [] }; // never written → no videos yet
+    return { ok: false, list: [] }; // unreadable → do NOT treat as empty
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { ok: false, list: [] }; // corrupt → do NOT treat as empty
+  }
+  if (!Array.isArray(parsed)) return { ok: false, list: [] };
+  return { ok: true, list: parsed };
+}
+
+// Restore must distinguish an absent gallery/sidecar from an unreadable or
+// corrupt one. The interactive gallery intentionally tolerates both, which
+// is inappropriate when replacing every restored cache row.
+async function readGalleryForRestore() {
+  const { PATHS } = await import('../../lib/fileUtils.js');
+  let files;
+  try { files = await readdir(PATHS.images); }
+  catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+  const images = [];
+  for (const filename of files.filter(name => /\.png$/i.test(name))) {
+    const info = await stat(join(PATHS.images, filename));
+    if (!info.isFile()) throw new Error('Media gallery contains a non-file image');
+    let metadata = {};
+    for (const sidecar of [filename.replace(/\.png$/i, '.metadata.json'), `${filename}.metadata.json`]) {
+      let raw;
+      try { raw = await readFile(join(PATHS.images, sidecar), 'utf8'); }
+      catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+      metadata = JSON.parse(raw);
+      if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
+        throw new Error('Media gallery sidecar must contain an object');
+      }
+      break;
+    }
+    images.push({ filename, path: `/data/images/${filename}`, createdAt: info.birthtime.toISOString(), ...metadata });
+  }
+  return images;
+}
+
+// Wrap a reader so a thrown error becomes { ok:false } rather than a trusted
+// empty list (the listGallery path throws on real I/O errors like EACCES/EIO).
+async function readListStrict(fn) {
+  const list = await fn().catch(() => null);
+  if (!Array.isArray(list)) return { ok: false, list: [] };
+  return { ok: true, list };
+}
+
+/**
+ * Full reconcile: make the index match what's on disk RIGHT NOW.
+ *
+ * 1. Read every image (gallery scan) + every video (history file).
+ * 2. Upsert a row for each — refreshing metadata for any that changed.
+ * 3. Prune index rows whose media_key is no longer on disk — but ONLY for a
+ *    kind whose disk read provably SUCCEEDED. A transient read failure (a
+ *    throwing gallery scan, a corrupt video-history.json) must NOT be mistaken
+ *    for "nothing on disk" and wipe live rows whose files still exist; in that
+ *    case we upsert what we did read and skip pruning that kind, leaving the
+ *    existing rows until a later clean reconcile. (This is the absent-vs-empty
+ *    sentinel rule from AGENTS.md — failed-read ≠ legitimately-empty.)
+ *
+ * Idempotent: re-running with no disk changes is a no-op upsert + empty prune.
+ * Cheap enough to run unconditionally at boot.
+ *
+ * The disk readers are injected (defaulting to the real services) so tests can
+ * drive reconcile without the media-gen stack. Both injected and default
+ * readers go through the same strict failure-vs-empty wrapper, so a throwing
+ * reader uniformly skips that kind's prune rather than wiping it.
+ */
+export function reconcileMediaAssets(deps = {}) {
+  return queueMediaIndexRefresh(() => reconcileNow(deps));
+}
+
+async function reconcileNow(deps) {
+  const now = new Date().toISOString();
+  // Rows indexed after this instant (a generation/upload/peer sync landing
+  // mid-reconcile) are absent from the disk snapshot but must not be pruned.
+  const startedAt = now;
+
+  const imageRead = await readListStrict(
+    deps.listGallery || (deps.rebuild || deps.requireComplete
+      ? readGalleryForRestore : (await import('../imageGen/local.js')).listGallery),
+  );
+  // The video default path needs the file-level missing-vs-corrupt distinction
+  // (loadHistory collapses both to []); an injected reader returns an array, so
+  // readListStrict suffices for it.
+  const videoRead = deps.loadHistory
+    ? await readListStrict(deps.loadHistory)
+    : await readVideoHistoryStrict();
+
+  const imageRows = (Array.isArray(imageRead.list) ? imageRead.list : [])
+    .map((it) => imageToRow(it, { now })).filter(Boolean);
+  const videoRows = (Array.isArray(videoRead.list) ? videoRead.list : [])
+    .map((v) => videoToRow(v, { now })).filter(Boolean);
+
+  // Restore cannot retain old or partially reconstructed cache rows. Read both
+  // authorities first, then replace the mirror atomically; a failed read is
+  // never a trusted empty gallery. This also removes future-dated legacy rows
+  // that the ordinary concurrent-generation prune deliberately preserves.
+  if ((deps.rebuild || deps.requireComplete) && (!imageRead.ok || !videoRead.ok)) {
+    throw new Error('Media index rebuild could not read authoritative files');
+  }
+  if (deps.rebuild) {
+    return withTransaction(async (client) => {
+      const removed = await client.query('DELETE FROM media_assets');
+      const indexed = await upsertAssets([...imageRows, ...videoRows], client.query.bind(client));
+      return { ok: true, indexed, pruned: removed.rowCount || 0, skippedPrune: [] };
+    });
+  }
+
+  // Rows WRITTEN, which is below the rows read when disk repeated a ref.
+  const indexed = await upsertAssets([...imageRows, ...videoRows]);
+
+  // Per-kind prune, gated on a successful read for that kind. Pruning one kind
+  // never touches the other's rows (an image-read failure can't wipe videos).
+  let pruned = 0;
+  if (imageRead.ok) pruned += await pruneKind('image', imageRows.map((r) => r.mediaKey), startedAt);
+  if (videoRead.ok) pruned += await pruneKind('video', videoRows.map((r) => r.mediaKey), startedAt);
+
+  const skipped = [!imageRead.ok && 'images', !videoRead.ok && 'videos'].filter(Boolean);
+  const skipNote = skipped.length ? ` — SKIPPED prune for ${skipped.join('+')} (disk read failed)` : '';
+  console.log(`🗂️  Media asset index reconciled: ${imageRows.length} img / ${videoRows.length} vid on disk, ${pruned} stale row(s) pruned${skipNote}`);
+  return { ok: true, indexed, pruned, skippedPrune: skipped };
+}
+
+// Delete index rows of `kind` whose media_key isn't in `liveKeys`. An empty
+// liveKeys set legitimately means "this kind has no assets on disk" — safe to
+// prune all of that kind — but the CALLER only reaches here when the read for
+// that kind succeeded, so empty is trustworthy.
+async function pruneKind(kind, liveKeys, startedAt) {
+  const res = liveKeys.length === 0
+    ? await query(
+      `DELETE FROM media_assets WHERE kind = $1 AND indexed_at < $2::timestamptz`,
+      [kind, startedAt],
+    )
+    : await query(
+      `DELETE FROM media_assets WHERE kind = $1 AND indexed_at < $2::timestamptz AND media_key <> ALL($3::text[])`,
+      [kind, startedAt, liveKeys],
+    );
+  return res.rowCount || 0;
+}

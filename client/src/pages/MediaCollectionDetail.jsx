@@ -1,0 +1,655 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useParams, Link, useNavigate } from 'react-router';
+import { ArrowLeft, Cloud, CloudOff, CheckSquare, Copy, DatabaseZap, FolderInput, HardDriveDownload, Inbox, Lock, Pencil, Star, StarOff, Trash2, X } from 'lucide-react';
+import ShareToButton from '../components/sharing/ShareToButton';
+import PageSkeleton from '../components/ui/PageSkeleton';
+import toast from '../components/ui/Toast';
+import MediaCard from '../components/media/MediaCard';
+import MediaPreview from '../components/media/MediaPreview';
+import BulkTargetPicker from '../components/media/BulkTargetPicker';
+import { normalizeMediaRow } from '../components/media/normalize';
+import { useMediaAnnotations } from '../hooks/useMediaAnnotations';
+import { useAsyncAction } from '../hooks/useAsyncAction';
+import useGalleryPreviewResolver from '../hooks/useGalleryPreviewResolver';
+import { UNSORTED_ID, buildUnsortedCollection } from '../lib/unsorted';
+import {
+  getMediaCollection, updateMediaCollection,
+  listMediaCollections,
+  addMediaCollectionItem, removeMediaCollectionItem,
+  deleteImage, deleteVideoHistoryItem,
+  pullMissingMetadata, localizeMediaCollection,
+} from '../services/api';
+import socket from '../services/socket';
+import useMediaPreviewActions from '../hooks/useMediaPreviewActions';
+import usePreviewRoute from '../hooks/usePreviewRoute';
+import { useGalleryPage } from '../hooks/useGalleryPage';
+
+// Local-vs-remote state of one collection item. Local files (the normal case)
+// carry no badge; the header summarizes the peer-hosted count.
+function LocationBadge({ entry }) {
+  if (entry?.location === 'remote') {
+    const host = entry.hostPeerName || 'peer';
+    return (
+      <span
+        className="absolute top-1.5 left-1.5 z-10 px-1.5 py-0.5 rounded bg-black/70 text-port-accent text-[10px] flex items-center gap-1 pointer-events-none"
+        title={`Hosted by ${host} — streamed on demand, not stored on this machine`}
+      >
+        <Cloud className="w-3 h-3" /> {host}
+      </span>
+    );
+  }
+  if (entry?.location === 'missing') {
+    return (
+      <span
+        className="absolute top-1.5 left-1.5 z-10 px-1.5 py-0.5 rounded bg-black/70 text-port-warning text-[10px] flex items-center gap-1 pointer-events-none"
+        title="The file is not on this machine and no peer is known to host it"
+      >
+        <CloudOff className="w-3 h-3" /> Not here
+      </span>
+    );
+  }
+  return null;
+}
+
+export default function MediaCollectionDetail() {
+  const { id } = useParams();
+  const navigate = useNavigate();
+  const isUnsorted = id === UNSORTED_ID;
+  const [collection, setCollection] = useState(null);
+  // Full collections list — fetched once for the bulk move/copy picker so it
+  // doesn't pay a per-mount listMediaCollections() round-trip when opened.
+  // Already loaded for the unsorted view as part of buildUnsortedCollection().
+  const [allCollections, setAllCollections] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [editingName, setEditingName] = useState(false);
+  const [nameDraft, setNameDraft] = useState('');
+  // Preview state is URL-driven (`?preview=<filename>`) — see `usePreviewRoute`
+  // call below, declared after `items` so the resolver can match against it.
+  const [selectMode, setSelectMode] = useState(false);
+  const [selected, setSelected] = useState(new Map());
+  useEffect(() => { setSelected(new Map()); setSelectMode(false); setPickerMode(null); }, [id]);
+  const [bulkBusy, setBulkBusy] = useState(false);
+  // 'move' = add to target + remove from current; 'copy' = add only.
+  const [pickerMode, setPickerMode] = useState(null);
+  const moveBtnRef = useRef(null);
+  const copyBtnRef = useRef(null);
+  const pageFocusRef = useRef(null);
+  const returningBulkFocus = useRef(false);
+  // Bulk selection disables its opener, then removes that toolbar on success.
+  // The page region survives loading and selection changes as a safe fallback.
+  useEffect(() => {
+    if (!returningBulkFocus.current) return;
+    if (document.activeElement === document.body || document.activeElement?.disabled) {
+      pageFocusRef.current?.focus({ preventScroll: true });
+    }
+    if (!bulkBusy) returningBulkFocus.current = false;
+  }, [bulkBusy, loading]);
+  const { annotations, toggleStar, updateAnnotation, getCardProps } = useMediaAnnotations();
+
+  const page = useGalleryPage({ collectionId: id, kind: 'all' }, { media: true });
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    page.refresh();
+    const [c, cols] = await Promise.all([
+      isUnsorted ? Promise.resolve(buildUnsortedCollection([], [], [])) : getMediaCollection(id, { silent: true }).catch(err => { toast.error(err.message || 'Collection not found'); return null; }),
+      listMediaCollections({ silent: true }).catch(() => []),
+    ]);
+    setCollection(c); setAllCollections(cols); setNameDraft(c?.name || ''); setLoading(false);
+  }, [id, isUnsorted, page.refresh]);
+  useEffect(() => { refresh(); }, [refresh]);
+  // Where each item's bytes live (server-annotated): 'local' | 'remote' (hosted
+  // by a peer and streamed on demand) | 'missing'. Items without an annotation
+  // (older server, unsorted view) read as local.
+  const locationByKey = useMemo(() => new Map((collection?.items || []).map(item => [`${item.kind}:${item.ref}`, item])), [collection]);
+  // The gallery index is built from local disk, so a peer-hosted image never
+  // appears in `page.items`. Append a stub row for each so it still renders
+  // (its /data/images URL falls through to the peer server-side). Videos need
+  // no stub: their rows arrive with the synced video history.
+  const galleryRows = useMemo(() => {
+    if (isUnsorted) return page.items;
+    const present = new Set(page.items.filter(row => row.kind === 'image').map(row => row.data.filename));
+    const remoteStubs = (collection?.items || [])
+      .filter(item => item.kind === 'image' && item.location === 'remote' && !present.has(item.ref))
+      .map(item => ({ kind: 'image', data: { filename: item.ref, prompt: '', createdAt: item.addedAt } }));
+    return remoteStubs.length ? [...page.items, ...remoteStubs] : page.items;
+  }, [page.items, collection, isUnsorted]);
+  const items = useMemo(() => galleryRows.filter(row => isUnsorted || collection?.items?.some(ref => ref.kind === row.kind && ref.ref === (row.kind === 'image' ? row.data.filename : row.data.id)))
+    .map(normalizeMediaRow), [galleryRows, collection, isUnsorted]);
+  const remoteKeys = useMemo(() => (collection?.items || []).filter(item => item.location === 'remote').map(item => `${item.kind}:${item.ref}`), [collection]);
+  const [runLocalize, localizing] = useAsyncAction(async () => {
+    const result = await localizeMediaCollection(id, remoteKeys, { silent: true });
+    toast.success(`Copying ${result?.started ?? remoteKeys.length} hosted item(s) to this machine…`);
+  });
+  // A copied file lands as `peerSync:asset-arrived`; re-read the annotations
+  // (and gallery rows) instead of polling. Debounced — a batch fires many.
+  useEffect(() => {
+    if (isUnsorted) return undefined;
+    let active = true;
+    let timer = null;
+    const onArrived = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        getMediaCollection(id, { silent: true }).then((c) => { if (active) setCollection(c); }).catch(() => {});
+        page.refresh();
+      }, 500);
+    };
+    socket.on('peerSync:asset-arrived', onArrived);
+    return () => { active = false; clearTimeout(timer); socket.off('peerSync:asset-arrived', onArrived); };
+  }, [id, isUnsorted, page.refresh]);
+  const resolvePreview = useGalleryPreviewResolver({ collectionId: id });
+  const [preview, setPreview] = usePreviewRoute(items, { resolveItem: resolvePreview });
+
+  // Unsorted-only action: pull gen-params sidecars for bare images from peers.
+  const unsortedImageFilenames = useMemo(() => isUnsorted ? items.filter(item => item.kind === 'image').map(item => item.filename) : [], [items, isUnsorted]);
+  const [runPullPrompts, pullingPrompts] = useAsyncAction(async () => {
+    const result = await pullMissingMetadata(unsortedImageFilenames, { silent: true });
+    if (!result) return null;
+    const { attempted = 0, recovered = 0 } = result;
+    if (recovered > 0) {
+      toast.success(`Recovered prompts for ${recovered}/${attempted} image${attempted === 1 ? '' : 's'}`);
+    } else {
+      toast(`No missing prompts found (${attempted} checked)`);
+    }
+    await refresh();
+    return result;
+  }, { errorMessage: 'Pull missing prompts failed' });
+
+  const handleRename = async () => {
+    const trimmed = nameDraft.trim();
+    if (!trimmed || trimmed === collection.name) { setEditingName(false); return; }
+    const updated = await updateMediaCollection(collection.id, { name: trimmed }, { silent: true }).catch((err) => {
+      toast.error(err.message || 'Rename failed');
+      return null;
+    });
+    if (updated) {
+      setCollection(updated);
+      setEditingName(false);
+    }
+  };
+
+  const handleSetCover = async (item) => {
+    const next = collection.coverKey === item.key ? null : item.key;
+    const updated = await updateMediaCollection(collection.id, { coverKey: next }, { silent: true }).catch((err) => {
+      toast.error(err.message || 'Failed to set cover');
+      return null;
+    });
+    if (updated) {
+      setCollection(updated);
+      toast.success(next ? 'Cover updated' : 'Cover reset to newest');
+    }
+  };
+
+  // Per-card trash deletes the underlying file (matches MediaHistory). To
+  // unfile an item from a single collection without deleting it, the user
+  // either un-checks the current collection via the folder+ menu, or selects
+  // it in select-mode and uses the bulk "Remove" action. Dropping the file
+  // from the loaded page removes it immediately; refreshing then restores
+  // a contiguous page after the server changes its ordering.
+  const handleDelete = useCallback(async (item) => {
+    const ok = await (item.kind === 'image'
+      ? deleteImage(item.filename, { silent: true })
+      : deleteVideoHistoryItem(item.id, { silent: true })
+    ).catch((err) => {
+      toast.error(err.message || 'Delete failed');
+      return null;
+    });
+    if (!ok) return;
+    page.setItems(rows => rows.filter(row => !(row.kind === item.kind && (row.kind === 'image' ? row.data.filename === item.filename : row.data.id === item.id))));
+    page.setTotal(total => Math.max(0, total - 1));
+    page.refresh();
+    toast.success(`Deleted ${item.kind === 'image' ? item.filename : 'video'}`);
+  }, [page.setItems, page.setTotal, page.refresh]);
+
+  const handlePromptSaved = useCallback((item, prompt) => {
+    page.setItems(rows => rows.map(row => row.kind === item.kind && (row.kind === 'image' ? row.data.filename === item.filename : row.data.id === item.id)
+      ? { ...row, data: { ...row.data, prompt: prompt === '(no prompt)' ? '' : prompt } } : row));
+    page.refresh();
+  }, [page.setItems, page.refresh]);
+
+  // Keep selected records across page resets so partial moves remain retryable.
+  const toggleSelect = useCallback((item) => setSelected((prev) => {
+    const next = new Map(prev);
+    if (next.has(item.key)) next.delete(item.key); else next.set(item.key, item);
+    return next;
+  }), []);
+  const handleSelectCard = useCallback((item) => toggleSelect(item), [toggleSelect]);
+  const handleAnnotate = useCallback((item) => {
+    navigate(`/media/annotate/${encodeURIComponent(item.key)}`);
+  }, [navigate]);
+  const exitSelectMode = () => { setSelectMode(false); setSelected(new Map()); setPickerMode(null); };
+  const selectedItems = useMemo(
+    () => [...selected.values()].map(item => items.find(current => current.key === item.key) || item),
+    [items, selected],
+  );
+
+  // Sequential — annotations and collections both do read-modify-write of a
+  // single JSON file with no per-record lock; parallel writes lose updates.
+  const bulkStar = async (starred) => {
+    if (selectedItems.length === 0) return;
+    setBulkBusy(true);
+    let successCount = 0;
+    let failedCount = 0;
+    for (const it of selectedItems) {
+      const { ok } = await updateAnnotation(it.key, { starred }, { silent: true });
+      if (ok) successCount++; else failedCount++;
+    }
+    setBulkBusy(false);
+    const verb = starred ? 'Favorited' : 'Unfavorited';
+    if (failedCount === 0) {
+      toast.success(`${verb} ${successCount} item${successCount === 1 ? '' : 's'}`);
+    } else if (successCount === 0) {
+      toast.error(`Failed to ${starred ? 'favorite' : 'unfavorite'} items`);
+    } else {
+      toast.error(`${verb} ${successCount} item${successCount === 1 ? '' : 's'}; ${failedCount} failed`);
+    }
+  };
+
+  const bulkRemove = async () => {
+    if (selectedItems.length === 0) return;
+    setBulkBusy(true);
+    let lastOk = null;
+    let failed = 0;
+    for (const it of selectedItems) {
+      const r = await removeMediaCollectionItem(collection.id, it.key, { silent: true }).catch(() => null);
+      if (r) lastOk = r; else failed++;
+    }
+    if (lastOk) { setCollection(lastOk); page.refresh(); }
+    setBulkBusy(false);
+    exitSelectMode();
+    if (failed) toast.error(`Removed ${selectedItems.length - failed}; ${failed} failed`);
+    else toast.success(`Removed ${selectedItems.length} item${selectedItems.length === 1 ? '' : 's'} from "${collection.name}"`);
+  };
+
+  const bulkMoveOrCopy = async (targetId, targetName) => {
+    if (selectedItems.length === 0 || !pickerMode) return;
+    const mode = pickerMode;
+    returningBulkFocus.current = true;
+    setPickerMode(null);
+    setBulkBusy(true);
+    const placedKeys = new Set();
+    let added = 0;
+    let dupes = 0;
+    for (const it of selectedItems) {
+      const ref = it.kind === 'video' ? it.id : it.filename;
+      const r = await addMediaCollectionItem(targetId, { kind: it.kind, ref }, { silent: true }).catch((err) => {
+        if (err?.code === 'DUPLICATE') { dupes++; placedKeys.add(it.key); return 'dupe'; }
+        return null;
+      });
+      if (r && r !== 'dupe') { added++; placedKeys.add(it.key); }
+    }
+    // A move is two writes: add to the target, then remove from here. When the
+    // second half fails the item now lives in BOTH collections — that is a
+    // half-completed move, not a success, so track those keys separately from
+    // the add failures and keep them selected for a retry.
+    const removeFailedKeys = new Set();
+    if (mode === 'move' && placedKeys.size > 0) {
+      if (isUnsorted) {
+        // Source is synthetic — placing items in any real collection takes
+        // them out of Unsorted automatically. Just re-derive the view.
+        await refresh();
+      } else {
+        let lastOk = null;
+        for (const it of selectedItems) {
+          if (!placedKeys.has(it.key)) continue;
+          const r = await removeMediaCollectionItem(collection.id, it.key, { silent: true }).catch(() => null);
+          if (r) lastOk = r; else removeFailedKeys.add(it.key);
+        }
+        // The last successful removal carries the authoritative server state,
+        // so a partial failure still reconciles the items that did move out.
+        if (lastOk) { setCollection(lastOk); page.refresh(); }
+      }
+    }
+    setBulkBusy(false);
+    if (removeFailedKeys.size > 0) {
+      // Stay in select mode with only the half-moved items selected so the
+      // user can re-run the move (or remove) on exactly what failed.
+      setSelected(new Map(selectedItems.filter(item => removeFailedKeys.has(item.key)).map(item => [item.key, item])));
+    } else {
+      exitSelectMode();
+    }
+    const verb = mode === 'move' ? (isUnsorted ? 'Filed' : 'Moved') : 'Copied';
+    const note = dupes > 0 ? ` (${dupes} already there)` : '';
+    const stranded = selectedItems.length - added - dupes;
+    const addNote = stranded > 0 ? `; ${stranded} failed to add` : '';
+    if (removeFailedKeys.size > 0) {
+      // Deliberately says "Copied" — calling a half-completed move a "Move"
+      // is the false success this branch exists to prevent.
+      toast.error(`Copied ${added} to "${targetName}"${note}, but ${removeFailedKeys.size} could not be removed from "${collection.name}"${addNote}`);
+    } else if (stranded > 0) {
+      toast.error(`${verb} ${added} to "${targetName}"${note}; ${stranded} failed`);
+    } else {
+      toast.success(`${verb} ${added} to "${targetName}"${note}`);
+    }
+  };
+
+  // Remix / SendToVideo / Continue / Clean share a single implementation
+  // with MediaHistory, ImageGen, and the Universe Builder lightbox via
+  // `useMediaPreviewActions`. The collection-specific post-clean step (add
+  // the cleaned image to THIS collection and refresh its page) is wired through
+  // `onCleanComplete`.
+  const { handleRemix, handleSendToImage, handleSendToVideo, handleContinue, handleClean, handleRemoveWatermark } = useMediaPreviewActions({
+    onCleanComplete: async (cleaned) => {
+      // The server's clean route auto-files the cleaned filename into every
+      // collection that contained the source — including this one — so this
+      // client-side add usually returns ERR_DUPLICATE. Catch both shapes:
+      // when the add wins (cleaning from outside any collection containing
+      // the source) we get an updated collection; when it loses to the
+      // server's pre-fill we get null and need to refresh from the server
+      // so collection.items picks up the new entry.
+      const updated = await addMediaCollectionItem(collection.id, {
+        kind: 'image',
+        ref: cleaned.filename,
+      }).catch(() => null);
+      if (updated) setCollection(updated);
+      else await refresh();
+      page.setItems(rows => [{ kind: 'image', data: cleaned }, ...rows.filter(row => row.kind !== 'image' || row.data.filename !== cleaned.filename)]);
+      page.refresh();
+    },
+  });
+
+  if (loading || (page.loading && page.items.length === 0)) {
+    return (
+      <div ref={pageFocusRef} tabIndex={-1} role="region" aria-label="Media collection">
+        <PageSkeleton
+          label="Loading collection"
+          titleWidthClass="w-56"
+          layout="grid"
+          cards={10}
+          gridColsClass="grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5"
+        />
+      </div>
+    );
+  }
+  if (!collection) return (
+    <div className="text-gray-500 text-sm">
+      <Link to="/media/collections" className="text-port-accent hover:underline">← Back to collections</Link>
+    </div>
+  );
+
+  const renderTitle = () => {
+    if (isUnsorted) return (
+      <h1 className="text-xl font-semibold text-white flex items-center gap-2">
+        <Inbox className="w-5 h-5 text-port-accent" />
+        {collection.name}
+      </h1>
+    );
+    // Universe-linked collections own their visible name — the user-facing
+    // identity follows the universe (renaming the universe cascades here).
+    // Routing is by `universeId` server-side regardless of name; this lock
+    // exists to keep the displayed name consistent with the universe. The
+    // server enforces it independently via the rename-lock in
+    // updateCollection. The lock state is exposed visually (icon + title
+    // tooltip for sighted users) and programmatically via the `sr-only`
+    // span — real text content screen readers announce after the
+    // collection name. An `aria-label` on the heading would override the
+    // visible name; the `sr-only` text adds context without clobbering it.
+    if (collection.universeId) {
+      const lockMsg = 'Linked to a Universe — rename the universe to rename this collection.';
+      return (
+        <h1
+          className="text-xl font-semibold text-white flex items-center gap-2"
+          title={lockMsg}
+        >
+          {collection.name}
+          <Lock className="w-4 h-4 text-gray-500" aria-hidden="true" />
+          <span className="sr-only">{lockMsg}</span>
+        </h1>
+      );
+    }
+    if (editingName) return (
+      <input
+        autoFocus
+        type="text"
+        value={nameDraft}
+        onChange={(e) => setNameDraft(e.target.value)}
+        onBlur={handleRename}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') handleRename();
+          if (e.key === 'Escape') { setNameDraft(collection.name); setEditingName(false); }
+        }}
+        maxLength={80}
+        aria-label="Collection name"
+        className="text-xl font-semibold bg-port-card border border-port-border rounded px-2 py-1 text-white focus:outline-none focus:border-port-accent"
+      />
+    );
+    return (
+      <button type="button" onClick={() => setEditingName(true)} className="text-xl font-semibold text-white hover:text-port-accent flex items-center gap-2">
+        {collection.name}
+        <Pencil className="w-4 h-4 text-gray-500" />
+      </button>
+    );
+  };
+
+  return (
+    <div ref={pageFocusRef} tabIndex={-1} role="region" aria-label="Media collection" className="space-y-4">
+      <div className="flex items-center gap-3">
+        <Link to="/media/collections" className="text-gray-400 hover:text-white" title="Back">
+          <ArrowLeft className="w-5 h-5" />
+        </Link>
+        {renderTitle()}
+        <span className="text-xs text-gray-500">{page.total} item{page.total === 1 ? '' : 's'}</span>
+        {remoteKeys.length > 0 && (
+          <span className="text-xs text-port-accent flex items-center gap-1" title="Hosted by a peer and streamed on demand — not stored on this machine">
+            <Cloud className="w-3.5 h-3.5" /> {remoteKeys.length} on peer
+          </span>
+        )}
+        {!selectMode && (
+          <div className="ml-auto flex items-center gap-2">
+            {isUnsorted && (
+              <button
+                type="button"
+                onClick={runPullPrompts}
+                disabled={pullingPrompts || unsortedImageFilenames.length === 0}
+                className="px-2.5 py-1 text-xs bg-port-accent/20 hover:bg-port-accent/40 text-port-accent rounded flex items-center gap-1.5 disabled:opacity-40"
+                title={unsortedImageFilenames.length === 0
+                  ? 'No unsorted images to check'
+                  : 'Fetch gen-params sidecars for images that synced without prompts'}
+              >
+                <DatabaseZap className="w-3.5 h-3.5" />
+                {pullingPrompts ? 'Pulling…' : 'Pull missing prompts'}
+              </button>
+            )}
+            {remoteKeys.length > 0 && (
+              <button
+                type="button"
+                onClick={runLocalize}
+                disabled={localizing}
+                className="px-2.5 py-1 text-xs bg-port-accent/20 hover:bg-port-accent/40 text-port-accent rounded flex items-center gap-1.5 disabled:opacity-40"
+                title="Download the peer-hosted items so they are stored on this machine"
+              >
+                <HardDriveDownload className="w-3.5 h-3.5" />
+                {localizing ? 'Copying…' : `Copy ${remoteKeys.length} to this machine`}
+              </button>
+            )}
+            {items.length > 0 && (
+              <button
+                type="button"
+                onClick={() => setSelectMode(true)}
+                className="px-2.5 py-1 text-xs bg-port-border hover:bg-port-border/70 text-white rounded flex items-center gap-1.5"
+                title="Select multiple to move, copy, star, or remove"
+              >
+                <CheckSquare className="w-3.5 h-3.5" /> Select
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+
+      {selectMode && (
+        <div className="bg-port-card border border-port-border rounded-lg px-3 py-2 flex flex-wrap items-center gap-2 sticky top-0 z-30">
+          <span className="text-xs text-gray-300">
+            <span className="text-white font-medium">{selected.size}</span> of {items.length} selected
+          </span>
+          <button
+            type="button"
+            onClick={() => setSelected(new Map(items.map((it) => [it.key, it])))}
+            disabled={bulkBusy || items.every(item => selected.has(item.key))}
+            className="px-2 py-1 text-[11px] bg-port-border hover:bg-port-border/70 text-white rounded disabled:opacity-40"
+          >
+            {page.hasMore ? 'Select loaded' : 'Select all'}
+          </button>
+          <button
+            type="button"
+            onClick={() => setSelected(new Map())}
+            disabled={bulkBusy || selected.size === 0}
+            className="px-2 py-1 text-[11px] bg-port-border hover:bg-port-border/70 text-white rounded disabled:opacity-40"
+          >
+            Clear
+          </button>
+          <div className="flex flex-wrap items-center gap-1.5 ml-auto">
+            <button
+              type="button"
+              onClick={() => bulkStar(true)}
+              disabled={bulkBusy || selected.size === 0}
+              className="px-2 py-1 text-[11px] bg-port-warning/20 hover:bg-port-warning/40 text-port-warning rounded flex items-center gap-1 disabled:opacity-40"
+              title="Favorite selected"
+            >
+              <Star className="w-3 h-3" /> Star
+            </button>
+            <button
+              type="button"
+              onClick={() => bulkStar(false)}
+              disabled={bulkBusy || selected.size === 0}
+              className="px-2 py-1 text-[11px] bg-port-border hover:bg-port-border/70 text-white rounded flex items-center gap-1 disabled:opacity-40"
+              title="Unfavorite selected"
+            >
+              <StarOff className="w-3 h-3" /> Unstar
+            </button>
+            <ShareToButton
+              kind="media"
+              items={selectedItems.map((it) => ({ kind: it.kind, ref: it.ref }))}
+              label="Share…"
+            />
+            <button
+              ref={moveBtnRef}
+              type="button"
+              onClick={() => setPickerMode((m) => (m === 'move' ? null : 'move'))}
+              disabled={bulkBusy || selected.size === 0}
+              className="px-2 py-1 text-[11px] bg-port-accent/20 hover:bg-port-accent/40 text-port-accent rounded flex items-center gap-1 disabled:opacity-40"
+              title={isUnsorted ? 'File selected into a collection' : 'Move selected to another collection'}
+            >
+              <FolderInput className="w-3 h-3" /> {isUnsorted ? 'File…' : 'Move…'}
+            </button>
+            {!isUnsorted && (
+              <>
+                <button
+                  ref={copyBtnRef}
+                  type="button"
+                  onClick={() => setPickerMode((m) => (m === 'copy' ? null : 'copy'))}
+                  disabled={bulkBusy || selected.size === 0}
+                  className="px-2 py-1 text-[11px] bg-port-accent/20 hover:bg-port-accent/40 text-port-accent rounded flex items-center gap-1 disabled:opacity-40"
+                  title="Copy selected to another collection"
+                >
+                  <Copy className="w-3 h-3" /> Copy…
+                </button>
+                <button
+                  type="button"
+                  onClick={bulkRemove}
+                  disabled={bulkBusy || selected.size === 0}
+                  className="px-2 py-1 text-[11px] bg-port-error/20 hover:bg-port-error/40 text-port-error rounded flex items-center gap-1 disabled:opacity-40"
+                  title="Remove selected from this collection"
+                >
+                  <Trash2 className="w-3 h-3" /> Remove
+                </button>
+              </>
+            )}
+            <button
+              type="button"
+              onClick={exitSelectMode}
+              disabled={bulkBusy}
+              className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center p-1 text-gray-400 hover:text-white disabled:opacity-40"
+              title="Exit select mode"
+              aria-label="Exit select mode"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+          {pickerMode && (
+            <BulkTargetPicker
+              anchorRef={pickerMode === 'move' ? moveBtnRef : copyBtnRef}
+              excludeId={collection.id}
+              busy={bulkBusy}
+              title={`${pickerMode === 'move' ? 'Move' : 'Copy'} ${selected.size} to…`}
+              collections={allCollections}
+              onPick={bulkMoveOrCopy}
+              onClose={() => setPickerMode(null)}
+            />
+          )}
+        </div>
+      )}
+
+      {items.length === 0 ? (
+        <div className="text-gray-500 text-sm bg-port-card border border-port-border rounded-lg p-6 text-center">
+          {isUnsorted
+            ? 'Nothing unsorted — every image and video is in at least one collection.'
+            : 'This collection is empty. Use the folder icon on any image/video card to add items here.'}
+        </div>
+      ) : (
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-3">
+          {items.map((item) => {
+            const key = item.key;
+            const isCover = collection.coverKey === key;
+            const isSelected = selected.has(key);
+            return (
+              <div key={key} className="relative">
+                <MediaCard
+                  item={item}
+                  onPreview={selectMode ? undefined : setPreview}
+                  onClick={selectMode ? handleSelectCard : undefined}
+                  onRemix={!selectMode ? handleRemix : undefined}
+                  onSendToImage={!selectMode && item.kind === 'image' ? handleSendToImage : undefined}
+                  onSendToVideo={!selectMode && item.kind === 'image' ? handleSendToVideo : undefined}
+                  onContinue={!selectMode && item.kind === 'video' ? handleContinue : undefined}
+                  onDelete={!selectMode ? handleDelete : undefined}
+                  hideActions={selectMode}
+                  selected={isSelected}
+                  {...getCardProps(key)}
+                  onToggleStar={!selectMode ? toggleStar : undefined}
+                  onAnnotate={!selectMode && item.kind === 'image' ? handleAnnotate : undefined}
+                />
+                <LocationBadge entry={locationByKey.get(key)} />
+                {!selectMode && !isUnsorted && (
+                  <button
+                    type="button"
+                    onClick={() => handleSetCover(item)}
+                    className={`absolute top-1.5 right-1.5 w-7 h-7 rounded-full flex items-center justify-center border transition-colors ${
+                      isCover
+                        ? 'bg-port-accent text-white border-port-accent'
+                        : 'bg-black/60 text-gray-300 border-port-border hover:text-white'
+                    }`}
+                    title={isCover ? 'Cover (click to reset to newest)' : 'Set as cover'} aria-label={isCover ? 'Cover (click to reset to newest)' : 'Set as cover'}
+                  >
+                    <Star className="w-3.5 h-3.5" fill={isCover ? 'currentColor' : 'none'} />
+                  </button>
+                )}
+                {selectMode && isSelected && (
+                  <div className="absolute top-1.5 right-1.5 w-7 h-7 rounded-full bg-port-accent text-white border border-port-accent flex items-center justify-center pointer-events-none">
+                    <CheckSquare className="w-4 h-4" />
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {page.error && <p role="alert" className="text-port-error">{page.error} <button type="button" onClick={page.retry}>Retry</button></p>}
+      {page.hasMore && <button type="button" disabled={page.loading} onClick={page.loadMore} className="w-full min-h-[44px] text-port-accent">{page.loading ? 'Loading…' : `Show more (${page.total - items.length} remaining)`}</button>}
+
+      <MediaPreview
+        preview={preview}
+        setPreview={setPreview}
+        items={items}
+        annotations={annotations}
+        updateAnnotation={updateAnnotation}
+        onPromptSaved={handlePromptSaved}
+        onRemix={handleRemix}
+        onSendToImage={handleSendToImage}
+        onSendToVideo={handleSendToVideo}
+        onContinue={(i) => handleContinue(i.raw || i)}
+        onClean={(i) => handleClean(i?.raw || i)}
+        onRemoveWatermark={(i) => handleRemoveWatermark(i?.raw || i)}
+      />
+    </div>
+  );
+}

@@ -1,0 +1,192 @@
+import { assertProductionApproval, productionReviewBasis, productionFeedbackContext } from './productionReview.js';
+/**
+ * User-triggered code-video generation (#9076).
+ *
+ * Nothing here runs from boot or from a project read. Both entry points are
+ * the Generate / Regenerate clicks: they resolve a provider, show it in the
+ * log line, and store section functions. The render path never calls them
+ * and never asks a footage model for pixels.
+ */
+
+import { ServerError } from '../../lib/errorHandler.js';
+import { PATHS } from '../../lib/paths.js';
+import { isDeterministicCodeSource } from '../../lib/musicVideoValidation.js';
+import { universeStyleLines } from '../../lib/styleSourcePrompt.js';
+import { musicVideoCodeDirectionContext } from '../../lib/musicVideoCreativeContext.js';
+import { buildMusicVideoCodePrompt, extractCodeSections } from '../codeAnimation/prompt.js';
+import { normalizeComposition } from './composition.js';
+import { approvedCastAndSetsDirection } from './castAndSets.js';
+import { getProject, mutateProjectRecord } from './projects.js';
+import { musicVideoLlmRouteLabel } from '../../lib/musicVideoAutomation.js';
+import { effortArg, resolveMusicVideoLlm } from './llmRoute.js';
+import { buildCodeTimeline, buildSongDocument, paletteFromProject } from './codeTimeline.js';
+
+export async function styleLinesFor(project) {
+  const universeId = project.concept?.universeId;
+  if (!universeId) return [];
+  try {
+    const { resolveUniverseStyleSource } = await import('../creativeStyleSources.js');
+    const universe = await resolveUniverseStyleSource(universeId, { imageSlots: 0 });
+    return universe ? universeStyleLines(universe) : [];
+  } catch (err) {
+    console.warn(`⚠️ Music-video code style source skipped: ${err.message}`);
+    return [];
+  }
+}
+
+// A shot with no time window counts as overlapping every section.
+const overlapsAny = (shot, sections) => !Number.isFinite(shot.startSec) || !Number.isFinite(shot.endSec)
+  || sections.some((section) => shot.startSec < section.endSec && shot.endSec > section.startSec);
+
+/**
+ * The approved procedural direction's definitions and rules, for a code-authoring request.
+ * `sceneIds` (with the batch's `sections`) scopes the guide's shot choreography to what a
+ * batch authors: every shot of a long storyboard otherwise rides in each section's prompt.
+ * A shot bound to a scene is kept when its scene is; a document shot (no `sceneId`) when its
+ * own time window overlaps a section, or when it has none.
+ */
+export const castAndSetsCodeContext = (project, { sceneIds = null, sections = [] } = {}) => {
+  const draft = project.productionReview?.draft;
+  const wanted = sceneIds ? new Set(sceneIds) : null;
+  const guide = draft && wanted && Array.isArray(draft.storyboard)
+    ? { ...draft, storyboard: draft.storyboard.filter((shot) => (shot.sceneId ? wanted.has(shot.sceneId) : overlapsAny(shot, sections))) }
+    : draft;
+  return [
+    productionFeedbackContext(project),
+    musicVideoCodeDirectionContext(approvedCastAndSetsDirection(project)),
+    guide && `HUMAN-REVIEWED VISUAL/MOTION GUIDE AND SHOT CHOREOGRAPHY:\n${JSON.stringify(guide)}`,
+  ].filter(Boolean).join('\n\n');
+};
+
+function acceptSources(parsed, ids) {
+  const wanted = new Set(ids);
+  const accepted = [];
+  for (const section of parsed) {
+    if (!wanted.has(section.id)) continue;
+    if (!isDeterministicCodeSource(section.source)) {
+      throw new ServerError(`Section ${section.id} used a non-deterministic or networked call`, { status: 422, code: 'NONDETERMINISTIC_SECTION' });
+    }
+    accepted.push({ id: section.id, source: section.source });
+  }
+  return accepted;
+}
+
+/**
+ * Run one code-authoring prompt. The provider resolves through llmRoute.js as
+ * the `authoring` stage — request pin > the brief's authoring-stage pin > its
+ * direction LLM (`automation`) > an eligible TUI provider > the active one —
+ * and `effort` rides the run when the provider has one. The route rides back on
+ * the result; it is not written to `automation.routes` here, because authoring
+ * runs inside production and the brief is part of production's creative basis.
+ */
+export async function runModel({ providerId, model, effort, automation = null, prompt, source = 'music-video-code', beforeSubmit = null }) {
+  const { assertProvider, runPromptThroughProvider } = await import('../promptRunner.js');
+  const { provider, selectedModel, route } = await resolveMusicVideoLlm({ providerId, model, effort, automation, stage: 'authoring' });
+  assertProvider(provider, { message: 'No AI provider available to write the code video', code: 'PROVIDER_UNAVAILABLE', status: 400 });
+  console.log(`🎬 Music-video code generation on ${musicVideoLlmRouteLabel(route)}`);
+  const { text } = await runPromptThroughProvider({
+    provider,
+    model: selectedModel || undefined,
+    ...effortArg(route),
+    prompt,
+    source,
+    cwd: PATHS.data,
+    ...(beforeSubmit ? { allowFallback: false, toolFree: true, beforeExecute: beforeSubmit } : {}),
+  });
+  return { text, providerId: provider.id, model: selectedModel || null, route };
+}
+
+function storeCodeVideo(project, { providerId, model, sections, timelineIds }) {
+  const allowed = new Set(timelineIds);
+  const previous = (project.composition?.codeVideo?.sections || []).filter((section) => allowed.has(section.id));
+  const merged = new Map(previous.map((section) => [section.id, section.source]));
+  for (const section of sections) merged.set(section.id, section.source);
+  const codeVideo = {
+    providerId,
+    model,
+    generatedAt: new Date().toISOString(),
+    sections: [...merged.entries()].map(([id, source]) => ({ id, source })),
+  };
+  return normalizeComposition({ ...(project.composition || {}), mode: 'code', codeVideo });
+}
+
+async function writeComposition(projectId, run, sections, timelineIds, authoringBasis) {
+  const { project } = await mutateProjectRecord(projectId, (current) => {
+    assertProductionApproval(current, 'storyboard');
+    if (productionReviewBasis(current).storyboard !== authoringBasis) throw new ServerError('The approved storyboard changed during authoring.', { status: 409, code: 'MUSIC_VIDEO_REVIEW_STALE' });
+    return { project: {
+      ...current,
+      composition: storeCodeVideo(current, { providerId: run.providerId, model: run.model, sections, timelineIds }),
+      updatedAt: new Date().toISOString(),
+    } };
+  });
+  return project;
+}
+
+/**
+ * Generate every section. Replaces stored functions for the sections the
+ * model returned; a section it omitted keeps its previous function.
+ */
+export async function generateMusicVideoCode(projectId, { providerId, model, effort } = {}) {
+  const project = await getProject(projectId);
+  if (!project) throw new ServerError('Project not found', { status: 404, code: 'NOT_FOUND' });
+  assertProductionApproval(project, 'storyboard');
+  const timeline = buildCodeTimeline(project);
+  if (!timeline.sections.length) {
+    throw new ServerError('Code-rendered video needs a song duration — analyze the track or time a scene or lyric line', { status: 422, code: 'NO_TIMELINE' });
+  }
+  const song = buildSongDocument(project, timeline);
+  const palette = paletteFromProject(project);
+  const prompt = buildMusicVideoCodePrompt({
+    title: project.name,
+    palette,
+    song,
+    styleLines: await styleLinesFor(project),
+    directionContext: castAndSetsCodeContext(project),
+  });
+  const run = await runModel({ providerId, model, effort, automation: project.automation, prompt, beforeSubmit: async () => {
+    const current = await getProject(projectId);
+    assertProductionApproval(current, 'storyboard');
+    if (productionReviewBasis(current).storyboard !== productionReviewBasis(project).storyboard) throw new ServerError('The approved storyboard changed before authoring.', { status: 409, code: 'MUSIC_VIDEO_REVIEW_STALE' });
+  } });
+  const parsed = extractCodeSections(run.text);
+  const sections = acceptSources(parsed, timeline.sections.map((section) => section.id));
+  if (!sections.length) {
+    throw new ServerError('The model did not return a section function', { status: 422, code: 'NO_SECTION_SOURCE' });
+  }
+  const updated = await writeComposition(projectId, run, sections, timeline.sections.map((section) => section.id), productionReviewBasis(project).storyboard);
+  console.log(`✅ Music-video code stored sections=${sections.length}`);
+  return { project: updated, providerId: run.providerId, model: run.model };
+}
+
+/** Replace one section function. Every other stored function stays. */
+export async function regenerateMusicVideoCodeSection(projectId, sectionId, { providerId, model, effort } = {}) {
+  const project = await getProject(projectId);
+  if (!project) throw new ServerError('Project not found', { status: 404, code: 'NOT_FOUND' });
+  assertProductionApproval(project, 'storyboard');
+  const timeline = buildCodeTimeline(project);
+  if (!timeline.sections.some((section) => section.id === sectionId)) {
+    throw new ServerError('That section is not on the code timeline', { status: 404, code: 'SECTION_NOT_FOUND' });
+  }
+  const song = buildSongDocument(project, timeline);
+  const prompt = buildMusicVideoCodePrompt({
+    title: project.name,
+    palette: paletteFromProject(project),
+    song,
+    styleLines: await styleLinesFor(project),
+    onlySectionId: sectionId,
+    directionContext: castAndSetsCodeContext(project),
+  });
+  const run = await runModel({ providerId, model, effort, automation: project.automation, prompt, beforeSubmit: async () => {
+    const current = await getProject(projectId);
+    assertProductionApproval(current, 'storyboard');
+    if (productionReviewBasis(current).storyboard !== productionReviewBasis(project).storyboard) throw new ServerError('The approved storyboard changed before authoring.', { status: 409, code: 'MUSIC_VIDEO_REVIEW_STALE' });
+  } });
+  const sections = acceptSources(extractCodeSections(run.text), [sectionId]);
+  if (!sections.length) {
+    throw new ServerError('The model did not return that section', { status: 422, code: 'NO_SECTION_SOURCE' });
+  }
+  const updated = await writeComposition(projectId, run, sections, timeline.sections.map((section) => section.id), productionReviewBasis(project).storyboard);
+  console.log(`✅ Music-video code replaced section=${sectionId}`);
+  return { project: updated, providerId: run.providerId, model: run.model, sectionId };
+}

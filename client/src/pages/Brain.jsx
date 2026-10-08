@@ -1,0 +1,173 @@
+import { useCallback, lazy, Suspense } from 'react';
+import { useParams, useNavigate } from 'react-router';
+import * as api from '../services/api';
+import {Brain as BrainIcon} from 'lucide-react';
+import PageSkeleton from '../components/ui/PageSkeleton';
+import PageHeader from '../components/PageHeader';
+import TabPills from '../components/ui/TabPills';
+import { useSocketResource } from '../hooks/useSocketResource';
+import { sameJsonShape } from '../lib/sameJsonShape';
+
+import { TABS, FULL_BLEED_TAB_IDS } from '../components/brain/constants';
+import { timeAgo } from '../utils/formatters';
+
+// Lazy-load tab bodies so opening one tab doesn't pull in all ten. BrainGraph in
+// particular drags in the three.js stack, so it must stay out of the eager set.
+const InboxTab = lazy(() => import('../components/brain/tabs/InboxTab'));
+const LinksTab = lazy(() => import('../components/brain/tabs/LinksTab'));
+const MemoryTab = lazy(() => import('../components/brain/tabs/MemoryTab'));
+const IdeasTab = lazy(() => import('../components/brain/tabs/IdeasTab'));
+const DigestTab = lazy(() => import('../components/brain/tabs/DigestTab'));
+const FeedsTab = lazy(() => import('../components/brain/tabs/FeedsTab'));
+const TrustTab = lazy(() => import('../components/brain/tabs/TrustTab'));
+const NotesTab = lazy(() => import('../components/brain/tabs/NotesTab'));
+const DailyLogTab = lazy(() => import('../components/brain/tabs/DailyLogTab'));
+const ConfigTab = lazy(() => import('../components/brain/tabs/ConfigTab'));
+const ImportTab = lazy(() => import('../components/brain/tabs/ImportTab'));
+const BrainGraph = lazy(() => import('../components/brain/tabs/BrainGraph'));
+const SpotifyTab = lazy(() => import('../components/brain/tabs/SpotifyTab'));
+const YoutubeTab = lazy(() => import('../components/brain/tabs/YoutubeTab'));
+const ThreadsTab = lazy(() => import('../components/brain/tabs/ThreadsTab'));
+
+const BRAIN_EVENTS = ['brain:changed'];
+
+export default function Brain() {
+  const { tab } = useParams();
+  const navigate = useNavigate();
+  const activeTab = tab || 'inbox';
+  // Full-bleed tabs own their internal scroll and fill height, so the shared
+  // wrapper must NOT add padding or a second scrollbar (issue #1177). The set
+  // is derived from the TABS registry so it can't drift from the tab list.
+  const fullBleed = FULL_BLEED_TAB_IDS.has(activeTab);
+
+  // Preserve the last good snapshot when a reconciliation read fails.
+  const fetchData = useCallback(async () => {
+    const [summary, settings] = await Promise.all([
+      api.getBrainSummary({ silent: true }),
+      api.getBrainSettings({ silent: true })
+    ]);
+    return { summary, settings };
+  }, []);
+
+  const { data, loading, refetch } = useSocketResource(fetchData, {
+    events: BRAIN_EVENTS,
+    compare: sameJsonShape,
+  });
+  const summary = data?.summary ?? null;
+  const settings = data?.settings ?? null;
+
+  const handleTabChange = (tabId) => {
+    navigate(`/brain/${tabId}`);
+  };
+
+  const renderTabContent = () => {
+    switch (activeTab) {
+      case 'inbox':
+        return <InboxTab onRefresh={refetch} settings={settings} />;
+      case 'threads':
+        return <ThreadsTab />;
+      case 'links':
+        return <LinksTab onRefresh={refetch} />;
+      case 'memory':
+        return <MemoryTab onRefresh={refetch} />;
+      case 'ideas':
+        return <IdeasTab onRefresh={refetch} />;
+      case 'notes':
+        return <NotesTab onRefresh={refetch} />;
+      case 'daily-log':
+        return <DailyLogTab />;
+      case 'graph':
+        return <BrainGraph />;
+      case 'digest':
+        return <DigestTab onRefresh={refetch} />;
+      case 'feeds':
+        return <FeedsTab onRefresh={refetch} />;
+      case 'trust':
+        return <TrustTab onRefresh={refetch} />;
+      case 'import':
+        return <ImportTab />;
+      case 'spotify':
+        return <SpotifyTab />;
+      case 'youtube':
+        return <YoutubeTab />;
+      case 'config':
+        return <ConfigTab onRefresh={refetch} />;
+      default:
+        return <InboxTab onRefresh={refetch} settings={settings} />;
+    }
+  };
+
+  if (loading && activeTab !== 'inbox') {
+    return (
+      <PageSkeleton
+        header="bar"
+        label="Loading brain"
+        fullHeight
+        // Full-bleed tabs render edge to edge; padding them shifts the body on load.
+        padded={!fullBleed}
+        titleWidthClass="w-28"
+        showSubtitle
+        tabs={TABS.length}
+        cards={3}
+        sidebar={false}
+      />
+    );
+  }
+
+  return (
+    <div className="flex flex-col h-full min-h-0">
+      <PageHeader
+        icon={BrainIcon}
+        title="Brain"
+        subtitle="Second brain for capturing and organizing thoughts"
+        actions={loading && !summary ? (
+          <span role="status" className="text-xs text-gray-500">Loading Brain summary</span>
+        ) : summary && (
+          // Quick stats — wrap on small screens; only "needs review" stays loud
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs sm:text-sm">
+            {summary.needsReview > 0 && (
+              <span className="px-2 py-0.5 rounded bg-port-warning/20 text-port-warning">
+                {summary.needsReview} needs review
+              </span>
+            )}
+            <span className="text-gray-500">
+              {summary.counts?.links || 0} links
+            </span>
+            <span className="text-gray-500">
+              {summary.counts?.projects || 0} projects
+            </span>
+            <span className="hidden sm:inline text-gray-500">
+              {summary.counts?.people || 0} people
+            </span>
+            {summary.lastDailyDigest && (
+              <span className="hidden md:inline text-gray-500">
+                Last digest: {timeAgo(summary.lastDailyDigest)}
+              </span>
+            )}
+          </div>
+        )}
+      />
+
+      <TabPills
+        tabs={TABS}
+        activeTab={activeTab}
+        onChange={handleTabChange}
+        mobileCompact
+        ariaLabel="Brain sections"
+      />
+
+      {/* Tab content — full-bleed tabs own their own scroll and fill height;
+          document-style tabs scroll inside a padded wrapper. */}
+      <div className={`flex-1 min-h-0 ${fullBleed ? 'overflow-hidden' : 'overflow-auto p-3 sm:p-4'}`}>
+        {/* The lazy tab chunk lands in a region the page has already sized, so
+            reserve that region's card stack rather than centering a spinner in
+            it (#4147). Mirror the wrapper: a document-style tab is padded by the
+            wrapper already, a full-bleed one isn't, so the skeleton pads itself
+            there instead of running its cards into the edges. */}
+        <Suspense fallback={<PageSkeleton header="none" label="Loading brain section" cards={3} sidebar={false} padded={fullBleed} />}>
+          {renderTabContent()}
+        </Suspense>
+      </div>
+    </div>
+  );
+}

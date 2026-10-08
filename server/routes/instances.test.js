@@ -1,0 +1,535 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import express from 'express';
+import { remoteRequestHandler } from '../lib/requestOrigin.js';
+import { verifySession } from '../services/auth.js';
+vi.mock('../services/auth.js', () => {
+  const verifySession = vi.fn().mockResolvedValue(true);
+  return {
+    extractToken: req => req.headers.authorization,
+    verifySession,
+    verifyRequestSession: async req => ((await verifySession(req.headers.authorization)) ? 'mock-session' : null),
+    isAuthEnabled: vi.fn().mockResolvedValue(false),
+  };
+});
+import { request } from '../lib/testHelper.js';
+import { errorMiddleware } from '../lib/errorHandler.js';
+
+// Heavy service deps are mocked so route validation stays cheap and does not
+// reach the live instance store.
+vi.mock('../services/syncOrchestrator.js', () => ({
+  getSyncStatus: vi.fn(),
+  syncWithPeer: vi.fn(),
+}));
+vi.mock('../services/instances.js', async (importOriginal) => ({
+  DEFAULT_SYNC_CATEGORIES: (await importOriginal()).DEFAULT_SYNC_CATEGORIES,
+  applyReciprocalSync: vi.fn(),
+  pairPeerSyncSecret: vi.fn(),
+  acceptPeerSyncSecretFromPeer: vi.fn(),
+  updatePeer: vi.fn(),
+  addPeer: vi.fn(),
+  sanitizePeerForClient: vi.fn((peer) => peer),
+  getAssignableInstances: vi.fn(),
+  getPeers: vi.fn(),
+  probePeer: vi.fn(),
+}));
+// This suite's routes/instances.js import pulls getSelf/updateSelf from the
+// identity leaf (#6836) — double it too so an untested route (e.g. GET /
+// self-view) can never fall through to a real data/instances.json read.
+vi.mock('../services/instanceIdentity.js', () => ({
+  getSelf: vi.fn(),
+  updateSelf: vi.fn(),
+}));
+vi.mock('../services/sharing/peerSync.js', () => ({
+  getFullSyncCoverageForPeer: vi.fn(),
+}));
+vi.mock('../services/certProvisioner.js', () => ({
+  provisionTailscaleCert: vi.fn(),
+}));
+vi.mock('../lib/tailscale.js', () => ({
+  getTailscaleStatus: vi.fn(),
+}));
+
+import { getFullSyncCoverageForPeer } from '../services/sharing/peerSync.js';
+import { getSyncStatus } from '../services/syncOrchestrator.js';
+import * as instances from '../services/instances.js';
+import { getTailscaleStatus } from '../lib/tailscale.js';
+vi.mock('../services/tailcatPeer.js', async (original) => ({
+  ...(await original()),
+  addPeerViaTailcat: vi.fn(),
+  listTailcatForwards: vi.fn(),
+  retryTailcatForward: vi.fn(),
+  forgetTailcatForward: vi.fn(),
+}));
+vi.mock('../services/tailcatServe.js', async (original) => ({
+  ...(await original()),
+  getTailcatServeStatus: vi.fn(),
+  ensureTailcatServe: vi.fn(),
+  retryTailcatServe: vi.fn(),
+  stopTailcatServe: vi.fn(),
+}));
+import {
+  addPeerViaTailcat,
+  listTailcatForwards,
+  retryTailcatForward,
+  forgetTailcatForward,
+} from '../services/tailcatPeer.js';
+import {
+  getTailcatServeStatus,
+  ensureTailcatServe,
+  retryTailcatServe,
+  stopTailcatServe,
+} from '../services/tailcatServe.js';
+import instancesRoutes from './instances.js';
+
+const buildApp = () => {
+  const app = express();
+  app.use(express.json());
+  app.use('/api/instances', instancesRoutes);
+  app.use(errorMiddleware);
+  return app;
+};
+
+describe('GET /api/instances/tailnet-suffix', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('returns the shared normalized MagicDNS snapshot used by setup guidance', async () => {
+    getTailscaleStatus.mockResolvedValue({
+      reason: 'running',
+      dnsName: 'host-alpha.example-tailnet.ts.net',
+      magicDnsSuffix: 'example-tailnet.ts.net',
+      peers: [{
+        dnsName: 'host-beta.example-tailnet.ts.net',
+        hostName: 'host-beta',
+        ips: ['100.64.0.50'],
+      }],
+    });
+
+    const res = await request(buildApp()).get('/api/instances/tailnet-suffix');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      reason: 'running',
+      self: 'host-alpha.example-tailnet.ts.net',
+      suffix: 'example-tailnet.ts.net',
+      peers: [{
+        dnsName: 'host-beta.example-tailnet.ts.net',
+        hostName: 'host-beta',
+        ips: ['100.64.0.50'],
+      }],
+    });
+  });
+});
+
+// #4520: the CoS task form's instance picker reads this. It is deliberately
+// narrower than GET /api/instances — no addresses, no sync state, no peer that
+// has yet to advertise a federation identity.
+describe('GET /api/instances/assignable', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('returns the assignable id/name pairs the picker renders', async () => {
+    const assignable = [
+      { instanceId: 'self-id', name: 'workstation', isSelf: true },
+      { instanceId: 'peer-id', name: 'render-box', isSelf: false }
+    ];
+    instances.getAssignableInstances.mockResolvedValue(assignable);
+    const res = await request(buildApp()).get('/api/instances/assignable');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ instances: assignable });
+  });
+
+  it('is not shadowed by the peer routes — a real handler answers it', async () => {
+    instances.getAssignableInstances.mockResolvedValue([]);
+    const res = await request(buildApp()).get('/api/instances/assignable');
+    expect(res.status).toBe(200);
+    expect(instances.getAssignableInstances).toHaveBeenCalled();
+  });
+});
+
+describe('GET /api/instances/sync-status — forPeer scoping', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    getSyncStatus.mockResolvedValue({ local: { brainSeq: 0, memorySeq: 0, checksums: {} } });
+  });
+
+  it('threads a canonical GUID forPeer through to getSyncStatus', async () => {
+    const id = '191aaece-a492-41ee-a66d-d4661eadc132';
+    const res = await request(buildApp()).get(`/api/instances/sync-status?forPeer=${id}`);
+    expect(res.status).toBe(200);
+    expect(getSyncStatus).toHaveBeenCalledWith({ includeChecksums: true, forPeer: id });
+  });
+
+  it('accepts a non-GUID forPeer (older PortOS / `unknown` sentinel) instead of throwing a 500', async () => {
+    // Regression: an older PortOS or a prober carrying the `unknown` instance-id
+    // sentinel hits us with a non-GUID value. The route must degrade
+    // gracefully, not throw a ServerError on every probe cycle.
+    const res = await request(buildApp()).get('/api/instances/sync-status?forPeer=unknown');
+    expect(res.status).toBe(200);
+    expect(getSyncStatus).toHaveBeenCalledWith({ includeChecksums: true, forPeer: 'unknown' });
+  });
+
+  it('accepts a bare empty ?forPeer= (the value z.string().guid() used to 500 on) → undefined', async () => {
+    const res = await request(buildApp()).get('/api/instances/sync-status?forPeer=');
+    expect(res.status).toBe(200);
+    expect(getSyncStatus).toHaveBeenCalledWith({ includeChecksums: true, forPeer: undefined });
+  });
+
+  it('trims whitespace and caps an oversized forPeer at 128 chars', async () => {
+    const long = 'x'.repeat(200);
+    const res = await request(buildApp()).get(`/api/instances/sync-status?forPeer=%20${long}%20`);
+    expect(res.status).toBe(200);
+    expect(getSyncStatus).toHaveBeenCalledWith({ includeChecksums: true, forPeer: 'x'.repeat(128) });
+  });
+
+  it('drops a blank/whitespace-only forPeer to undefined (unscoped self-view)', async () => {
+    const res = await request(buildApp()).get('/api/instances/sync-status?forPeer=%20%20');
+    expect(res.status).toBe(200);
+    expect(getSyncStatus).toHaveBeenCalledWith({ includeChecksums: true, forPeer: undefined });
+  });
+
+  it('drops a repeated forPeer (array) to undefined so only a scalar id scopes', async () => {
+    const res = await request(buildApp()).get('/api/instances/sync-status?forPeer=a&forPeer=b');
+    expect(res.status).toBe(200);
+    expect(getSyncStatus).toHaveBeenCalledWith({ includeChecksums: true, forPeer: undefined });
+  });
+
+  it('omits forPeer entirely (legacy inbound-only shape) → undefined', async () => {
+    const res = await request(buildApp()).get('/api/instances/sync-status');
+    expect(res.status).toBe(200);
+    expect(getSyncStatus).toHaveBeenCalledWith({ includeChecksums: true, forPeer: undefined });
+  });
+
+  it('surfaces cursorForYou only when getSyncStatus returns one', async () => {
+    getSyncStatus.mockResolvedValue({
+      local: { brainSeq: 3, memorySeq: 5, checksums: { universe: 'abc' } },
+      cursorForYou: 42,
+    });
+    const res = await request(buildApp()).get('/api/instances/sync-status?forPeer=peer-1');
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ brainSeq: 3, memorySeq: 5, cursorForYou: 42 });
+  });
+});
+
+describe('sync-category route validation', () => {
+  const instanceId = '191aaece-a492-41ee-a66d-d4661eadc132';
+  const categories = Object.fromEntries(
+    Object.keys(instances.DEFAULT_SYNC_CATEGORIES).map((key, index) => [key, index % 2 === 0])
+  );
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    instances.updatePeer.mockImplementation(async (id, updates) => ({ id, ...updates }));
+    instances.applyReciprocalSync.mockResolvedValue({ changed: false });
+  });
+
+  it('preserves every service category and strips unknown keys on peer updates', async () => {
+    const res = await request(buildApp()).put('/api/instances/peers/peer-1')
+      .send({ syncCategories: { ...categories, unknownCategory: true } });
+    expect(res.status).toBe(200);
+    expect(instances.updatePeer).toHaveBeenCalledWith('peer-1', { syncCategories: categories });
+  });
+
+  it('allows peer updates that omit syncCategories', async () => {
+    const res = await request(buildApp()).put('/api/instances/peers/peer-1')
+      .send({ name: 'Example peer' });
+    expect(res.status).toBe(200);
+    expect(instances.updatePeer).toHaveBeenCalledWith('peer-1', { name: 'Example peer' });
+  });
+
+  it('rejects nonboolean known values before updating a peer', async () => {
+    const key = Object.keys(categories)[0];
+    const res = await request(buildApp()).put('/api/instances/peers/peer-1')
+      .send({ syncCategories: { [key]: 'true' } });
+    expect(res.status).toBe(400);
+    expect(instances.updatePeer).not.toHaveBeenCalled();
+  });
+
+  it('preserves the category map through reciprocal validation', async () => {
+    const res = await request(buildApp()).post('/api/instances/peers/sync-categories')
+      .send({ instanceId, syncCategories: { ...categories, unknownCategory: true } });
+    expect(res.status).toBe(200);
+    expect(instances.applyReciprocalSync).toHaveBeenCalledWith(instanceId, categories, { fullSync: undefined });
+  });
+
+  it('requires the reciprocal category field but accepts an empty map', async () => {
+    const app = buildApp();
+    const missing = await request(app).post('/api/instances/peers/sync-categories')
+      .send({ instanceId });
+    expect(missing.status).toBe(400);
+    expect(instances.applyReciprocalSync).not.toHaveBeenCalled();
+
+    const empty = await request(app).post('/api/instances/peers/sync-categories')
+      .send({ instanceId, syncCategories: {} });
+    expect(empty.status).toBe(200);
+    expect(empty.body).toEqual({ applied: false });
+    expect(instances.applyReciprocalSync).toHaveBeenCalledWith(instanceId, {}, { fullSync: undefined });
+  });
+});
+
+describe('PUT /api/instances/peers/:id — media provider selection', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    instances.updatePeer.mockImplementation(async (id, updates) => ({ id, ...updates }));
+  });
+
+  it('validates and preserves mixed-version fields in the consumer allowlist', async () => {
+    const mediaProvider = {
+      enabled: true,
+      futureField: 'keep',
+      audioModels: [{
+        engine: 'minimax-music3',
+        modelId: 'minimax-music3',
+        futureModelField: 'keep-too',
+      }],
+    };
+
+    const res = await request(buildApp())
+      .put('/api/instances/peers/peer-example')
+      .send({ mediaProvider });
+
+    expect(res.status).toBe(200);
+    expect(instances.updatePeer).toHaveBeenCalledWith('peer-example', { mediaProvider });
+    expect(res.body.mediaProvider).toEqual(mediaProvider);
+  });
+
+  it('rejects duplicate engine/model pairs before mutating the peer record', async () => {
+    const model = { engine: 'minimax-music3', modelId: 'minimax-music3' };
+    const res = await request(buildApp())
+      .put('/api/instances/peers/peer-example')
+      .send({ mediaProvider: { enabled: true, audioModels: [model, model] } });
+
+    expect(res.status).toBe(400);
+    expect(instances.updatePeer).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /api/instances/peers/tailcat', () => {
+  const tcAddress = 'tcEXAMPLE' + 'A'.repeat(40);
+  beforeEach(() => vi.clearAllMocks());
+
+  it('passes the selected HTTPS protocol and credentials through the managed transport', async () => {
+    const peer = { id: 'peer-example', transport: 'tailcat', address: '127.0.0.1', port: 15555, protocol: 'https' };
+    addPeerViaTailcat.mockResolvedValue(peer);
+    const auth = { password: 'example-password' };
+    const res = await request(buildApp()).post('/api/instances/peers/tailcat')
+      .send({ tcAddress: ` ${tcAddress} `, protocol: 'https', auth });
+    expect(res.status).toBe(201);
+    expect(addPeerViaTailcat).toHaveBeenCalledWith({ tcAddress, protocol: 'https', auth, remotePort: 5565 });
+    expect(instances.sanitizePeerForClient).toHaveBeenCalledWith(peer);
+    expect(res.body).toEqual(peer);
+  });
+
+  it('rejects invalid addresses and protocols without starting a transport', async () => {
+    for (const body of [{ tcAddress: 'invalid' }, { tcAddress, protocol: 'file' }]) {
+      const res = await request(buildApp()).post('/api/instances/peers/tailcat').send(body);
+      expect(res.status).toBe(400);
+    }
+    expect(addPeerViaTailcat).not.toHaveBeenCalled();
+  });
+
+  it('keeps the classic loopback guard in force', async () => {
+    const res = await request(buildApp()).post('/api/instances/peers')
+      .send({ address: '127.0.0.1', port: 15555, transport: 'tailcat' });
+    expect(res.status).toBe(400);
+    expect(instances.addPeer).not.toHaveBeenCalled();
+    expect(addPeerViaTailcat).not.toHaveBeenCalled();
+  });
+});
+
+describe('saved tailcat forward routes', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('lists saved forwards ahead of the /peers/:id patterns', async () => {
+    const rows = [{ id: 'fwd_1', tcAddress: 'tcEX…wxyz', status: 'failed', lastError: 'startup timed out' }];
+    listTailcatForwards.mockResolvedValue(rows);
+    const res = await request(buildApp()).get('/api/instances/peers/tailcat/forwards');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ forwards: rows });
+  });
+
+  it('probes a repaired forward immediately instead of returning stale offline backoff', async () => {
+    const peer = { id: 'peer-example', transport: 'tailcat', address: '127.0.0.1', port: 15556 };
+    retryTailcatForward.mockResolvedValue(peer);
+    const recovered = { ...peer, status: 'online', consecutiveFailures: 0, nextProbeAt: null };
+    instances.probePeer.mockResolvedValue(recovered);
+    const res = await request(buildApp()).post('/api/instances/peers/tailcat/forwards/fwd_1/retry');
+    expect(res.status).toBe(200);
+    expect(retryTailcatForward).toHaveBeenCalledWith('fwd_1', {});
+    expect(instances.probePeer).toHaveBeenCalledWith(peer);
+    expect(instances.sanitizePeerForClient).toHaveBeenCalledWith(recovered);
+    expect(res.body).toEqual(recovered);
+  });
+
+  it('keeps a reachable but unpaired peer distinct from a recovered peer', async () => {
+    const peer = { id: 'peer-example', transport: 'tailcat', port: 15555 };
+    retryTailcatForward.mockResolvedValue(peer);
+    instances.probePeer.mockResolvedValue({ ...peer, status: 'offline', authRequired: true });
+    const res = await request(buildApp()).post('/api/instances/peers/tailcat/forwards/fwd_1/retry');
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ authRequired: true, status: 'offline' });
+  });
+
+  it('validates replacement capabilities before restarting a saved forward', async () => {
+    const tcAddress = 'tcEXAMPLE' + 'A'.repeat(40);
+    const peer = { id: 'peer-example', port: 15555 };
+    retryTailcatForward.mockResolvedValue(peer);
+    instances.probePeer.mockResolvedValue(peer);
+    const ok = await request(buildApp()).post('/api/instances/peers/tailcat/forwards/fwd_1/retry').send({ tcAddress });
+    expect(ok.status).toBe(200);
+    expect(retryTailcatForward).toHaveBeenCalledWith('fwd_1', { tcAddress });
+    retryTailcatForward.mockClear();
+    const bad = await request(buildApp()).post('/api/instances/peers/tailcat/forwards/fwd_1/retry').send({ tcAddress: 'x'.repeat(30) });
+    expect(bad.status).toBe(400);
+    expect(retryTailcatForward).not.toHaveBeenCalled();
+  });
+
+  it('forgets a saved forward', async () => {
+    forgetTailcatForward.mockResolvedValue({ id: 'fwd_1', peerId: 'peer-example' });
+    const res = await request(buildApp()).delete('/api/instances/peers/tailcat/forwards/fwd_1');
+    expect(res.status).toBe(200);
+    expect(forgetTailcatForward).toHaveBeenCalledWith('fwd_1');
+    expect(res.body).toEqual({ id: 'fwd_1', peerId: 'peer-example' });
+  });
+});
+
+
+describe('tailcat serve routes', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('returns serve status including a copyable address shape', async () => {
+    const status = {
+      enabled: true,
+      status: 'active',
+      live: true,
+      localPort: 5555,
+      keyName: 'portos-api',
+      tcAddress: 'tcEXAMPLE' + 'A'.repeat(40),
+      tcAddressRedacted: 'tcEX…AAAA',
+      hasAddress: true,
+      lastError: null,
+      lastErrorAt: null,
+    };
+    getTailcatServeStatus.mockResolvedValue(status);
+    const res = await request(buildApp()).get('/api/instances/peers/tailcat/serve');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(status);
+  });
+
+  it('starts serve via POST', async () => {
+    const status = { enabled: true, live: true, status: 'active', localPort: 5555, keyName: 'portos-api', hasAddress: true };
+    ensureTailcatServe.mockResolvedValue(status);
+    const res = await request(buildApp()).post('/api/instances/peers/tailcat/serve').send({});
+    expect(res.status).toBe(200);
+    expect(ensureTailcatServe).toHaveBeenCalled();
+    expect(res.body).toEqual(status);
+  });
+
+  it('retries and stops serve', async () => {
+    retryTailcatServe.mockResolvedValue({ enabled: true, live: true, status: 'active' });
+    stopTailcatServe.mockResolvedValue({ enabled: false, live: false, status: 'stopped' });
+    const retry = await request(buildApp()).post('/api/instances/peers/tailcat/serve/retry');
+    expect(retry.status).toBe(200);
+    expect(retryTailcatServe).toHaveBeenCalled();
+    const stop = await request(buildApp()).delete('/api/instances/peers/tailcat/serve');
+    expect(stop.status).toBe(200);
+    expect(stopTailcatServe).toHaveBeenCalledWith({ disable: true });
+  });
+});
+
+it('rejects main API and HTTP mirror ports for managed serving', async () => {
+  for (const localPort of [5555, 5553]) {
+    const response = await request(buildApp()).post('/api/instances/peers/tailcat/serve').send({ localPort });
+    expect(response.status).toBe(400);
+  }
+});
+
+describe('GET /api/instances/peers/:id/full-sync-coverage', () => {
+  it('preserves unavailable coverage and partial counts on the local endpoint', async () => {
+    instances.getPeers.mockResolvedValue([{ id: 'peer-1', instanceId: 'remote-1' }]);
+    const coverage = {
+      total: 2, confirmed: 2, pending: 0, fullyMirrored: false,
+      available: false, partial: true,
+      failedReads: [{ kind: 'universe', operation: 'records' }],
+      byKind: { universe: { total: 0, confirmed: 0, pending: 0, partial: true } },
+    };
+    getFullSyncCoverageForPeer.mockResolvedValue(coverage);
+    const res = await request(buildApp()).get('/api/instances/peers/peer-1/full-sync-coverage');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(coverage);
+    expect(getFullSyncCoverageForPeer).toHaveBeenCalledWith('remote-1');
+  });
+});
+
+
+describe('local peer admission configuration', () => {
+  beforeEach(() => { vi.clearAllMocks(); vi.mocked(verifySession).mockResolvedValue(false); });
+  it('starts automatic pairing from an authenticated local session', async () => {
+    vi.mocked(verifySession).mockResolvedValue(true);
+    instances.pairPeerSyncSecret.mockResolvedValue({ id: 'peer-a', hasSyncSecret: true });
+    const res = await request(buildApp()).post('/api/instances/peers/peer-a/pair-secret');
+    expect(res.status).toBe(200);
+    expect(instances.pairPeerSyncSecret).toHaveBeenCalledWith('peer-a');
+  });
+
+  it('accepts the one-time bootstrap only from Basic auth and a registered peer identity', async () => {
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.portosAuthContext = { enabled: true, authenticated: true, method: 'basic' };
+      next();
+    });
+    app.use('/api/instances', instancesRoutes);
+    app.use(errorMiddleware);
+    const instanceId = '191aaece-a492-41ee-a66d-d4661eadc132';
+    instances.acceptPeerSyncSecretFromPeer.mockResolvedValue({ id: 'peer-a' });
+    const res = await request(remoteRequestHandler(app)).post('/api/instances/peers/pair-secret')
+      .set('X-PortOS-Instance-Id', instanceId)
+      .send({ syncSecret: 'synthetic-pair-secret-32-characters-long' });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ paired: true });
+    expect(instances.acceptPeerSyncSecretFromPeer).toHaveBeenCalledWith(instanceId, 'synthetic-pair-secret-32-characters-long');
+  });
+
+  it('does not let a scoped peer credential use the setup endpoint', async () => {
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.portosAuthContext = { enabled: true, authenticated: true, method: 'peer' };
+      next();
+    });
+    app.use('/api/instances', instancesRoutes);
+    app.use(errorMiddleware);
+    const res = await request(remoteRequestHandler(app)).post('/api/instances/peers/pair-secret')
+      .set('X-PortOS-Instance-Id', '191aaece-a492-41ee-a66d-d4661eadc132')
+      .send({ syncSecret: 'synthetic-pair-secret-32-characters-long' });
+    expect(res.status).toBe(403);
+    expect(instances.acceptPeerSyncSecretFromPeer).not.toHaveBeenCalled();
+  });
+
+  it('rejects an anonymous remote transport even when it forwards localhost headers', async () => {
+    const res = await request(remoteRequestHandler(buildApp())).put('/api/instances/peers/peer-a')
+      .set('Host', 'localhost').set('Origin', 'http://localhost').set('X-Forwarded-For', '127.0.0.1')
+      .send({ syncSecret: 'synthetic-pair-secret-32-characters-long' });
+    expect(res.status).toBe(403);
+    expect(instances.updatePeer).not.toHaveBeenCalled();
+  });
+  it('rejects apparent loopback access without an operator session', async () => {
+    const res = await request(buildApp()).put('/api/instances/peers/peer-a')
+      .send({ syncSecret: 'synthetic-pair-secret-32-characters-long' });
+    expect(res.status).toBe(403);
+    expect(instances.updatePeer).not.toHaveBeenCalled();
+  });
+  it('refuses anonymous reciprocal admission of discovery peers', async () => {
+    const res = await request(remoteRequestHandler(buildApp())).post('/api/instances/peers/sync-categories')
+      .send({ instanceId: '191aaece-a492-41ee-a66d-d4661eadc132', syncCategories: { universe: true }, fullSync: true });
+    expect(res.status).toBe(403);
+    expect(instances.applyReciprocalSync).not.toHaveBeenCalled();
+  });
+  it('allows an authenticated operator to configure the secret remotely', async () => {
+    vi.mocked(verifySession).mockResolvedValue(true);
+    instances.updatePeer.mockResolvedValue({ id: 'peer-a', hasSyncSecret: true });
+    const res = await request(remoteRequestHandler(buildApp())).put('/api/instances/peers/peer-a')
+      .set('Authorization', 'Bearer synthetic-operator-token')
+      .send({ syncSecret: 'synthetic-pair-secret-32-characters-long' });
+    expect(res.status).toBe(200);
+    expect(instances.updatePeer).toHaveBeenCalledWith('peer-a', { syncSecret: 'synthetic-pair-secret-32-characters-long' });
+  });
+});

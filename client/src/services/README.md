@@ -1,0 +1,163 @@
+# client/src/services/ — HTTP, sockets, and browser-facing clients
+
+API wrappers, Socket.IO client, and browser-facing clients (voice, DOM, UI dispatch).
+**Before adding a new HTTP call inline, grep this catalog first** — almost every backend
+domain already has a service file.
+
+`api.js` is a barrel that re-exports everything from the `apiX.js` files; callers can
+either `import * as api from '.../services/api'` or `import { specificFn } from '.../services/apiX'`.
+
+This directory has no `index.js` barrel because every file already follows the `apiX.js`
+naming convention, and `api.js` already aggregates them. When you add a new `apiX.js`,
+add it to `api.js` and add a row here. `index.test.js` fails if either side drifts
+(or if a non-api helper is added without a README row).
+
+## Discovery rule
+
+```
+grep -i "what you want to do" client/src/services/README.md
+```
+
+The `request()` helper in `apiCore.js` toasts errors by default. Pass `{ silent: true }`
+when the caller owns its own error UI (custom catch + toast, or `useAsyncAction` which
+toasts on throw). **Custom catch ⇒ `silent: true`** — otherwise toasts fire twice.
+
+---
+
+## Core / infrastructure
+
+| File | Purpose |
+|---|---|
+| `api.js` | Barrel — re-exports every `apiX.js`. |
+| `apiCore.js` | `request()` and `uploadBody()` (stream File/Blob multipart; legacy base64 JSON) + stable PortOS-app id. Shared error / toast handling. |
+| `apiBatch.js` | `fetchByIds(path, ids, options)` — batch-fetch records through a list route's `?ids=a,b,c` filter (dedupe, empty-list short-circuit, `{ items }` envelope unwrap). |
+| `socket.js` | Singleton Socket.IO client over relative path (Tailscale-friendly). |
+| `appUrls.js` | Compute candidate launch URLs for an app from page context. |
+
+## App lifecycle / system
+
+| File | Purpose |
+|---|---|
+| `apiApps.js` | App CRUD + PM2 ops (start/stop/restart) + local open actions (editor, folder, Xcode) + `getAppIssues` (open GitHub/GitLab issues for the Issues tab). |
+| `apiWorkspaceContexts.js` | Per-project working-context save/restore (branch, shells, tasks). |
+| `apiAccounts.js` | Platform accounts. |
+| `apiAgents.js` | Running-agent process management, CoS run-event diagnostics, the CoS task schedule (intervals, on-demand triggers, manual maintenance runs via `getMaintenanceRuns`/`startMaintenanceRun`/`stopMaintenanceRun`), and persistent-mind conversation, lifecycle, context, runtime-telemetry calls, and versioned tool recipe library CRUD, validation, archive, and restore calls. |
+| `apiCommands.js` | CLI command dispatch. |
+| `apiDashboard.js` | Dashboard state. |
+| `apiDatabase.js` | Database introspection. |
+| `apiLocalLlm.js` | Local LLM backends (Ollama / LM Studio): status (incl. installed models), catalog, model install/delete, the managed Prompt Guard model-abuse classifier lifecycle, the jev entailment scorer lifecycle (status / install / cancel / score / unload / integration policies) plus its project-specific trained heads (list / train / adopt / discard, where adoption is gated server-side on beating both the stock zero-shot and the majority-class baseline), backend install (Homebrew/script), switch/migrate, playground test/compare, and measured per-model assessments (run + persisted results + intent ranking + the server-side "measure everything" sweep). Also the PM2-managed runtime servers (llama.cpp, MTPLX, Slotstream) and their checkpoint catalogs — `searchMtplxModels` / `pullMtplxModel` / `removeMtplxModel` and `downloadSlotstreamModel` / `cancelSlotstreamModelDownload`, so weights are managed in-app rather than from a terminal. |
+| `apiGit.js` | Git operations. |
+| `apiGithub.js` | GitHub repo metadata. |
+| `apiHistory.js` | Historical logs / runs. |
+| `apiLogs.js` | PM2 system logs: fetch a process's recent log tail (process list comes from `apiCommands.getProcessesList`). |
+| `apiPorts.js` | Port scan/detect wrappers (no current UI callers; module kept for the catalog). |
+| `apiHarnesses.js` | Coding-agent harness (CLI/TUI) inventory for Models → Harnesses: installed vs latest version, the providers riding on each, and the model-catalog refresh. Install/update/remove is an SSE stream driven by `RuntimeInstallModal`, not a call here. |
+| `apiModelComparison.js` | Read selectable inventory, the PortOS composite and merged shipped/researched model evidence. |
+| `apiModelPerformance.js` | Explicit model discovery and PortOS task benchmarks shown on Models → Performance. |
+| `apiProviders.js` | Explicit vision diagnostics (`getProviderVisionHealth`, `testProviderVision`, `runProviderVisionSuite`); AI provider configuration, plus provider-runtime (CLI) install readiness for the per-card Install buttons, and the Codex / ChatGPT-subscription account calls (`getCodexAccount`, `startCodexLogin`, `cancelCodexLogin`, `codexLogout`) — sign-in STATE only, never a token. `getProviderCatalog` (`GET /providers/catalog`, #7566) is the composition surface `useProviderCatalog` fetches; `createProviderPreset` (`POST /providers/presets`) is the compose popover's "Save as preset". The AI Providers page's three axes (#7567): `setProviderHarnessEnabled` (per-harness enablement; the read rides `getProviderCatalog`), `getProviderBootstraps` / `saveProviderBootstraps` (credential-bootstrap apps), and the service-instance calls (`getProviderServiceDefinitions`, `getProviderServices`, `createProviderService`, `updateProviderService`, `deleteProviderService`, `refreshProviderServiceCatalog`) — every response credential-free, and only the explicit catalog refresh contacts a provider. The dedicated-host calls are `getFleetLlmHost` / `getFleetLlmHostUsage` (who is using this machine's GPU right now, and what each caller has spent) / `stopFleetLlmHost` (close the queue, clear the enable marker, drop the Windows login task, remove the container) / `revealFleetLlmHostKey`, plus the peer-side `getFleetPeerHosts` and `revealFleetPeerHostKey`. |
+| `apiPrompts.js` | Prompt Manager: stage templates, variables, and job-skill templates (providers list reuses `apiProviders.getProviders`). |
+| `apiReferenceRepos.js` | Per-app reference-repo registry. |
+| `apiReview.js` | Review hub. |
+| `apiCodeReview.js` | Code Review Defaults (Review Loop reviewer chain + per-backend local-LLM model). |
+| `apiCatalog.js` | Creative catalog ingredients (list/create/update/delete + `listCatalogIngredientsByIds` / facets) and scrap ingest (create/extract/commit + url/file/voice/brain). |
+| `apiCatalogTypes.js` | User-defined catalog ingredient types (list active registry + create/update/delete user types). |
+| `apiRuns.js` | Agent run history. |
+| `apiScaffold.js` | App scaffolding templates. |
+| `apiSchedules.js` | Automation schedules. |
+| `apiQuotaBurn.js` | Quota Burn plan + live status, the job-type catalog its config form renders, and manual runs (`getQuotaBurn`/`getQuotaBurnCatalog`/`saveQuotaBurn`/`runQuotaBurn`), plus `rearmQuotaBurn` to put spent `run once` steps back into the rotation. |
+| `apiRapidReader.js` | Rapid Reader's optional author-hosted Accelerando loader and machine-local shelf API. |
+| `apiSystem.js` | System info (CPU/memory/ports/alerts/active processing (`getSystemActivity` for the bounded snapshot, `getGpuTelemetry` for visible-only GPU samples) and local hardware capabilities) + D&D-style character sheet getter, plus the usage cost report and explicit historical reconciliation (`getUsage`, `getClaudeCodeModelUsage` (per-model token totals for all local Claude Code use, from CLI transcripts), `getProviderUsage`, `getUsageBackfillStatus`/`startUsageBackfill`, `updateSubscriptionCosts` for the subscription-vs-API savings comparison, `getSubscriptions` / `updateSubscriptions` / `setSubscriptionEnabled` for the Subscriptions page's plan rows (PortOS-side enablement and plan-tier tracking only, never vendor billing), `updateUsageFleetBilling` to exclude an API-billed federated instance from Across Instances totals). Also `saveCredential` (write-only integration key save/clear) and `getCredentialInventory` (`GET /settings/credentials`) — presence and source of each PortOS credential, never a value. Also the Eidoverse world controls and its foundation ledger (`listEidoverseFoundations`, `recordEidoverseFoundation`, `packageEidoverseFoundationCandidate`, `promoteEidoverseFoundation`, `getEidoverseContributions`) — the last three answer 200 with a refusal verdict when a promote gate says no, so callers read `outcome` rather than catching. |
+| `apiAuth.js` | Optional login password — status, login, set/clear password, list/revoke sessions, and read-only password-risk status. |
+| `apiLoops.js` | Scheduled loops. |
+
+## Personal data / identity
+
+| File | Purpose |
+|---|---|
+| `apiBrainThreads.js` | Brain threads — the bullet journal's open loops (`/brain/threads`, Brain `threads` entity; a *thread* is a tracked topic, never a message thread): filtered list (`listThreads({ status, priority, tag, pinned, refKind, q })`), full record with `resolvedRefs` (`getThread`), create / defaults-free PUT / tombstone delete, per-ref attach/detach (`addThreadRef`, `removeThreadRef`), attach (`attachToThread`), and explicit assigned GitHub ingestion (`syncGithubThreads({ appId, pinned })`). |
+| `apiBrain.js` | Brain (second-brain) search + ingest + edit, plus the federation parity audit (`getBrainParityReports`, `runBrainParityCheck`). |
+| `apiMemory.js` | Memory CRUD. |
+| `apiNotes.js` | Notes vault. |
+| `apiDigitalTwin.js` | Digital twin status + summary. |
+| `apiModelPersonality.js` | LLM personality self-profile tests: run, history, delete, scorer settings. |
+| `apiGoals.js` | Identity / goals tracking. |
+| `apiHealth.js` | Apple Health. |
+| `apiMeatspace.js` | MeatSpace health, genome, POST, memory-practice, and atomic POST training-run APIs. |
+| `apiMortalLoom.js` | Mortality tracking. |
+| `apiMoodBoard.js` | Mood boards (inspiration canvas + items), `listMoodBoardNames()` for pickers, `composeMoodBoardPrompt()` which stores the board's composite style prompt. |
+| `apiTribe.js` | Tribe people (relationship rings + contacts), plus `getTribeDuplicateIdentifiers()` (`GET /tribe/duplicate-identifiers`): a non-blocking report of emails/phones shared by more than one person. |
+| `apiTimeline.js` | Human-activity timeline: `/timeline/day`. |
+| `apiCalendar.js` | Calendar events. |
+| `apiMessages.js` | Messages / notifications + iMessage manager (#2413). |
+| `apiStackerNews.js` | Stacker News account, territory, review-action, and safe analysis APIs. |
+| `apiX.js` | X account diagnostics, public post metrics, review-gated drafts, and manual browser handoffs. |
+| `apiContacts.js` | macOS Contacts sync + identity resolve + Tribe enrich (#2415). |
+| `apiSignal.js` | Signal Desktop ingestion status / setup-check / sync. |
+| `apiBeeper.js` | Beeper Desktop bridge: saved conversation scopes (list/create/update/delete); status card and live connectivity check (#30), the connect flow (#31) — OAuth start, paste-a-token, disconnect — the mirrored chat surface (#35): conversations, thread pages, rail networks, archive/low-priority — the durable send outbox (#36): create an entry, send it (with the first-contact confirmation), list a conversation's entries, clear the runaway breaker; write paths never retry — and the attachment byte mirror (#37): `beeperAttachmentUrl` (a relative `/api/...` src, so an `<img loading="lazy">` IS the fetch-on-view), `fetchBeeperAttachment` ("fetch anyway"), `setBeeperAttachmentKeep`, the backfill census + run, and the per-conversation mirror purge. |
+| `apiSpotify.js` | Spotify OAuth + listening-history and playlist-library sync. |
+| `apiYoutube.js` | YouTube watch-history scrape, playlist/video library sync, and setup check. |
+| `apiPersonalities.js` | Agent personality profiles. |
+
+## Media / creative
+
+| File | Purpose |
+|---|---|
+| `apiImageVideo.js` | Image-gen local backend extras; bounded image/mixed gallery pages, global facets and collection summaries, exact-reference `getGalleryImages`, one image's original-vs-cleaned variant set via `listImageVariants`, plus models, LoRAs, cancel and delete. |
+| `apiLoraTraining.js` | Character LoRA training — datasets (CRUD, upload, generate, slice, caption), training runs (start/list/cancel + status), character→LoRA link lookup. |
+| `apiMedia.js` | Screenshots + media assets. Also owns the multi-file upload orchestration — `processScreenshotUploads` / `processAttachmentUploads` — moved from `utils/fileUpload.js` since they perform network I/O, not pure transforms. `utils/fileUpload.js` keeps only the pure helpers/constants and no longer re-exports these. |
+| `apiMediaJobs.js` | Media generation job tracking + `refineMediaPrompt` / `promptFromMedia` (vision reverse-prompt). |
+| `apiDecks.js` | Decks (playing-card / tarot designer) — deck + card CRUD, sample-design style analysis, universe casting + prompt generation (plus its SSE progress URL), single/batch card renders. |
+| `apiCreativeDirector.js` | Creative Director (video production). |
+| `apiCreativeCommission.js` | Creative Commissions (Autonomous Creation Engine — standing recurring briefs). |
+| `apiFableLoom.js` | FableLoom branching narratives — loom/episode/scene-node/transition CRUD, deterministic graph validation, AI authoring lanes, and the bounded editorial/playthrough autopilot lifecycle. |
+| `apiGames.js` | Game studio records, managed-app binding, reusable sprite/music bindings, deterministic asset-bundle compilation/integrity preflight, and AI feedback history. |
+| `apiMusicVideo.js` | Music Video projects + scene board + audio analysis. |
+| `apiContinuousVideo.js` | Continuous-video episode generation: client-side-callable lint preview of a scene draft, queue-episode submit, and the SSE progress-events URL. |
+| `apiSprites.js` | Sprite Manager records, asset library, production-set import (#2895), reference workflow: create/generate/lock (#2896), directional walk and per-track generation/approval, animation-type definition CRUD (#3153), trim/postprocess, and per-run source-frame listing for the Loop Trimmer's re-derive (#2980), and animation render-provider readiness (#4876). |
+| `apiShell.js` | Shell sessions over HTTP: hand a photo (plus a message) to the agent TUI running in a session. Keystrokes/output stay on the `shell:*` socket protocol. |
+| `apiCodeAnimation.js` | Code Animation: host-contract options, LLM-written briefs from a universe, universe-styled prompt building, a persistent generation gallery, provider jobs, frame-exact export, portable package download, and opt-in Production project settings, immutable candidate/accepted source imports, brief handoff paged run history, and bounded production stage runs (start, cancel, resume). |
+| `apiThreejsModels.js` | Procedural Three.js model workspaces: gallery-image generation, refinement, source export, deletion, and the subject-family checklist options. |
+| `apiImageTo3d.js` | Image-to-3D (`/3d`): selectable targets (TRELLIS.2) with host availability/install status, and per-image model records — create/list/get/generate/delete + GLB asset URL, the full-resolution OBJ download URL, and the AR Quick Look USDZ upload/download pair. |
+| `apiPipeline.js` | Pipeline (issues + stages + canon; series names and index summaries). |
+| `apiUniverseBuilder.js` | Universe Builder (generate + edit + commit; names and index summaries). |
+| `apiAuthors.js` | Author personas (name, writing style, bio, headshot description/style). |
+| `apiArtists.js` | Music artist personas (name, genre, bio, musical style, portrait description/style). |
+| `apiAlbums.js` | Music albums (title, artist FK + name, description, genre, release year, cover art, ordered track ids). |
+| `apiTracks.js` | Music tracks (title, album/artist FKs, lyrics, prompt, gen metadata, audio-library pointer) + shared music-library list + audio upload/attach + saving drawn-waveform and code-engine takes. |
+| `apiVideoDownload.js` | Dev Tools video downloader (#1946): start/cancel a YouTube/x.com full-video download via yt-dlp (SSE progress), list + delete downloaded clips, plus `getYtDlpStatus`/`updateYtDlp` for the in-place yt-dlp update the page offers when a download fails on a stale binary. |
+| `apiMusic.js` | On-device music generation (MusicGen / AudioLDM2 / ACE-Step): list engines (+ readiness), the stepped designer's AI describe/lyrics steps, the drawn-waveform and Strudel-code engines' LLM calls, generate a track from a prompt/lyrics, and the SuperCollider runtime (status, setup, render, cancel). |
+| `apiWritersRoom.js` | Writers Room (folders + works + drafts, live continuation + render-preview reservation, scene-image attach). |
+| `apiSharing.js` | Share buckets + federation sync. |
+| `apiRounds.js` | Rounds workbench CRUD (a cappella round writing + arranging voice layers + learning tracking). |
+| `apiSongbook.js` | SongBook repertoire tracker (`/songbook` — Brain `songs` entity): song CRUD + stage PATCH, `practiceSong(id, quality)` (logs a 0..5-graded practice run; the server owns the SM-2 advance and the resulting `stage`/`practice`), URL import draft, and attachments (base64 upload, present-flag list, raw serve URL via `songAttachmentUrl`). |
+| `apiPeerSync.js` | Per-record federated sync subscriptions, integrity checks, and manual push/pull controls (including Universe, Pipeline, Media Collections, and FableLoom). |
+| `apiSyncReview.js` | Sync hygiene: duplicate-record detection + smart merge (universe/series) and the non-blocking edit-conflict journal (list/resolve). Surfaced in Sharing → Duplicates / Conflicts. |
+
+## Tools / integrations
+
+| File | Purpose |
+|---|---|
+| `apiAsk.js` | Ask page (chat-like). |
+| `apiGSD.js` | "Get Stuff Done" integration. |
+| `apiImporter.js` | Manuscript / chat importer. |
+| `apiStoryBuilder.js` | Unified Story Builder conductor (sessions, step lock/unlock, generate/refine, cross-machine sync toggle + reconcile). |
+| `apiOpenClaw.js` | File browser / picker backend. |
+| `apiPalette.js` | Command-palette manifest + action dispatch. |
+| `apiVoice.js` | Voice synthesis / processing. |
+| `apiPrivacy.js` | Privacy Center — encrypted PII Vault + Trusted Organizations registry (status, vault CRUD + reveal, org CRUD, org holdings replace-set) + Digital Twin social-account cross-link + household subjects (subject CRUD, consent audit, and a `subjectId` scope passed in each wrapper's trailing `options`). |
+
+## Browser-facing (DOM, voice, build) — not pure API wrappers
+
+| File | Purpose |
+|---|---|
+| `voiceProfileBenchmark.js` | Prepares fresh profile probes and measures render plus explicit playback-start time for one-use qualification receipts. |
+| `voiceClient.js` | Browser-side voice capture + playback (two modes). |
+| `browserLlm.js` | Client for Chrome's on-device "Gemini Nano" (Prompt API): dual-shape detection, availability enum, cached `promptNano()` with timeout. Tier 2 of the voice fast-resolution cascade. |
+| `voiceFastPath.js` | Voice fast-resolution cascade: trigger nav → on-device Nano → server LLM. Decides how each spoken/typed turn is resolved. |
+| `voiceVisibility.js` | Voice UI state manager. |
+| `uiInteract.js` | Execute voice `ui_click` / `ui_fill` / `ui_select` against live DOM. |
+| `domIndex.js` | DOM indexer for voice accessibility mode. |
+| `staleBuildToast.jsx` | Sticky toast shown when server's build id differs from client's. |
+| `apiRigging.js` | Character rigging. `getRiggingReadiness()` (`GET /rigging/readiness`): whether this install's Blender runtime is provisioned, the resolved interpreter, the module version, the install command when it is not, and the auto-skin threshold defaults. `rigImageTo3dModel(id, body)` (`POST /rigging/models/:id`): auto-skin a rendered mesh behind the measured weight-coverage gate, resolving with the updated model record. `listRiggingClips()` (`GET /rigging/clips`): the locally-held animation clip library plus CoS-state coverage. `retargetImageTo3dModel(id, body)` (`POST /rigging/models/:id/retarget`): apply a clip to a published rig in `diagnostic` (measure only) or `write` mode, resolving with the updated model record. |
+| `apiAvatar.js` | Avatar surfaces. `getRiggedAvatars()` (`GET /avatar/rigged`): the install's verified animated records, each with its `?variant=` spelling, serving URL, retargeted clip name, and server-computed CoS-state coverage. |
+

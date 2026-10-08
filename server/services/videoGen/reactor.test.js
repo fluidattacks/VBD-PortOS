@@ -1,0 +1,407 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { EventEmitter, once } from 'events';
+import { mkdir, readFile, rm, stat, writeFile } from 'fs/promises';
+import { join } from 'path';
+import { tmpdir } from 'os';
+
+const root = join(tmpdir(), `reactor-test-${process.pid}`);
+const mocks = vi.hoisted(() => ({ spawn: vi.fn(), finalize: vi.fn(), settings: vi.fn(), samples: vi.fn(), runtime: vi.fn(), optimize: vi.fn(), thumbnail: vi.fn(), history: vi.fn(), rm: vi.fn() }));
+vi.mock('../../lib/childProcess.js', async (importOriginal) => ({ ...await importOriginal(), spawn: mocks.spawn }));
+vi.mock('./reactorRuntime.js', () => ({ ensureReactorRuntime: mocks.runtime }));
+vi.mock('../../lib/ffmpeg.js', () => ({ extractEvaluationFrames: mocks.samples, optimizeForStreaming: mocks.optimize, generateThumbnail: mocks.thumbnail }));
+vi.mock('./history.js', () => ({ mutateVideoHistory: mocks.history }));
+// Partial: only the finalize is stubbed. emitCloudRenderStatus is real, so the
+// status/phase frames the Video Gen page reads stay covered by these tests.
+vi.mock('./generateVideoHelpers.js', async (importOriginal) => ({
+  ...(await importOriginal()),
+  finalizeGeneratedVideo: mocks.finalize,
+}));
+vi.mock('../settings.js', () => ({ getSettings: mocks.settings }));
+vi.mock('../../lib/fileUtils.js', async () => {
+  const actual = await vi.importActual('../../lib/fileUtils.js');
+  return { ...actual, PATHS: { ...actual.PATHS, videos: join(root, 'videos'), videoThumbnails: root, data: root }, ensureDir: (dir) => mkdir(dir, { recursive: true }) };
+});
+// fs/promises: real by default; mocks.rm allows a test to intercept rm without
+// affecting mkdir/writeFile/stat/readFile which are used directly in tests.
+vi.mock('fs/promises', async (importOriginal) => {
+  const actual = await importOriginal();
+  return { ...actual, rm: (...args) => mocks.rm(...args) };
+});
+const reactor = await import('./reactor.js');
+const { videoGenEvents } = await import('./events.js');
+const settings = { videoGen: { reactor: { apiKey: 'example-key' } } };
+let child;
+let input;
+beforeEach(async () => {
+  vi.clearAllMocks();
+  // Default rm to the real implementation so existing tests use real FS operations.
+  const { rm: realRm } = await vi.importActual('fs/promises');
+  mocks.rm.mockImplementation(realRm);
+  await mkdir(root, { recursive: true });
+  await writeFile(join(root, 'python'), 'placeholder');
+  vi.stubEnv('REACTOR_PYTHON_PATH', join(root, 'python'));
+  vi.stubEnv('REACTOR_API_KEY', '');
+  mocks.runtime.mockResolvedValue(join(root, 'python'));
+  mocks.settings.mockResolvedValue(settings);
+  mocks.samples.mockResolvedValue([]);
+  vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, json: async () => ({ jwt: 'example-jwt' }) })));
+  mocks.spawn.mockImplementation(() => {
+    child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.stdin = new EventEmitter();
+    child.stdin.end = vi.fn((body) => { input = JSON.parse(body); });
+    child.kill = vi.fn(() => { queueMicrotask(() => child.emit('close', null)); });
+    return child;
+  });
+});
+afterEach(async () => {
+  reactor.cancelAll();
+  vi.useRealTimers();
+  vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
+  videoGenEvents.removeAllListeners();
+  await rm(root, { recursive: true, force: true });
+});
+const started = async (options = {}) => {
+  const result = await reactor.generateVideo({ prompt: 'A camera holds on a quiet gate.', seconds: 6, ...options });
+  await vi.waitFor(() => expect(mocks.spawn).toHaveBeenCalled());
+  return result;
+};
+
+describe('Reactor SDK adapter', () => {
+  it('mints the official scoped token, pipes it privately, and finalizes only a captured file', async () => {
+    const job = await started({ sourceImagePath: '/example/first-frame.png', seed: 42 });
+    expect(fetch).toHaveBeenCalledWith('https://api.reactor.inc/tokens', expect.objectContaining({ headers: { 'Reactor-API-Key': 'example-key', 'Content-Type': 'application/json' }, body: JSON.stringify({ authorization_details: [{ type: 'session', resources: { models: { match: ['reactor/fast-h3'] } }, constraints: { max_sessions: 1 } }] }) }));
+    expect(input).toMatchObject({ jwt: 'example-jwt', seconds: 6, seed: 42, sourceImagePath: '/example/first-frame.png' });
+    expect(JSON.stringify(mocks.spawn.mock.calls)).not.toContain('example-jwt');
+    await writeFile(input.outputPath, 'example-video');
+    child.stdout.emit('data', Buffer.from('{"type":"complete","clipId":"clip-example","seconds":6}\n'));
+    expect(mocks.finalize).not.toHaveBeenCalled();
+    child.emit('close', 0);
+    await vi.waitFor(() => expect(mocks.finalize).toHaveBeenCalledWith(expect.objectContaining({ jobId: job.jobId, meta: expect.objectContaining({ clipId: 'clip-example', seconds: 6 }) })));
+  });
+
+  it.each(['optimize', 'thumbnail', 'history'])('refuses late cancellation during %s and retains the published video', async (stage) => {
+    const { finalizeGeneratedVideo } = await vi.importActual('./generateVideoHelpers.js');
+    mocks.finalize.mockImplementationOnce(finalizeGeneratedVideo);
+    const records = [];
+    mocks.optimize.mockResolvedValue(undefined);
+    mocks.thumbnail.mockResolvedValue('example-thumb.jpg');
+    mocks.history.mockImplementation(async (mutate) => mutate(records));
+    let release;
+    const deferred = new Promise((resolve) => { release = resolve; });
+    const original = mocks[stage].getMockImplementation();
+    mocks[stage].mockImplementationOnce(async (...args) => { await deferred; return original(...args); });
+    const completed = vi.fn();
+    const failed = vi.fn();
+    videoGenEvents.on('completed', completed);
+    videoGenEvents.on('failed', failed);
+    const job = await started();
+    await writeFile(input.outputPath, 'example-video');
+    child.stdout.emit('data', Buffer.from('{"type":"complete","clipId":"clip-example","seconds":6}\n'));
+    child.emit('close', 0);
+    await vi.waitFor(() => expect(mocks[stage]).toHaveBeenCalledOnce());
+    expect(reactor.cancel(job.jobId)).toBe(false);
+    expect(reactor.getActiveJob()?.generationId).toBe(job.jobId);
+    release();
+    await vi.waitFor(() => expect(reactor.getActiveJob()).toBeNull());
+    expect(completed).toHaveBeenCalledOnce();
+    expect(failed).not.toHaveBeenCalled();
+    expect(records).toHaveLength(1);
+    expect(records[0].id).toBe(job.jobId);
+    expect(await readFile(input.outputPath, 'utf8')).toBe('example-video');
+    expect(reactor.cancel(job.jobId)).toBe(false);
+  });
+
+  it('releases finalization ownership and reports one failure when publication fails', async () => {
+    mocks.finalize.mockRejectedValueOnce(new Error('History write failed'));
+    const failed = vi.fn();
+    const completed = vi.fn();
+    videoGenEvents.on('failed', failed);
+    videoGenEvents.on('completed', completed);
+    const job = await started();
+    await writeFile(input.outputPath, 'example-video');
+    child.stdout.emit('data', Buffer.from('{"type":"complete","clipId":"clip-example","seconds":6}\n'));
+    child.emit('close', 0);
+    await vi.waitFor(() => expect(reactor.getActiveJob()).toBeNull());
+    expect(failed).toHaveBeenCalledOnce();
+    expect(completed).not.toHaveBeenCalled();
+    expect(reactor.cancel(job.jobId)).toBe(false);
+    await expect(stat(input.outputPath)).rejects.toBeTruthy();
+  });
+
+  it('identifies connection timeouts before submission without exposing SDK diagnostics', async () => {
+    await started();
+    const failed = once(videoGenEvents, 'failed');
+    child.stdout.emit('data', Buffer.from(JSON.stringify({ type: 'error', phase: 'connecting', errorType: 'TimeoutError', message: 'private SDK diagnostics' }) + '\n'));
+    child.emit('close', 1);
+    const [event] = await failed;
+    expect(event.error).toContain('connection timed out before any clip was submitted');
+    expect(event.error).toContain('check provider availability and network access, then retry');
+    expect(event.error).not.toContain('private SDK diagnostics');
+    expect(mocks.finalize).not.toHaveBeenCalled();
+    expect(reactor.getActiveJob()).toBeNull();
+  });
+
+  it.each([400, undefined, 'private-status', 600])('reports session rejection with safe status %s before clip submission', async (httpStatus) => {
+    await started();
+    const failed = once(videoGenEvents, 'failed');
+    child.stdout.emit('data', Buffer.from(JSON.stringify({ type: 'error', phase: 'connecting', errorType: 'BadRequestError', httpStatus, message: 'private response body' }) + '\n'));
+    child.emit('close', 1);
+    const [event] = await failed;
+    expect(event.error).toContain('before any clip was submitted');
+    expect(event.error).toContain('check the provider account and model availability');
+    if (httpStatus === 400) expect(event.error).toContain(`HTTP ${httpStatus}`);
+    else expect(event.error).not.toContain('HTTP');
+    expect(event.error).not.toContain('private');
+    expect(mocks.spawn).toHaveBeenCalledOnce();
+    expect(mocks.finalize).not.toHaveBeenCalled();
+    expect(reactor.getActiveJob()).toBeNull();
+  });
+
+  it('reports credit rejection without exposing remote diagnostics', async () => {
+    await started();
+    const failed = once(videoGenEvents, 'failed');
+    child.stdout.emit('data', Buffer.from(JSON.stringify({ type: 'error', phase: 'connecting', errorType: 'BadRequestError', httpStatus: 402, message: 'private account details' }) + '\n'));
+    child.emit('close', 1);
+    const [event] = await failed;
+    expect(event.error).toContain('additional credits (HTTP 402)');
+    expect(event.error).not.toContain('private account details');
+    expect(mocks.finalize).not.toHaveBeenCalled();
+  });
+
+  it('rejects all blank samples before history publication and removes the output', async () => {
+    const sharp = (await import('sharp')).default;
+    await sharp({ create: { width: 32, height: 32, channels: 3, background: '#000000' } }).png().toFile(join(root, 'blank.png'));
+    mocks.samples.mockResolvedValue(Array(5).fill('blank.png'));
+    await started();
+    await writeFile(input.outputPath, 'example-video');
+    const failed = once(videoGenEvents, 'failed');
+    child.stdout.emit('data', Buffer.from('{"type":"complete","clipId":"clip-example","seconds":6,"frames":116}\n'));
+    child.emit('close', 0);
+    const [event] = await failed;
+    expect(event.error).toContain('Reactor streamed 116 frames but every sampled frame was blank');
+    expect(mocks.finalize).not.toHaveBeenCalled();
+    await expect(stat(input.outputPath)).rejects.toBeTruthy();
+    await expect(stat(join(root, 'blank.png'))).rejects.toBeTruthy();
+  });
+
+  it.each(['dark-content', 'unmeasurable'])('accepts a black opening when a later sample is %s', async (kind) => {
+    const sharp = (await import('sharp')).default;
+    await sharp({ create: { width: 32, height: 32, channels: 3, background: '#000000' } }).png().toFile(join(root, 'blank.png'));
+    const later = join(root, 'later.png');
+    if (kind === 'unmeasurable') await writeFile(later, 'undecodable');
+    else {
+      const pixels = Buffer.from(Array.from({ length: 32 * 32 * 3 }, (_, i) => Math.floor(i / 3) % 8));
+      await sharp(pixels, { raw: { width: 32, height: 32, channels: 3 } }).png().toFile(later);
+    }
+    mocks.samples.mockResolvedValue(['blank.png', 'blank.png', 'later.png', 'blank.png', 'blank.png']);
+    await started();
+    await writeFile(input.outputPath, 'example-video');
+    child.stdout.emit('data', Buffer.from('{"type":"complete","clipId":"clip-example","seconds":6}\n'));
+    child.emit('close', 0);
+    await vi.waitFor(() => expect(mocks.finalize).toHaveBeenCalledOnce());
+    expect(mocks.samples).toHaveBeenCalledWith(input.outputPath, expect.stringContaining('-capture'), 5);
+  });
+
+  it('rejects unsupported requests before minting or spending', async () => {
+    for (const options of [
+      { prompt: 'x'.repeat(801) },
+      { seconds: 5 },
+      { seconds: 15 },
+      // Continuation and a starting frame both say "begin from this picture",
+      // so accepting both would leave the winner up to the SDK.
+      { continueFromClipId: 'clip-example', sourceImagePath: '/example/first-frame.png' },
+      // A canvas fast-h3 cannot open must fail here rather than silently
+      // rendering on 16:9 — the shape of the original bug.
+      { aspect: '21:9' },
+    ]) {
+      await expect(reactor.generateVideo({ prompt: 'A gate', ...options })).rejects.toBeTruthy();
+    }
+    expect(fetch).not.toHaveBeenCalled();
+    expect(mocks.spawn).not.toHaveBeenCalled();
+  });
+
+  // fast-h3 FITS a starting frame to whatever canvas the session opened with,
+  // and PortOS pinned 16:9 for every render — which is why a portrait image
+  // came back as a clip with clean audio and no usable picture.
+  it('opens a portrait session for a portrait frame and uploads it pre-cropped', async () => {
+    const sourceImagePath = join(root, 'portrait.png');
+    const sharp = (await import('sharp')).default;
+    await sharp({ create: { width: 900, height: 1600, channels: 3, background: '#204080' } }).png().toFile(sourceImagePath);
+    const job = await started({ sourceImagePath });
+    expect(input.aspect).toBe('9:16');
+    // The upload is the fitted copy, not the oversized original.
+    expect(input.sourceImagePath).toBe(`${input.outputPath}.start.png`);
+    await writeFile(input.outputPath, 'example-video');
+    child.stdout.emit('data', Buffer.from('{"type":"complete","clipId":"clip-example","seconds":6}\n'));
+    child.emit('close', 0);
+    await vi.waitFor(() => expect(mocks.finalize).toHaveBeenCalledWith(expect.objectContaining({
+      jobId: job.jobId,
+      meta: expect.objectContaining({ aspect: '9:16', width: 768, height: 1344 }),
+    })));
+    // The fitted copy is scratch, not a render output left beside the clip.
+    // Polled, not asserted once: finalize is awaited inside the try, while the
+    // fitted frame is removed in the finally that runs after it — so the call
+    // above can land a tick before the cleanup does. On Linux the rm usually
+    // wins that tick and a bare assertion passes; on Windows it does not, and
+    // this failed the whole matrix from a shard that changed nothing (#7786).
+    await vi.waitFor(async () => { await expect(stat(input.sourceImagePath)).rejects.toBeTruthy(); });
+  });
+
+  it('opens the canvas the request named, over the one the frame implies', async () => {
+    const sourceImagePath = join(root, 'explicit.png');
+    const sharp = (await import('sharp')).default;
+    await sharp({ create: { width: 900, height: 1600, channels: 3, background: '#204080' } }).png().toFile(sourceImagePath);
+    await started({ sourceImagePath, aspect: '1:1' });
+    expect(input.aspect).toBe('1:1');
+  });
+
+  // The clip id is stamped on every completed reactor history record precisely
+  // so a later render can chain off it; forwarding it as continue_from_clip_id
+  // is what makes that stored id worth anything.
+  it('forwards a stored clip id as the continuation the SDK understands', async () => {
+    await started({ continueFromClipId: 'clip-example' });
+    expect(input).toMatchObject({ continueFromClipId: 'clip-example' });
+    expect(input.sourceImagePath).toBeFalsy();
+  });
+
+  // A continuation names a clip reactor rendered in an earlier session, and
+  // reactor owns whether it still holds it — a failure there must not read as
+  // "your prompt was bad".
+  it('says the clip may be gone when a continuation fails', async () => {
+    const job = await started({ continueFromClipId: 'clip-example' });
+    const failed = once(videoGenEvents, 'failed');
+    child.stdout.emit('data', Buffer.from('{"type":"error","phase":"enqueue","errorType":"RuntimeError"}\n'));
+    child.emit('close', 1);
+    const [event] = await failed;
+    expect(event.generationId).toBe(job.jobId);
+    expect(event.error).toContain('Continue from clip');
+    expect(mocks.finalize).not.toHaveBeenCalled();
+  });
+
+  it('reports automatic setup failure without minting a token', async () => {
+    mocks.runtime.mockRejectedValue(new Error('Automatic Reactor runtime preparation failed'));
+    const failed = once(videoGenEvents, 'failed');
+    await reactor.generateVideo({ prompt: 'A gate' });
+    const [event] = await failed;
+    expect(event.error).toContain('Automatic Reactor runtime preparation failed');
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('cancels during setup immediately and never opens a session after setup finishes', async () => {
+    let finish;
+    mocks.runtime.mockImplementation(() => new Promise((resolve) => { finish = resolve; }));
+    const job = await reactor.generateVideo({ prompt: 'A gate' });
+    await vi.waitFor(() => expect(finish).toBeTypeOf('function'));
+    const failed = once(videoGenEvents, 'failed');
+    expect(reactor.cancel(job.jobId)).toBe(true);
+    await failed;
+    finish(join(root, 'python'));
+    await new Promise(setImmediate);
+    expect(fetch).not.toHaveBeenCalled();
+    expect(mocks.spawn).not.toHaveBeenCalled();
+    expect(reactor.getActiveJob()).toBeNull();
+  });
+
+  it('does not prepare a runtime without a configured key', async () => {
+    mocks.settings.mockResolvedValue({});
+    await expect(reactor.generateVideo({ prompt: 'A gate' })).rejects.toMatchObject({ code: 'REACTOR_NOT_CONFIGURED' });
+    expect(mocks.runtime).not.toHaveBeenCalled();
+  });
+
+  it('does not finalize a completion marker without its output file', async () => {
+    await started();
+    const scratch = `${input.outputPath}.capture`;
+    await mkdir(scratch);
+    await writeFile(join(scratch, 'video.bgra'), 'partial capture');
+    const failed = once(videoGenEvents, 'failed');
+    child.stdout.emit('data', Buffer.from('{"type":"complete","clipId":"clip-example","seconds":6}\n'));
+    child.emit('close', 0);
+    await failed;
+    await vi.waitFor(async () => { await expect(stat(scratch)).rejects.toBeTruthy(); });
+    expect(mocks.finalize).not.toHaveBeenCalled();
+  });
+
+  it('cancels the child and never finalizes a canceled request', async () => {
+    const job = await started();
+    const failed = once(videoGenEvents, 'failed');
+    expect(reactor.cancel(job.jobId)).toBe(true);
+    expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+    await failed;
+    expect(mocks.finalize).not.toHaveBeenCalled();
+  });
+
+  it('can still cancel and reap a renderer after it reports a failure', async () => {
+    vi.useFakeTimers();
+    const job = await started();
+    child.kill.mockImplementation((signal) => { if (signal === 'SIGKILL') child.emit('close', null); });
+    const failed = once(videoGenEvents, 'failed');
+    child.stdout.emit('data', Buffer.from('{"type":"error","phase":"capture","errorType":"RuntimeError"}\n'));
+    expect(reactor.cancel(job.jobId)).toBe(true);
+    expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(child.kill).toHaveBeenCalledWith('SIGKILL');
+    await failed;
+    expect(reactor.getActiveJob()).toBeNull();
+    expect(mocks.finalize).not.toHaveBeenCalled();
+  });
+
+  it('bounds process output instead of publishing success', async () => {
+    await started();
+    const failed = once(videoGenEvents, 'failed');
+    child.stderr.emit('data', Buffer.alloc(1024 * 1024 + 1));
+    await failed;
+    expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+    expect(mocks.finalize).not.toHaveBeenCalled();
+  });
+  it('terminates timed-out sessions and escalates when graceful termination is ignored', async () => {
+    vi.useFakeTimers();
+    await started();
+    child.kill.mockImplementation((signal) => { if (signal === 'SIGKILL') child.emit('close', null); });
+    const failed = once(videoGenEvents, 'failed');
+    await vi.advanceTimersByTimeAsync(20 * 60 * 1000);
+    expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(child.kill).toHaveBeenCalledWith('SIGKILL');
+    await failed;
+    expect(mocks.finalize).not.toHaveBeenCalled();
+  });
+
+  // Acceptance criteria for #7799: a cleanup rm that rejects must be logged with
+  // the path and error code; the job's success verdict must be unchanged.
+  it('logs a cleanup rm failure and still finalizes the job successfully', async () => {
+    const sourceImagePath = join(root, 'portrait.png');
+    const sharp = (await import('sharp')).default;
+    await sharp({ create: { width: 900, height: 1600, channels: 3, background: '#204080' } }).png().toFile(sourceImagePath);
+    const { rm: realRm } = await vi.importActual('fs/promises');
+    const eperm = Object.assign(new Error('EPERM: operation not permitted'), { code: 'EPERM' });
+    // Intercept only the fitted-frame removal; let all other rm calls through.
+    mocks.rm.mockImplementation(async (path, opts) => {
+      if (typeof path === 'string' && path.endsWith('.start.png')) throw eperm;
+      return realRm(path, opts);
+    });
+    const logged = [];
+    const spy = vi.spyOn(console, 'log').mockImplementation((...args) => { logged.push(args.join(' ')); });
+    const completed = vi.fn();
+    const failed = vi.fn();
+    videoGenEvents.on('completed', completed);
+    videoGenEvents.on('failed', failed);
+    const job = await started({ sourceImagePath });
+    await writeFile(input.outputPath, 'example-video');
+    child.stdout.emit('data', Buffer.from('{\"type\":\"complete\",\"clipId\":\"clip-example\",\"seconds\":6}\n'));
+    child.emit('close', 0);
+    // Job must finalize (success verdict unchanged even though cleanup rm failed).
+    await vi.waitFor(() => expect(mocks.finalize).toHaveBeenCalledWith(
+      expect.objectContaining({ jobId: job.jobId }),
+    ));
+    expect(failed).not.toHaveBeenCalled();
+    // Cleanup failure must have been logged with the path and error code.
+    const warning = logged.find((l) => l.includes('⚠️') && l.includes('EPERM'));
+    expect(warning, 'expected a ⚠️ log naming EPERM for the failed rm').toBeTruthy();
+    expect(warning).toContain('.start.png');
+    spy.mockRestore();
+  });
+
+});

@@ -1,0 +1,904 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import EventEmitter from 'events';
+
+// All upstream services are mocked so the unit under test is the
+// orchestration logic itself: parallel retrieval, ranking, prompt assembly,
+// and stream-event shape.
+
+vi.mock('./providers.js', () => ({
+  getActiveProvider: vi.fn(),
+  getProviderById: vi.fn(),
+}));
+
+// Issue #8104: `streamCompletion` routes every API-shaped provider through the
+// single shared managed-runtime wake instead of an Ollama-only check, so
+// MTPLX/Slotstream get woken (and their idle clock refreshed) too. Mocked here
+// so these tests assert the DISPATCH — that askService consults the shared
+// gate for any provider and never sends the chat request when it fails —
+// without depending on the real MTPLX/Slotstream/Ollama manager modules,
+// which are covered on their own terms in providerExecutionReadiness.test.js.
+vi.mock('./providerExecutionReadiness.js', () => ({
+  ensureManagedRuntimeReady: vi.fn(),
+}));
+
+vi.mock('../lib/childProcess.js', async (importOriginal) => {
+  const actual = await importOriginal();
+  return { ...actual, spawn: vi.fn() };
+});
+
+vi.mock('./memoryBackend.js', () => ({
+  hybridSearchMemories: vi.fn(),
+  getMemory: vi.fn(),
+}));
+
+vi.mock('./memoryEmbeddings.js', () => ({
+  generateQueryEmbedding: vi.fn(),
+}));
+
+vi.mock('./brainStorage.js', () => ({
+  getInboxLog: vi.fn(),
+  getProjects: vi.fn(),
+  getIdeas: vi.fn(),
+}));
+
+vi.mock('./autobiography.js', () => ({
+  getStories: vi.fn(),
+}));
+
+vi.mock('./identity.js', () => ({
+  getGoals: vi.fn(),
+}));
+
+vi.mock('./character.js', () => ({
+  getCharacter: vi.fn(),
+}));
+
+vi.mock('./calendarSync.js', () => ({
+  getEvents: vi.fn(),
+}));
+
+// catalogDB is mocked so the catalog retriever never touches Postgres; the real
+// catalogTypes lib (getCatalogType) stays unmocked — it's pure.
+vi.mock('./catalogDB.js', () => ({
+  hybridSearchIngredients: vi.fn(),
+}));
+
+const { spawn } = await import('../lib/childProcess.js');
+
+// Windows takes killProcessTree's tree-wide `taskkill /T` branch instead, so
+// `needsProcessGroup` is false there and these sites spawn attached. The policy
+// itself is pinned with an injected platform in credentialBootstrap.test.js;
+// these assert only that each site plumbs the decision through.
+const EXPECT_GROUP = process.platform !== 'win32';
+const catalogDB = await import('./catalogDB.js');
+const memoryBackend = await import('./memoryBackend.js');
+const memoryEmbeddings = await import('./memoryEmbeddings.js');
+const brainStorage = await import('./brainStorage.js');
+const autobiography = await import('./autobiography.js');
+const identity = await import('./identity.js');
+const character = await import('./character.js');
+const calendarSync = await import('./calendarSync.js');
+const providers = await import('./providers.js');
+const providerExecutionReadiness = await import('./providerExecutionReadiness.js');
+
+const askService = await import('./askService.js');
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  // Sensible defaults — each test overrides what it cares about.
+  memoryEmbeddings.generateQueryEmbedding.mockResolvedValue([0.1, 0.2, 0.3]);
+  memoryBackend.hybridSearchMemories.mockResolvedValue({ memories: [] });
+  memoryBackend.getMemory.mockResolvedValue(null);
+  brainStorage.getInboxLog.mockResolvedValue([]);
+  brainStorage.getProjects.mockResolvedValue([]);
+  brainStorage.getIdeas.mockResolvedValue([]);
+  autobiography.getStories.mockResolvedValue([]);
+  identity.getGoals.mockResolvedValue({ goals: [] });
+  character.getCharacter.mockResolvedValue({ name: 'Adam', class: 'Developer' });
+  calendarSync.getEvents.mockResolvedValue({ events: [] });
+  catalogDB.hybridSearchIngredients.mockResolvedValue([]);
+  providerExecutionReadiness.ensureManagedRuntimeReady.mockResolvedValue({ success: true });
+});
+
+describe('gatherSources', () => {
+  it('returns memories with stable ids and tagged kind', async () => {
+    memoryBackend.hybridSearchMemories.mockResolvedValue({
+      memories: [{ id: 'mem-1', rrfScore: 0.9 }, { id: 'mem-2', rrfScore: 0.7 }],
+    });
+    memoryBackend.getMemory.mockImplementation((id) => Promise.resolve({
+      id,
+      content: `body of ${id}`,
+      summary: `summary ${id}`,
+      type: 'fact',
+    }));
+
+    const sources = await askService.gatherSources('what did i decide about X');
+    expect(sources).toHaveLength(2);
+    expect(sources[0].kind).toBe('memory');
+    expect(sources[0].id).toBe('memory:mem-1');
+  });
+
+  it('surfaces catalog ingredients with kind/id/href shape and the type primary-content snippet', async () => {
+    catalogDB.hybridSearchIngredients.mockResolvedValue([
+      { ingredient: { id: 'cat-chr-1', type: 'character', name: 'Ada', tags: ['mentor'], payload: { physicalDescription: 'sharp eyes' } }, rrfScore: 0.9 },
+      { ingredient: { id: 'cat-idea-2', type: 'idea', name: 'Heist', tags: [], payload: { summary: 'a clockwork heist' } }, rrfScore: 0.6 },
+      // Character whose only text is in a SECONDARY field (personality) — the
+      // snippet should fall through the registry snippetFallbackKeys, not name.
+      { ingredient: { id: 'cat-chr-3', type: 'character', name: 'Grim', tags: [], payload: { personality: 'brooding and loyal' } }, rrfScore: 0.5 },
+    ]);
+
+    const sources = await askService.gatherSources('who is in my story');
+    const catalog = sources.filter((s) => s.kind === 'catalog');
+    expect(catalog).toHaveLength(3);
+    const ada = catalog.find((s) => s.id === 'catalog:character:cat-chr-1');
+    expect(ada).toBeTruthy();
+    expect(ada.title).toBe('Ada');
+    expect(ada.snippet).toBe('sharp eyes');                 // character primaryContentKey
+    expect(ada.href).toBe('/catalog/character/cat-chr-1');
+    const idea = catalog.find((s) => s.id === 'catalog:idea:cat-idea-2');
+    expect(idea.snippet).toBe('a clockwork heist');         // idea primaryContentKey = summary
+    const grim = catalog.find((s) => s.id === 'catalog:character:cat-chr-3');
+    expect(grim.snippet).toBe('brooding and loyal');        // fell through to personality, not name
+  });
+
+  it('still answers when the catalog retriever throws (isolated by allSettled)', async () => {
+    catalogDB.hybridSearchIngredients.mockRejectedValue(new Error('catalog down'));
+    memoryBackend.hybridSearchMemories.mockResolvedValue({ memories: [{ id: 'mem-1', rrfScore: 0.9 }] });
+    memoryBackend.getMemory.mockResolvedValue({ id: 'mem-1', content: 'x', summary: 's', type: 'fact' });
+
+    const sources = await askService.gatherSources('anything');
+    expect(sources.some((s) => s.kind === 'memory')).toBe(true);
+    expect(sources.some((s) => s.kind === 'catalog')).toBe(false);
+  });
+
+  it('keeps producing answers when one retriever throws', async () => {
+    // Memory throws — brain notes still surface.
+    memoryBackend.hybridSearchMemories.mockRejectedValue(new Error('vector backend down'));
+    brainStorage.getIdeas.mockResolvedValue([
+      { id: 'idea-1', title: 'Move workout to mornings', description: 'shift to AM for better adherence' },
+    ]);
+
+    const sources = await askService.gatherSources('move workout to mornings');
+    expect(sources.length).toBeGreaterThan(0);
+    expect(sources[0].kind).toBe('brain-note');
+  });
+
+  it('dedupes by source id when a retriever returns the same hit twice', async () => {
+    // Hybrid memory search can occasionally return the same record twice
+    // (BM25 + vector hits both surface it before RRF) — the merged source
+    // list should only carry one copy regardless.
+    memoryBackend.hybridSearchMemories.mockResolvedValue({
+      memories: [
+        { id: 'mem-dup', rrfScore: 0.9 },
+        { id: 'mem-dup', rrfScore: 0.8 },
+      ],
+    });
+    memoryBackend.getMemory.mockResolvedValue({
+      id: 'mem-dup',
+      content: 'workout decision',
+      summary: 'workout',
+    });
+
+    const sources = await askService.gatherSources('workout');
+    const memorySources = sources.filter((s) => s.id === 'memory:mem-dup');
+    expect(memorySources).toHaveLength(1);
+  });
+
+  it('caps the result list to maxSources', async () => {
+    // Generate 20 idea-style brain notes, all matching the question.
+    brainStorage.getIdeas.mockResolvedValue(
+      Array.from({ length: 20 }, (_, i) => ({
+        id: `idea-${i}`,
+        title: `workout idea ${i}`,
+        description: 'workout details',
+      })),
+    );
+    const sources = await askService.gatherSources('workout details', { maxSources: 3 });
+    expect(sources).toHaveLength(3);
+  });
+
+  it('ranks active goals when lexical match is weak', async () => {
+    identity.getGoals.mockResolvedValue({
+      goals: [
+        { id: 'g-1', title: 'Run a marathon', description: 'finish a 26.2', status: 'active', horizon: 'year' },
+        { id: 'g-2', title: 'Watch movies', description: 'leisure', status: 'archived', horizon: 'month' },
+      ],
+    });
+    const sources = await askService.gatherSources('marathon training');
+    expect(sources.find((s) => s.id === 'goal:g-1')).toBeDefined();
+  });
+});
+
+describe('buildPrompt', () => {
+  it('composes persona + directive + sources + question', async () => {
+    const sources = [
+      { kind: 'memory', id: 'memory:1', title: 'Past decision', snippet: 'I decided to ship slice (a) first.' },
+      { kind: 'goal', id: 'goal:g-1', title: 'Run a marathon', snippet: 'horizon: year · status: active' },
+    ];
+    const prompt = await askService.buildPrompt({ question: 'What should I do today?', mode: 'advise', sources });
+    expect(prompt).toContain('digital twin');
+    expect(prompt).toContain('What should I do today?');
+    expect(prompt).toContain('[1] memory — Past decision');
+    expect(prompt).toContain('[2] goal — Run a marathon');
+    // 'advise' directive is distinct from 'ask' so a typo in mode wiring would catch.
+    expect(prompt).toContain('advising');
+  });
+
+  it('inlines history for multi-turn context', async () => {
+    const prompt = await askService.buildPrompt({
+      question: 'Follow-up?',
+      mode: 'ask',
+      sources: [],
+      history: [
+        { role: 'user', content: 'previous question' },
+        { role: 'assistant', content: 'previous answer' },
+      ],
+    });
+    expect(prompt).toContain('previous question');
+    expect(prompt).toContain('previous answer');
+  });
+
+  it('falls back to a generic persona when character is absent', async () => {
+    character.getCharacter.mockResolvedValue(null);
+    const preamble = await askService.buildPersonaPreamble();
+    expect(preamble).toMatch(/digital twin/i);
+  });
+});
+
+describe('runAsk', () => {
+  // Minimal API-shaped provider; fetch is mocked to return the SSE response.
+  function fakeStreamProvider() {
+    return {
+      id: 'fake',
+      type: 'api',
+      enabled: true,
+      apiKey: 'k',
+      endpoint: 'https://example.test/v1',
+      defaultModel: 'fake-model',
+      timeout: 5000,
+      allowCustomEndpoint: true,
+    };
+  }
+
+  function buildSSEResponse(deltas) {
+    const encoder = new TextEncoder();
+    const frames = deltas.map((d) =>
+      `data: ${JSON.stringify({ choices: [{ delta: { content: d } }] })}\n\n`
+    ).concat('data: [DONE]\n\n');
+    return new Response(new ReadableStream({
+      start(ctrl) {
+        for (const f of frames) ctrl.enqueue(encoder.encode(f));
+        ctrl.close();
+      },
+    }), { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+  }
+
+  it('emits sources, deltas, then done', async () => {
+    providers.getActiveProvider.mockResolvedValue(fakeStreamProvider());
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(buildSSEResponse(['Hello, ', 'world.']));
+
+    const events = [];
+    for await (const evt of askService.runAsk({ question: 'hi' })) {
+      events.push(evt);
+    }
+    fetchSpy.mockRestore();
+
+    const types = events.map((e) => e.type);
+    expect(types[0]).toBe('sources');
+    expect(types).toContain('delta');
+    expect(types[types.length - 1]).toBe('done');
+    const fullText = events.filter((e) => e.type === 'delta').map((e) => e.text).join('');
+    expect(fullText).toBe('Hello, world.');
+  });
+
+  // Ask carries private records: a bare harness spawn would fall through to the
+  // machine's ambient vendor auth and send the prompt to the wrong backend.
+  it('spawns a CLI provider through its credential bootstrap when one is configured', async () => {
+    providers.getActiveProvider.mockResolvedValue({
+      id: 'claude-code', type: 'cli', enabled: true, command: 'claude', args: [], defaultModel: 'sonnet',
+      credentialBootstrap: { command: 'token-cli', args: ['run'], harnessId: 'claude-code', argsSeparator: '--' },
+    });
+    spawn.mockImplementation(() => {
+      const child = Object.assign(new EventEmitter(), {
+        stdout: new EventEmitter(), stderr: new EventEmitter(),
+        stdin: Object.assign(new EventEmitter(), { end: vi.fn() }), kill: vi.fn(),
+      });
+      setImmediate(() => { child.stdout.emit('data', Buffer.from('answer')); child.emit('close', 0); });
+      return child;
+    });
+
+    const events = [];
+    for await (const evt of askService.runAsk({ question: 'hi' })) events.push(evt);
+
+    expect(events.at(-1).type).toBe('done');
+    const [command, args] = spawn.mock.calls[0];
+    expect(command).toBe('token-cli');
+    expect(args.slice(0, 3)).toEqual(['run', 'claude-code', '--']);
+    // The harness's own argv (Ask's model pin) follows the separator.
+    expect(args.slice(3)).toEqual(expect.arrayContaining(['--model', 'sonnet']));
+    // #7496: the direct child is now the WRAPPER, so both stop paths below (the
+    // timeout and the user's abort) have to reach the harness behind it.
+    expect(spawn.mock.calls[0][2].detached).toBe(EXPECT_GROUP);
+  });
+
+  // #7496. Ask's abort IS the user pressing stop, and it carries private
+  // records — a harness left running past it keeps reading them. A per-pid
+  // SIGKILL reaches only the bootstrap wrapper.
+  it.skipIf(process.platform === 'win32')('SIGKILLs the whole process group when the user aborts a bootstrap-wrapped ask', async () => {
+    // Spy so the negative pid never reaches a real process group.
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    providers.getActiveProvider.mockResolvedValue({
+      id: 'claude-code', type: 'cli', enabled: true, command: 'claude', args: [], defaultModel: 'sonnet',
+      credentialBootstrap: { command: 'token-cli', args: ['run'] },
+    });
+    const controller = new AbortController();
+    const kill = vi.fn();
+    spawn.mockImplementation(() => {
+      const child = Object.assign(new EventEmitter(), {
+        pid: 828282,
+        stdout: new EventEmitter(), stderr: new EventEmitter(),
+        stdin: Object.assign(new EventEmitter(), { end: vi.fn() }), kill,
+      });
+      setImmediate(() => controller.abort());
+      return child;
+    });
+
+    const events = [];
+    for await (const evt of askService.runAsk({ question: 'hi', signal: controller.signal })) events.push(evt);
+
+    expect(killSpy).toHaveBeenCalledWith(-828282, 'SIGKILL');
+    // The group signal landed, so killProcessTree never falls back to the
+    // wrapper's own pid — the harness behind it is covered by the same signal.
+    expect(kill).not.toHaveBeenCalled();
+    killSpy.mockRestore();
+  });
+
+  it.skipIf(process.platform === 'win32')('SIGKILLs only the child when an UNWRAPPED ask is aborted', async () => {
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    providers.getActiveProvider.mockResolvedValue({
+      id: 'claude-code', type: 'cli', enabled: true, command: 'claude', args: [], defaultModel: 'sonnet',
+    });
+    const controller = new AbortController();
+    const kill = vi.fn();
+    spawn.mockImplementation(() => {
+      const child = Object.assign(new EventEmitter(), {
+        pid: 929292,
+        stdout: new EventEmitter(), stderr: new EventEmitter(),
+        stdin: Object.assign(new EventEmitter(), { end: vi.fn() }), kill,
+      });
+      setImmediate(() => controller.abort());
+      return child;
+    });
+
+    const events = [];
+    for await (const evt of askService.runAsk({ question: 'hi', signal: controller.signal })) events.push(evt);
+
+    expect(spawn.mock.calls[0][2].detached).toBe(false);
+    expect(killSpy).not.toHaveBeenCalledWith(-929292, expect.anything());
+    expect(kill).toHaveBeenCalledWith('SIGKILL');
+    killSpy.mockRestore();
+  });
+
+  it('keeps streamed content and emits an error when the canonical reader fails', async () => {
+    providers.getActiveProvider.mockResolvedValue(fakeStreamProvider());
+    const encoded = new TextEncoder().encode('data: {"choices":[{"delta":{"content":"partial"}}]}\n');
+    let reads = 0;
+    const cancel = vi.fn(async () => {});
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      status: 200,
+      body: {
+        getReader: () => ({
+          read: vi.fn(async () => {
+            reads += 1;
+            if (reads === 1) return { done: false, value: encoded };
+            throw new Error('socket reset');
+          }),
+          cancel,
+        }),
+      },
+    });
+
+    const events = [];
+    for await (const evt of askService.runAsk({ question: 'hi' })) events.push(evt);
+    fetchSpy.mockRestore();
+
+    expect(events.find((event) => event.type === 'delta')).toEqual({ type: 'delta', text: 'partial' });
+    expect(events.find((event) => event.type === 'error')?.error).toContain('socket reset');
+    expect(events.find((event) => event.type === 'done')).toBeUndefined();
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it('cancels the canonical reader without a terminal event after client abort', async () => {
+    providers.getActiveProvider.mockResolvedValue(fakeStreamProvider());
+    const controller = new AbortController();
+    const encoded = new TextEncoder().encode('data: {"choices":[{"delta":{"content":"partial"}}]}\n');
+    const cancel = vi.fn(async () => {});
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      status: 200,
+      body: {
+        getReader: () => ({
+          read: vi.fn(async () => ({ done: false, value: encoded })),
+          cancel,
+        }),
+      },
+    });
+
+    const stream = askService.runAsk({ question: 'hi', signal: controller.signal });
+    expect((await stream.next()).value.type).toBe('sources');
+    expect((await stream.next()).value).toEqual({ type: 'delta', text: 'partial' });
+    controller.abort();
+    expect(await stream.next()).toEqual({ done: true, value: undefined });
+    fetchSpy.mockRestore();
+
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it('emits an error event for an empty question', async () => {
+    const events = [];
+    for await (const evt of askService.runAsk({ question: '   ' })) events.push(evt);
+    expect(events).toHaveLength(1);
+    expect(events[0].type).toBe('error');
+  });
+
+  it('emits an error when no provider is available', async () => {
+    providers.getActiveProvider.mockResolvedValue(null);
+    const events = [];
+    for await (const evt of askService.runAsk({ question: 'hi' })) events.push(evt);
+    // Expect one sources event then a terminating error.
+    expect(events.find((e) => e.type === 'error')).toBeDefined();
+    expect(events.find((e) => e.type === 'done')).toBeUndefined();
+  });
+
+  it('omits --model flag when effectiveModel is the codex sentinel (CLI provider)', async () => {
+    providers.getActiveProvider.mockResolvedValue({
+      id: 'codex',
+      type: 'cli',
+      enabled: true,
+      command: 'codex',
+      args: [],
+      defaultModel: 'codex-configured-default',
+      timeout: 5000,
+    });
+
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.stdin = { on: vi.fn(), end: vi.fn() };
+    child.kill = vi.fn();
+    setImmediate(() => {
+      child.stdout.emit('data', Buffer.from('answer text'));
+      child.emit('close', 0);
+    });
+    spawn.mockReturnValue(child);
+
+    const events = [];
+    for await (const evt of askService.runAsk({ question: 'test question', hasHostControl: () => true })) {
+      events.push(evt);
+    }
+
+    const [, args] = spawn.mock.calls.at(-1);
+    expect(args).not.toContain('--model');
+    expect(events.find((e) => e.type === 'done')).toBeDefined();
+  });
+
+  it('passes --model normally for non-sentinel CLI models (CLI provider)', async () => {
+    providers.getActiveProvider.mockResolvedValue({
+      id: 'codex',
+      type: 'cli',
+      enabled: true,
+      command: 'codex',
+      args: [],
+      defaultModel: 'o4-mini',
+      timeout: 5000,
+    });
+
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.stdin = { on: vi.fn(), end: vi.fn() };
+    child.kill = vi.fn();
+    setImmediate(() => {
+      child.stdout.emit('data', Buffer.from('answer text'));
+      child.emit('close', 0);
+    });
+    spawn.mockReturnValue(child);
+
+    const events = [];
+    for await (const evt of askService.runAsk({ question: 'test question', hasHostControl: () => true })) {
+      events.push(evt);
+    }
+
+    const [, args] = spawn.mock.calls.at(-1);
+    const modelIdx = args.indexOf('--model');
+    expect(modelIdx).toBeGreaterThanOrEqual(0);
+    expect(args[modelIdx + 1]).toBe('o4-mini');
+  });
+
+  it('runs `grok` headless with plain output, read-only permission mode, no tools, and stdin prompt file (no --model for configured-default)', async () => {
+    providers.getActiveProvider.mockResolvedValue({
+      id: 'grok-cli',
+      type: 'cli',
+      enabled: true,
+      command: 'grok',
+      args: [],
+      defaultModel: 'grok-configured-default',
+      timeout: 5000,
+    });
+
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.stdin = { on: vi.fn(), end: vi.fn(), write: vi.fn() };
+    child.kill = vi.fn();
+    setImmediate(() => {
+      child.stdout.emit('data', Buffer.from('answer text'));
+      child.emit('close', 0);
+    });
+    spawn.mockReturnValue(child);
+
+    const events = [];
+    for await (const evt of askService.runAsk({ question: 'test question' })) {
+      events.push(evt);
+    }
+
+    const [, args] = spawn.mock.calls.at(-1);
+    // Windows has no /dev/stdin, so the spawn helper rewrites grok's sentinel
+    // to a real temp file (see lib/grok.js GROK_STDIN_PROMPT_PATH). Assert the
+    // per-platform value rather than pinning the POSIX one — both paths ship,
+    // so both deserve coverage on their own runner.
+    const expectedPromptFile = process.platform === 'win32'
+      ? expect.stringMatching(/grok-prompt-.*\.txt$/)
+      : '/dev/stdin';
+    // #9008: Ask runs tool-free — never grok's agent-path bypassPermissions.
+    expect(args).toEqual([
+      '--output-format', 'plain',
+      '--prompt-file', expectedPromptFile,
+      '--permission-mode', 'plan',
+      '--tools', '',
+    ]);
+    expect(args).not.toContain('--model');
+    // POSIX delivery: the prompt is piped in via stdin.
+    if (process.platform !== 'win32') expect(child.stdin.end).toHaveBeenCalled();
+  });
+
+  it('runs `agy --model <id> --print <prompt>` with headlessArgs still ahead of the print marker', async () => {
+    providers.getActiveProvider.mockResolvedValue({
+      id: 'antigravity-cli',
+      type: 'cli',
+      enabled: true,
+      command: 'agy',
+      args: [],
+      headlessArgs: ['--add-dir', '/tmp/x'],
+      defaultModel: 'gemini-3.1-pro-high',
+      timeout: 5000,
+    });
+
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.stdin = { on: vi.fn(), end: vi.fn(), write: vi.fn() };
+    child.kill = vi.fn();
+    setImmediate(() => {
+      child.stdout.emit('data', Buffer.from('answer text'));
+      child.emit('close', 0);
+    });
+    spawn.mockReturnValue(child);
+
+    for await (const _evt of askService.runAsk({ question: 'test question', hasHostControl: () => true })) { /* drain */ }
+
+    const [, args] = spawn.mock.calls.at(-1);
+    // agy takes the prompt as the --print VALUE, so --print must be second-to-last
+    // with the prompt after it — nothing else may follow the marker.
+    expect(args.slice(0, -1)).toEqual([
+      '--add-dir', '/tmp/x',
+      // The suffixed id splits into base + `--effort` (equivalent invocation).
+      '--model', 'gemini-3.1-pro', '--effort', 'high',
+      // #9008: the bypass ensureAntigravityPrintArgs adds is stripped.
+      '--print',
+    ]);
+    expect(args.at(-1)).toContain('test question');
+  });
+
+  it('omits --model for the Antigravity configured-default sentinel', async () => {
+    providers.getActiveProvider.mockResolvedValue({
+      id: 'antigravity-cli',
+      type: 'cli',
+      enabled: true,
+      command: 'agy',
+      args: [],
+      defaultModel: 'antigravity-configured-default',
+      timeout: 5000,
+    });
+
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.stdin = { on: vi.fn(), end: vi.fn(), write: vi.fn() };
+    child.kill = vi.fn();
+    setImmediate(() => {
+      child.stdout.emit('data', Buffer.from('answer text'));
+      child.emit('close', 0);
+    });
+    spawn.mockReturnValue(child);
+
+    for await (const _evt of askService.runAsk({ question: 'test question', hasHostControl: () => true })) { /* drain */ }
+
+    const [, args] = spawn.mock.calls.at(-1);
+    expect(args).not.toContain('--model');
+    expect(args.slice(0, -1)).toEqual(['--print']);
+    expect(args.at(-1)).toContain('test question');
+  });
+
+  it('runs `opencode run --model ollama/<id>` for an OpenCode Ollama provider', async () => {
+    providers.getActiveProvider.mockResolvedValue({
+      id: 'opencode-ollama',
+      type: 'cli',
+      enabled: true,
+      command: 'opencode',
+      args: ['run'],
+      ollamaBacked: true,
+      defaultModel: 'qwen2.5:7b',
+      timeout: 5000,
+    });
+
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.stdin = { on: vi.fn(), end: vi.fn() };
+    child.kill = vi.fn();
+    setImmediate(() => {
+      child.stdout.emit('data', Buffer.from('answer text'));
+      child.emit('close', 0);
+    });
+    spawn.mockReturnValue(child);
+
+    const events = [];
+    for await (const evt of askService.runAsk({ question: 'test question', hasHostControl: () => true })) {
+      events.push(evt);
+    }
+
+    const [, args] = spawn.mock.calls.at(-1);
+    expect(args).toContain('run');
+    const modelIdx = args.indexOf('--model');
+    expect(modelIdx).toBeGreaterThanOrEqual(0);
+    expect(args[modelIdx + 1]).toBe('ollama/qwen2.5:7b');
+  });
+
+  it('prepends the `run` subcommand for an OpenCode provider whose args dropped it', async () => {
+    // e.g. the TUI-shaped variant (args: []) selected as the Ask provider —
+    // without `run`, bare `opencode` would launch the interactive TUI and hang.
+    providers.getActiveProvider.mockResolvedValue({
+      id: 'opencode-ollama-tui',
+      type: 'tui',
+      enabled: true,
+      command: 'opencode',
+      args: [],
+      ollamaBacked: true,
+      defaultModel: 'qwen2.5:7b',
+      timeout: 5000,
+    });
+
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.stdin = { on: vi.fn(), end: vi.fn() };
+    child.kill = vi.fn();
+    setImmediate(() => {
+      child.stdout.emit('data', Buffer.from('answer text'));
+      child.emit('close', 0);
+    });
+    spawn.mockReturnValue(child);
+
+    const events = [];
+    for await (const evt of askService.runAsk({ question: 'test question', hasHostControl: () => true })) {
+      events.push(evt);
+    }
+
+    const [, args] = spawn.mock.calls.at(-1);
+    expect(args[0]).toBe('run');
+    expect(args[args.indexOf('--model') + 1]).toBe('ollama/qwen2.5:7b');
+  });
+
+  describe('endpoint guard (SSRF / key-exfiltration)', () => {
+    it('blocks a keyed api provider pointed at a cloud-metadata endpoint and never calls fetch', async () => {
+      providers.getActiveProvider.mockResolvedValue({
+        id: 'fake', type: 'api', enabled: true, apiKey: 'secret-key',
+        endpoint: 'http://169.254.169.254/latest/meta-data/', defaultModel: 'fake-model', timeout: 5000,
+        // allowCustomEndpoint intentionally absent — must not matter for a
+        // metadata endpoint (it's never overridable).
+      });
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(buildSSEResponse(['should not reach here']));
+
+      const events = [];
+      for await (const evt of askService.runAsk({ question: 'hi' })) events.push(evt);
+      const callCount = fetchSpy.mock.calls.length;
+      fetchSpy.mockRestore();
+
+      const errorEvt = events.find((e) => e.type === 'error');
+      expect(errorEvt).toBeDefined();
+      expect(errorEvt.error).toContain('Provider endpoint blocked');
+      expect(errorEvt.error).toContain('cloud-metadata endpoint blocked');
+      expect(events.find((e) => e.type === 'done')).toBeUndefined();
+      expect(callCount).toBe(0);
+    });
+
+    it('blocks a keyed api provider on a non-allowlisted host when allowCustomEndpoint is not set', async () => {
+      providers.getActiveProvider.mockResolvedValue({
+        id: 'fake', type: 'api', enabled: true, apiKey: 'secret-key',
+        endpoint: 'https://not-an-allowlisted-host.example', defaultModel: 'fake-model', timeout: 5000,
+      });
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(buildSSEResponse(['should not reach here']));
+
+      const events = [];
+      for await (const evt of askService.runAsk({ question: 'hi' })) events.push(evt);
+      const callCount = fetchSpy.mock.calls.length;
+      fetchSpy.mockRestore();
+
+      const errorEvt = events.find((e) => e.type === 'error');
+      expect(errorEvt).toBeDefined();
+      expect(errorEvt.error).toContain('Provider endpoint blocked');
+      expect(errorEvt.error).toContain('refusing to send API key to non-allowlisted host');
+      expect(events.find((e) => e.type === 'done')).toBeUndefined();
+      expect(callCount).toBe(0);
+    });
+
+    it('allows a keyed api provider on a non-allowlisted host through when allowCustomEndpoint is true', async () => {
+      providers.getActiveProvider.mockResolvedValue({
+        id: 'fake', type: 'api', enabled: true, apiKey: 'secret-key',
+        endpoint: 'https://not-an-allowlisted-host.example', defaultModel: 'fake-model', timeout: 5000,
+        allowCustomEndpoint: true,
+      });
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(buildSSEResponse(['Hello.']));
+
+      const events = [];
+      for await (const evt of askService.runAsk({ question: 'hi' })) events.push(evt);
+      const callCount = fetchSpy.mock.calls.length;
+      fetchSpy.mockRestore();
+
+      expect(events.find((e) => e.type === 'error')).toBeUndefined();
+      expect(events.find((e) => e.type === 'done')).toBeDefined();
+      expect(callCount).toBe(1);
+    });
+
+    it('allows a keyless api provider on a non-allowlisted host through (guard only applies when apiKey is set)', async () => {
+      providers.getActiveProvider.mockResolvedValue({
+        id: 'fake-local', type: 'api', enabled: true, apiKey: undefined,
+        endpoint: 'https://not-an-allowlisted-host.example', defaultModel: 'fake-model', timeout: 5000,
+      });
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(buildSSEResponse(['Hello.']));
+
+      const events = [];
+      for await (const evt of askService.runAsk({ question: 'hi' })) events.push(evt);
+      const callCount = fetchSpy.mock.calls.length;
+      fetchSpy.mockRestore();
+
+      expect(events.find((e) => e.type === 'error')).toBeUndefined();
+      expect(events.find((e) => e.type === 'done')).toBeDefined();
+      expect(callCount).toBe(1);
+    });
+  });
+
+  describe('managed-runtime wake (issue #8104)', () => {
+    // Before this fix, `streamCompletion` only called `ensureProviderReady`
+    // from ollamaManager.js — a daemon stopped by the idle reaper (MTPLX,
+    // Slotstream) was never woken for an Ask turn and every request against
+    // it failed with a bare connection refusal instead. It now routes through
+    // the shared `ensureManagedRuntimeReady`, which recognizes all three.
+    it('consults the shared managed-runtime gate before sending the chat request', async () => {
+      providers.getActiveProvider.mockResolvedValue(fakeStreamProvider());
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(buildSSEResponse(['Hello.']));
+
+      const events = [];
+      for await (const evt of askService.runAsk({ question: 'hi' })) events.push(evt);
+
+      expect(providerExecutionReadiness.ensureManagedRuntimeReady).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 'fake' }),
+      );
+      // The gate ran before the chat request went out, not after. (Read the
+      // call order BEFORE mockRestore(), which also resets the recorded calls.)
+      expect(fetchSpy.mock.calls.length).toBeGreaterThan(0);
+      const gateOrder = providerExecutionReadiness.ensureManagedRuntimeReady.mock.invocationCallOrder[0];
+      const fetchOrder = fetchSpy.mock.invocationCallOrder[0];
+      fetchSpy.mockRestore();
+      expect(gateOrder).toBeLessThan(fetchOrder);
+    });
+
+    // Covers MTPLX and Slotstream (and any future managed runtime) through the
+    // one shared contract, rather than re-deriving each manager's own
+    // recognition logic here — that's `providerExecutionReadiness.test.js`'s
+    // job. What Ask owns is: a failed wake must stop the turn before fetch,
+    // and the runtime's own error message must reach the caller unmodified.
+    it('never sends the chat request when the managed runtime fails to wake, and surfaces its error', async () => {
+      providers.getActiveProvider.mockResolvedValue(fakeStreamProvider());
+      providerExecutionReadiness.ensureManagedRuntimeReady.mockResolvedValue({
+        success: false,
+        error: 'MTPLX is not running and PortOS could not start it: checkpoint failed to load',
+      });
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(buildSSEResponse(['should not reach here']));
+
+      const events = [];
+      for await (const evt of askService.runAsk({ question: 'hi' })) events.push(evt);
+      const callCount = fetchSpy.mock.calls.length;
+      fetchSpy.mockRestore();
+
+      const errorEvt = events.find((e) => e.type === 'error');
+      expect(errorEvt?.error).toBe(
+        'Provider stream failed: MTPLX is not running and PortOS could not start it: checkpoint failed to load',
+      );
+      expect(events.find((e) => e.type === 'done')).toBeUndefined();
+      expect(callCount).toBe(0);
+    });
+  });
+});
+
+// #9008: Ask hands a caller-chosen provider the caller's own question. A CLI
+// that cannot be made tool-free is an agent, so it needs host control; one
+// that can runs with its bypass stripped and its tool-disable switch applied.
+describe('tool-free Ask (#9008)', () => {
+  const AGY = { id: 'antigravity-cli', type: 'cli', enabled: true, command: 'agy', args: ['--print', '--dangerously-skip-permissions'], timeout: 5000 };
+  const CLAUDE = {
+    id: 'claude-code', type: 'cli', enabled: true, command: 'claude', timeout: 5000,
+    // A saved bypass must not survive, and a saved tool list must not widen the set.
+    args: ['--print', '--dangerously-skip-permissions', '--tools', 'Bash'],
+    headlessArgs: ['--no-session-persistence', '--disable-slash-commands', '--tools', ''],
+  };
+  const fakeChild = () => {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.stdin = { on: vi.fn(), end: vi.fn(), write: vi.fn() };
+    child.kill = vi.fn();
+    setImmediate(() => {
+      child.stdout.emit('data', Buffer.from('answer text'));
+      child.emit('close', 0);
+    });
+    return child;
+  };
+
+  it('refuses a provider that cannot run tool-free for a caller without host control, before spawning', async () => {
+    providers.getProviderById.mockResolvedValue(AGY);
+    await expect(askService.resolveAskProvider('antigravity-cli', { hasHostControl: false }))
+      .rejects.toMatchObject({ status: 403, code: 'HOST_CONTROL_FORBIDDEN' });
+
+    // The voice/palette path resolves inside runAsk and must fail closed the same way.
+    const events = [];
+    for await (const evt of askService.runAsk({ question: 'hi', providerId: 'antigravity-cli', hasHostControl: async () => false })) events.push(evt);
+    expect(events.at(-1)).toMatchObject({ type: 'error', code: 'HOST_CONTROL_FORBIDDEN' });
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it('keeps every provider for a caller with host control, still without the bypass flag', async () => {
+    providers.getProviderById.mockResolvedValue(AGY);
+    await expect(askService.resolveAskProvider('antigravity-cli', { hasHostControl: true })).resolves.toBe(AGY);
+    spawn.mockReturnValue(fakeChild());
+    for await (const _evt of askService.runAsk({ question: 'hi', provider: AGY })) { /* drain */ }
+    const [, args] = spawn.mock.calls.at(-1);
+    expect(args).not.toContain('--dangerously-skip-permissions');
+  });
+
+  it('lets a caller without host control use claude-code with no tools and no bypass', async () => {
+    providers.getProviderById.mockResolvedValue(CLAUDE);
+    const provider = await askService.resolveAskProvider('claude-code', { hasHostControl: false });
+    expect(provider).toBe(CLAUDE);
+    spawn.mockReturnValue(fakeChild());
+    const events = [];
+    for await (const evt of askService.runAsk({ question: 'hi', provider })) events.push(evt);
+    expect(events.at(-1).type).toBe('done');
+    const [, args] = spawn.mock.calls.at(-1);
+    expect(args).not.toContain('--dangerously-skip-permissions');
+    expect(args).not.toContain('Bash');
+    expect(args.filter((a) => a === '--tools')).toHaveLength(1);
+    expect(args[args.indexOf('--tools') + 1]).toBe('');
+    // A project `.mcp.json` or `.claude/settings.json` cannot add servers or hooks.
+    expect(args).toContain('--strict-mcp-config');
+    expect(args[args.indexOf('--setting-sources') + 1]).toBe('user');
+  });
+
+  it('lets a caller without host control use an API provider', async () => {
+    const api = { id: 'example-api', type: 'api', enabled: true, endpoint: 'http://127.0.0.1:1', defaultModel: 'm' };
+    providers.getProviderById.mockResolvedValue(api);
+    await expect(askService.resolveAskProvider('example-api', { hasHostControl: false })).resolves.toBe(api);
+  });
+});

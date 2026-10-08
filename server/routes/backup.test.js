@@ -1,0 +1,625 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import express from 'express';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'stream';
+import { request } from '../lib/testHelper.js';
+import { errorMiddleware, ServerError } from '../lib/errorHandler.js';
+
+vi.mock('../services/backup.js', () => ({
+  getState: vi.fn(),
+  getNextRunTime: vi.fn(),
+  runBackup: vi.fn(),
+  listSnapshots: vi.fn(),
+  openSnapshotStream: vi.fn(),
+  restoreSnapshot: vi.fn(),
+  restorePostgres: vi.fn(),
+  deleteSnapshot: vi.fn(),
+  DEFAULT_EXCLUDES: [
+    { path: '/browser-profile/', reason: 'test', overridable: false },
+    { path: '/loras/*.safetensors', reason: 'test', overridable: true }
+  ]
+}));
+
+vi.mock('../services/backupRestoreRecovery.js', () => ({
+  getDatabaseRestoreRecoveryStatus: vi.fn(() => ({ pending: false })),
+  resumeDatabaseRestore: vi.fn(),
+}));
+
+vi.mock('../services/settings.js', () => ({
+  getSettings: vi.fn(),
+  settingsEvents: new EventEmitter()
+}));
+
+vi.mock('../services/auth.js', () => ({
+  isAuthEnabled: vi.fn(),
+  verifyPassword: vi.fn(),
+  verifyRequestSession: vi.fn(),
+}));
+vi.mock('../services/instanceIdentity.js', () => ({ loadData: vi.fn() }));
+
+import { isAuthEnabled, verifyPassword, verifyRequestSession } from '../services/auth.js';
+import { loadData } from '../services/instanceIdentity.js';
+import { authGate, hostControlRouteGate } from '../services/authGate.js';
+import { derivePeerAuthToken, PEER_AUTH_HEADER, PEER_INSTANCE_HEADER } from '../lib/peerHttpClient.js';
+import { DEV_PROXY_CLIENT_ADDRESS_HEADER } from '../../lib/portosAuthCore.js';
+import * as backup from '../services/backup.js';
+import { getDatabaseRestoreRecoveryStatus, resumeDatabaseRestore } from '../services/backupRestoreRecovery.js';
+import { getSettings } from '../services/settings.js';
+import backupRoutes from './backup.js';
+
+const buildApp = () => {
+  const app = express();
+  app.use(express.json());
+  app.use('/api/backup', backupRoutes);
+  app.use(errorMiddleware);
+  return app;
+};
+
+describe('backup routes', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  describe('GET /api/backup/status', () => {
+    it('returns merged state, configured destPath, and nextRun', async () => {
+      backup.getState.mockResolvedValue({ lastRun: '2026-04-01T00:00:00Z', success: true });
+      backup.getNextRunTime.mockReturnValue('2026-04-08T00:00:00Z');
+      getSettings.mockResolvedValue({ backup: { destPath: '/backup/target' } });
+
+      const res = await request(buildApp()).get('/api/backup/status');
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({
+        lastRun: '2026-04-01T00:00:00Z',
+        success: true,
+        destPath: '/backup/target',
+        nextRun: '2026-04-08T00:00:00Z',
+        defaultExcludes: [
+          { path: '/browser-profile/', reason: 'test', overridable: false },
+          { path: '/loras/*.safetensors', reason: 'test', overridable: true }
+        ],
+        restoreRecovery: { pending: false },
+      });
+    });
+
+    it('reports a committed restore awaiting recovery (#9725)', async () => {
+      backup.getState.mockResolvedValue({});
+      getSettings.mockResolvedValue({ backup: {} });
+      const pending = { pending: true, id: '00000000-0000-4000-8000-000000000001', stage: 'repairing', snapshotId: 'snap-1', createdAt: '2026-01-01T00:00:00.000Z' };
+      getDatabaseRestoreRecoveryStatus.mockReturnValueOnce(pending);
+      const res = await request(buildApp()).get('/api/backup/status');
+      expect(res.body.restoreRecovery).toEqual(pending);
+    });
+
+    it('serves a process-local persistence failure without hiding the last successful snapshot', async () => {
+      const state = {
+        status: 'error', lastSnapshotId: 'previous-snapshot',
+        lastRun: '2026-01-02T00:00:00.000Z', pgBackup: null,
+        error: 'Backup failed; status persistence failed (EACCES). See server logs.',
+      };
+      backup.getState.mockResolvedValue(state);
+      backup.getNextRunTime.mockReturnValue(null);
+      getSettings.mockResolvedValue({ backup: { destPath: '/backup/target' } });
+      const res = await request(buildApp()).get('/api/backup/status');
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject(state);
+    });
+
+    it('returns null destPath when backup is not configured', async () => {
+      backup.getState.mockResolvedValue({});
+      backup.getNextRunTime.mockReturnValue(null);
+      getSettings.mockResolvedValue({});
+      const res = await request(buildApp()).get('/api/backup/status');
+      expect(res.status).toBe(200);
+      expect(res.body.destPath).toBeNull();
+    });
+  });
+
+  describe('POST /api/backup/run', () => {
+    it('returns 400 when no destination is configured', async () => {
+      getSettings.mockResolvedValue({ backup: {} });
+      const res = await request(buildApp()).post('/api/backup/run');
+      expect(res.status).toBe(400);
+      // Standard error envelope: machine code in `code`, human text in `error`.
+      expect(res.body.code).toBe('BACKUP_NOT_CONFIGURED');
+      expect(res.body.error).toBe('No backup destination configured in settings');
+      expect(backup.runBackup).not.toHaveBeenCalled();
+    });
+
+    it('runs the backup and forwards excludePaths', async () => {
+      getSettings.mockResolvedValue({
+        // Anchored is the canonical spelling; the second entry is deliberately
+        // not, to pin that the route forwards STORED settings verbatim — anchoring
+        // is a read-time concern inside computeEffectiveExcludes (#7241).
+        backup: { destPath: '/dest', excludePaths: ['/node_modules', '.git'] }
+      });
+      backup.runBackup.mockResolvedValue({ success: true, files: 100 });
+      const res = await request(buildApp()).post('/api/backup/run');
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ success: true, files: 100 });
+      expect(backup.runBackup).toHaveBeenCalledWith(
+        '/dest',
+        undefined,
+        { excludePaths: ['/node_modules', '.git'], disabledDefaultExcludes: [], retentionCount: null }
+      );
+    });
+
+    it('passes empty excludePaths when not configured', async () => {
+      getSettings.mockResolvedValue({ backup: { destPath: '/dest' } });
+      backup.runBackup.mockResolvedValue({ success: true });
+      await request(buildApp()).post('/api/backup/run');
+      expect(backup.runBackup).toHaveBeenCalledWith(
+        '/dest',
+        undefined,
+        { excludePaths: [], disabledDefaultExcludes: [], retentionCount: null }
+      );
+    });
+
+    it('forwards disabledDefaultExcludes when configured', async () => {
+      getSettings.mockResolvedValue({
+        backup: { destPath: '/dest', disabledDefaultExcludes: ['/loras/*.safetensors'] }
+      });
+      backup.runBackup.mockResolvedValue({ success: true });
+      await request(buildApp()).post('/api/backup/run');
+      expect(backup.runBackup).toHaveBeenCalledWith(
+        '/dest',
+        undefined,
+        { excludePaths: [], disabledDefaultExcludes: ['/loras/*.safetensors'], retentionCount: null }
+      );
+    });
+
+    it('forwards the resolved retentionCount', async () => {
+      getSettings.mockResolvedValue({
+        backup: { destPath: '/dest', retentionCount: 14 }
+      });
+      backup.runBackup.mockResolvedValue({ success: true });
+      await request(buildApp()).post('/api/backup/run');
+      expect(backup.runBackup).toHaveBeenCalledWith(
+        '/dest',
+        undefined,
+        { excludePaths: [], disabledDefaultExcludes: [], retentionCount: 14 }
+      );
+    });
+  });
+
+  describe('GET /api/backup/snapshots', () => {
+    it('returns classified inventory failures through the centralized boundary', async () => {
+      getSettings.mockResolvedValue({ backup: { destPath: '/backup/target' } });
+      backup.listSnapshots.mockRejectedValueOnce(new ServerError(
+        'Backup inventory unavailable: read-namespace (EIO)',
+        { code: 'BACKUP_INVENTORY_UNAVAILABLE', context: { operation: 'read-namespace', filesystemCode: 'EIO' } },
+      ));
+      const res = await request(buildApp()).get('/api/backup/snapshots');
+      expect(res.status).toBe(500);
+      expect(res.body).toMatchObject({
+        error: 'Backup inventory unavailable: read-namespace (EIO)',
+        code: 'BACKUP_INVENTORY_UNAVAILABLE',
+      });
+      expect(JSON.stringify(res.body)).not.toContain('/backup/target');
+    });
+
+    it('returns the list of snapshots from the configured destPath', async () => {
+      getSettings.mockResolvedValue({ backup: { destPath: '/dest' } });
+      backup.listSnapshots.mockResolvedValue([{ id: 's1' }, { id: 's2' }]);
+      const res = await request(buildApp()).get('/api/backup/snapshots');
+      expect(res.status).toBe(200);
+      expect(res.body).toHaveLength(2);
+      expect(backup.listSnapshots).toHaveBeenCalledWith('/dest');
+    });
+  });
+
+  describe('GET /api/backup/snapshots/:snapshotId/download', () => {
+    it('streams a gzip attachment for the requested snapshot', async () => {
+      getSettings.mockResolvedValue({ backup: { destPath: '/dest' } });
+      backup.openSnapshotStream.mockImplementation(async () => {
+        const stream = new PassThrough();
+        process.nextTick(() => stream.end(Buffer.from('tarball')));
+        return stream;
+      });
+
+      const res = await request(buildApp()).get('/api/backup/snapshots/snap-1/download');
+
+      expect(res.status).toBe(200);
+      expect(res.headers['content-type']).toMatch(/^application\/gzip/);
+      expect(res.headers['content-disposition']).toBe('attachment; filename="portos-snapshot-snap-1.tar.gz"');
+      expect(res.body.toString()).toBe('tarball');
+      expect(backup.openSnapshotStream).toHaveBeenCalledWith('/dest', 'snap-1');
+    });
+
+    it('validates and forwards the selected snapshot source', async () => {
+      getSettings.mockResolvedValue({ backup: { destPath: '/dest' } });
+      backup.openSnapshotStream.mockImplementation(async () => {
+        const stream = new PassThrough();
+        process.nextTick(() => stream.end(Buffer.from('tarball')));
+        return stream;
+      });
+
+      const res = await request(buildApp())
+        .get('/api/backup/snapshots/snap-1/download?source=previous-machine');
+
+      expect(res.status).toBe(200);
+      expect(res.headers['content-disposition'])
+        .toBe('attachment; filename="portos-snapshot-previous-machine-snap-1.tar.gz"');
+      expect(backup.openSnapshotStream)
+        .toHaveBeenCalledWith('/dest', 'snap-1', { source: 'previous-machine' });
+    });
+
+    it('rejects a traversing source before opening the snapshot', async () => {
+      getSettings.mockResolvedValue({ backup: { destPath: '/dest' } });
+      const res = await request(buildApp())
+        .get('/api/backup/snapshots/snap-1/download?source=..%2Fother-machine');
+
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('VALIDATION_ERROR');
+      expect(backup.openSnapshotStream).not.toHaveBeenCalled();
+    });
+
+    it('returns 400 when the backup destination is not configured', async () => {
+      getSettings.mockResolvedValue({ backup: {} });
+
+      const res = await request(buildApp()).get('/api/backup/snapshots/snap-1/download');
+
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('BACKUP_NOT_CONFIGURED');
+      expect(backup.openSnapshotStream).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('DELETE /api/backup/snapshots/:snapshotId', () => {
+    it('deletes a snapshot on the current machine by default', async () => {
+      getSettings.mockResolvedValue({ backup: { destPath: '/dest' } });
+      backup.deleteSnapshot.mockResolvedValue({ deleted: true, snapshotId: 'snap-1', source: 'this-machine' });
+
+      const res = await request(buildApp()).delete('/api/backup/snapshots/snap-1');
+
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ deleted: true, snapshotId: 'snap-1', source: 'this-machine' });
+      expect(backup.deleteSnapshot).toHaveBeenCalledWith('/dest', 'snap-1', { source: undefined });
+    });
+
+    it('forwards an explicitly selected source', async () => {
+      getSettings.mockResolvedValue({ backup: { destPath: '/dest' } });
+      backup.deleteSnapshot.mockResolvedValue({ deleted: true, snapshotId: 'snap-1', source: 'previous-machine' });
+
+      const res = await request(buildApp())
+        .delete('/api/backup/snapshots/snap-1?source=previous-machine');
+
+      expect(res.status).toBe(200);
+      expect(backup.deleteSnapshot).toHaveBeenCalledWith('/dest', 'snap-1', { source: 'previous-machine' });
+    });
+
+    it('rejects a traversing source before deleting anything', async () => {
+      getSettings.mockResolvedValue({ backup: { destPath: '/dest' } });
+      const res = await request(buildApp())
+        .delete('/api/backup/snapshots/snap-1?source=..%2Fother-machine');
+
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('VALIDATION_ERROR');
+      expect(backup.deleteSnapshot).not.toHaveBeenCalled();
+    });
+
+    it('returns 400 when the backup destination is not configured', async () => {
+      getSettings.mockResolvedValue({ backup: {} });
+      const res = await request(buildApp()).delete('/api/backup/snapshots/snap-1');
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('BACKUP_NOT_CONFIGURED');
+      expect(backup.deleteSnapshot).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('POST /api/backup/restore', () => {
+    it('returns 400 when snapshotId is missing', async () => {
+      getSettings.mockResolvedValue({ backup: { destPath: '/dest' } });
+      const res = await request(buildApp()).post('/api/backup/restore').send({});
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('VALIDATION_ERROR');
+      expect(backup.restoreSnapshot).not.toHaveBeenCalled();
+    });
+
+    it('forwards a valid restore request to the service', async () => {
+      getSettings.mockResolvedValue({ backup: { destPath: '/dest' } });
+      backup.restoreSnapshot.mockResolvedValue({
+        success: true,
+        restored: 42,
+        verification: { status: 'verified', checkedFiles: 42 },
+      });
+      const res = await request(buildApp())
+        .post('/api/backup/restore')
+        .send({ snapshotId: 'snap-1', subdirFilter: 'data', dryRun: false });
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({
+        success: true,
+        restored: 42,
+        verification: { status: 'verified', checkedFiles: 42 },
+      });
+      expect(backup.restoreSnapshot).toHaveBeenCalledWith(
+        '/dest',
+        'snap-1',
+        { dryRun: false, subdirFilter: 'data' }
+      );
+    });
+
+    it('forwards source with file restore preview and execution requests', async () => {
+      getSettings.mockResolvedValue({ backup: { destPath: '/dest' } });
+      backup.restoreSnapshot.mockResolvedValue({ changedFiles: [] });
+      const res = await request(buildApp())
+        .post('/api/backup/restore')
+        .send({ snapshotId: 'snap-1', source: '@legacy', subdirFilter: null, dryRun: true });
+
+      expect(res.status).toBe(200);
+      expect(backup.restoreSnapshot).toHaveBeenCalledWith('/dest', 'snap-1', {
+        dryRun: true,
+        subdirFilter: null,
+        source: '@legacy',
+      });
+    });
+
+    it('defaults dryRun to true when omitted', async () => {
+      getSettings.mockResolvedValue({ backup: { destPath: '/dest' } });
+      backup.restoreSnapshot.mockResolvedValue({ success: true });
+      await request(buildApp())
+        .post('/api/backup/restore')
+        .send({ snapshotId: 'snap-2' });
+      expect(backup.restoreSnapshot).toHaveBeenCalledWith(
+        '/dest',
+        'snap-2',
+        expect.objectContaining({ dryRun: true })
+      );
+    });
+  });
+
+  describe('POST /api/backup/restore-db/recover', () => {
+    it('resumes exactly the named pending operation', async () => {
+      const id = '00000000-0000-4000-8000-000000000001';
+      resumeDatabaseRestore.mockResolvedValue({ status: 'ok', outcome: 'repaired', syncCursorsRewound: 1 });
+      const res = await request(buildApp()).post('/api/backup/restore-db/recover').send({ id });
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ status: 'ok', outcome: 'repaired', syncCursorsRewound: 1 });
+      expect(resumeDatabaseRestore).toHaveBeenCalledWith(id);
+    });
+
+    it('rejects a missing or malformed operation id without resuming', async () => {
+      for (const body of [{}, { id: 'snap-1' }, { id: '00000000-0000-4000-8000-000000000001', dryRun: false }]) {
+        const res = await request(buildApp()).post('/api/backup/restore-db/recover').send(body);
+        expect(res.status).toBe(400);
+      }
+      expect(resumeDatabaseRestore).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('POST /api/backup/restore-db', () => {
+    it('calls restorePostgres with the validated body (dryRun default true)', async () => {
+      getSettings.mockResolvedValue({ backup: { destPath: '/dest' } });
+      backup.restorePostgres.mockResolvedValue({ status: 'ok', dryRun: true, sizeBytes: 10, tableCount: 1 });
+      const res = await request(buildApp())
+        .post('/api/backup/restore-db')
+        .send({ snapshotId: '2026-06-05T00-00-00' });
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ status: 'ok', dryRun: true, sizeBytes: 10, tableCount: 1 });
+      expect(backup.restorePostgres).toHaveBeenCalledWith(
+        '/dest',
+        '2026-06-05T00-00-00',
+        { dryRun: true }
+      );
+    });
+
+    it('reports a refused preflight and a concurrent maintenance request without success', async () => {
+      getSettings.mockResolvedValue({ backup: { destPath: '/dest' } });
+      backup.restorePostgres.mockResolvedValueOnce({ status: 'failed', reason: 'restore_preflight' });
+      const refused = await request(buildApp()).post('/api/backup/restore-db').send({ snapshotId: 'snap-1' });
+      expect(refused.body).toMatchObject({ status: 'failed', reason: 'restore_preflight' });
+      backup.restorePostgres.mockRejectedValueOnce(Object.assign(new Error('Restore in progress'), {
+        status: 503, code: 'DATABASE_MAINTENANCE',
+      }));
+      const busy = await request(buildApp()).post('/api/backup/restore-db').send({ snapshotId: 'snap-1', dryRun: false });
+      expect(busy.status).toBe(503);
+    });
+
+    it('forwards source with database restore preview and execution requests', async () => {
+      getSettings.mockResolvedValue({ backup: { destPath: '/dest' } });
+      backup.restorePostgres.mockResolvedValue({ status: 'ok', dryRun: true });
+      const res = await request(buildApp())
+        .post('/api/backup/restore-db')
+        .send({ snapshotId: 'snap-1', source: 'previous-machine', dryRun: true });
+
+      expect(res.status).toBe(200);
+      expect(backup.restorePostgres).toHaveBeenCalledWith('/dest', 'snap-1', {
+        dryRun: true,
+        source: 'previous-machine',
+      });
+    });
+
+    it.each(['../other-machine', 'machine/name', '', 42])(
+      'rejects invalid snapshot source %j before database restore',
+      async (source) => {
+        getSettings.mockResolvedValue({ backup: { destPath: '/dest' } });
+        const res = await request(buildApp())
+          .post('/api/backup/restore-db')
+          .send({ snapshotId: 'snap-1', source });
+        expect(res.status).toBe(400);
+        expect(res.body.code).toBe('VALIDATION_ERROR');
+        expect(backup.restorePostgres).not.toHaveBeenCalled();
+      },
+    );
+
+    it('forwards dryRun=false when explicitly requested', async () => {
+      getSettings.mockResolvedValue({ backup: { destPath: '/dest' } });
+      backup.restorePostgres.mockResolvedValue({ status: 'ok', dryRun: false });
+      await request(buildApp())
+        .post('/api/backup/restore-db')
+        .send({ snapshotId: 'snap-9', dryRun: false });
+      expect(backup.restorePostgres).toHaveBeenCalledWith(
+        '/dest',
+        'snap-9',
+        { dryRun: false }
+      );
+    });
+
+    it('returns 400 when snapshotId is missing', async () => {
+      getSettings.mockResolvedValue({ backup: { destPath: '/dest' } });
+      const res = await request(buildApp()).post('/api/backup/restore-db').send({});
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('VALIDATION_ERROR');
+      expect(backup.restorePostgres).not.toHaveBeenCalled();
+    });
+
+    it('returns 400 when no destination is configured', async () => {
+      getSettings.mockResolvedValue({ backup: {} });
+      const res = await request(buildApp())
+        .post('/api/backup/restore-db')
+        .send({ snapshotId: 'snap-1' });
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('BACKUP_NOT_CONFIGURED');
+      expect(backup.restorePostgres).not.toHaveBeenCalled();
+    });
+
+    // `restoreDbRequestSchema` types snapshotId as a non-empty string. A client
+    // that sends a number, object, array, null, or '' must get the structured
+    // 400 VALIDATION_ERROR envelope — never a coerced snapshot id reaching the
+    // service, and never a generic 500.
+    it.each([
+      ['a number', 12345],
+      ['an object', { id: 'snap-1' }],
+      ['an array', ['snap-1']],
+      ['null', null],
+      ['an empty string', ''],
+      ['a boolean', true]
+    ])('returns 400 VALIDATION_ERROR when snapshotId is %s', async (_label, snapshotId) => {
+      getSettings.mockResolvedValue({ backup: { destPath: '/dest' } });
+      const res = await request(buildApp())
+        .post('/api/backup/restore-db')
+        .send({ snapshotId });
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('VALIDATION_ERROR');
+      expect(backup.restorePostgres).not.toHaveBeenCalled();
+    });
+
+    // dryRun is the safety switch between "report what would happen" and
+    // "replay the dump over the live database". Zod must NOT coerce a truthy/
+    // falsy lookalike — a client sending the string 'false' has to be rejected
+    // outright rather than silently arriving as `true` and wiping the DB.
+    it.each([
+      ['the string "false"', 'false'],
+      ['the string "true"', 'true'],
+      ['the number 0', 0],
+      ['the number 1', 1],
+      ['null', null],
+      ['an object', {}]
+    ])('returns 400 VALIDATION_ERROR when dryRun is %s', async (_label, dryRun) => {
+      getSettings.mockResolvedValue({ backup: { destPath: '/dest' } });
+      const res = await request(buildApp())
+        .post('/api/backup/restore-db')
+        .send({ snapshotId: 'snap-1', dryRun });
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('VALIDATION_ERROR');
+      expect(backup.restorePostgres).not.toHaveBeenCalled();
+    });
+
+    // Bypass probe: the rejections above must come from the schema rejecting
+    // those specific values, not from the request never reaching the handler.
+    it('accepts a well-formed body so the rejections above are not vacuous', async () => {
+      getSettings.mockResolvedValue({ backup: { destPath: '/dest' } });
+      backup.restorePostgres.mockResolvedValue({ status: 'ok', dryRun: false });
+      const res = await request(buildApp())
+        .post('/api/backup/restore-db')
+        .send({ snapshotId: 'snap-1', dryRun: false });
+      expect(res.status).toBe(200);
+      expect(backup.restorePostgres).toHaveBeenCalledWith('/dest', 'snap-1', { dryRun: false });
+    });
+
+    // restorePostgres reports domain failures in its resolved value rather than
+    // by throwing. The route must serialize those verbatim at 200 so the client
+    // can surface the reason — collapsing them into a 500 envelope would hide
+    // which check refused the restore.
+    it.each([
+      ['manifest_unreadable', { status: 'failed', reason: 'manifest_unreadable' }],
+      ['manifest_mismatch', { status: 'failed', reason: 'manifest_mismatch' }],
+      ['restore_schema_reconciliation', { status: 'failed', reason: 'restore_schema_reconciliation', error: 'The database dump was applied, but schema recovery is incomplete. Restart PortOS.' }],
+      ['restore_error', { status: 'failed', reason: 'restore_error', error: 'psql: exited 1' }],
+      ['no_dump', { status: 'skipped', reason: 'no_dump' }],
+      ['not_configured', { status: 'skipped', reason: 'not_configured' }]
+    ])('returns the %s service result verbatim with a 200 status', async (_label, serviceResult) => {
+      getSettings.mockResolvedValue({ backup: { destPath: '/dest' } });
+      backup.restorePostgres.mockResolvedValue(serviceResult);
+      const res = await request(buildApp())
+        .post('/api/backup/restore-db')
+        .send({ snapshotId: 'snap-1', dryRun: false });
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual(serviceResult);
+    });
+  });
+});
+
+// These requests exercise the production authorization chain before the real
+// router. Mocking restore services prevents all rsync/psql, maintenance and
+// settings-reload effects, and proves denied requests never reach those sinks.
+describe('backup restore operator authority (#8772)', () => {
+  const peer = { id: 'example-peer', instanceId: 'example-instance', enabled: true, syncSecret: 'synthetic-pair-secret-for-tests-only' };
+  const buildGuardedApp = (remoteAddress) => {
+    const app = express();
+    app.use((req, res, next) => {
+      Object.defineProperty(req.socket, 'remoteAddress', { value: remoteAddress, configurable: true });
+      next();
+    });
+    app.use(authGate);
+    app.use(hostControlRouteGate);
+    app.use(express.json());
+    app.use('/api/backup', backupRoutes);
+    app.use(errorMiddleware);
+    return app;
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    isAuthEnabled.mockResolvedValue(false);
+    verifyRequestSession.mockImplementation(async (req) => req.headers.authorization === 'Bearer example-operator');
+    verifyPassword.mockResolvedValue(false);
+    loadData.mockResolvedValue({ peers: [peer] });
+    getSettings.mockResolvedValue({ backup: { destPath: '/example-backups' } });
+    backup.restoreSnapshot.mockResolvedValue({ success: true });
+    backup.restorePostgres.mockResolvedValue({ success: true });
+  });
+
+  describe.each([
+    ['restore', 'restoreSnapshot'],
+    ['restore-db', 'restorePostgres'],
+  ])('%s', (route, service) => {
+    it.each([true, false])('rejects unauthorized callers before restore, dryRun=%s', async (dryRun) => {
+      const cases = [
+        { address: '192.0.2.10', headers: {}, enabled: false, status: 403, code: 'HOST_CONTROL_FORBIDDEN' },
+        { address: '192.0.2.10', headers: { 'X-Forwarded-For': '127.0.0.1', [DEV_PROXY_CLIENT_ADDRESS_HEADER]: '127.0.0.1' }, enabled: false, status: 403, code: 'HOST_CONTROL_FORBIDDEN' },
+        { address: '127.0.0.1', headers: { [DEV_PROXY_CLIENT_ADDRESS_HEADER]: '192.0.2.10', 'X-Forwarded-For': '127.0.0.1' }, enabled: false, status: 403, code: 'HOST_CONTROL_FORBIDDEN' },
+        { address: '127.0.0.1', headers: {}, enabled: true, status: 401, code: 'AUTH_REQUIRED' },
+        { address: '192.0.2.10', headers: { [PEER_AUTH_HEADER]: derivePeerAuthToken(peer.syncSecret, peer.instanceId), [PEER_INSTANCE_HEADER]: peer.instanceId }, enabled: true, status: 403, code: 'PEER_SCOPE_FORBIDDEN' },
+        { address: '127.0.0.1', headers: { Authorization: 'Basic ' + Buffer.from(':example-password').toString('base64') }, enabled: true, status: 403, code: 'HOST_CONTROL_FORBIDDEN', basic: true },
+      ];
+      for (const scenario of cases) {
+        isAuthEnabled.mockResolvedValue(scenario.enabled);
+        verifyPassword.mockResolvedValue(scenario.basic === true);
+        const pending = request(buildGuardedApp(scenario.address)).post('/api/backup/' + route);
+        for (const [header, value] of Object.entries(scenario.headers)) pending.set(header, value);
+        const res = await pending.send({ snapshotId: 'snap-1', dryRun });
+        expect(res.status).toBe(scenario.status);
+        expect(res.body.code).toBe(scenario.code);
+        expect(backup.restoreSnapshot).not.toHaveBeenCalled();
+        expect(backup.restorePostgres).not.toHaveBeenCalled();
+      }
+    });
+
+    it.each([undefined, true, false])('preserves operator restores and dry-run defaults, dryRun=%s', async (dryRun) => {
+      for (const scenario of [
+        { address: '127.0.0.1', headers: {}, enabled: false },
+        { address: '127.0.0.1', headers: { [DEV_PROXY_CLIENT_ADDRESS_HEADER]: '::1' }, enabled: false },
+        { address: '192.0.2.10', headers: { Authorization: 'Bearer example-operator' }, enabled: true },
+      ]) {
+        isAuthEnabled.mockResolvedValue(scenario.enabled);
+        const pending = request(buildGuardedApp(scenario.address)).post('/api/backup/' + route);
+        for (const [header, value] of Object.entries(scenario.headers)) pending.set(header, value);
+        const res = await pending.send({ snapshotId: 'snap-1', dryRun });
+        expect(res.status).toBe(200);
+        expect(res.body).toEqual({ success: true });
+        expect(backup[service]).toHaveBeenLastCalledWith('/example-backups', 'snap-1',
+          expect.objectContaining({ dryRun: dryRun ?? true }));
+      }
+    });
+  });
+});

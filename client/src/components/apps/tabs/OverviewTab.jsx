@@ -1,0 +1,462 @@
+import { useState, useEffect, useMemo } from 'react';
+import { Link, useNavigate } from 'react-router';
+import { FolderOpen, Gamepad2, Terminal, Code, RefreshCw, Wrench, Archive, ArchiveRestore, Download, Tag, AlertTriangle, Rocket, Camera, Image, Sparkles, Trash2, Smartphone, Clapperboard, X, Loader2 } from 'lucide-react';
+import toast from '../../ui/Toast';
+import InlineConfirmRow from '../../ui/InlineConfirmRow';
+import { isStandardizable, NON_PM2_TYPES, isLaunchVideoDisabled } from '../constants';
+import { PORTOS_APP_ID } from '../../../lib/appIdentity.js';
+import ActivityLog from '../ActivityLog';
+import SlashDoPanel from '../SlashDoPanel';
+import Banner from '../../ui/Banner';
+import { safeReadStorage, safeWriteStorage } from '../../../lib/safeStorage';
+import { useAppOperation } from '../../../hooks/useAppOperation';
+import * as api from '../../../services/api';
+import { formatBytes } from '../../../utils/formatters';
+
+const SCRIPT_ICONS = {
+  'deploy.sh': Rocket,
+  'take_screenshots.sh': Camera,
+  'take_screenshots_macos.sh': Camera
+};
+
+export default function OverviewTab({ app, onRefresh }) {
+  const navigate = useNavigate();
+  const [refreshingConfig, setRefreshingConfig] = useState(false);
+  const [archiving, setArchiving] = useState(false);
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [installingScripts, setInstallingScripts] = useState(false);
+  const [detectingIcon, setDetectingIcon] = useState(false);
+  // Reverse lookup (#2991): sprite records that publish assets into this app.
+  const [spriteBindings, setSpriteBindings] = useState([]);
+
+  const onComplete = useMemo(() => () => onRefresh(), [onRefresh]);
+  // Scoped to this app: the shared hook otherwise reports whichever operation
+  // is running, which would stream another app's steps into this tab.
+  const { steps, isOperating, operationType, error, completed, restarting, startUpdate, startStandardize } = useAppOperation({ onComplete, appId: app?.id });
+  const updating = isOperating && operationType === 'update';
+  const standardizing = isOperating && operationType === 'standardize';
+
+  // Load the sprite records bound to this app (empty for an app with none).
+  useEffect(() => {
+    if (!app?.id) return;
+    let cancelled = false;
+    api.getAppSpriteBindings(app.id)
+      .then((res) => { if (!cancelled) setSpriteBindings(res?.bindings || []); })
+      .catch(() => { if (!cancelled) setSpriteBindings([]); });
+    return () => { cancelled = true; };
+  }, [app?.id]);
+
+  const handleUpdate = () => startUpdate(app.id, app.name);
+
+  const handleRefreshConfig = async () => {
+    setRefreshingConfig(true);
+    await api.refreshAppConfig(app.id).catch(() => null);
+    setRefreshingConfig(false);
+    onRefresh();
+  };
+
+  const handleStandardize = () => startStandardize(app.id, app.name);
+
+  const handleOpenXcode = () => api.openAppInXcode(app.id)
+    .then(result => {
+      if (result?.success) toast.success(`Opening ${app.name} in Xcode`);
+    })
+    .catch(() => null);
+
+  const handleDetectIcon = async () => {
+    setDetectingIcon(true);
+    const result = await api.detectAppIcon(app.id).catch(() => null);
+    setDetectingIcon(false);
+    if (!result) return;
+    if (result.detected) {
+      toast.success(`Icon detected for ${app.name}`);
+      onRefresh();
+    } else {
+      toast.error(`No icon found for ${app.name}`);
+    }
+  };
+
+  const missingScripts = app.xcodeScripts?.missing || [];
+
+  const handleInstallScripts = async (scriptNames) => {
+    setInstallingScripts(true);
+    const result = await api.installXcodeScripts(app.id, scriptNames).catch(() => null);
+    setInstallingScripts(false);
+    if (!result) return; // request() already showed error toast
+
+    if (result.installed?.length) {
+      toast.success(`Installed: ${result.installed.join(', ')}`);
+      onRefresh();
+    }
+
+    if (result.errors?.length) {
+      toast.error(`Some scripts could not be installed: ${result.errors.join(', ')}`);
+    }
+  };
+
+  // Same contract as the /apps list (#3436): `request()` already toasted the
+  // failure, so a success toast on top of it would tell the user the app was
+  // excluded from CoS scheduling when nothing changed.
+  const setArchived = async (archived) => {
+    setArchiving(true);
+    const result = await (archived ? api.archiveApp(app.id) : api.unarchiveApp(app.id)).catch(() => null);
+    setArchiving(false);
+    if (!result) return;
+    toast.success(archived
+      ? `${app.name} archived — excluded from CoS tasks`
+      : `${app.name} unarchived — included in CoS tasks`);
+    onRefresh();
+  };
+
+  const handleArchive = () => setArchived(true);
+
+  const handleUnarchive = () => setArchived(false);
+
+  const handleDelete = async () => {
+    if (deleting) return;
+    setDeleting(true);
+    // DELETE returns 204, so success is represented by resolution rather than
+    // a response body. request() owns the failure toast; this handler only
+    // adds the success path and returns the user to the registry.
+    const removed = await api.deleteApp(app.id).then(() => true, () => false);
+    setDeleting(false);
+    if (!removed) return;
+    toast.success(`${app.name} removed from PortOS — files kept on disk`);
+    navigate('/apps');
+  };
+
+  const launchVideoPath = `/apps/${encodeURIComponent(app.id)}/launch-video`;
+  const launchVideoDismissKey = `portos:launch-video-card-dismissed:${app?.id}`;
+  const [launchVideoCardDismissed, setLaunchVideoCardDismissed] = useState(
+    () => safeReadStorage(launchVideoDismissKey) === 'true'
+  );
+
+  useEffect(() => {
+    if (!app?.id) return;
+    setLaunchVideoCardDismissed(safeReadStorage(`portos:launch-video-card-dismissed:${app.id}`) === 'true');
+  }, [app?.id]);
+
+  const handleDismissLaunchVideoCard = () => {
+    setLaunchVideoCardDismissed(true);
+    if (app?.id) {
+      safeWriteStorage(`portos:launch-video-card-dismissed:${app.id}`, 'true');
+    }
+  };
+
+  const showLaunchVideoCard = app.id !== PORTOS_APP_ID && !isLaunchVideoDisabled(app) && !launchVideoCardDismissed;
+
+  return (
+    <div className="space-y-6">
+      {showLaunchVideoCard && (
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-port-border bg-port-card p-4">
+          <div>
+            <h2 className="font-semibold">Launch videos</h2>
+            <p className="text-sm text-port-text-muted">Make a short launch video with any agent, then preview and download every take.</p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Link to={launchVideoPath} className="inline-flex items-center gap-2 rounded border border-port-border px-3 py-2 text-port-text hover:border-port-accent">
+              <Clapperboard size={16} aria-hidden="true" />View launch videos
+            </Link>
+            <Link to={`${launchVideoPath}?launchVideo=true`} className="rounded bg-port-accent px-3 py-2 text-white">Make launch video</Link>
+            <button
+              type="button"
+              onClick={handleDismissLaunchVideoCard}
+              aria-label="Dismiss launch video card"
+              title="Dismiss launch video card"
+              className="inline-flex items-center justify-center rounded p-2 text-port-text-muted hover:bg-port-border hover:text-white transition-colors"
+            >
+              <X size={16} aria-hidden="true" />
+            </button>
+          </div>
+        </div>
+      )}
+      {/* Capped width so key/value pairs stay legible. (JIRA config + the sprint
+          Kanban board, which needed the full page width, now live on the app's
+          own JIRA tab.) */}
+      <div className="space-y-6 max-w-5xl">
+      {/* Details Grid */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 sm:gap-6">
+        <div>
+          <div className="text-xs text-gray-500 uppercase tracking-wide mb-2">Repository Path</div>
+          <div className="flex items-start gap-2">
+            <FolderOpen size={16} className="text-yellow-400 shrink-0 mt-0.5" />
+            <code className="text-sm text-gray-300 font-mono break-all">{app.repoPath}</code>
+          </div>
+        </div>
+        <div>
+          <div className="text-xs text-gray-500 uppercase tracking-wide mb-2">Editor Command</div>
+          <div className="flex items-center gap-2">
+            <Code size={16} className="text-blue-400 shrink-0" />
+            <code className="text-sm text-gray-300 font-mono">{app.editorCommand || 'code .'}</code>
+          </div>
+        </div>
+        {app.appVersion && (
+          <div>
+            <div className="text-xs text-gray-500 uppercase tracking-wide mb-2">Version</div>
+            <div className="flex items-center gap-2">
+              <Tag size={16} className="text-port-accent shrink-0" />
+              <span className="px-2 py-0.5 bg-port-accent/10 text-port-accent text-sm font-mono rounded">
+                v{app.appVersion}
+              </span>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Missing Xcode Scripts Banner */}
+      {missingScripts.length > 0 && (
+        <Banner
+          tone="warning"
+          size="lg"
+          icon={AlertTriangle}
+          title="Missing management scripts"
+        >
+          <div className="flex flex-wrap gap-2 mb-3 mt-2">
+            {missingScripts.map(s => {
+              const Icon = SCRIPT_ICONS[s.name] || Terminal;
+              return (
+                <span key={s.name} className="inline-flex items-center gap-1.5 px-2 py-1 bg-port-card border border-port-border rounded text-xs text-gray-300">
+                  <Icon size={12} />
+                  <span className="font-mono">{s.name}</span>
+                  <span className="text-gray-500">— {s.description}</span>
+                </span>
+              );
+            })}
+          </div>
+          <div className="flex gap-2">
+            <button
+              onClick={() => handleInstallScripts(missingScripts.map(s => s.name))}
+              disabled={installingScripts}
+              className="px-3 py-1.5 bg-port-warning/20 text-port-warning hover:bg-port-warning/30 rounded text-xs font-medium disabled:opacity-50"
+            >
+              {installingScripts ? 'Installing...' : 'Install All'}
+            </button>
+            {missingScripts.length > 1 && missingScripts.map(s => (
+              <button
+                key={s.name}
+                onClick={() => handleInstallScripts([s.name])}
+                disabled={installingScripts}
+                className="px-2 py-1.5 bg-port-border hover:bg-port-border/80 text-gray-300 rounded text-xs disabled:opacity-50"
+              >
+                Install {s.name}
+              </button>
+            ))}
+          </div>
+        </Banner>
+      )}
+
+      {/* Start Commands */}
+      {app.startCommands?.length > 0 && (
+        <div>
+          <div className="text-xs text-gray-500 uppercase tracking-wide mb-2">Start Commands</div>
+          <div className="bg-port-card border border-port-border rounded-lg p-3">
+            {app.startCommands.map((cmd, i) => (
+              <div key={i} className="flex items-start gap-2 py-1">
+                <Terminal size={14} className="text-green-400 shrink-0 mt-0.5" />
+                <code className="text-sm text-cyan-300 font-mono break-all">{cmd}</code>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {app.nativeLaunch && (
+        <div>
+          <div className="text-xs text-gray-500 uppercase tracking-wide mb-2">Native Launch</div>
+          <div className="flex flex-wrap items-center gap-2 bg-port-card border border-port-border rounded-lg p-3">
+            <Gamepad2 size={14} className="text-port-success shrink-0" />
+            <span className="text-sm text-white">{app.nativeLaunch.label}</span>
+            <code className="text-sm text-cyan-300 font-mono break-all">{app.nativeLaunch.command}</code>
+            <span className="text-xs text-gray-500 font-mono">{app.nativeLaunch.processName}</span>
+          </div>
+        </div>
+      )}
+
+      {/* PM2 Processes Status */}
+      {app.pm2Status && Object.keys(app.pm2Status).length > 0 && (
+        <div>
+          <div className="text-xs text-gray-500 uppercase tracking-wide mb-2">PM2 Processes</div>
+          <div className="flex flex-wrap gap-2">
+            {Object.values(app.pm2Status).map((proc, i) => {
+              const processConfig = app.processes?.find(p => p.name === proc.name);
+              return (
+                <div
+                  key={i}
+                  className="flex flex-wrap items-center gap-2 px-3 py-1.5 bg-port-card border border-port-border rounded-lg"
+                >
+                  <span className={`w-2 h-2 rounded-full shrink-0 ${
+                    proc.status === 'online' ? 'bg-port-success' :
+                    proc.status === 'stopped' ? 'bg-gray-500' :
+                    proc.status === 'unknown' ? 'bg-port-warning' : 'bg-port-error'
+                  }`} />
+                  <span className="text-sm text-white font-mono">{proc.name}</span>
+                  {processConfig?.ports && Object.keys(processConfig.ports).length > 0 && (
+                    <span className="text-xs text-cyan-400 font-mono">
+                      {Object.entries(processConfig.ports).length > 1
+                        ? ` (${Object.entries(processConfig.ports).map(([label, port]) => `${label}:${port}`).join(', ')})`
+                        : `:${Object.values(processConfig.ports)[0]}`}
+                    </span>
+                  )}
+                  <span className="text-xs text-gray-500">{proc.status}</span>
+                  {proc.cpu !== undefined && (
+                    <span className="text-xs text-green-400">{proc.cpu}%</span>
+                  )}
+                  {proc.memory !== undefined && (
+                    <span className="text-xs text-blue-400">{formatBytes(proc.memory)}</span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Sprite assets PortOS publishes into this app (reverse lookup, #2991).
+          Shown only when at least one sprite record is bound — makes "PortOS is
+          the creative source for this app" visible from the app side. */}
+      {spriteBindings.length > 0 && (
+        <div>
+          <div className="text-xs text-gray-500 uppercase tracking-wide mb-2">Published Sprite Assets</div>
+          <div className="bg-port-card border border-port-border rounded-lg divide-y divide-port-border">
+            {spriteBindings.map((b) => (
+              <div key={b.recordId} className="flex flex-wrap items-center gap-2 px-3 py-2">
+                <Sparkles size={14} className="text-port-accent shrink-0" />
+                <Link
+                  to={`/sprites/${b.recordId}`}
+                  className="text-sm text-port-accent hover:underline font-medium"
+                >
+                  {b.name}
+                </Link>
+                {b.kind && <span className="text-xs text-gray-500">{b.kind}</span>}
+                {b.atlasDestPath && (
+                  <code className="text-xs text-cyan-300 font-mono break-all">→ {b.atlasDestPath}</code>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Agent Operations */}
+      <SlashDoPanel appId={app.id} appName={app.name} appType={app.type} />
+
+      {/* Quick Actions */}
+      <div className="flex flex-wrap gap-2 pt-2">
+        <button
+          onClick={() => api.openAppInEditor(app.id).catch(() => null)}
+          className="px-3 py-1.5 bg-port-border hover:bg-port-border/80 text-white rounded-lg text-xs flex items-center gap-1"
+        >
+          <Code size={14} /> Open in Editor
+        </button>
+        <button
+          onClick={() => api.openAppFolder(app.id).catch(() => null)}
+          className="px-3 py-1.5 bg-port-border hover:bg-port-border/80 text-white rounded-lg text-xs flex items-center gap-1"
+        >
+          <FolderOpen size={14} /> Open Folder
+        </button>
+        {NON_PM2_TYPES.has(app.type) && (
+          <button
+            onClick={handleOpenXcode}
+            className="px-3 py-1.5 bg-port-accent/20 text-port-accent hover:bg-port-accent/30 rounded-lg text-xs flex items-center gap-1"
+            aria-label={`Open ${app.name} in Xcode`}
+          >
+            <Smartphone size={14} /> Open in Xcode
+          </button>
+        )}
+        <button
+          onClick={handleUpdate}
+          disabled={isOperating || restarting}
+          className="px-3 py-1.5 bg-port-success/20 text-port-success hover:bg-port-success/30 rounded-lg text-xs flex items-center gap-1 disabled:opacity-50"
+        >
+          {updating ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
+          {updating ? 'Updating...' : restarting ? 'Restarting...' : 'Update'}
+        </button>
+        <button
+          onClick={handleRefreshConfig}
+          disabled={refreshingConfig}
+          className="px-3 py-1.5 bg-port-border hover:bg-port-border/80 text-white rounded-lg text-xs flex items-center gap-1 disabled:opacity-50"
+        >
+          <RefreshCw size={14} className={refreshingConfig ? 'animate-spin' : ''} />
+          Refresh Config
+        </button>
+        <button
+          onClick={handleDetectIcon}
+          disabled={detectingIcon}
+          className="px-3 py-1.5 bg-port-border hover:bg-port-border/80 text-white rounded-lg text-xs flex items-center gap-1 disabled:opacity-50"
+          title="Scan the app's repo for an icon/logo"
+        >
+          <Image size={14} />
+          {detectingIcon ? 'Scanning...' : 'Detect Icon'}
+        </button>
+        {/* PortOS's own ecosystem.config.cjs is the canonical PORTS source —
+            it is never regenerated from an LLM analysis (the server refuses too).
+            `isStandardizable` also keeps the button off non-Node repos, whose
+            ecosystem config the Node-shaped prompt has no business writing. */}
+        {isStandardizable(app.type) && app.id !== api.PORTOS_APP_ID && (
+          <button
+            onClick={handleStandardize}
+            disabled={isOperating}
+            className="px-3 py-1.5 bg-port-accent/20 text-port-accent hover:bg-port-accent/30 rounded-lg text-xs flex items-center gap-1 disabled:opacity-50"
+          >
+            <Wrench size={14} className={standardizing ? 'animate-spin' : ''} />
+            {standardizing ? 'Standardizing...' : 'Standardize PM2'}
+          </button>
+        )}
+        {app.id !== api.PORTOS_APP_ID && (
+          <button
+            onClick={app.archived ? handleUnarchive : handleArchive}
+            disabled={archiving}
+            className={`px-3 py-1.5 rounded-lg text-xs flex items-center gap-1 transition-colors disabled:opacity-50 border ${
+              app.archived
+                ? 'bg-port-success/20 text-port-success border-port-success/30 hover:bg-port-success/30'
+                : 'bg-port-border text-gray-400 border-port-border hover:text-white hover:bg-port-border/80'
+            }`}
+          >
+            {app.archived ? <ArchiveRestore size={14} /> : <Archive size={14} />}
+            {archiving ? '...' : app.archived ? 'Unarchive' : 'Archive'}
+          </button>
+        )}
+      </div>
+
+      {app.id !== api.PORTOS_APP_ID && (
+        <div className="border-t border-port-border pt-4">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div>
+              <h3 className="text-sm font-medium text-white">PortOS registration</h3>
+              <p className="text-xs text-gray-500 mt-1">
+                Remove PortOS&apos;s record of this app without deleting its repository from disk.
+              </p>
+            </div>
+            {!confirmingDelete && (
+              <button
+                onClick={() => setConfirmingDelete(true)}
+                disabled={deleting}
+                className="self-start sm:self-auto px-3 py-1.5 bg-port-error/10 text-port-error hover:bg-port-error/20 rounded-lg text-xs flex items-center gap-1 disabled:opacity-50"
+              >
+                <Trash2 size={14} />
+                Remove from PortOS
+              </button>
+            )}
+          </div>
+          {confirmingDelete && (
+            <InlineConfirmRow
+              className="mt-3"
+              autoFocus
+              aria-label={`Confirm removal of ${app.name} from PortOS`}
+              question={`Remove ${app.name} from PortOS? Its repository will stay on disk.`}
+              confirmText={deleting ? 'Removing…' : 'Remove'}
+              cancelText="Keep"
+              onConfirm={handleDelete}
+              onCancel={() => setConfirmingDelete(false)}
+            />
+          )}
+        </div>
+      )}
+
+      {/* Activity Log */}
+      <ActivityLog steps={steps} error={error} completed={completed} />
+      </div>
+    </div>
+  );
+}

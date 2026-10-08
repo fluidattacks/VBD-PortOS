@@ -1,0 +1,353 @@
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import {
+  LOCAL_RUNTIMES,
+  LOCAL_RUNTIME_MANAGE_URLS,
+  isLocalInstanceEndpoint,
+  localRuntimeForProvider,
+  normalizeOpenAiBaseUrl,
+} from './localProviderRuntime.js';
+import { opencodeLocalBaseUrl } from './opencodeConfig.js';
+import { PORTS } from './ports.js';
+import { NAV_COMMANDS } from './navManifest.js';
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
+
+const opencodeConfig = (namespace, baseURL) => JSON.stringify({
+  permission: 'allow',
+  provider: { [namespace]: { npm: '@ai-sdk/openai-compatible', options: { baseURL } } },
+});
+
+describe('normalizeOpenAiBaseUrl', () => {
+  it('appends /v1 only when the URL does not already end in a version segment', () => {
+    expect(normalizeOpenAiBaseUrl('http://localhost:11434')).toBe('http://localhost:11434/v1');
+    expect(normalizeOpenAiBaseUrl('http://localhost:11434/v1')).toBe('http://localhost:11434/v1');
+    expect(normalizeOpenAiBaseUrl('http://localhost:11434/v1/')).toBe('http://localhost:11434/v1');
+  });
+
+  it('returns null for anything unusable', () => {
+    expect(normalizeOpenAiBaseUrl('')).toBeNull();
+    expect(normalizeOpenAiBaseUrl('   ')).toBeNull();
+    expect(normalizeOpenAiBaseUrl(null)).toBeNull();
+    expect(normalizeOpenAiBaseUrl(42)).toBeNull();
+  });
+});
+
+describe('isLocalInstanceEndpoint', () => {
+  it('accepts every loopback / bind-all spelling, with or without a version segment', () => {
+    expect(isLocalInstanceEndpoint('http://localhost:1234/v1')).toBe(true);
+    expect(isLocalInstanceEndpoint('http://127.0.0.1:11434')).toBe(true);
+    expect(isLocalInstanceEndpoint('http://127.5.5.5:8080/v1/')).toBe(true);
+    expect(isLocalInstanceEndpoint('http://0.0.0.0:1234/v1')).toBe(true);
+    expect(isLocalInstanceEndpoint('http://[::1]:1234/v1')).toBe(true);
+  });
+
+  it('rejects another machine, a public API, and anything unparseable', () => {
+    expect(isLocalInstanceEndpoint('http://192.0.2.10:1234/v1')).toBe(false);
+    expect(isLocalInstanceEndpoint('http://nas.example.com:11434/v1')).toBe(false);
+    expect(isLocalInstanceEndpoint('https://api.openai.com/v1')).toBe(false);
+    expect(isLocalInstanceEndpoint('localhost:1234')).toBe(false); // no scheme — not a URL
+    expect(isLocalInstanceEndpoint('')).toBe(false);
+    expect(isLocalInstanceEndpoint(null)).toBe(false);
+  });
+});
+
+describe('localRuntimeForProvider', () => {
+  it('prefers the baseURL the provider itself declares over the canonical default', () => {
+    const runtime = localRuntimeForProvider({
+      id: 'opencode-llama-tui',
+      command: 'opencode',
+      llamaBacked: true,
+      endpoint: 'http://127.0.0.1:8080/v1',
+      envVars: { OPENCODE_CONFIG_CONTENT: opencodeConfig('llama', 'http://127.0.0.1:8090/v1') },
+    });
+    expect(runtime.kind).toBe('llama');
+    expect(runtime.label).toBe('llama.cpp');
+    expect(runtime.command).toBe('llama-server');
+    expect(runtime.endpoint).toBe('http://127.0.0.1:8090/v1');
+    // Models → Runtimes (#7414), not the LLMs catalog: llama-server's
+    // lifecycle is what an unmet check sends the user to.
+    expect(runtime.manageUrl).toBe('/models/llms-runtimes');
+  });
+
+  it('falls back to the provider endpoint when the stored OpenCode config is unparseable', () => {
+    const runtime = localRuntimeForProvider({
+      command: 'opencode',
+      llamaBacked: true,
+      endpoint: 'http://127.0.0.1:8081/v1',
+      envVars: { OPENCODE_CONFIG_CONTENT: '{not json' },
+    });
+    expect(runtime.endpoint).toBe('http://127.0.0.1:8081/v1');
+  });
+
+  it('falls back to the canonical default when the provider declares no endpoint at all', () => {
+    const runtime = localRuntimeForProvider({ command: 'opencode', ollamaBacked: true, envVars: {} });
+    expect(runtime.endpoint).toBe(LOCAL_RUNTIMES.ollama.defaultBaseUrl);
+  });
+
+  it('reads the Claude Ollama wrapper base URL out of ANTHROPIC_BASE_URL', () => {
+    const runtime = localRuntimeForProvider({
+      command: 'claude',
+      ollamaBacked: true,
+      envVars: { ANTHROPIC_BASE_URL: 'http://localhost:11500' },
+    });
+    expect(runtime.endpoint).toBe('http://localhost:11500/v1');
+  });
+
+  it('ignores a foreign namespace in the stored OpenCode config', () => {
+    // A config that only declares `ollama` says nothing about where this
+    // llama-backed provider points — using its baseURL would probe Ollama and
+    // report the wrong daemon as the missing requirement.
+    const runtime = localRuntimeForProvider({
+      command: 'opencode',
+      llamaBacked: true,
+      envVars: { OPENCODE_CONFIG_CONTENT: opencodeConfig('ollama', 'http://localhost:11434/v1') },
+    });
+    expect(runtime.endpoint).toBe(LOCAL_RUNTIMES.llama.defaultBaseUrl);
+  });
+
+  it('returns null for providers with no local dependency', () => {
+    expect(localRuntimeForProvider({ command: 'claude', type: 'cli' })).toBeNull();
+  });
+
+  it('returns null for an API provider whose endpoint lives on ANOTHER machine', () => {
+    // The name matches `lmstudio`, so the card used to report THIS host's
+    // install state — "`lms` is on PortOS's PATH", "start LM Studio from
+    // Models → LLMs" — for a server PortOS neither runs nor can start.
+    expect(localRuntimeForProvider({
+      type: 'api',
+      id: 'lmstudio-peer',
+      name: 'LM Studio peer',
+      endpoint: 'http://192.0.2.10:1234/v1',
+    })).toBeNull();
+    // Same for the authoritative `*Backed` markers and for an OpenCode config
+    // that points its namespace at a peer.
+    expect(localRuntimeForProvider({
+      command: 'claude',
+      ollamaBacked: true,
+      envVars: { ANTHROPIC_BASE_URL: 'http://192.0.2.10:11434' },
+    })).toBeNull();
+    expect(localRuntimeForProvider({
+      command: 'opencode',
+      llamaBacked: true,
+      envVars: { OPENCODE_CONFIG_CONTENT: opencodeConfig('llama', 'http://192.0.2.10:8080/v1') },
+    })).toBeNull();
+  });
+
+  it('returns null when the env override the managers read points off-box', () => {
+    // OLLAMA_HOST on another machine means no local daemon to install here.
+    vi.stubEnv('OLLAMA_HOST', '192.0.2.10:11434');
+    expect(localRuntimeForProvider({ command: 'opencode', ollamaBacked: true, envVars: {} })).toBeNull();
+  });
+
+  it('takes the canonical default from the OpenCode provider table, not a second copy', () => {
+    // These are the base URLs a spawned OpenCode actually talks to; probing a
+    // hand-typed duplicate would eventually check a port nothing is on.
+    expect(LOCAL_RUNTIMES.llama.defaultBaseUrl).toBe(opencodeLocalBaseUrl('llama'));
+    expect(LOCAL_RUNTIMES.ollama.defaultBaseUrl).toBe(opencodeLocalBaseUrl('ollama'));
+    expect(LOCAL_RUNTIMES.mtplx.defaultBaseUrl).toBe(opencodeLocalBaseUrl('mtplx'));
+    expect(LOCAL_RUNTIMES.lmstudio.defaultBaseUrl).toBe(opencodeLocalBaseUrl('lmstudio'));
+    expect(LOCAL_RUNTIMES.vllm.defaultBaseUrl).toBe(opencodeLocalBaseUrl('vllm'));
+    expect(LOCAL_RUNTIMES.slotstream.defaultBaseUrl).toBe(`http://127.0.0.1:${PORTS.SLOTSTREAM}/v1`);
+    expect(LOCAL_RUNTIMES.slotstream.defaultBaseUrl).not.toMatch(/11434/);
+  });
+
+  it('honors the env override the backend managers themselves read', () => {
+    // A user who relocated Ollama via OLLAMA_HOST reaches it fine everywhere
+    // else in PortOS; the card must not answer "not responding — install it".
+    vi.stubEnv('OLLAMA_HOST', 'localhost:11500');
+    const runtime = localRuntimeForProvider({ command: 'opencode', ollamaBacked: true, envVars: {} });
+    // Bare `host:port` is Ollama's own convention — the scheme is added here.
+    expect(runtime.endpoint).toBe('http://localhost:11500/v1');
+  });
+
+  it('lets the provider config win over the env override', () => {
+    vi.stubEnv('OLLAMA_HOST', 'localhost:11500');
+    const runtime = localRuntimeForProvider({
+      command: 'opencode',
+      ollamaBacked: true,
+      envVars: { OPENCODE_CONFIG_CONTENT: opencodeConfig('ollama', 'http://localhost:11600/v1') },
+    });
+    expect(runtime.endpoint).toBe('http://localhost:11600/v1');
+  });
+
+  // #6466 — before the id-based fallback, `localRuntimeKind` had no answer for
+  // the bare API record, so this returned null and the shipped provider got no
+  // readiness checklist at all.
+  it('resolves the shipped mtplx API record — no command, no marker', () => {
+    const runtime = localRuntimeForProvider({ id: 'mtplx', type: 'api', endpoint: 'http://127.0.0.1:8000/v1' });
+    expect(runtime.kind).toBe('mtplx');
+    expect(runtime.label).toBe('MTPLX');
+    expect(runtime.endpoint).toBe('http://127.0.0.1:8000/v1');
+  });
+});
+
+// #7414 split the runtimes off the LLMs page, and the hand-sweep that followed
+// is what these guards exist to prevent repeating: a breadcrumb typed into a
+// runtime row goes stale the next time a page moves, and nothing fails.
+describe('LOCAL_RUNTIMES — user-facing copy names its page by route, never by literal', () => {
+  // Every user-readable string on a row. `setupStateDetail` is a nested
+  // state -> prose map, so walk it rather than listing its keys — a runtime that
+  // adds a state must inherit the guard, not dodge it.
+  const copyStrings = ([id, runtime]) => ['modelsHint', 'standbyDetail', 'setupStateDetail']
+    .flatMap((field) => {
+      const value = runtime[field];
+      if (typeof value === 'string') return [[`${id}.${field}`, value]];
+      if (value && typeof value === 'object') {
+        return Object.entries(value)
+          .filter(([, nested]) => typeof nested === 'string')
+          .map(([state, nested]) => [`${id}.${field}.${state}`, nested]);
+      }
+      return [];
+    });
+  const rows = Object.entries(LOCAL_RUNTIMES);
+  const allCopy = rows.flatMap(copyStrings);
+
+  it('writes no breadcrumb into a runtime row', () => {
+    expect(allCopy.filter(([, text]) => text.includes('→')).map(([name]) => name)).toEqual([]);
+  });
+
+  // The token only expands for a runtime that HAS a page; on one with
+  // `manageUrl: null` it would ship as a literal `{page}` or as filler prose.
+  it('uses the {page} token only where a manage route can name a page', () => {
+    const pageless = new Set(rows.filter(([, runtime]) => !runtime.manageUrl).map(([id]) => id));
+    const offenders = allCopy
+      .filter(([name, text]) => text.includes('{page}') && pageless.has(name.split('.')[0]))
+      .map(([name]) => name);
+    expect(offenders).toEqual([]);
+  });
+
+  // The guard above is only as good as its corpus: if `copyStrings` ever stopped
+  // finding the fields, both assertions would pass vacuously over an empty list.
+  it('actually reads the rows it claims to guard', () => {
+    expect(allCopy.length).toBeGreaterThanOrEqual(rows.length);
+    expect(allCopy.some(([, text]) => text.includes('{page}'))).toBe(true);
+    expect(allCopy.map(([name]) => name)).toContain('vllm.setupStateDetail.empty');
+  });
+
+  it('takes every manageUrl from the shared map the client reads', () => {
+    expect(Object.fromEntries(rows.map(([id, runtime]) => [id, runtime.manageUrl])))
+      .toEqual(LOCAL_RUNTIME_MANAGE_URLS);
+  });
+
+  it('points each runtime at the surface that actually manages it', () => {
+    // Server lifecycle is Models → Runtimes; the weights catalog is Models →
+    // LLMs. Pinned per runtime because getting ONE of these wrong is the whole
+    // bug — a checklist that links llama.cpp at the catalog is a dead end.
+    expect(LOCAL_RUNTIME_MANAGE_URLS).toEqual({
+      llama: '/models/llms-runtimes',
+      slotstream: '/models/llms-runtimes',
+      mtplx: '/models/llms-runtimes',
+      ollama: '/models/llms',
+      lmstudio: '/models/llms',
+      // Operator-owned compose projects: the readiness checklist is the only
+      // PortOS surface, so there is no page to link.
+      vllm: null,
+      sglang: null,
+    });
+  });
+});
+
+// #7419 repeated the #7414 hand-sweep — a SECOND breadcrumb split into runtimes
+// no LOCAL_RUNTIMES row was in scope for (fleetLlmHost.js, the Persistent Mind
+// recommenders, llamaServerManager.js, the playground back-link). Each of those
+// now resolves its page from `getNavPageForPath`/`expandPageToken` instead of a
+// literal, so this scans the whole server+client tree for the next one typed by
+// hand — a net, not a proof: a lexer-assisted line scan, not an AST pass.
+describe('shipped copy names a Models page by route, never by literal (#7419)', () => {
+  const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
+
+  const MODELS_TAB_LABELS = [...new Set(
+    NAV_COMMANDS.filter((c) => c.section === 'Models' && c.label).map((c) => c.label),
+  )];
+
+  // Longest-first so "Abuse Guard" cannot be shadowed by a shorter overlapping
+  // label (none currently overlap, but a future label might).
+  const BREADCRUMB_PATTERN = new RegExp(
+    `Models\\s*→\\s*(${MODELS_TAB_LABELS.slice().sort((a, b) => b.length - a.length)
+      .map((label) => label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})`,
+    'g',
+  );
+
+  // A hardcoded "Models → LLMs → Abuse Guard" names a THIRD-level breadcrumb
+  // (Abuse Guard nests under the LLMs tab in the sidebar) that
+  // `getNavPageForPath` cannot produce — it returns one `section → label` hop,
+  // never a drill-down chain. Deliberate, not a regression; #7419 leaves it.
+  const ABUSE_GUARD_CONTINUATION = /^\s*→\s*Abuse Guard/;
+
+  // Deliberate weights-catalog references #7419 leaves alone: the LLMs page
+  // they name has not moved, and rewriting them buys nothing a literal
+  // "Models → LLMs" doesn't already say correctly.
+  const ALLOWLISTED_FILES = new Set([
+    'server/lib/navManifest.js',
+    'server/services/loraDatasetCaption.js',
+    'client/src/components/loraTraining/CaptionModelPicker.jsx',
+  ]);
+
+  /**
+   * Blank every comment — `//…`, `/* … *\/`, and the `{/* … *\/}` JSX form,
+   * which is the same block-comment syntax wrapped in a brace — while leaving
+   * string/template literals and JSX text untouched, so a hardcoded breadcrumb
+   * SHIPPED to a user still matches. Line-based and conservative: once a line
+   * opens a block comment it blanks every line through the one that closes it,
+   * so a rule merely DESCRIBED across a JSDoc block can't trip the guard.
+   */
+  function blankBlockComments(src) {
+    let inBlock = false;
+    return src.split('\n').map((line) => {
+      if (inBlock) {
+        if (line.includes('*/')) inBlock = false;
+        return '';
+      }
+      if (/^\s*\/\//.test(line)) return '';
+      if (/^\s*(\/\*|\{\/\*)/.test(line)) {
+        if (!line.includes('*/')) inBlock = true;
+        return '';
+      }
+      return line;
+    }).join('\n');
+  }
+
+  function breadcrumbOffenders(src) {
+    const code = blankBlockComments(src);
+    return [...code.matchAll(BREADCRUMB_PATTERN)]
+      .filter((match) => !ABUSE_GUARD_CONTINUATION.test(code.slice(match.index + match[0].length, match.index + match[0].length + 20)))
+      .map((match) => match[0]);
+  }
+
+  const trackedSources = () => [
+    ...execFileSync('git', ['ls-files', 'server/**/*.js'], { cwd: REPO_ROOT, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }).split('\n'),
+    ...execFileSync('git', ['ls-files', 'client/src/**/*.js', 'client/src/**/*.jsx'], { cwd: REPO_ROOT, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }).split('\n'),
+  ].filter((f) => f && !f.includes('.test.'));
+
+  it('scans the whole tree', () => {
+    // A broken `git ls-files` (wrong cwd, detached checkout) would otherwise let
+    // every assertion below pass by scanning nothing at all.
+    expect(trackedSources().length).toBeGreaterThan(800);
+  });
+
+  it('recognizes a real hardcoded breadcrumb as an offense', () => {
+    // Proves the extractor still catches a violation — without this the scan
+    // below could go vacuously green after a regex/comment-blanking regression.
+    expect(breadcrumbOffenders('const msg = "Start it from Models → Runtimes.";')).toEqual(['Models → Runtimes']);
+  });
+
+  it('still recognizes a deliberate breadcrumb it must NOT flag', () => {
+    // The guard's own negative case: `getNavPageForPath` cannot produce a
+    // third-level breadcrumb, so this must stay allowlisted rather than
+    // vacuously passing because nothing matched at all.
+    expect(breadcrumbOffenders('const msg = "Open Models → LLMs → Abuse Guard to repair it.";')).toEqual([]);
+  });
+
+  it('flags a hardcoded breadcrumb outside the allowlist', () => {
+    const offenders = trackedSources()
+      .filter((file) => !ALLOWLISTED_FILES.has(file))
+      .flatMap((file) => breadcrumbOffenders(readFileSync(join(REPO_ROOT, file), 'utf8')).map((text) => `${file}: ${text}`));
+    expect(offenders).toEqual([]);
+  });
+});

@@ -1,0 +1,576 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+vi.mock('./taskSchedule.js', () => ({
+  getScheduleStatus: vi.fn()
+}));
+
+vi.mock('./autonomousJobs.js', () => ({
+  getAllJobs: vi.fn()
+}));
+
+vi.mock('./jobGates.js', () => ({
+  checkJobGate: vi.fn(),
+  hasGate: vi.fn(),
+  getRegisteredGates: vi.fn()
+}));
+
+const { getScheduleStatus } = await import('./taskSchedule.js');
+const { getAllJobs } = await import('./autonomousJobs.js');
+const { checkJobGate, hasGate, getRegisteredGates } = await import('./jobGates.js');
+const { getWorkflowGraph, projectWorkflowTimeline, WORKFLOW_STAGES } = await import('./workflow.js');
+const { AUDIT_TASK_TYPES } = await import('../lib/auditCatalog.js');
+
+const STAGE_IDS = WORKFLOW_STAGES.map(s => s.id);
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  getRegisteredGates.mockReturnValue([]);
+  hasGate.mockReturnValue(false);
+});
+
+describe('WORKFLOW_STAGES contract', () => {
+  it('canonical stages exist in expected order', () => {
+    expect(STAGE_IDS).toEqual(['hygiene', 'review', 'plan', 'audit', 'build', 'report', 'ambient']);
+  });
+
+  it('places do-replan in the plan stage and feature-ideas in build', () => {
+    const planStage = WORKFLOW_STAGES.find(s => s.id === 'plan');
+    const buildStage = WORKFLOW_STAGES.find(s => s.id === 'build');
+    expect(planStage.taskTypes).toContain('do-replan');
+    expect(buildStage.taskTypes).toContain('feature-ideas');
+  });
+
+  it('places branch-reconcile in the hygiene stage and pr-reviewer in review', () => {
+    const hygiene = WORKFLOW_STAGES.find(s => s.id === 'hygiene');
+    const review = WORKFLOW_STAGES.find(s => s.id === 'review');
+    expect(hygiene.taskTypes).toContain('branch-reconcile');
+    expect(review.taskTypes).toContain('pr-reviewer');
+  });
+
+  it('places PortOS catalog refresh custom tasks in the audit stage', () => {
+    const audit = WORKFLOW_STAGES.find(s => s.id === 'audit');
+    expect(audit.taskTypes).not.toContain('refresh-local-llm-catalog');
+    expect(audit.jobIds).toContain('job-refresh-local-llm-catalog');
+    expect(audit.taskTypes).not.toContain('refresh-cli-provider-catalogs');
+    expect(audit.jobIds).toContain('job-refresh-cli-provider-catalogs');
+  });
+
+  it('does not place the same task type in two stages', () => {
+    const seen = new Set();
+    for (const stage of WORKFLOW_STAGES) {
+      for (const t of stage.taskTypes) {
+        expect(seen.has(t), `task type ${t} appears in multiple stages`).toBe(false);
+        seen.add(t);
+      }
+    }
+  });
+
+  // The audit stage is now derived from the catalog, so "every audit type is in
+  // it" is true by construction and no longer worth asserting. What IS still a
+  // decision — and the only part a reader could get wrong — is the one type the
+  // stage adds on top of the catalog.
+  it('adds dependency-updates to the derived audit stage, and nothing else', () => {
+    const audit = WORKFLOW_STAGES.find(s => s.id === 'audit');
+    const extras = audit.taskTypes.filter(type => !AUDIT_TASK_TYPES.has(type));
+    expect(extras).toEqual(['dependency-updates']);
+    // It earns the stage without being a catalog type: no file-issues toggle.
+    expect(AUDIT_TASK_TYPES.has('dependency-updates')).toBe(false);
+  });
+
+  it('does not place the same job id in two stages', () => {
+    const seen = new Set();
+    for (const stage of WORKFLOW_STAGES) {
+      for (const j of stage.jobIds) {
+        expect(seen.has(j), `job id ${j} appears in multiple stages`).toBe(false);
+        seen.add(j);
+      }
+    }
+  });
+});
+
+describe('getWorkflowGraph', () => {
+  it('returns nodes for tasks with their stage classification', async () => {
+    getScheduleStatus.mockResolvedValue({
+      tasks: {
+        'do-replan': { type: 'cron', cronExpression: '0 7 * * 1', enabled: true, runAfter: ['pr-reviewer'], lastRun: null, runCount: 0, status: { shouldRun: true, reason: 'weekly-due' } },
+        'feature-ideas': { type: 'cron', cronExpression: '0 7 * * *', enabled: true, runAfter: ['do-replan'], lastRun: null, runCount: 0, status: { shouldRun: false, reason: 'waiting-on-dependencies', pendingDeps: ['do-replan'] } }
+      }
+    });
+    getAllJobs.mockResolvedValue([]);
+
+    const graph = await getWorkflowGraph();
+
+    const replan = graph.nodes.find(n => n.id === 'task:do-replan');
+    expect(replan).toBeDefined();
+    expect(replan.stage).toBe('plan');
+    expect(replan.kind).toBe('task');
+    expect(replan.runAfter).toEqual(['pr-reviewer']);
+    expect(replan.shouldRun).toBe(true);
+
+    const featureIdeas = graph.nodes.find(n => n.id === 'task:feature-ideas');
+    expect(featureIdeas.stage).toBe('build');
+    expect(featureIdeas.blocked).toBe('waiting-on-dependencies');
+    expect(featureIdeas.pendingDeps).toEqual(['do-replan']);
+  });
+
+  it('forwards per-app override config onto task nodes', async () => {
+    getScheduleStatus.mockResolvedValue({
+      tasks: {
+        'do-replan': {
+          type: 'cron', cronExpression: '0 7 * * 1', enabled: true, runAfter: [], lastRun: null, runCount: 0,
+          status: { shouldRun: true },
+          appOverrides: { 'app-1': { enabled: true, interval: 'daily' } },
+          enabledAppCount: 1,
+          totalAppCount: 3,
+          taskMetadata: { worktree: true },
+          managedAgentOptions: ['worktree']
+        }
+      }
+    });
+    getAllJobs.mockResolvedValue([]);
+
+    const graph = await getWorkflowGraph();
+    const replan = graph.nodes.find(n => n.id === 'task:do-replan');
+    expect(replan.appOverrides).toEqual({ 'app-1': { enabled: true, interval: 'daily' } });
+    expect(replan.enabledAppCount).toBe(1);
+    expect(replan.totalAppCount).toBe(3);
+    expect(replan.taskMetadata).toEqual({ worktree: true });
+    expect(replan.managedAgentOptions).toEqual(['worktree']);
+  });
+
+  it('defaults per-app override fields when absent', async () => {
+    getScheduleStatus.mockResolvedValue({
+      tasks: {
+        'feature-ideas': { type: 'cron', cronExpression: '0 7 * * *', enabled: true, runAfter: [], lastRun: null, runCount: 0, status: { shouldRun: true } }
+      }
+    });
+    getAllJobs.mockResolvedValue([]);
+
+    const graph = await getWorkflowGraph();
+    const node = graph.nodes.find(n => n.id === 'task:feature-ideas');
+    expect(node.appOverrides).toEqual({});
+    expect(node.enabledAppCount).toBe(0);
+    expect(node.totalAppCount).toBe(0);
+    expect(node.taskMetadata).toBeNull();
+    expect(node.managedAgentOptions).toBeNull();
+  });
+
+  it('emits a depends-on edge for every runAfter entry', async () => {
+    getScheduleStatus.mockResolvedValue({
+      tasks: {
+        'feature-ideas': { type: 'cron', cronExpression: '0 7 * * *', enabled: true, runAfter: ['do-replan'], lastRun: null, runCount: 0, status: { shouldRun: true } }
+      }
+    });
+    getAllJobs.mockResolvedValue([]);
+
+    const graph = await getWorkflowGraph();
+    const dep = graph.edges.find(e => e.kind === 'depends-on' && e.to === 'task:feature-ideas');
+    expect(dep).toEqual({ from: 'task:do-replan', to: 'task:feature-ideas', kind: 'depends-on' });
+  });
+
+  it('classifies known job IDs into their canonical stage', async () => {
+    getScheduleStatus.mockResolvedValue({ tasks: {} });
+    getAllJobs.mockResolvedValue([
+      { id: 'job-daily-briefing', name: 'Daily Briefing', enabled: true, interval: 'daily', lastRun: null, runCount: 0 },
+      { id: 'job-system-health-check', name: 'System Health Check', enabled: true, interval: 'custom', intervalMs: 900000, lastRun: null, runCount: 0 }
+    ]);
+
+    const graph = await getWorkflowGraph();
+    const briefing = graph.nodes.find(n => n.id === 'job:job-daily-briefing');
+    const health = graph.nodes.find(n => n.id === 'job:job-system-health-check');
+    expect(briefing.stage).toBe('report');
+    expect(health.stage).toBe('ambient');
+  });
+
+  it('forwards rich recurrence rules onto job nodes', async () => {
+    const cronSchedule = { frequency: 'weekly', interval: 2, weekdays: [1], time: '02:00', anchorDate: '2026-08-31' };
+    getScheduleStatus.mockResolvedValue({ tasks: {} });
+    getAllJobs.mockResolvedValue([
+      { id: 'job-biweekly', name: 'Biweekly', enabled: true, cronSchedule, cronExpression: '0 2 * * 1' }
+    ]);
+
+    const graph = await getWorkflowGraph();
+
+    expect(graph.nodes.find(n => n.id === 'job:job-biweekly').schedule.cronSchedule).toEqual(cronSchedule);
+  });
+
+  it('falls back to ambient stage for unknown task types and jobs', async () => {
+    getScheduleStatus.mockResolvedValue({
+      tasks: {
+        'custom-thing': { type: 'cron', cronExpression: '0 7 * * *', enabled: true, runAfter: [], lastRun: null, runCount: 0, status: { shouldRun: true } }
+      }
+    });
+    getAllJobs.mockResolvedValue([
+      { id: 'job-custom', name: 'Custom', enabled: false, interval: 'daily', lastRun: null, runCount: 0 }
+    ]);
+
+    const graph = await getWorkflowGraph();
+    expect(graph.nodes.find(n => n.id === 'task:custom-thing').stage).toBe('ambient');
+    expect(graph.nodes.find(n => n.id === 'job:job-custom').stage).toBe('ambient');
+  });
+
+  it('emits stage-flow edges only between populated stages', async () => {
+    // Only plan and build populated — flow edge should connect plan → build directly
+    getScheduleStatus.mockResolvedValue({
+      tasks: {
+        'do-replan': { type: 'cron', cronExpression: '0 7 * * 1', enabled: true, runAfter: [], lastRun: null, runCount: 0, status: { shouldRun: true } },
+        'feature-ideas': { type: 'cron', cronExpression: '0 7 * * *', enabled: true, runAfter: [], lastRun: null, runCount: 0, status: { shouldRun: true } }
+      }
+    });
+    getAllJobs.mockResolvedValue([]);
+
+    const graph = await getWorkflowGraph();
+    const stageEdges = graph.edges.filter(e => e.kind === 'stage-flow');
+    expect(stageEdges).toEqual([{ from: 'plan', to: 'build', kind: 'stage-flow' }]);
+  });
+
+  it('includes gate state for jobs that have a registered gate', async () => {
+    getScheduleStatus.mockResolvedValue({ tasks: {} });
+    getAllJobs.mockResolvedValue([
+      { id: 'job-brain-review', name: 'Brain Review', enabled: true, interval: 'daily', lastRun: null, runCount: 0 }
+    ]);
+    getRegisteredGates.mockReturnValue(['job-brain-review']);
+    hasGate.mockImplementation(id => id === 'job-brain-review');
+    checkJobGate.mockResolvedValue({ shouldRun: false, reason: 'No inbox items need review' });
+
+    const graph = await getWorkflowGraph();
+    const node = graph.nodes.find(n => n.id === 'job:job-brain-review');
+    expect(node.gate).toEqual({ shouldRun: false, reason: 'No inbox items need review' });
+    expect(node.blocked).toBe('No inbox items need review');
+    expect(node.shouldRun).toBe(false);
+  });
+
+  it('treats gate errors as fail-open', async () => {
+    getScheduleStatus.mockResolvedValue({ tasks: {} });
+    getAllJobs.mockResolvedValue([
+      { id: 'job-brain-review', name: 'Brain Review', enabled: true, interval: 'daily', lastRun: null, runCount: 0 }
+    ]);
+    getRegisteredGates.mockReturnValue(['job-brain-review']);
+    hasGate.mockImplementation(id => id === 'job-brain-review');
+    checkJobGate.mockRejectedValue(new Error('boom'));
+
+    const graph = await getWorkflowGraph();
+    const node = graph.nodes.find(n => n.id === 'job:job-brain-review');
+    expect(node.gate.shouldRun).toBe(true);
+    expect(node.gate.error).toBe(true);
+  });
+
+  it('reports per-stage enabled/total counts', async () => {
+    getScheduleStatus.mockResolvedValue({
+      tasks: {
+        'do-replan': { type: 'cron', cronExpression: '0 7 * * 1', enabled: true, runAfter: [], lastRun: null, runCount: 0, status: { shouldRun: true } },
+        'feature-ideas': { type: 'cron', cronExpression: '0 7 * * *', enabled: false, runAfter: [], lastRun: null, runCount: 0, status: { shouldRun: false, reason: 'disabled' } }
+      }
+    });
+    getAllJobs.mockResolvedValue([]);
+
+    const graph = await getWorkflowGraph();
+    const planStage = graph.stages.find(s => s.id === 'plan');
+    const buildStage = graph.stages.find(s => s.id === 'build');
+    expect(planStage).toMatchObject({ nodeCount: 1, enabledCount: 1 });
+    expect(buildStage).toMatchObject({ nodeCount: 1, enabledCount: 0 });
+  });
+});
+
+describe('projectWorkflowTimeline', () => {
+  const range = {
+    start: new Date('2026-07-09T00:00:00.000Z'),
+    end: new Date('2026-07-10T00:00:00.000Z'),
+    timezone: 'America/Los_Angeles'
+  };
+
+  it('projects pinned cron tasks onto the shared clock', () => {
+    const timeline = projectWorkflowTimeline([{
+      id: 'task:morning', kind: 'task', enabled: true, schedule: { type: 'cron', cronExpression: '30 9 * * *' }
+    }], range);
+
+    expect(timeline.occurrences).toEqual([
+      expect.objectContaining({ nodeId: 'task:morning', at: '2026-07-09T16:30:00.000Z', kind: 'launch' })
+    ]);
+  });
+
+  it('projects anchored biweekly recurrence without collapsing it to weekly', () => {
+    const timeline = projectWorkflowTimeline([{
+      id: 'job:biweekly', kind: 'job', enabled: true,
+      schedule: {
+        type: 'cron',
+        cronExpression: '0 2 * * 1',
+        cronSchedule: { frequency: 'weekly', interval: 2, weekdays: [1], time: '02:00', anchorDate: '2026-08-31' }
+      }
+    }], {
+      start: new Date('2026-09-07T00:00:00.000Z'),
+      end: new Date('2026-09-30T00:00:00.000Z'),
+      timezone: 'UTC'
+    });
+
+    expect(timeline.occurrences.map(item => item.at)).toEqual([
+      '2026-09-14T02:00:00.000Z',
+      '2026-09-28T02:00:00.000Z'
+    ]);
+  });
+
+  it('projects the last weekday of a month through the recurrence parser', () => {
+    const timeline = projectWorkflowTimeline([{
+      id: 'job:last-thursday', kind: 'job', enabled: true,
+      schedule: {
+        type: 'cron',
+        cronSchedule: { frequency: 'monthly-weekday', interval: 1, ordinal: 'last', weekday: 4, time: '19:00', anchorDate: '2026-01-01' }
+      }
+    }], {
+      start: new Date('2026-08-01T00:00:00.000Z'),
+      end: new Date('2026-09-01T00:00:00.000Z'),
+      timezone: 'UTC'
+    });
+
+    expect(timeline.occurrences).toEqual([
+      expect.objectContaining({ nodeId: 'job:last-thursday', at: '2026-08-27T19:00:00.000Z', kind: 'launch' })
+    ]);
+  });
+
+  it('does not project automatic launches or rechecks for manual drains', () => {
+    const timeline = projectWorkflowTimeline([{
+      id: 'task:drain', kind: 'task', enabled: true,
+      schedule: { type: 'on-demand', perpetual: true, autoStart: false, recheckCron: '0 9 * * *' }
+    }], range);
+    expect(timeline.windows).toEqual([]);
+    expect(timeline.occurrences).toEqual([]);
+  });
+
+  it('bounds an in-progress drain to a nominal hour instead of the whole horizon', () => {
+    const timeline = projectWorkflowTimeline([{
+      id: 'task:drain', kind: 'task', enabled: true, shouldRun: true,
+      schedule: { type: 'on-demand', perpetual: true, recheckCron: '0 9 * * *' }
+    }], range);
+
+    expect(timeline.windows[0]).toMatchObject({
+      nodeId: 'task:drain',
+      state: 'draining',
+      startAt: '2026-07-09T00:00:00.000Z',
+      endAt: '2026-07-09T01:00:00.000Z'
+    });
+    expect(timeline.occurrences[0]).toMatchObject({ nodeId: 'task:drain', at: '2026-07-09T16:00:00.000Z', kind: 'recheck' });
+  });
+
+  it('gives a parked perpetual task a runtime bar at each recurrence rather than none', () => {
+    const timeline = projectWorkflowTimeline([{
+      id: 'task:drain', kind: 'task', enabled: true, shouldRun: true,
+      perpetualStatus: { globalParked: false, trackedAppCount: 2, parkedAppCount: 2 },
+      schedule: { type: 'on-demand', perpetual: true, recheckCron: '0 9 * * *' }
+    }], range);
+
+    // Parked: no bar at Now, but the projected recurrence still shows when the
+    // drain next starts.
+    expect(timeline.windows).toEqual([
+      expect.objectContaining({ nodeId: 'task:drain', state: 'scheduled', startAt: '2026-07-09T16:00:00.000Z' })
+    ]);
+    expect(timeline.occurrences[0]).toMatchObject({ nodeId: 'task:drain', kind: 'recheck' });
+  });
+
+  // Nothing enforces a minimum recheck cadence, so a sub-hourly one would stack
+  // 200 overlapping bars — the endless band this change exists to remove.
+  it('skips a recurrence whose bar the preceding one already covers', () => {
+    const timeline = projectWorkflowTimeline([{
+      id: 'task:drain', kind: 'task', enabled: true,
+      schedule: { type: 'on-demand', perpetual: true, recheckCron: '*/20 * * * *' }
+    }], range);
+
+    // Every 20 minutes over 24h is 72 rechecks; an hour apiece leaves 24 bars.
+    expect(timeline.occurrences).toHaveLength(72);
+    expect(timeline.windows).toHaveLength(24);
+    expect(timeline.windows.slice(0, 2).map(item => [item.startAt, item.endAt])).toEqual([
+      ['2026-07-09T00:00:00.000Z', '2026-07-09T01:00:00.000Z'],
+      ['2026-07-09T01:00:00.000Z', '2026-07-09T02:00:00.000Z']
+    ]);
+  });
+
+  // A task left on-demand globally while one managed app pins a cron is the
+  // shape that fell off this page entirely: the global row promises no clock
+  // time, so the projection skipped it and the UI filed it under "unpinned".
+  it('projects the cron an app pins on a task that is on-demand globally', () => {
+    const timeline = projectWorkflowTimeline([{
+      id: 'task:audit', kind: 'task', enabled: true,
+      schedule: { type: 'on-demand' },
+      appSchedules: [{ appId: 'acme', appName: 'Acme', cronExpression: '30 9 * * *' }]
+    }], range);
+
+    expect(timeline.occurrences).toEqual([
+      expect.objectContaining({ nodeId: 'task:audit', at: '2026-07-09T16:30:00.000Z', kind: 'launch', apps: ['acme'] })
+    ]);
+  });
+
+  it('draws one marker for several apps sharing an expression, and keeps a differing one separate', () => {
+    const timeline = projectWorkflowTimeline([{
+      id: 'task:audit', kind: 'task', enabled: true,
+      schedule: { type: 'on-demand' },
+      appSchedules: [
+        { appId: 'acme', cronExpression: '30 9 * * *' },
+        { appId: 'beta', cronExpression: '30 9 * * *' },
+        { appId: 'gamma', cronExpression: '0 13 * * *' }
+      ]
+    }], range);
+
+    expect(timeline.occurrences.map(item => [item.at, item.apps])).toEqual([
+      ['2026-07-09T16:30:00.000Z', ['acme', 'beta']],
+      ['2026-07-09T20:00:00.000Z', ['gamma']]
+    ]);
+  });
+
+  // The global cadence covers every app that has not opted out, so a launch it
+  // already draws must not be narrowed to the one app that restated the slot.
+  it('merges an app slot that coincides with the global cadence into one app-agnostic launch', () => {
+    const timeline = projectWorkflowTimeline([{
+      id: 'task:audit', kind: 'task', enabled: true,
+      schedule: { type: 'cron', cronExpression: '30 9 * * *' },
+      appSchedules: [{ appId: 'acme', cronExpression: '30 9,17 * * *' }]
+    }], range);
+
+    // 17:30 local is the app-only slot; 09:30 local is the shared one.
+    expect(timeline.occurrences).toHaveLength(2);
+    expect(timeline.occurrences[0]).toMatchObject({ at: '2026-07-09T00:30:00.000Z', apps: ['acme'] });
+    expect(timeline.occurrences[1]).toMatchObject({ at: '2026-07-09T16:30:00.000Z' });
+    expect(timeline.occurrences[1].apps).toBeUndefined();
+  });
+
+  it('marks an app whose own schedule is already due at Now, using that app\'s reason', () => {
+    const timeline = projectWorkflowTimeline([{
+      id: 'task:audit', kind: 'task', enabled: true,
+      // The GLOBAL row is not due — only the app is, which is exactly the
+      // state a node-level dueNow flag would have gotten wrong.
+      shouldRun: false, runReason: null,
+      schedule: { type: 'on-demand' },
+      appSchedules: [{ appId: 'acme', cronExpression: '30 9 * * *', shouldRun: true, reason: 'cron-catch-up', missedSlot: '2026-07-08T16:30:00.000Z' }]
+    }], range);
+
+    expect(timeline.occurrences[0]).toMatchObject({
+      at: '2026-07-09T00:00:00.000Z',
+      dueNow: true,
+      reason: 'cron-catch-up',
+      missedSlot: '2026-07-08T16:30:00.000Z',
+      apps: ['acme']
+    });
+  });
+
+  it('does not double up a recurrence that lands inside the in-progress drain bar', () => {
+    const timeline = projectWorkflowTimeline([{
+      id: 'task:drain', kind: 'task', enabled: true, shouldRun: true,
+      // Half an hour in, so the bar that opens at Now already covers it.
+      nextRunAt: '2026-07-09T00:30:00.000Z',
+      schedule: { type: 'on-demand', perpetual: true, recheckIntervalMs: 6 * 60 * 60_000 }
+    }], range);
+
+    expect(timeline.windows.map(item => [item.state, item.startAt])).toEqual([
+      ['draining', '2026-07-09T00:00:00.000Z'],
+      ['scheduled', '2026-07-09T06:30:00.000Z'],
+      ['scheduled', '2026-07-09T12:30:00.000Z'],
+      ['scheduled', '2026-07-09T18:30:00.000Z']
+    ]);
+  });
+
+  it('clamps a recurrence bar that would overrun the horizon', () => {
+    const timeline = projectWorkflowTimeline([{
+      id: 'task:drain', kind: 'task', enabled: true,
+      nextRunAt: '2026-07-09T23:40:00.000Z',
+      schedule: { type: 'on-demand', perpetual: true, recheckIntervalMs: 24 * 60 * 60_000 }
+    }], range);
+
+    expect(timeline.windows).toEqual([
+      expect.objectContaining({ startAt: '2026-07-09T23:40:00.000Z', endAt: '2026-07-10T00:00:00.000Z' })
+    ]);
+  });
+
+  it('tags an overdue cron task launch as due-now and carries its reason', () => {
+    const timeline = projectWorkflowTimeline([{
+      id: 'task:weekly', kind: 'task', enabled: true, shouldRun: true,
+      runReason: 'cron-due', lastRun: null,
+      schedule: { type: 'cron', cronExpression: '0 7 * * 1' }
+    }], range);
+
+    // The NOW marker is flagged; subsequent cadence slots (out of the 24h
+    // window) are not, so only the tagged launch is present.
+    expect(timeline.occurrences).toEqual([
+      expect.objectContaining({ nodeId: 'task:weekly', at: range.start.toISOString(), dueNow: true, reason: 'cron-due' })
+    ]);
+  });
+
+  it('tags a cron catch-up launch as due-now with the missed slot', () => {
+    const timeline = projectWorkflowTimeline([{
+      id: 'task:sunday', kind: 'task', enabled: true, shouldRun: true,
+      runReason: 'cron-catch-up', missedSlot: '2026-07-05T14:00:00.000Z',
+      lastRun: '2026-07-05T00:57:50.000Z',
+      schedule: { type: 'cron', cronExpression: '0 7 * * 0' }
+    }], range);
+
+    expect(timeline.occurrences[0]).toMatchObject({
+      nodeId: 'task:sunday', at: range.start.toISOString(), dueNow: true,
+      reason: 'cron-catch-up', missedSlot: '2026-07-05T14:00:00.000Z'
+    });
+  });
+
+  it('omits weekend slots for weekday-only cron tasks', () => {
+    const timeline = projectWorkflowTimeline([{
+      id: 'task:cron-weekdays', kind: 'task', enabled: true, shouldRun: false,
+      schedule: { type: 'cron', cronExpression: '0 9 * * *', weekdaysOnly: true }
+    }], {
+      start: new Date('2026-07-10T10:00:00.000Z'),
+      end: new Date('2026-07-13T10:00:00.000Z'),
+      timezone: 'Etc/UTC'
+    });
+
+    expect(timeline.occurrences).toEqual([
+      expect.objectContaining({ nodeId: 'task:cron-weekdays', at: '2026-07-13T09:00:00.000Z', kind: 'launch' })
+    ]);
+  });
+
+  it('does not duplicate the due-now marker when a cron slot lands exactly on the window start', () => {
+    const timeline = projectWorkflowTimeline([{
+      id: 'task:now', kind: 'task', enabled: true, shouldRun: true,
+      schedule: { type: 'cron', cronExpression: '0 0 * * *' }
+    }], {
+      start: new Date('2026-07-09T00:00:00.000Z'),
+      end: new Date('2026-07-10T00:00:00.000Z'),
+      timezone: 'Etc/UTC'
+    });
+
+    expect(timeline.occurrences).toEqual([
+      expect.objectContaining({ nodeId: 'task:now', at: '2026-07-09T00:00:00.000Z', kind: 'launch' })
+    ]);
+    const ids = timeline.occurrences.map(item => item.id);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it('omits weekend occurrences for weekday-only interval jobs', () => {
+    const timeline = projectWorkflowTimeline([{
+      id: 'job:weekdays', kind: 'job', enabled: true,
+      lastRun: '2026-07-10T09:00:00.000Z',
+      schedule: { type: 'daily', intervalMs: 86_400_000, weekdaysOnly: true }
+    }], {
+      start: new Date('2026-07-10T10:00:00.000Z'),
+      end: new Date('2026-07-13T10:00:00.000Z'),
+      timezone: 'UTC'
+    });
+
+    expect(timeline.occurrences).toEqual([
+      expect.objectContaining({ nodeId: 'job:weekdays', at: '2026-07-13T09:00:00.000Z' })
+    ]);
+  });
+
+  it('flags launches from different nodes within fifteen minutes', () => {
+    const timeline = projectWorkflowTimeline([
+      { id: 'task:a', kind: 'task', enabled: true, schedule: { type: 'cron', cronExpression: '0 9 * * *' } },
+      { id: 'job:b', kind: 'job', enabled: true, schedule: { type: 'cron', cronExpression: '10 9 * * *' } }
+    ], range);
+
+    expect(timeline.occurrences).toHaveLength(2);
+    expect(timeline.occurrences.every(item => item.collision)).toBe(true);
+  });
+
+  it('leaves on-demand tasks — and a cron task with no usable expression — unpinned', () => {
+    const timeline = projectWorkflowTimeline([
+      { id: 'task:broken-cron', kind: 'task', enabled: true, schedule: { type: 'cron', cronExpression: null } },
+      { id: 'task:demand', kind: 'task', enabled: true, schedule: { type: 'on-demand' } }
+    ], range);
+
+    expect(timeline.occurrences).toEqual([]);
+    expect(timeline.windows).toEqual([]);
+  });
+});

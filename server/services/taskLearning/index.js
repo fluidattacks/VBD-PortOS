@@ -1,0 +1,121 @@
+/**
+ * Task Learning Service — barrel
+ *
+ * Tracks patterns from completed tasks to improve future task execution.
+ * Learns from success/failure rates, duration patterns, and error categories
+ * to provide smarter task prioritization and model selection.
+ *
+ * The implementation is split by concern:
+ *   - store.js                — shared persistence, cache, mutex, pure helpers
+ *   - metrics.js              — recording completions + rebuilding aggregates
+ *   - reset.js                — destructive per-task-type reset leaf (imported by
+ *                               metrics + routing; owns no cycle)
+ *   - routing.js              — heuristic routing, cooldown, skip, confidence
+ *   - safetyKind.js           — outward-facing/irreversible safety-kind classifier
+ *   - correlationQuality.js   — enriched-signal ↔ outcome correlation window
+ *   - durations.js            — duration estimates + queue completion
+ *   - insights.js             — insights view, recommendations, dismissals
+ *   - promptRecommendations.js — prompt-improvement suggestions
+ *   - lifecycle.js            — init wiring + history backfill
+ *
+ * This barrel preserves the original public API of `taskLearning.js` so
+ * every existing importer is unaffected.
+ */
+
+export {
+  clearLearningCache,
+  extractTaskType,
+  classifyUntypedTask,
+  isSandboxedTaskType,
+  summarizeFailureSignatures,
+  appendInsight,
+  buildRecurrenceInsight,
+  recurrenceMilestoneReached,
+  INSIGHT_CAP,
+  RECURRENCE_INSIGHT_MILESTONES,
+  EXTERNAL_UNTYPED_TASK_TYPE,
+  appendRecentOutcome,
+  computeWindowedStats,
+  computeEffectiveSuccessRate,
+  isSkipCandidate,
+  EFFECTIVE_RATE_MIN_WINDOW_SAMPLES,
+  RECENT_OUTCOMES_CAP,
+  DEFAULT_WINDOW_MAX_COUNT,
+  DEFAULT_WINDOW_MAX_AGE_MS
+} from './store.js';
+
+export {
+  recordTaskCompletion,
+  buildTaskTelemetryContext,
+  computeLatencySplit,
+  recordFailureSignature,
+  recordEnvironmentalFailure,
+  ENVIRONMENTAL_ERROR_CATEGORIES,
+  recalculateModelTierMetrics,
+  recalculateDurationStats,
+  getWindowedStats
+} from './metrics.js';
+
+export {
+  purgeEnvironmentalFailuresForType,
+  resetTaskTypeLearning,
+  removeTaskTypeFromLearningData
+} from './reset.js';
+
+export {
+  getTaskTypePriorityMultiplier,
+  suggestModelTier,
+  deriveFailureSignalAvoidance,
+  getRoutingAccuracy,
+  getPerformanceSummary,
+  getAdaptiveCooldownMultiplier,
+  getSkippedTaskTypes,
+  shouldSkipTaskType,
+  checkAndRehabilitateSkippedTasks,
+  getSkippedTaskTypesWithStatus,
+  getTaskTypeConfidence,
+  getConfidenceLevels
+} from './routing.js';
+
+export {
+  computeCorrelationQuality,
+  recordCorrelationSample,
+  isCorrelationProven,
+  getCorrelationQuality,
+  CORRELATION_QUALITY_THRESHOLD,
+  MIN_CORRELATION_SAMPLES
+} from './correlationQuality.js';
+
+export {
+  getTaskDurationEstimate,
+  getAllTaskDurations
+} from './durations.js';
+
+export {
+  getLearningInsights,
+  dismissRecommendation,
+  restoreRecommendation,
+  clearDismissedRecommendations,
+  getDismissedRecommendations,
+  recordLearningInsight,
+  getRecentInsights,
+  getLearningSummary
+} from './insights.js';
+
+export {
+  getPromptImprovementRecommendations,
+  getAllPromptRecommendations
+} from './promptRecommendations.js';
+
+export {
+  classifySafetyKind,
+  requiresSafetyApproval,
+  REVERSIBLE_SAFETY_KIND,
+  OUTWARD_SAFETY_KINDS,
+  DEFAULT_ALWAYS_APPROVE_KINDS
+} from './safetyKind.js';
+
+export {
+  initTaskLearning,
+  backfillFromHistory
+} from './lifecycle.js';

@@ -1,0 +1,148 @@
+import { z } from 'zod';
+import { DEPLOY_FLAGS } from './appDeployFlags.js';
+
+// =============================================================================
+// SOCKET EVENT SCHEMAS
+// =============================================================================
+
+// detect:start — path to scan
+export const detectStartSchema = z.object({
+  path: z.string().min(1, 'path is required')
+});
+
+// standardize:start — repo path and optional provider.
+// `overwriteEcosystem: true` is the explicit opt-in to regenerate an existing,
+// non-PortOS-generated ecosystem.config.cjs (default false preserves it).
+export const standardizeStartSchema = z.object({
+  repoPath: z.string().min(1, 'repoPath is required'),
+  providerId: z.string().min(1).optional(),
+  overwriteEcosystem: z.boolean().optional()
+});
+
+// logs:subscribe — process name and optional line count. `appId` is optional and
+// only used to resolve that app's custom PM2_HOME: an app running in its own PM2
+// instance keeps its logs in a separate home, so a stream spawned against the
+// default home would silently tail nothing. Absent = default PM2_HOME (the common
+// case), so existing subscribers are unaffected.
+export const logsSubscribeSchema = z.object({
+  processName: z.string().min(1, 'processName is required'),
+  lines: z.number().int().positive().max(10000).default(100),
+  appId: z.string().min(1).optional()
+});
+
+// logs:unsubscribe — scoped cleanup for one live PM2 stream. The empty legacy
+// payload remains valid so an older client can retain the former "unsubscribe
+// everything" behavior while newer clients release only their own process.
+export const logsUnsubscribeSchema = z.object({
+  processName: z.string().min(1, 'processName is required').optional()
+}).default({});
+
+// error:recover — error code and context
+export const errorRecoverSchema = z.object({
+  code: z.string().min(1, 'error code is required'),
+  context: z.record(z.unknown()).optional().default({})
+});
+
+// shell:input — session ID and input data
+export const shellInputSchema = z.object({
+  sessionId: z.string().min(1, 'sessionId is required'),
+  data: z.string()
+});
+
+// shell:cd — session id + the directory to change into. The client sends a PATH,
+// not a command: the `cd` line is built server-side from the session's actual
+// shell (see lib/shellCd.js), since only the server knows which one it spawned.
+export const shellCdSchema = z.object({
+  sessionId: z.string().min(1, 'sessionId is required'),
+  path: z.string().min(1, 'path is required')
+});
+
+// shell:resize — session ID with cols and rows
+export const shellResizeSchema = z.object({
+  sessionId: z.string().min(1, 'sessionId is required'),
+  cols: z.number().int().positive().max(500),
+  rows: z.number().int().positive().max(500)
+});
+
+// Shared session ID schema for shell operations
+export const shellSessionIdSchema = z.object({
+  sessionId: z.string().min(1, 'sessionId is required')
+});
+
+// shell:attach — session id + optional claim flag.
+// `claim: true` means "attach only if currently unattached or already mine" — used by
+// auto-pick paths so a multi-tab race doesn't displace another tab. Default (false)
+// preserves the manual-attach takeover semantics (deep-link / tab-click intent).
+export const shellAttachSchema = z.object({
+  sessionId: z.string().min(1, 'sessionId is required'),
+  claim: z.boolean().optional()
+});
+
+// shell:stop — session ID
+export const shellStopSchema = shellSessionIdSchema;
+
+// iterm:* — the iTerm2 view's own events (#8114). Ids are `iterm-<iTerm session
+// UUID>` and never overlap PortOS shell session ids.
+const itermSessionId = z.string().regex(/^iterm-[A-Za-z0-9-]{1,64}$/, 'id must be an iTerm2 session id');
+
+// iterm:attach / iterm:detach — the iTerm2 session to start or stop viewing.
+export const itermSessionRefSchema = z.object({ id: itermSessionId });
+
+// iterm:input — exact bytes to type into the iTerm2 session.
+export const itermInputSchema = z.object({
+  id: itermSessionId,
+  data: z.string().max(1_000_000)
+});
+
+// app:update — app ID for pull/install/restart cycle. `acknowledgeFork` and
+// `acknowledgePersistentMindImageBackup` are only consulted for the PortOS app
+// record — they mirror POST /api/update/execute's executeSchema so App
+// Management can supply the same preflight acknowledgements (#5984).
+export const appUpdateSchema = z.object({
+  appId: z.string().min(1, 'appId is required'),
+  syncFork: z.boolean().optional(),
+  acknowledgeFork: z.boolean().optional(),
+  acknowledgePersistentMindImageBackup: z.boolean().optional()
+});
+
+// app:standardize — app ID for PM2 standardization.
+// `overwriteEcosystem: true` is the explicit opt-in to regenerate an existing,
+// non-PortOS-generated ecosystem.config.cjs (default false preserves it).
+export const appStandardizeSchema = z.object({
+  appId: z.string().min(1, 'appId is required'),
+  overwriteEcosystem: z.boolean().optional()
+});
+
+// app:deploy — app ID and optional flags for Xcode deploy
+const appDeployFlagSchema = z.enum(DEPLOY_FLAGS, {
+  errorMap: () => ({ message: `flag must be one of: ${DEPLOY_FLAGS.join(', ')}` })
+});
+
+export const appDeploySchema = z.object({
+  appId: z.string().min(1, 'appId is required'),
+  flags: z.array(appDeployFlagSchema).max(20, 'no more than 20 flags are allowed').default([])
+});
+
+// =============================================================================
+// VALIDATION HELPER
+// =============================================================================
+
+/**
+ * Validate socket event data against a Zod schema.
+ * Emits `${event}:error` on failure and returns null.
+ * Returns the parsed (and defaulted) data on success.
+ */
+export function validateSocketData(schema, data, socket, event) {
+  const result = schema.safeParse(data);
+  if (!result.success) {
+    socket.emit(`${event}:error`, {
+      message: 'Validation failed',
+      details: result.error.issues.map(i => ({
+        path: i.path.join('.'),
+        message: i.message
+      }))
+    });
+    return null;
+  }
+  return result.data;
+}

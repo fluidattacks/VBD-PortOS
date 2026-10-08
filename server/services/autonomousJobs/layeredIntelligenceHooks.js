@@ -1,0 +1,755 @@
+/**
+ * Layered Intelligence as programmatic-I/O hooks (issue-follow-up to #2322).
+ *
+ * LI used to run as a HANDLER-BACKED task — an inline `runPromptThroughProvider`
+ * call wrapped in `runLayeredIntelligenceForApp`, invisible to the CoS queue /
+ * Active Agents and un-attachable in a TUI. It is now a NORMAL agent-backed
+ * scheduled task with two programmatic slots (see taskTypeHooks.js +
+ * docs/plans/2026-07-09-programmatic-io-scheduled-tasks.md):
+ *
+ *   - `buildTaskInput({ app })` — the GATHER layer: park-check (skip if parked),
+ *     gather the app's sources + open issues, and build the reasoning prompt the
+ *     agent runs. Returns `{ prompt, skip? }`.
+ *   - `processTaskOutput({ appId, payload, ... })` — the DECIDE + ACT layers:
+ *     validate the agent's structured `.agent-done` payload, scope-gate, dedup
+ *     (exact + semantic), file exactly one tracker issue, pause, optional Engine-A
+ *     hand-off, and record last-run bookkeeping.
+ *
+ * The REASON layer is now the agent itself (visible, TUI-capable). Its worktree
+ * is discarded without a commit (LI's task metadata sets discardWorktree), so the
+ * agent can't land code — the structured payload is its only channel out, exactly
+ * the "reasoner never writes code" guarantee the old handler enforced by never
+ * spawning an agent at all. Every deterministic side effect stays in these hooks.
+ *
+ * Runs OUTSIDE the request lifecycle (scheduler tick / agent completion), so per
+ * the AGENTS.md no-try/catch rule the dispatchers own the async boundary; these
+ * stay defensive so a partial failure degrades to a recorded no-op.
+ */
+
+import { PORTOS_APP_ID, updateAppLayeredIntelligence, getAppById } from '../apps.js'
+import { resolvePlannerId } from '../../lib/dispatchLabels.js'
+import {
+  getEffectiveConfig,
+  buildPrompt,
+  gatherSources,
+  listForgeIssues,
+  listBlockingIssues,
+  isAppParked,
+  validateReasonerResponse,
+  isScopeAllowed,
+  isProposalDuplicate,
+  checkSemanticDuplicate,
+  isHandoffEligible,
+  buildHandoffTask,
+  filerForTracker,
+  trackerSupportsPause,
+  resolveBlockOnIssue,
+  fileProposalToForge,
+  applyBlockingLabel,
+  appendProposalToPlan,
+  extractPlanSlugs,
+  listJiraIssues,
+  listJiraBlockingIssues,
+  fileProposalToJira,
+  resolveJiraBlockKey,
+  applyJiraBlockingLabel,
+  computeOutcomesReport,
+  computeDeliveryMetrics,
+  formatDeliveryThrottleGuidance,
+  renderCosMetricsSource,
+  computeSelfEvalSummary,
+  computeProposalExecutionAwareness,
+  computeCrossReferenceAnalysis,
+  computeHandoffRouting,
+  computeHardExclusionGate,
+  computeHardExclusionNotice,
+  computeLiExecutionHealth,
+  readLiTaskMetrics,
+  hasPlannedWorkListing
+} from '../layeredIntelligence.js'
+import { recordFiledProposal, listOutcomesResult, reconcileOutcomes, listOutcomes } from '../layeredIntelligenceOutcomes.js'
+
+// The outcome feedback loop (#2428) can only reconcile a proposal's fate on a
+// tracker that reports closed-state. All three now qualify: a forge (gh/glab
+// issues) and jira report a real closed state, and since #2435 the `plan`
+// tracker preserves each `[lil-*]` item's checkbox — a `- [x]` item reads
+// `closed` (deriveOutcome → 'merged'), so a completed PLAN proposal reconciles
+// like any other. (A `- [ ]` item stays open and unresolved, as before.)
+function outcomesTrackerSupported(filer) {
+  return filer === 'forge' || filer === 'jira' || filer === 'plan'
+}
+import { resolveAppWorkTracker, resolveRepoForgeTarget } from '../../lib/workTracker.js'
+import { tryReadFile } from '../../lib/fileUtils.js'
+import { resolveAgentProviderPin } from '../appTaskProviderPin.js'
+import { PROGRAMMATIC_OUTPUT_COMPLETION_HEADING } from '../../lib/agentSentinel.js'
+import { join } from 'path'
+
+/**
+ * Resolve the per-app LI execution context shared by both hooks: effective
+ * config (with the per-app task provider/model overlaid), whether this app IS
+ * the PortOS install, the resolved work tracker + filer, and the Jira coords when
+ * jira-tracked. Mirrors the old handler's L91–126 setup so the split hooks agree
+ * on WHERE work files.
+ */
+async function resolveLiContext(app) {
+  const isPortos = app.id === PORTOS_APP_ID
+  const config = getEffectiveConfig({ ...app, isPortos })
+
+  // Option A: provider/model live in the per-app scheduled-task override; overlay
+  // them onto the effective config so `config.providerId`/`config.model` express
+  // the app's PER-APP choice — the input resolveLiAgentProvider walks (per-app →
+  // schedule pin → default) to produce LI's final agent provider.
+  const override = (app.taskTypeOverrides && typeof app.taskTypeOverrides === 'object')
+    ? (app.taskTypeOverrides['layered-intelligence'] || {})
+    : {}
+  if (override.providerId != null) config.providerId = override.providerId
+  if (override.model != null) config.model = override.model
+
+  const tracker = await resolveAppWorkTracker(app).catch(() => ({ resolved: 'plan', forge: null }))
+  const filer = filerForTracker(tracker.resolved)
+  const forgeCli = tracker.forge // 'gh' | 'glab' | null
+  const cwd = app.repoPath
+  const preferredForge = (tracker.resolved === 'github' || tracker.resolved === 'gitlab')
+    ? tracker.resolved
+    : null
+  const forgeTarget = await resolveRepoForgeTarget(cwd, { preferredForge })
+  const apiHost = forgeTarget?.apiHost || null
+  const jira = (filer === 'jira' && app.jira?.enabled && app.jira?.instanceId && app.jira?.projectKey)
+    ? { instanceId: app.jira.instanceId, projectKey: app.jira.projectKey, issueType: app.jira.issueType || 'Task' }
+    : null
+
+  return { isPortos, config, tracker, filer, forgeCli, cwd, apiHost, jira }
+}
+
+/**
+ * Resolve LI's reasoning-AGENT provider/model — the SINGLE source of truth, so the
+ * spawn path's hookOverride carries the fully-resolved choice rather than
+ * re-deriving the schedule pin in cosTaskGenerator. Delegates the per-app →
+ * schedule-pin → default walk (and the api-harness guard) to the shared
+ * `resolveAgentProviderPin`, which every task type now runs (#4783).
+ *
+ * The guard matters most here because of LI's own history: pre-#2322 LI called the
+ * API path directly, so an api provider was valid then, and migration 184
+ * faithfully carried whatever `layeredIntelligence.providerId` held — INCLUDING
+ * ollama/lmstudio/kimi — into the per-app override, which outranks everything at
+ * spawn. Any install that ran LI on an api provider before #2322 is wedged, and
+ * the user's natural fix (picking a CLI/TUI provider on the global Schedule page)
+ * silently misses because that only sets the FALLBACK. The shared resolver's
+ * self-heal adopts that pin instead of wedging.
+ *
+ * `config` is a read-only input (its `providerId`/`model` are the per-app
+ * effective override). Returns `{ providerId, model, skipReason }`; the caller
+ * gates on `skipReason` — LI is the one caller that CAN decline to generate, and
+ * guiding the user to pick a real CLI/TUI provider beats silently substituting one
+ * they never chose.
+ */
+async function resolveLiAgentProvider(app, config) {
+  const { providerId, model, skipReason } = await resolveAgentProviderPin({
+    appPin: { providerId: config.providerId || null, model: config.model ?? null },
+    // A thunk: an already-usable per-app provider never pays for the schedule read.
+    readSchedulePin: async () => {
+      const { getTaskInterval } = await import('../taskSchedule.js')
+      return getTaskInterval('layered-intelligence')
+    },
+    taskType: 'layered-intelligence',
+    appName: app.name
+  })
+  if (skipReason) return { providerId: null, model: null, skipReason }
+  return { providerId, model, skipReason: null }
+}
+
+/**
+ * Read the app's open + existing tracker issues for the reasoner (open issues) and
+ * the dedup guard (all existing). Returns `{ openIssues, existingIssues,
+ * trackerReadFailed }`. A failed read is surfaced (never treated as "no issues")
+ * so the caller can suppress filing rather than risk a blind duplicate.
+ */
+async function readIssues({ filer, forgeCli, cwd, jira, config }) {
+  let openIssues = []
+  let existingIssues = []
+  let trackerReadFailed = false
+  if (filer === 'forge' && forgeCli) {
+    const listed = await listForgeIssues({ cli: forgeCli, cwd })
+    trackerReadFailed = !listed.ok
+    existingIssues = listed.issues
+    if (config.sources?.openIssues !== false) openIssues = existingIssues.filter(i => i.state === 'open')
+  } else if (filer === 'jira' && jira) {
+    const listed = await listJiraIssues({ instanceId: jira.instanceId, projectKey: jira.projectKey })
+    trackerReadFailed = !listed.ok
+    existingIssues = listed.issues
+    if (config.sources?.openIssues !== false) openIssues = existingIssues.filter(i => i.state === 'open')
+  } else if (filer === 'plan' && cwd) {
+    const planContent = await tryReadFile(join(cwd, 'PLAN.md'))
+    // extractPlanSlugs preserves each tag's checkbox state ({ slug, state }): a
+    // `- [x]` item reads 'closed' (with no closedAt) so the outcome loop can
+    // reconcile it, and it stays PERMANENTLY within the dedup window — a completed
+    // plan item never needs re-proposal (#2620) — while `- [ ]` stays open.
+    existingIssues = extractPlanSlugs(planContent || '')
+  }
+  return { openIssues, existingIssues, trackerReadFailed }
+}
+
+/**
+ * The completion contract appended to the reasoning prompt: the agent must NOT
+ * write code or open a PR (its worktree is discarded anyway) — it reasons and
+ * writes its structured result to the completion sentinel so the
+ * processTaskOutput hook can file it. `payload` is the exact reasoner-JSON shape
+ * buildPrompt already documents.
+ *
+ * This hook renders the prompt BEFORE spawn, so it cannot know the sentinel's
+ * per-instance filename (`.agent-done-<agentId>`) — it names the briefing
+ * section that prints the absolute path instead, via the shared heading
+ * constant so the two can't drift. It says only where the path IS: an earlier
+ * revision also warned against writing a bare `.agent-done` (a leftover from
+ * when this contract named that file itself), which in a prompt that mentions
+ * it nowhere else only teaches the agent a wrong filename.
+ */
+function buildCompletionContract() {
+  return [
+    '',
+    '---',
+    '',
+    '## How to finish',
+    '',
+    'You are a REASONING agent, not a coding agent. Do NOT edit code, run `/do:pr`,',
+    'commit, or open a pull request — any changes you make to this worktree are',
+    'discarded. Your ONLY output is the JSON described above.',
+    'You MAY inspect repository files and run read-only commands when the gathered',
+    'metrics are insufficient to understand the app context or identify a precise',
+    'visibility gap.',
+    '',
+    'When you have decided, write your result to the completion sentinel. Its',
+    `absolute path is printed in the **${PROGRAMMATIC_OUTPUT_COMPLETION_HEADING}**`,
+    'section of this briefing — copy that path exactly; its filename is scoped to',
+    'this run. The file must contain a single JSON object with this shape:',
+    '',
+    '```json',
+    '{ "summary": "<one-line human summary of what you proposed, or that you proposed nothing>",',
+    '  "payload": <the exact JSON object described above> }',
+    '```',
+    '',
+    'The file MUST contain ONLY that raw JSON object — no ``` fences, no prose',
+    'before or after it, and every newline inside a string value escaped as \\n.',
+    '',
+    'Then stop. Do nothing else.'
+  ].join('\n')
+}
+
+/**
+ * Pre-agent GATHER hook. Resolves context, skips a parked/unfileable app, gathers
+ * sources + open issues, and returns the fully-rendered reasoning prompt for the
+ * agent. `{ skip: { reason } }` short-circuits dispatch (no agent spawned).
+ */
+export async function buildTaskInput({ app } = {}) {
+  if (!app) return { skip: { reason: 'no-app' } }
+  const ctx = await resolveLiContext(app)
+  const { isPortos, config, tracker, filer, forgeCli, cwd, apiHost, jira } = ctx
+
+  // A skip means no agent spawns, so processTaskOutput never records the run —
+  // record the last-run outcome HERE (mirrors the old handler's settle()) so the
+  // Intelligence tab's "Last run: parked / skipped" explanation stays accurate.
+  const skip = async (action, reason) => {
+    await recordRun(app, { action, reason })
+    return { skip: { reason } }
+  }
+
+  // Resolve LI's reasoning-agent provider/model in one place (per-app → schedule
+  // pin → default, with the api-only self-heal). The resolver is the single source
+  // of truth: its `{ providerId, model }` flows out as this hook's return so the
+  // spawn path pins the agent to the fully-resolved choice.
+  const agent = await resolveLiAgentProvider(app, config)
+  if (agent.skipReason) return skip('skipped', agent.skipReason)
+
+  // A jira-tracked app with no usable instance/project can't file — skip before
+  // burning an agent on a result we couldn't land.
+  if (filer === 'jira' && !jira) return skip('skipped', 'jira-not-configured')
+
+  // Same reasoning for an unreachable `gh` (#3358): every downstream guard here
+  // (park check, dedup against existing issues, and the filing itself) reads the
+  // forge, so running the reasoner now would burn a provider call on a proposal
+  // we could neither dedup nor file. Skip with the probe's single log line.
+  if (filer === 'forge' && forgeCli === 'gh') {
+    const { ensureForgeReachable } = await import('../github.js')
+    // Probed against the app's OWN forge API host, not gh's
+    // default: a bare probe would skip a healthy GitHub Enterprise app whenever
+    // github.com is unreachable, and run one whose enterprise host is down.
+    const forge = await ensureForgeReachable('layered-intelligence', { hostname: apiHost })
+    if (!forge.ok) return skip('skipped', 'forge-unreachable')
+  }
+
+  // Park check (forge + jira; plan has no issue to block on). A FAILED read is not
+  // "no blocking issues" — skip rather than resume work the user parked.
+  if (trackerSupportsPause(tracker.resolved)) {
+    const blocking = filer === 'jira'
+      ? await listJiraBlockingIssues({ instanceId: jira.instanceId, projectKey: jira.projectKey })
+      : (forgeCli ? await listBlockingIssues({ cli: forgeCli, cwd }) : null)
+    if (blocking && !blocking.ok) return skip('skipped', 'blocking-read-failed')
+    if (blocking && isAppParked(blocking.issues)) return skip('parked', 'blocking-open')
+  }
+
+  // Independent reads (app source set vs the tracker's open-issue list) — overlap
+  // them so the non-parked path pays one round-trip, not two.
+  // The resolved tracker coords flow into gatherSources so the plannedWork source
+  // (#2698) can read the app's committed backlog off the SAME tracker the loop
+  // files to — gatherSources has no other way to know where work lives.
+  const [sources, issuesRead] = await Promise.all([
+    gatherSources(app, config, { tracker: { filer, forgeCli, cwd, jira }, isPortos }),
+    readIssues({ filer, forgeCli, cwd, jira, config })
+  ])
+  const { openIssues, existingIssues, trackerReadFailed } = issuesRead
+
+  // Feedback loop (#2428): reconcile past proposals' outcomes against the fresh
+  // tracker read, then fold the merge-rate report into the prompt so the reasoner
+  // calibrates on its own history. Gated on the per-app `outcomes` source toggle
+  // AND an outcomes-capable tracker (forge / jira / plan — #2435 taught the plan
+  // parse to read a checked `- [x]` item as closed). A failed tracker read skips
+  // reconciliation (never mark closed on a blind read).
+  // `null` (not `[]`) until the outcomes pipeline actually runs this cycle: selfEval
+  // reads this too, and "the outcomes source is off" must not reach it looking like
+  // "this app has never had a proposal merged" (#2700).
+  let outcomes = null
+  let outcomesReport = ''
+  // Per-proposal-domain execution record (#2765): the true avoid/prefer signal keyed
+  // on how LI's OWN proposals in each domain fared once handed off + executed. Derived
+  // from the SAME outcome records loaded below (no extra store read), so it's gated on
+  // the same outcomes source; stays '' until at least one domain clears the sample floor.
+  let proposalExecutionReport = ''
+  // Cross-reference (#2764 §3): domains LI proposes well but executes poorly. Derived
+  // from the SAME outcome records as the two blocks above (no extra store read), so it
+  // rides the same outcomes gate and stays '' until a domain has both a merge and a
+  // diagnosed failed hand-off.
+  let crossReferenceReport = ''
+  if (config.sources?.outcomes && outcomesTrackerSupported(filer)) {
+    // Pass the forge handle so the reconciler can read an implementing PR's merge
+    // state/checks (#2748, deliverable 2) to classify merge-conflict/validation-failed.
+    // gh-only + bounded inside reconcileOutcomes; glab/plan carry no PR ref so no read.
+    if (!trackerReadFailed) await reconcileOutcomes({ appId: app.id, existingIssues, cli: forgeCli, cwd })
+    // Discriminated read: an unreadable outcome store stays `null` here rather than
+    // collapsing to `[]`, so selfEval reports its merge rate as UNAVAILABLE instead
+    // of telling the reasoner it has never filed a proposal.
+    const outcomesRead = await listOutcomesResult({ appId: app.id })
+    outcomes = outcomesRead.read ? outcomesRead.outcomes : null
+    // The low-merge-rate warning cites the plannedWork block by name — only let it
+    // do that when a real BACKLOG LISTING was gathered. The source is
+    // per-app-toggleable, yields nothing on an unresolvable tracker, and renders a
+    // sentinel (not a listing) when the tracker is empty or unreadable — none of
+    // which are something the reasoner can go review.
+    outcomesReport = computeOutcomesReport({
+      outcomes,
+      hasPlannedWork: hasPlannedWorkListing(sources.plannedWork)
+    })
+    // Only a successful read yields records to attribute; a failed read (outcomes ===
+    // null) leaves the block empty rather than claiming "no domain has executed".
+    if (Array.isArray(outcomes)) {
+      proposalExecutionReport = computeProposalExecutionAwareness({ outcomes })
+      crossReferenceReport = computeCrossReferenceAnalysis({ outcomes })
+    }
+  }
+
+  // Delivery block (#3085): fold the approval → delivery numbers into the SAME
+  // cosMetrics document the per-task-type run rates live in, so a healthy run rate can
+  // never be read as a healthy pipeline. Done here rather than inside gatherSources
+  // because only this point has POST-reconciliation outcomes — a pre-reconcile snapshot
+  // would report a different approval count than the liOutcomes block in the same
+  // prompt. Present only when the `cosMetrics` source is enabled, so an app that turned
+  // that source off gets no block (its delivery signal rides liOutcomes / liSelfEval).
+  // `cosMetricsByType` is gatherSources' internal hand-off for exactly this re-render;
+  // drop it once consumed rather than leaving a spent key on the source map.
+  if (sources.cosMetricsByType) {
+    const rendered = renderCosMetricsSource({
+      metricsByType: sources.cosMetricsByType,
+      // Not an array = the outcomes source is off / the tracker can't report outcomes /
+      // the store was unreadable. Omit the block rather than emitting zeros that would
+      // read as "nothing has ever been approved".
+      delivery: Array.isArray(outcomes) ? computeDeliveryMetrics(outcomes) : null
+    })
+    // '' when BOTH halves are empty (no task types, no delivery data) — buildPrompt
+    // drops a blank source, so the block is omitted rather than rendering a hollow `{}`.
+    sources.cosMetrics = rendered
+    delete sources.cosMetricsByType
+  }
+
+  // Self-evaluation (#2700): the loop's deterministic pre-filing check on its own
+  // reasoning — no LLM call, just a read of the record it already keeps. Note
+  // `existingIssues` is passed as null on a FAILED tracker read: readIssues returns
+  // `[]` in that case, which would otherwise tell selfEval "you have filed nothing"
+  // and license a duplicate re-file off a blind read.
+  //
+  // Scope: `trackerReadFailed` is only ever set by the forge and jira branches. The
+  // `plan` branch cannot distinguish an unreadable PLAN.md from an absent one, so it
+  // reports `[]` either way — but for a plan tracker that is honest rather than
+  // blind: the downstream isProposalDuplicate guard reads the same empty list, so
+  // selfEval's "nothing is currently suppressed" correctly describes what filing
+  // will actually do. Do NOT "fix" this by marking a missing PLAN.md as a failed
+  // read: an app with no PLAN.md yet genuinely has nothing filed, and suppressing
+  // its proposals would park the loop on every such app permanently.
+  // Read LI's own execution-health stats ONCE and feed BOTH the selfEval Signal-3 line
+  // and the hard-exclusion notice (#2824) — they must judge health off the same number.
+  // Read UNCONDITIONALLY (not gated on the selfEval source): the hard-exclusion gate in
+  // processTaskOutput enforces regardless of any source toggle, so the reasoner-facing
+  // notice must arm under the SAME condition — otherwise a selfEval-off app would get no
+  // warning yet still have its proposal silently dropped, wasting the whole run.
+  const liTaskStats = await readLiTaskMetrics()
+  let selfEvalReport = ''
+  if (config.sources?.selfEval) {
+    selfEvalReport = computeSelfEvalSummary({
+      outcomes,
+      existingIssues: trackerReadFailed ? null : existingIssues,
+      liTaskStats
+    })
+  }
+
+  // Hard-exclusion notice (#2824): the reasoner-facing mirror of the deterministic
+  // filing gate. '' unless LI's execution health is degraded (gate armed), so a healthy
+  // loop's prompt is unchanged. Armed off the same liTaskStats the enforcement gate reads.
+  // Its failing-domain list must be derived from the SAME outcomes the enforcement gate
+  // reads in processTaskOutput — which loads them DIRECTLY (independent of the `outcomes`
+  // prompt-source toggle). So when the gathered `outcomes` aren't an array (source off /
+  // store unreadable), read them directly here too; otherwise a domain the gate would
+  // exclude on could be silently absent from the notice.
+  const noticeOutcomes = Array.isArray(outcomes)
+    ? outcomes
+    : await listOutcomes({ appId: app.id }).catch(() => [])
+  const hardExclusionNotice = computeHardExclusionNotice({ liTaskStats, outcomes: noticeOutcomes })
+  // Delivery throttle (#3160): unlike the optional selfEval report, this signal is
+  // present on every LI prompt. It reads the same direct outcome snapshot as the hard
+  // exclusion notice, so turning off the outcomes/selfEval prompt sources cannot hide
+  // a stopped delivery pipeline from the reasoner.
+  const deliveryThrottleReport = formatDeliveryThrottleGuidance(
+    computeLiExecutionHealth(liTaskStats, noticeOutcomes)
+  )
+
+  const prompt = buildPrompt({ app, config, sources, openIssues, isPortos, outcomesReport, selfEvalReport, deliveryThrottleReport, proposalExecutionReport, crossReferenceReport, hardExclusionNotice }) + buildCompletionContract()
+  // Option A: surface the fully-resolved LI agent provider/model (from
+  // resolveLiAgentProvider — per-app override, else the resolved schedule pin) so
+  // the generator pins the AGENT to it. Resolving the pin HERE (not delegating it
+  // to the generator's interval.providerId) keeps this hook the single source of
+  // truth for LI's provider.
+  return { prompt, providerId: agent.providerId, model: agent.model }
+}
+
+/**
+ * The planner identity of the agent run that produced a proposal — the model
+ * PortOS actually dispatched, read from the agent record `agentLifecycle` stamps
+ * at spawn. Best-effort: an unreadable record (or a run older than the stamp)
+ * yields null and the proposal is filed with no `planner:` label rather than a
+ * fabricated one.
+ */
+async function resolveProposalPlanner(agentId) {
+  if (!agentId) return null
+  const { getAgentRecord } = await import('../cosAgentLifecycle.js')
+  const record = await getAgentRecord(agentId).catch(() => null)
+  if (!record?.metadata) return null
+  return resolvePlannerId({ providerId: record.metadata.providerId, model: record.metadata.model })
+}
+
+/**
+ * File the proposal via the resolved tracker's filer (forge / jira / plan).
+ */
+async function fileProposal({ filer, forgeCli, cwd, apiHost, app, proposal, jira, planner }) {
+  if (filer === 'forge' && forgeCli) {
+    return fileProposalToForge({
+      cli: forgeCli, cwd, hostname: forgeCli === 'gh' ? apiHost : null,
+      title: proposal.title, body: proposal.body, slug: proposal.slug,
+      model: proposal.model, effort: proposal.effort,
+      goodFirstIssue: proposal.goodFirstIssue, helpWanted: proposal.helpWanted, planner
+    })
+  }
+  if (filer === 'jira' && jira) {
+    return fileProposalToJira({
+      instanceId: jira.instanceId, projectKey: jira.projectKey, issueType: jira.issueType,
+      title: proposal.title, body: proposal.body, slug: proposal.slug,
+      model: proposal.model, effort: proposal.effort,
+      goodFirstIssue: proposal.goodFirstIssue, helpWanted: proposal.helpWanted, planner
+    })
+  }
+  if (filer === 'plan' && cwd) {
+    const res = await appendProposalToPlan({ repoPath: cwd, appName: app.name, slug: proposal.slug, title: proposal.title, body: proposal.body })
+    // Propagate `duplicate`: appendProposalToPlan dedups on the raw `[lil-<slug>]`
+    // tag regardless of checkbox. Since #2620 a CHECKED item stays within the
+    // dedup window, so a re-proposal normally never reaches here; should the
+    // guard ever miss, this backstop writes nothing and returns duplicate. The
+    // caller must NOT treat that as a fresh file — see processTaskOutput.
+    return { success: res.success, number: null, duplicate: res.duplicate }
+  }
+  return { success: false, error: `filer "${filer}" not implemented` }
+}
+
+/** Semantic near-duplicate check (embedding similarity), best-effort. */
+async function isSemanticDuplicate(app, proposal, existingIssues, now) {
+  const semantic = await checkSemanticDuplicate({ proposal, existingIssues, now })
+  if (!semantic.available || !semantic.duplicate) return false
+  const m = semantic.match
+  const ref = m?.number != null
+    ? (typeof m.number === 'number' ? `#${m.number}` : String(m.number))
+    : (m?.slug || 'an existing issue')
+  const score = typeof m?.score === 'number' ? m.score.toFixed(2) : '?'
+  console.log(`♻️ Layered Intelligence: ${app.name} proposal "${proposal.slug}" is a near-duplicate of ${ref} (score ${score}) — suppressed`)
+  return true
+}
+
+/** The user-facing ref for a filed proposal (Jira key, else `#<number>`, else null). */
+function filedRef(key, number) {
+  return key || (number != null ? `#${number}` : null)
+}
+
+/**
+ * Persist per-app run bookkeeping — run cadence AND the last run's OUTCOME.
+ * Re-reads the current stored config and merges only these fields so a mid-run
+ * user config edit isn't clobbered.
+ */
+async function recordRun(app, outcome = {}) {
+  const patch = {
+    lastRunAt: new Date().toISOString(),
+    lastRunAction: outcome.action ?? null,
+    lastRunReason: outcome.reason ?? null,
+    lastRunRef: filedRef(outcome.filedKey, outcome.filedNumber)
+  }
+  await updateAppLayeredIntelligence(app.id, patch).catch((err) => {
+    console.error(`❌ Layered Intelligence: failed to record run for ${app.id}: ${err.message}`)
+  })
+}
+
+/** Default hand-off enqueue: an approval-gated internal CoS task for a coding agent. */
+// The documented reasoner response shape. An object carrying none of these keys
+// isn't an answer at all — see the envelope resolution in processTaskOutput.
+const REASONER_ENVELOPE_KEYS = ['analysis', 'proposal', 'pause']
+
+/**
+ * Is this a reasoner envelope at all? A bare string/number/array, or an object
+ * carrying none of the documented keys ({}, {"foo":1}), is not an answer.
+ * `Object.hasOwn` — an inherited key must not qualify a junk object as one.
+ *
+ * Exported as this hook's `isTaskOutputPayload` (see taskTypeHooks' module
+ * header): the finalize-time transcript rescue (#3640) asks the OWNING hook
+ * what its deliverable looks like before adopting JSON it scraped out of a
+ * terminal, and that must be the same question processTaskOutput asks below —
+ * a looser rescue check would hand the hook a shape it would then reject as
+ * `unparseable-response`.
+ */
+export function isTaskOutputPayload(payload) {
+  return !!payload && typeof payload === 'object' && !Array.isArray(payload)
+    && REASONER_ENVELOPE_KEYS.some(k => Object.hasOwn(payload, k))
+}
+
+async function defaultEnqueueHandoff(taskData) {
+  const { addTask } = await import('../cos.js')
+  return addTask(taskData, 'internal')
+}
+
+/**
+ * Post-agent DECIDE + ACT hook. Validates the agent's `.agent-done` payload
+ * (the reasoner JSON), scope-gates, dedups against a FRESH tracker read, files
+ * exactly one issue, applies a pause, optionally hands the proposal to a coding
+ * agent, and records the run. Every terminal path records an outcome so the UI's
+ * last-run status matches what happened. Injectable deps for tests.
+ */
+export async function processTaskOutput({ appId, success, payload, agentId } = {}, deps = {}) {
+  const { enqueueHandoff = defaultEnqueueHandoff, now = Date.now() } = deps
+  if (!appId) return { action: 'no-op', reason: 'no-app' }
+  const app = await getAppById(appId).catch(() => null)
+  if (!app) return { action: 'no-op', reason: 'app-not-found' }
+
+  const settle = async (outcome) => {
+    await recordRun(app, outcome)
+    return { app: app.id, ...outcome }
+  }
+
+  // A failed/aborted agent produced no trustworthy reasoning — record and stop.
+  if (success === false) return settle({ action: 'no-op', reason: 'agent-failed' })
+
+  const ctx = await resolveLiContext(app)
+  const { isPortos, config, tracker, filer, forgeCli, cwd, apiHost, jira } = ctx
+
+  // The payload IS the reasoner's JSON object (parsed from the sentinel). A null/
+  // malformed payload is the "returned nothing usable" case.
+  //
+  // Sentinel discipline (#2727): resolve the usable ENVELOPE once and key both the
+  // validation and the `reason` below off it. A payload that parsed as JSON but
+  // isn't a reasoner envelope — a bare string/number/array, or an object carrying
+  // none of the documented keys ({}, {"foo":1}) — used to reach
+  // `reason = 'no-proposal'`, the SAME reason a well-formed response that
+  // legitimately proposes nothing gets. So "the agent emitted garbage" was
+  // indistinguishable from "the agent correctly had nothing to propose", and the
+  // former was recorded as a successful run. Reachable both ways: the sentinel
+  // envelope only requires `payload` to be an object, and salvageSentinelPayload's
+  // lenient extractor can surface a non-envelope object out of prose.
+  const envelope = isTaskOutputPayload(payload) ? payload : null
+  const { proposal, invalidFields = [], pause } = validateReasonerResponse(envelope)
+
+  // A reasoner that SUPPLIED an envelope field which then failed validation did not
+  // "look and find nothing" — it tried to answer and emitted the wrong shape. That
+  // used to land on `no-proposal` → success. Originally (#2727) only the `proposal`
+  // field was reclassified; #4166 extends it to every supplied-but-unusable field
+  // (`{"analysis": 7}`, a `pause` with no resolvable target), since
+  // validateReasonerResponse now reports them all in `invalidFields`. A `null` field
+  // is ABSENT, not malformed, so `proposal: null` stays the legitimate empty answer.
+  // A null envelope never reaches here with a non-empty list (the validator returns
+  // the empty triple for it), and the ternary below short-circuits on it anyway; the
+  // `= []` destructuring default keeps a stubbed validator from throwing.
+  //
+  // Asymmetry, unchanged from #2727 and deliberate: a SURVIVING proposal overwrites
+  // `reason` on every branch of the filing path below, so a junk `analysis` alongside
+  // a filed proposal records the filing outcome — but a surviving `pause` does NOT
+  // re-derive `reason`, so it still applies its blocking label while the run records
+  // `unparseable-response`. The proposal is the run's deliverable; a pause is a side
+  // effect, and a reasoner that got another field wrong is worth surfacing.
+  const malformedEnvelope = invalidFields.length > 0
+  // Name the offending fields — `unparseable-response` alone can't tell an operator
+  // whether the model returned no JSON at all or one wrong-typed key.
+  if (malformedEnvelope) console.warn(`⚠️ Layered Intelligence: ${app.name} reasoner envelope has unusable fields: ${invalidFields.join(', ')}`)
+
+  let filedNumber = null
+  let filedKey = null
+  let filedAction = 'no-op'
+  let reason = envelope == null || malformedEnvelope ? 'unparseable-response' : 'no-proposal'
+  let handedOff = false
+  // §4 (#2764): when the deterministic routing gate files-for-human instead of
+  // auto-handing-off a trivial+safe proposal, surface WHY on the returned result.
+  let handoffRouted = false
+  let handoffRoutingReason = null
+
+  if (proposal) {
+    // Re-read issues NOW (not at gather time) so dedup sees the freshest tracker
+    // state — the agent may have run for minutes. Scoped to the has-a-proposal path:
+    // it's an unbounded forge call and only this branch consumes it, so the common
+    // no-proposal/unparseable runs no longer shell out to `gh issue list` (which,
+    // since the #2727 hoist, would hold a CoS concurrency slot and could burn the
+    // finalize timeout on a run whose verdict is already known).
+    const { existingIssues, trackerReadFailed } = await readIssues({ filer, forgeCli, cwd, jira, config })
+    const scopeOk = isScopeAllowed({ scope: proposal.scope, allowedScopes: config.allowedScopes, isPortos })
+    // Hard exclusion gate (#2824): deterministic pre-filing suppression, enforced
+    // independent of what the reasoner returned. Reads LI's own execution health + this
+    // app's outcome records; suppresses when the loop is degraded AND the proposal maps
+    // to self-improve scope or a chronically-failing domain. Only computed on the
+    // scope-allowed path (an out-of-scope proposal is already suppressed). An unreadable
+    // outcome store degrades to [] → the domain rule simply can't fire, never a false
+    // exclusion.
+    //
+    // Health/outcomes are re-read HERE (freshest state), deliberately NOT reusing the
+    // snapshot buildTaskInput built the prompt notice from — the SAME freshness choice as
+    // the readIssues re-read above (the agent may have run for minutes). A hard gate must
+    // enforce against current reality; the notice is best-effort guidance. Within one
+    // install LI runs are serialized and this run's own outcome isn't recorded until after
+    // this point, so the two reads agree in practice — but if reality shifted mid-run,
+    // enforcing on the fresher read is correct, exactly as dedup/scope do.
+    const hardExclusion = scopeOk
+      ? computeHardExclusionGate({
+        proposal,
+        liTaskStats: await readLiTaskMetrics(),
+        outcomes: await listOutcomes({ appId: app.id }).catch(() => []),
+        now
+      })
+      : { excluded: false, reason: null }
+    if (!scopeOk) {
+      console.log(`🚫 Layered Intelligence: ${app.name} proposal scope "${proposal.scope}" not allowed — suppressed`)
+      reason = 'scope-suppressed'
+    } else if (hardExclusion.excluded) {
+      console.log(`🚫 Layered Intelligence: ${app.name} proposal "${proposal.slug}" hard-excluded before filing — ${hardExclusion.reason}`)
+      filedAction = 'excluded'
+      reason = 'hard-gate-excluded'
+    } else if (trackerReadFailed) {
+      console.warn(`⚠️ Layered Intelligence: ${app.name} tracker read failed — suppressing proposal to avoid a blind duplicate`)
+      filedAction = 'tracker-read-failed'
+      reason = 'tracker-read-failed'
+    } else if (isProposalDuplicate({ slug: proposal.slug, existingIssues, now })) {
+      console.log(`♻️ Layered Intelligence: ${app.name} proposal "${proposal.slug}" is a duplicate — suppressed`)
+      filedAction = 'duplicate'
+      reason = 'duplicate'
+    } else if (await isSemanticDuplicate(app, proposal, existingIssues, now)) {
+      filedAction = 'semantic-duplicate'
+      reason = 'semantic-duplicate'
+    } else {
+      // Which model actually REASONED this proposal, read off the agent record
+      // rather than re-resolving the configured pin: a run that fell back to a
+      // different provider must be attributed to the model that ran, not the one
+      // that was scheduled. Unresolvable (a pre-upgrade record, or no agentId) ⇒
+      // no planner label, never a guess.
+      const planner = await resolveProposalPlanner(agentId)
+      const filed = await fileProposal({ filer, forgeCli, cwd, apiHost, app, proposal, jira, planner })
+      if (filed.success && filed.duplicate) {
+        // The tracker already carries this slug's tag (a checked PLAN item the
+        // reasoner re-proposed — normally caught by the dedup guard since #2620,
+        // so this is the guard-miss backstop): appendProposalToPlan wrote
+        // nothing. Report a duplicate and leave any recorded outcome untouched —
+        // reporting `filed` here would clear the merged outcome and let the
+        // still-checked item reconcile as a false fresh merge on the next run
+        // (#2435).
+        filedAction = 'duplicate'
+        reason = 'duplicate'
+        console.log(`♻️ Layered Intelligence: ${app.name} proposal "${proposal.slug}" already tracked in PLAN.md — suppressed`)
+      } else if (filed.success) {
+        filedNumber = filed.number ?? null
+        filedKey = filed.key ?? null
+        filedAction = 'filed'
+        reason = null
+        const ref = filedRef(filedKey, filedNumber) ?? ''
+        console.log(`📌 Layered Intelligence: ${app.name} filed "${proposal.title}" [${proposal.slug}]${ref ? ` (${ref})` : ''}`)
+        // Feedback loop (#2428): remember what we just filed so a later run can
+        // read back its outcome. Gated on the app's `outcomes` source toggle AND
+        // an outcomes-capable tracker (forge / jira / plan — a checked `- [x]`
+        // PLAN item now reconciles, #2435).
+        const outcomesRecordable = !!(config.sources?.outcomes && outcomesTrackerSupported(filer))
+        if (outcomesRecordable) {
+          await recordFiledProposal({
+            appId: app.id, slug: proposal.slug, tracker: tracker.resolved,
+            issueRef: filedRef(filedKey, filedNumber), scope: proposal.scope
+          })
+        }
+        const issueRef = filedKey || filedNumber
+        if (isHandoffEligible({ proposal, config, filed: issueRef })) {
+          // §4 (#2764): the reasoner-signal gate (isHandoffEligible) passed, but the
+          // SYSTEM still refuses to auto-hand-off a trivial+safe proposal in a domain
+          // where LI's OWN prior hand-offs chronically fail — it stays filed for a human
+          // instead. Load the app's historical outcomes lazily (only on the hand-off-
+          // eligible path) for computeHandoffRouting. An unreadable history degrades to
+          // "allow hand-off as before" (no-signal → handoff:true) — a store hiccup must
+          // never silently SUPPRESS a hand-off.
+          const outcomes = await listOutcomes({ appId: app.id }).catch(() => [])
+          const routing = computeHandoffRouting({ proposal, outcomes })
+          if (routing.handoff === false) {
+            // Filing-for-human IS the intended good outcome here, not a failure — the
+            // proposal WAS filed successfully, so `reason` stays null. Record the routing
+            // on the returned result for observability.
+            handoffRouted = true
+            handoffRoutingReason = routing.reason
+            console.log(`🧭 Layered Intelligence: ${app.name} routed ${ref} to human review instead of auto-hand-off — ${routing.reason}`)
+          } else {
+            // Only mark the hand-off for per-domain execution recording (#2765) when the
+            // proposal itself was recorded above — same gate — so execution-tracking never
+            // creates an outcome row for a proposal the `outcomes` toggle says isn't tracked.
+            const task = await enqueueHandoff(buildHandoffTask({ app, proposal, issueRef, recordExecution: outcomesRecordable }))
+              .catch((err) => { console.error(`❌ Layered Intelligence: ${app.name} hand-off enqueue failed: ${err.message}`); return null })
+            if (task && !task.duplicate) {
+              handedOff = true
+              console.log(`🤝 Layered Intelligence: ${app.name} handed off ${ref} to a coding agent (task ${task.id})`)
+            }
+          }
+        }
+      } else {
+        console.error(`❌ Layered Intelligence: ${app.name} failed to file proposal: ${filed.error || 'unknown'}`)
+        reason = 'file-failed'
+      }
+    }
+  }
+
+  // Pause (forge + jira; resolve blockOnIssue after filing).
+  let paused = false
+  if (pause && filer === 'forge' && forgeCli) {
+    const number = resolveBlockOnIssue(pause, filedNumber)
+    if (Number.isInteger(number)) {
+      const res = await applyBlockingLabel({ cli: forgeCli, cwd, number })
+      paused = res.success
+      if (paused) console.log(`⏸️ Layered Intelligence: ${app.name} paused on #${number} — ${pause.reason}`)
+    }
+  } else if (pause && filer === 'jira' && jira) {
+    const key = resolveJiraBlockKey(pause, filedKey, jira.projectKey)
+    if (key) {
+      const res = await applyJiraBlockingLabel({ instanceId: jira.instanceId, key })
+      paused = res.success
+      if (paused) console.log(`⏸️ Layered Intelligence: ${app.name} paused on ${key} — ${pause.reason}`)
+    }
+  }
+
+  return settle({ action: filedAction, reason, filedNumber, filedKey, paused, handedOff, handoffRouted, handoffRoutingReason })
+}

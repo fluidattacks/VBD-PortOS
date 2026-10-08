@@ -1,0 +1,323 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { useState } from 'react';
+import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
+import { awaitEnabled } from '../../../test/enabledBarrier.js';
+
+// Stub every API call WordplayTrainer (and the shared WordplayDrillUI scoring
+// core it now delegates to) can reach — mirrors the mocking convention used
+// by MorseTrainer.test.jsx / PostDrillConfig.test.jsx.
+vi.mock('../../../services/api', () => ({
+  generatePostDrill: vi.fn(),
+  scorePostLlmDrill: vi.fn(),
+  getPostDrillCacheStatus: vi.fn(() => Promise.resolve({})),
+  fillPostDrillCache: vi.fn(() => Promise.resolve({})),
+  updatePostConfig: vi.fn(() => Promise.resolve({})),
+  submitTrainingEntry: vi.fn(() => Promise.resolve({})),
+  getProviders: vi.fn(() => Promise.resolve({ providers: [] })),
+}));
+
+import WordplayTrainer from './WordplayTrainer';
+import {
+  generatePostDrill, scorePostLlmDrill, getPostDrillCacheStatus, submitTrainingEntry,
+} from '../../../services/api';
+
+// Mode activation crosses cache-status and drill-generation promises before a
+// clue renders. Give that real async chain enough time when the full client
+// suite is competing for CI's event loop.
+const GENERATED_DRILL_TIMEOUT = 5_000;
+
+function wordplayScore(score, feedback, response = {}) {
+  return {
+    score,
+    evaluation: {
+      overallScore: score,
+      scores: [{ score, feedback }],
+      summary: feedback,
+      provenance: {
+        generator: { schemaVersion: '1', promptVersion: '1', providerId: 'provider-a', model: 'model-a' },
+        scorer: { kind: 'local', rubricVersion: '1', providerId: 'local', model: 'local' },
+      },
+    },
+    questions: [{ questionIndex: 0, responseMs: 1000, llmScore: score, llmFeedback: feedback, ...response }],
+  };
+}
+
+// Vitest's default per-test timeout was also 5s, so a `waitFor` bounded at
+// GENERATED_DRILL_TIMEOUT was allowed to consume the entire test budget: the
+// inner bound could never actually report its own failure, and a test with work
+// left after that wait had nothing left to spend on it. The premature-submit
+// test has eight awaited transitions after its drill wait and died on CI at
+// 5011ms with a bare "Test timed out" pointing at the `it(` line rather than the
+// step that stalled. Derive the per-test budget from the inner bound so the two
+// can't drift back into equality. The suite-wide budget in src/test/timeouts.js
+// now clears 5s by the same 3x rule, so this happens to agree with it today —
+// it is kept because this file's bound is its OWN constant, and pinning it here
+// is what keeps the two independent of each other.
+vi.setConfig({ testTimeout: GENERATED_DRILL_TIMEOUT * 3 });
+
+// The selected mode now lives in the URL (`/post/wordplay/:mode`) — PostTab
+// owns that param and passes it down. This harness stands in for that routing:
+// clicking a mode button calls onSelectMode, which sets the `mode` prop, and the
+// component's URL-driven effect then generates the drill (mirroring a real
+// navigation to the mode's route).
+function TrainerHarness(props) {
+  const [mode, setMode] = useState(null);
+  return (
+    <WordplayTrainer
+      {...props}
+      mode={mode}
+      onSelectMode={setMode}
+      onExitMode={() => setMode(null)}
+    />
+  );
+}
+
+// The exact promise the component's mount effect chained `setCacheStatus` off,
+// so `selectMode` can await THAT rather than guessing at a microtask count.
+let cacheStatusPromise;
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  submitTrainingEntry.mockResolvedValue({});
+  // Cache reported warm for every mode so startMode skips the cache-fill
+  // consent modal and goes straight to runMode — the modal flow is covered
+  // separately and isn't the concern of these tests.
+  getPostDrillCacheStatus.mockImplementation(() => {
+    cacheStatusPromise = Promise.resolve({
+      'compound-chain': { cold: false },
+      'bridge-word': { cold: false },
+    });
+    return cacheStatusPromise;
+  });
+});
+
+/**
+ * Click a mode button on the grid, but only once the cache-status fetch has
+ * actually landed in state.
+ *
+ * `cacheStatus` starts `null`, and both `handleModeSelect` and `startMode`
+ * read `cacheStatus?.[modeId]?.cold ?? true` — so until that fetch resolves,
+ * EVERY mode reads as cold. That default is deliberate on the component's side
+ * (never skip the consent modal on an unresolved fetch, per the
+ * no-surprise-LLM-calls rule), which means a click that beats the fetch opens
+ * the consent modal instead of generating: the drill text then never appears
+ * and the test dies on a `waitFor` timeout that looks like slowness.
+ *
+ * Locally the mocked promise always wins that race, so this only bit on a
+ * loaded CI runner — `WordplayTrainer.test.jsx` timing out at ~5s while the
+ * same commit passed in a parallel run. Awaiting the component's own promise
+ * inside `act` makes the ordering deterministic instead of wall-clock-bound;
+ * do NOT replace this with a bare timeout bump, which cannot fix an ordering
+ * bug.
+ */
+async function selectMode(name) {
+  const button = await screen.findByText(name);
+  await act(async () => { await cacheStatusPromise; });
+  fireEvent.click(button);
+}
+
+describe('WordplayTrainer — training-log persistence (issue #2097)', () => {
+  it('submits a training entry on round completion, with correctCount derived from the scored responses', async () => {
+    let resolveSave;
+    submitTrainingEntry.mockImplementation(() => new Promise(resolve => { resolveSave = resolve; }));
+    const onContinue = vi.fn();
+    generatePostDrill.mockResolvedValue({
+      type: 'compound-chain',
+      challenges: [{ rootWord: 'fire', position: 'prefix', minExpected: 1 }],
+    });
+    scorePostLlmDrill.mockResolvedValue(wordplayScore(85, 'Nice compounds!', { items: ['firehouse'] }));
+
+    render(<TrainerHarness onBack={() => {}} onContinue={onContinue} config={{}} onConfigUpdate={() => {}} />);
+
+    await selectMode('Compound Chain');
+
+    // Drill generated — a single-challenge round keeps this test to one round.
+    await waitFor(() => expect(screen.getByText('fire')).toBeInTheDocument(), { timeout: GENERATED_DRILL_TIMEOUT });
+
+    const input = screen.getByPlaceholderText(/other half/i);
+    fireEvent.change(input, { target: { value: 'firehouse' } });
+    fireEvent.click(screen.getByText('Add'));
+
+    fireEvent.click(screen.getByText(/Done — Submit 1 compound\b/));
+
+    // Scoring resolves (score: 85 >= 70 correct threshold) — "See Results" is
+    // the last-question label for handleNext.
+    const seeResults = await screen.findByText('See Results');
+    fireEvent.click(seeResults);
+
+    await waitFor(() => expect(submitTrainingEntry).toHaveBeenCalledTimes(1));
+    expect(submitTrainingEntry).toHaveBeenCalledWith(expect.objectContaining({
+      module: 'llm-drills',
+      drillType: 'compound-chain',
+      questionCount: 1,
+      correctCount: 1,
+    }));
+    const entry = submitTrainingEntry.mock.calls[0][0];
+    expect(entry.totalMs).toBeGreaterThanOrEqual(0);
+
+    // Per-question breakdown (issue #2114) — one entry per scored response,
+    // carrying the score/feedback already computed for the results screen.
+    expect(entry.questions).toHaveLength(1);
+    expect(entry.questions[0]).toMatchObject({
+      prompt: 'fire',
+      items: ['firehouse'],
+      score: 85,
+      feedback: 'Nice compounds!',
+      correct: true,
+    });
+
+    fireEvent.click(screen.getByText("Continue Today's Routine"));
+    expect(onContinue).not.toHaveBeenCalled();
+    await act(async () => resolveSave({}));
+    await waitFor(() => expect(onContinue).toHaveBeenCalledTimes(1));
+  });
+
+  it('stays on the results screen when a retry still cannot save', async () => {
+    const onContinue = vi.fn();
+    submitTrainingEntry.mockRejectedValue(new Error('offline'));
+    generatePostDrill.mockResolvedValue({
+      type: 'compound-chain',
+      challenges: [{ rootWord: 'fire', position: 'prefix', minExpected: 1 }],
+    });
+    scorePostLlmDrill.mockResolvedValue(wordplayScore(85, 'Nice compounds!', { items: ['firehouse'] }));
+
+    render(<TrainerHarness onBack={() => {}} onContinue={onContinue} config={{}} onConfigUpdate={() => {}} />);
+    await selectMode('Compound Chain');
+    await waitFor(() => expect(screen.getByText('fire')).toBeInTheDocument(), { timeout: GENERATED_DRILL_TIMEOUT });
+    fireEvent.change(screen.getByPlaceholderText(/other half/i), { target: { value: 'firehouse' } });
+    fireEvent.click(screen.getByText('Add'));
+    fireEvent.click(screen.getByText(/Done — Submit 1 compound\b/));
+    fireEvent.click(await screen.findByText('See Results'));
+
+    await waitFor(() => expect(submitTrainingEntry).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByText("Continue Today's Routine"));
+    await waitFor(() => expect(submitTrainingEntry).toHaveBeenCalledTimes(2));
+    expect(onContinue).not.toHaveBeenCalled();
+    await awaitEnabled(() => screen.getByText("Continue Today's Routine"));
+  });
+
+  it('does not wedge on a permanent spinner after leaving a mode mid-generation then picking another (issue #2098)', async () => {
+    generatePostDrill
+      .mockImplementationOnce(() => new Promise(() => {})) // mode A generation hangs
+      .mockResolvedValueOnce({
+        type: 'bridge-word',
+        puzzles: [{ clues: ['news___', '___back'], answer: 'paper' }],
+      });
+
+    render(<TrainerHarness onBack={() => {}} config={{}} onConfigUpdate={() => {}} />);
+
+    await selectMode('Compound Chain'); // enter mode A → loading (hangs)
+    await waitFor(() => expect(screen.getByText(/Generating/i)).toBeInTheDocument());
+
+    // Leave mid-generation via the header Back (mirrors browser-back off the URL).
+    // The stale `loading` from the aborted generation must be cleared, or the
+    // next mode would be stuck on a permanent spinner.
+    fireEvent.click(screen.getAllByRole('button')[0]);
+    await screen.findByText('Bridge Word'); // back on the mode grid
+
+    fireEvent.click(screen.getByText('Bridge Word')); // enter mode B
+    await waitFor(() => expect(screen.getByText('news___')).toBeInTheDocument(), { timeout: GENERATED_DRILL_TIMEOUT }); // B generated, not wedged
+  });
+
+  it('ignores a superseded generation when the same mode is re-entered mid-generation (issue #2098)', async () => {
+    let resolveFirst;
+    generatePostDrill
+      .mockImplementationOnce(() => new Promise(r => { resolveFirst = r; })) // run #1 (deferred)
+      .mockResolvedValueOnce({
+        type: 'compound-chain',
+        challenges: [{ rootWord: 'water', position: 'prefix', minExpected: 1 }],
+      }); // run #2
+
+    render(<TrainerHarness onBack={() => {}} config={{}} onConfigUpdate={() => {}} />);
+
+    await selectMode('Compound Chain'); // enter A → run #1 (deferred)
+    await waitFor(() => expect(screen.getByText(/Generating/i)).toBeInTheDocument());
+    fireEvent.click(screen.getAllByRole('button')[0]);         // back to grid (invalidates run #1)
+    await screen.findByText('Compound Chain');
+    fireEvent.click(screen.getByText('Compound Chain'));       // re-enter A → run #2 resolves
+    await waitFor(() => expect(screen.getByText('water')).toBeInTheDocument(), { timeout: GENERATED_DRILL_TIMEOUT });
+
+    // The stale run #1 finally resolves — its token is superseded, so it must NOT
+    // swap the drill out from under the live run #2.
+    await act(async () => {
+      resolveFirst({ type: 'compound-chain', challenges: [{ rootWord: 'fire', position: 'prefix', minExpected: 1 }] });
+    });
+    expect(screen.getByText('water')).toBeInTheDocument();
+    expect(screen.queryByText('fire')).toBeNull();
+  });
+
+  it('does not submit a training entry before the round completes', async () => {
+    generatePostDrill.mockResolvedValue({
+      type: 'bridge-word',
+      puzzles: [
+        { clues: ['news___', '___back'], answer: 'paper' },
+        { clues: ['sun___', '___light'], answer: 'flower' },
+      ],
+    });
+    scorePostLlmDrill.mockResolvedValue(wordplayScore(40, 'Not quite', { response: 'wrongword' }));
+
+    render(<TrainerHarness onBack={() => {}} config={{}} onConfigUpdate={() => {}} />);
+
+    await selectMode('Bridge Word');
+
+    await waitFor(() => expect(screen.getByText('news___')).toBeInTheDocument(), { timeout: GENERATED_DRILL_TIMEOUT });
+
+    // Answer the FIRST of two puzzles.
+    fireEvent.change(screen.getByPlaceholderText(/bridge word is/i), { target: { value: 'wrongword' } });
+    fireEvent.click(screen.getByText('Submit'));
+
+    // Non-final question → the feedback panel's advance button reads "Next"
+    // (not "See Results"). Instead of a bare synchronous "not called yet"
+    // check at one incidental instant (which CI's variable scheduling could
+    // trip), gate the negative assertion on an explicit, settled observable
+    // transition: advancing to the SECOND puzzle. If any premature-submit
+    // regression fired a training entry mid-round, it would have happened by
+    // the time puzzle two has rendered.
+    fireEvent.click(await screen.findByText('Next'));
+    await waitFor(() => expect(screen.getByText('sun___')).toBeInTheDocument());
+    expect(submitTrainingEntry).not.toHaveBeenCalled();
+
+    // Positive anchor (deterministic): only completing the FINAL puzzle logs
+    // the entry — and exactly once. This pins the round-completion boundary so
+    // the mid-round negative above can't pass vacuously.
+    fireEvent.change(screen.getByPlaceholderText(/bridge word is/i), { target: { value: 'wrongagain' } });
+    fireEvent.click(screen.getByText('Submit'));
+    const seeResults = await screen.findByText('See Results');
+    expect(submitTrainingEntry).not.toHaveBeenCalled(); // still mid-flow until clicked
+    fireEvent.click(seeResults);
+    await waitFor(() => expect(submitTrainingEntry).toHaveBeenCalledTimes(1));
+  });
+
+  it('persists a Bridge Word breakdown with a readable prompt built from the clue set (issue #2114)', async () => {
+    // Regression: Bridge Word puzzles have no rootWord/word/idiom field, only
+    // `clues`. Before this fix, the persisted question's `prompt` silently
+    // fell through to '' for this mode — the training log couldn't identify
+    // which puzzle a missed answer belonged to.
+    generatePostDrill.mockResolvedValue({
+      type: 'bridge-word',
+      puzzles: [{ clues: ['news___', '___back'], answer: 'paper' }],
+    });
+    scorePostLlmDrill.mockResolvedValue(wordplayScore(40, 'Not quite', { response: 'wrongword' }));
+
+    render(<TrainerHarness onBack={() => {}} config={{}} onConfigUpdate={() => {}} />);
+
+    await selectMode('Bridge Word');
+    await waitFor(() => expect(screen.getByText('news___')).toBeInTheDocument(), { timeout: GENERATED_DRILL_TIMEOUT });
+
+    const input = screen.getByPlaceholderText(/bridge word is/i);
+    fireEvent.change(input, { target: { value: 'wrongword' } });
+    fireEvent.click(screen.getByText('Submit'));
+
+    const seeResults = await screen.findByText('See Results');
+    fireEvent.click(seeResults);
+
+    await waitFor(() => expect(submitTrainingEntry).toHaveBeenCalledTimes(1));
+    const entry = submitTrainingEntry.mock.calls[0][0];
+    expect(entry.questions[0]).toMatchObject({
+      prompt: 'news___ / ___back',
+      response: 'wrongword',
+      score: 40,
+      correct: false,
+    });
+  });
+});

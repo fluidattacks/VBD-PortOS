@@ -1,0 +1,421 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { homedir } from 'os';
+import { TELEGRAM_MAX_RAW_CHARS } from '../lib/telegramMessage.js';
+import { join } from 'path';
+
+const ENV_FILE = join(homedir(), '.claude', 'channels', 'telegram', '.env');
+const ACCESS_FILE = join(homedir(), '.claude', 'channels', 'telegram', 'access.json');
+
+// Files the bridge reads at init/reload time.
+const fileStore = new Map();
+
+vi.mock('../lib/fileUtils.js', () => ({
+  tryReadFile: vi.fn(async (path) => (fileStore.has(path) ? fileStore.get(path) : null)),
+  // Stubs to satisfy notifications.js and cosState.js (the latter is pulled in
+  // by the bridge's per-domain messages gate; it needs PATHS.cos + ensureDirs).
+  PATHS: { data: '/mock/data', cos: '/mock/data/cos', reports: '/mock/data/reports', scripts: '/mock/data/scripts', root: '/mock/data' },
+  ensureDir: vi.fn().mockResolvedValue(undefined),
+  ensureDirs: vi.fn().mockResolvedValue(undefined),
+  safeJSONParse: vi.fn((str, defaultVal) => { if (!str) return defaultVal; try { return JSON.parse(str); } catch { return defaultVal; } }),
+  readJSONFile: vi.fn(async (_path, defaultValue = null) => defaultValue),
+  atomicWrite: vi.fn().mockResolvedValue(undefined)
+}));
+
+// The bridge's per-domain "messages" gate reads getDomainAutonomyMode from
+// cosState. Mock it with a mutable mode so we can exercise off/dry-run without
+// a real state.json. Default 'execute' keeps the pre-existing forwarding tests
+// behaving as before.
+let mockMessagesMode = 'execute';
+vi.mock('./cosState.js', () => ({
+  getDomainAutonomyMode: vi.fn(async () => mockMessagesMode)
+}));
+
+// The shared forward pipeline (services/telegramForward.js) resolves the pending
+// memory for a MEMORY_APPROVAL notification. Mocked so the bridge suite never
+// touches the real memory backend (Postgres) — `mockApprovalMemory` is what
+// peekMemory returns.
+let mockApprovalMemory = null;
+vi.mock('./memoryBackend.js', () => ({
+  peekMemory: vi.fn(async () => mockApprovalMemory)
+}));
+
+// The bridge also reads the messages daily budget; keep it always-within-budget
+// here (the budget math itself is covered by domainBudgets/domainUsage tests) so
+// these gate tests stay focused on the autonomy mode.
+let mockMessagesWithinBudget = true;
+vi.mock('./domainUsage.js', () => ({
+  getDomainBudgetStatus: vi.fn(async () => ({
+    withinBudget: mockMessagesWithinBudget,
+    exceeded: mockMessagesWithinBudget ? null : 'actions',
+    budget: { maxActionsPerDay: null, maxMinutesPerDay: null },
+    usage: { actions: 0, ms: 0 }
+  })),
+  recordDomainUsage: vi.fn().mockResolvedValue(undefined)
+}));
+
+// We import the real notifications module so the bridge can subscribe to the
+// event emitter — that's the spot where forwardNotification is exercised
+// without poking at any private internal.
+const { notificationEvents, NOTIFICATION_TYPES, PRIORITY_LEVELS } = await import('./notifications.js');
+
+const {
+  init,
+  cleanup,
+  sendMessage,
+  getStatus,
+  reload,
+  updateCachedForwardTypes
+} = await import('./telegramBridge.js');
+
+const BOT_TOKEN = '123:ABC';
+const CHAT_ID = 12345;
+
+// EventEmitter.emit discards returned promises. Await the actual subscribed
+// handler so dynamic imports and suppressed forwards finish before assertions
+// and cleanup; a fixed number of event-loop ticks cannot establish completion.
+async function forwardAdded(notification) {
+  const listeners = notificationEvents.listeners('added');
+  expect(listeners).toHaveLength(1);
+  await listeners[0](notification);
+}
+
+function mockTelegramFetch({ getMeOk = true, sendOk = true } = {}) {
+  const fetchSpy = vi.fn(async (url) => {
+    if (url.endsWith('/getMe')) {
+      return {
+        ok: true,
+        json: async () => (getMeOk
+          ? { ok: true, result: { username: 'portos_test_bot' } }
+          : { ok: false, description: 'Unauthorized' })
+      };
+    }
+    if (url.endsWith('/sendMessage')) {
+      return {
+        ok: true,
+        json: async () => (sendOk
+          ? { ok: true, result: { message_id: 1 } }
+          : { ok: false, description: 'Bad Request' })
+      };
+    }
+    throw new Error(`unexpected telegram URL ${url}`);
+  });
+  return fetchSpy;
+}
+
+function seedCredentials(chatId = CHAT_ID) {
+  fileStore.set(ENV_FILE, `TELEGRAM_BOT_TOKEN=${BOT_TOKEN}\n`);
+  fileStore.set(ACCESS_FILE, JSON.stringify({ allowFrom: [chatId] }));
+}
+
+describe('telegramBridge service', () => {
+  // The rate-limit token bucket is module-level state with no public reset;
+  // bumping the virtual clock by 5 minutes between tests guarantees the next
+  // consumeToken() call triggers a bucket refill before any assertions.
+  let virtualNow = Date.now();
+
+  beforeEach(() => {
+    fileStore.clear();
+    virtualNow += 5 * 60_000;
+    vi.useFakeTimers({ now: virtualNow, toFake: ['Date'] });
+  });
+
+  afterEach(async () => {
+    // Reset module-level state and unsubscribe from the EventEmitter.
+    await cleanup();
+    updateCachedForwardTypes(null);
+    mockMessagesMode = 'execute';
+    mockMessagesWithinBudget = true;
+    mockApprovalMemory = null;
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  describe('init', () => {
+    it('returns false when no bot token file is present', async () => {
+      expect(await init()).toBe(false);
+      expect(getStatus()).toMatchObject({ connected: false, hasBotToken: false });
+    });
+
+    it('returns false when the access.json has no allowFrom entries', async () => {
+      fileStore.set(ENV_FILE, `TELEGRAM_BOT_TOKEN=${BOT_TOKEN}\n`);
+      fileStore.set(ACCESS_FILE, JSON.stringify({ allowFrom: [] }));
+      expect(await init()).toBe(false);
+      expect(getStatus().connected).toBe(false);
+    });
+
+    it('returns false and clears the token when getMe rejects the token', async () => {
+      seedCredentials();
+      vi.stubGlobal('fetch', mockTelegramFetch({ getMeOk: false }));
+      expect(await init()).toBe(false);
+      expect(getStatus()).toMatchObject({
+        connected: false,
+        botUsername: null,
+        hasBotToken: false,
+        hasChatId: true
+      });
+    });
+
+    it('returns true and records the bot username on a valid handshake', async () => {
+      seedCredentials();
+      vi.stubGlobal('fetch', mockTelegramFetch());
+      expect(await init()).toBe(true);
+      expect(getStatus()).toMatchObject({
+        connected: true,
+        botUsername: 'portos_test_bot',
+        chatId: CHAT_ID,
+        hasBotToken: true,
+        hasChatId: true
+      });
+    });
+
+    it('parses TELEGRAM_BOT_TOKEN from a multi-line .env file', async () => {
+      fileStore.set(ENV_FILE, `OTHER=ignored\nTELEGRAM_BOT_TOKEN=${BOT_TOKEN}\nTRAILING=value\n`);
+      fileStore.set(ACCESS_FILE, JSON.stringify({ allowFrom: [CHAT_ID] }));
+      vi.stubGlobal('fetch', mockTelegramFetch());
+      expect(await init()).toBe(true);
+      expect(getStatus().connected).toBe(true);
+    });
+  });
+
+  describe('sendMessage', () => {
+    it('refuses to send before init (no bot token)', async () => {
+      const result = await sendMessage('hello');
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/no bot token/i);
+    });
+
+    it('posts to the Telegram API with HTML parse mode', async () => {
+      seedCredentials();
+      const fetchSpy = mockTelegramFetch();
+      vi.stubGlobal('fetch', fetchSpy);
+      await init();
+
+      const result = await sendMessage('<b>hi</b>');
+      expect(result).toEqual({ success: true });
+
+      const sendCall = fetchSpy.mock.calls.find(([url]) => url.endsWith('/sendMessage'));
+      expect(sendCall).toBeDefined();
+      const [, opts] = sendCall;
+      expect(opts.method).toBe('POST');
+      expect(JSON.parse(opts.body)).toEqual({
+        chat_id: CHAT_ID,
+        text: '<b>hi</b>',
+        parse_mode: 'HTML'
+      });
+    });
+
+    it('surfaces an error when the API replies ok:false', async () => {
+      seedCredentials();
+      vi.stubGlobal('fetch', mockTelegramFetch({ sendOk: false }));
+      await init();
+      const result = await sendMessage('boom');
+      expect(result).toEqual({ success: false, error: 'Send failed' });
+    });
+
+    it('returns a rate-limit error once the 30-message bucket drains', async () => {
+      seedCredentials();
+      const fetchSpy = mockTelegramFetch();
+      vi.stubGlobal('fetch', fetchSpy);
+      await init();
+      // init() consumes one call against /getMe; reset before counting sends.
+      fetchSpy.mockClear();
+
+      // Drain 30 successes, then the 31st must hit the rate-limit branch.
+      for (let i = 0; i < 30; i++) await sendMessage(`msg ${i}`);
+      const sent = fetchSpy.mock.calls.filter(([url]) => url.endsWith('/sendMessage'));
+      expect(sent).toHaveLength(30);
+
+      const blocked = await sendMessage('one too many');
+      expect(blocked).toEqual({ success: false, error: 'Rate limit exceeded' });
+    });
+  });
+
+  describe('reload', () => {
+    it('no-ops when the bridge is not active', async () => {
+      // Seed a different chat id but don't init — reload should silently do nothing.
+      fileStore.set(ACCESS_FILE, JSON.stringify({ allowFrom: [999] }));
+      await reload();
+      expect(getStatus().chatId).toBeNull();
+    });
+
+    it('swaps the chat id when access.json changes while active', async () => {
+      seedCredentials();
+      vi.stubGlobal('fetch', mockTelegramFetch());
+      await init();
+      expect(getStatus().chatId).toBe(CHAT_ID);
+
+      fileStore.set(ACCESS_FILE, JSON.stringify({ allowFrom: [987] }));
+      await reload();
+      expect(getStatus().chatId).toBe(987);
+    });
+  });
+
+  describe('cleanup', () => {
+    it('clears module state and unsubscribes from notification events', async () => {
+      // Capture baseline listener count; the assertion is relative so any
+      // unrelated listeners attached at module-import time don't false-fail us.
+      const baselineListeners = notificationEvents.listenerCount('added');
+      seedCredentials();
+      const fetchSpy = mockTelegramFetch();
+      vi.stubGlobal('fetch', fetchSpy);
+      await init();
+      expect(notificationEvents.listenerCount('added')).toBe(baselineListeners + 1);
+
+      await cleanup();
+      expect(getStatus()).toMatchObject({
+        connected: false,
+        botUsername: null,
+        chatId: null,
+        hasBotToken: false,
+        hasChatId: false
+      });
+      expect(notificationEvents.listenerCount('added')).toBe(baselineListeners);
+    });
+  });
+
+  describe('notification forwarding', () => {
+    it('forwards a notification through the registered added-event listener after init', async () => {
+      seedCredentials();
+      const fetchSpy = mockTelegramFetch();
+      vi.stubGlobal('fetch', fetchSpy);
+      await init();
+      fetchSpy.mockClear();
+
+      await forwardAdded({
+        type: NOTIFICATION_TYPES.HEALTH_ISSUE,
+        title: 'High & rising',
+        description: '<script>',
+        priority: PRIORITY_LEVELS.HIGH
+      });
+
+      const sendCall = fetchSpy.mock.calls.find(([url]) => url.endsWith('/sendMessage'));
+      expect(sendCall).toBeDefined();
+      const body = JSON.parse(sendCall[1].body);
+      expect(body.text).toContain('⚠️');
+      expect(body.text).toContain('<b>High &amp; rising</b>');
+      expect(body.text).toContain('&lt;script&gt;');
+      expect(body.text).toContain('Priority: 🟠 high');
+    });
+
+    it('filters by updateCachedForwardTypes when the whitelist is non-empty', async () => {
+      seedCredentials();
+      const fetchSpy = mockTelegramFetch();
+      vi.stubGlobal('fetch', fetchSpy);
+      await init();
+      fetchSpy.mockClear();
+
+      updateCachedForwardTypes([NOTIFICATION_TYPES.HEALTH_ISSUE]);
+      await forwardAdded({
+        type: NOTIFICATION_TYPES.CODE_REVIEW, // not in whitelist
+        title: 'PR ready',
+        priority: PRIORITY_LEVELS.LOW
+      });
+      expect(fetchSpy.mock.calls.filter(([url]) => url.endsWith('/sendMessage'))).toHaveLength(0);
+
+      fetchSpy.mockClear();
+      await forwardAdded({
+        type: NOTIFICATION_TYPES.HEALTH_ISSUE,
+        title: 'Glucose',
+        priority: PRIORITY_LEVELS.MEDIUM
+      });
+      expect(fetchSpy.mock.calls.filter(([url]) => url.endsWith('/sendMessage'))).toHaveLength(1);
+    });
+
+    it('suppresses forwarding when the messages domain is off or dry-run (#711)', async () => {
+      for (const mode of ['off', 'dry-run']) {
+        mockMessagesMode = mode;
+        seedCredentials();
+        const fetchSpy = mockTelegramFetch();
+        vi.stubGlobal('fetch', fetchSpy);
+        await init();
+        fetchSpy.mockClear();
+
+        await forwardAdded({
+          type: NOTIFICATION_TYPES.HEALTH_ISSUE,
+          title: 'Should not send',
+          priority: PRIORITY_LEVELS.HIGH
+        });
+
+        expect(
+          fetchSpy.mock.calls.filter(([url]) => url.endsWith('/sendMessage')),
+          `messages mode "${mode}" must not forward to Telegram`
+        ).toHaveLength(0);
+        await cleanup();
+      }
+    });
+
+    // #5688 — the bridge was a copy-paste of the direct bot and had silently
+    // dropped the approval keyboard and the length cap. Both now come from the
+    // one shared pipeline, so these pin the parity from the bridge side.
+    it('attaches the memory approve/reject keyboard to a MEMORY_APPROVAL forward (#5688)', async () => {
+      mockApprovalMemory = { summary: 'Remember the example project deadline' };
+      seedCredentials();
+      const fetchSpy = mockTelegramFetch();
+      vi.stubGlobal('fetch', fetchSpy);
+      await init();
+      fetchSpy.mockClear();
+
+      await forwardAdded({
+        type: NOTIFICATION_TYPES.MEMORY_APPROVAL,
+        title: 'Approve memory?',
+        description: 'ignored once the memory resolves',
+        priority: PRIORITY_LEVELS.MEDIUM,
+        metadata: { memoryId: 'mem-1' }
+      });
+
+      const sendCall = fetchSpy.mock.calls.find(([url]) => url.endsWith('/sendMessage'));
+      expect(sendCall, 'a memory approval must still be forwarded').toBeDefined();
+      const body = JSON.parse(sendCall[1].body);
+      expect(body.text).toContain('Remember the example project deadline');
+      // A pre-serialized string would reach Telegram as a literal string, so the
+      // keyboard must survive as a real object through the HTTP body.
+      expect(body.reply_markup.inline_keyboard[0]).toEqual([
+        { text: '✅ Approve', callback_data: 'mem_approve:mem-1' },
+        { text: '❌ Reject', callback_data: 'mem_reject:mem-1' }
+      ]);
+    });
+
+    it('truncates a body past the raw cap before escaping it (#5688)', async () => {
+      // '&' sits exactly on the cut: escaping first would leave a split '&am'.
+      mockApprovalMemory = { content: `${'a'.repeat(TELEGRAM_MAX_RAW_CHARS - 1)}&${'b'.repeat(200)}` };
+      seedCredentials();
+      const fetchSpy = mockTelegramFetch();
+      vi.stubGlobal('fetch', fetchSpy);
+      await init();
+      fetchSpy.mockClear();
+
+      await forwardAdded({
+        type: NOTIFICATION_TYPES.MEMORY_APPROVAL,
+        title: 'Long one',
+        priority: PRIORITY_LEVELS.LOW,
+        metadata: { memoryId: 'mem-2' }
+      });
+
+      const sendCall = fetchSpy.mock.calls.find(([url]) => url.endsWith('/sendMessage'));
+      const bodyLine = JSON.parse(sendCall[1].body).text.split('\n')[1];
+      expect(bodyLine.endsWith('&amp;…')).toBe(true);
+      expect(bodyLine).not.toContain('b');
+    });
+
+    it('suppresses forwarding when the messages daily budget is exhausted (#711)', async () => {
+      mockMessagesWithinBudget = false; // over budget while mode stays execute
+      seedCredentials();
+      const fetchSpy = mockTelegramFetch();
+      vi.stubGlobal('fetch', fetchSpy);
+      await init();
+      fetchSpy.mockClear();
+
+      await forwardAdded({
+        type: NOTIFICATION_TYPES.HEALTH_ISSUE,
+        title: 'Over budget',
+        priority: PRIORITY_LEVELS.HIGH
+      });
+
+      expect(
+        fetchSpy.mock.calls.filter(([url]) => url.endsWith('/sendMessage')),
+        'an exhausted messages budget must not forward to Telegram'
+      ).toHaveLength(0);
+    });
+  });
+});

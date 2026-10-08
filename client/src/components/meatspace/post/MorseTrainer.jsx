@@ -1,0 +1,1458 @@
+import { useState, useEffect, useRef, useCallback, useId } from 'react';
+import { ArrowLeft, Radio, Headphones, Hand, EyeOff, CheckCircle, XCircle, Play, RefreshCw, Volume2, GitBranch, List as ListIcon, Ruler, Eraser } from 'lucide-react';
+import useDrawerTab from '../../../hooks/useDrawerTab';
+import useAudioSessionClaim from '../../../hooks/useAudioSessionClaim.js';
+import useKeyCapture from '../../../hooks/useKeyCapture';
+import { submitTrainingEntry, getTrainingStats, submitMorseRound, getMorseProgress, updateMorseLevel } from '../../../services/api';
+import { DRILL_DESCRIPTIONS } from './constants';
+import MorseProgressPanel from './MorseProgressPanel';
+import { streakGlyph } from '../../../lib/streakGlyph.js';
+import { safeReadJsonStorage, safeWriteStorage } from '../../../lib/safeStorage';
+import { resumeAudioContext } from '../../../lib/audioContext.js';
+import { MORSE_MATERIAL_MODES, canAdvanceMorseLevel, selectMorsePrompt } from '../../../lib/morsePractice.js';
+import { isPressKey, noPointerFocusSurfaceProps } from '../../../lib/a11yKeyboard.js';
+import PostCompletionActions from './PostCompletionActions';
+import { startRetryableSaves } from './completionSave';
+
+export const MORSE_TABLE = {
+  A: '.-',     B: '-...',   C: '-.-.',   D: '-..',    E: '.',      F: '..-.',
+  G: '--.',    H: '....',   I: '..',     J: '.---',   K: '-.-',    L: '.-..',
+  M: '--',     N: '-.',     O: '---',    P: '.--.',   Q: '--.-',   R: '.-.',
+  S: '...',    T: '-',      U: '..-',    V: '...-',   W: '.--',    X: '-..-',
+  Y: '-.--',   Z: '--..',
+  0: '-----',  1: '.----',  2: '..---',  3: '...--',  4: '....-',
+  5: '.....',  6: '-....',  7: '--...',  8: '---..',  9: '----.',
+  '.': '.-.-.-', ',': '--..--', '?': '..--..', '/': '-..-.', '=': '-...-',
+};
+
+const MORSE_LOOKUP = Object.fromEntries(Object.entries(MORSE_TABLE).map(([k, v]) => [v, k]));
+const MORSE_ENTRIES = Object.entries(MORSE_TABLE);
+
+// Group entries by code length for the "Length" reference view.
+const MORSE_BY_LENGTH = MORSE_ENTRIES.reduce((acc, [ch, code]) => {
+  (acc[code.length] ||= []).push([ch, code]);
+  return acc;
+}, {});
+
+// Binary tree: walk left for `-` (DAH), right for `.` (DIT). Each node's path
+// from the root spells its morse code; missing paths are nulls (e.g. `----`).
+// Morse is timing-decoded rather than prefix-free, so a node can carry both a
+// letter (e.g. E, T, A) AND have children for longer codes that extend it.
+const MORSE_TREE = (() => {
+  const root = { char: '·', code: '', dah: null, dit: null };
+  for (const [ch, code] of MORSE_ENTRIES) {
+    let node = root;
+    for (const sym of code) {
+      const k = sym === '-' ? 'dah' : 'dit';
+      if (!node[k]) node[k] = { char: '', code: node.code + sym, dah: null, dit: null };
+      node = node[k];
+    }
+    node.char = ch;
+  }
+  return root;
+})();
+
+// Tidy tree layout: true leaves (nodes with no dah/dit children) get
+// sequential x-slots in left-to-right (dah-then-dit) order; every internal
+// node's x is the midpoint of its children. This replaces nested equal-split
+// `flex-1` divs — which gave a missing branch the same width as a populated
+// one at every depth, so a lightly-populated subtree several levels down
+// could visually squeeze/shift everything above it, including the root —
+// with positions derived from each subtree's real size. The root always
+// lands at the midpoint of its two top branches and every node keeps a
+// stable, non-overlapping slot regardless of how deep/sparse its subtree is.
+function layoutMorseTree(root) {
+  const nodes = [];
+  const edges = [];
+  let nextLeafX = 0;
+
+  function visit(node, depth) {
+    if (!node) return null;
+    let x;
+    const dahPos = visit(node.dah, depth + 1);
+    const ditPos = visit(node.dit, depth + 1);
+    const childXs = [dahPos, ditPos].filter(Boolean).map((p) => p.x);
+    if (childXs.length === 0) {
+      x = nextLeafX;
+      nextLeafX += 1;
+    } else {
+      x = childXs.reduce((a, b) => a + b, 0) / childXs.length;
+    }
+    if (dahPos) edges.push({ x1: x, y1: depth, x2: dahPos.x, y2: depth + 1, childCode: node.dah.code });
+    if (ditPos) edges.push({ x1: x, y1: depth, x2: ditPos.x, y2: depth + 1, childCode: node.dit.code });
+    const pos = { x, depth, node };
+    nodes.push(pos);
+    return pos;
+  }
+
+  visit(root, 0);
+  const maxDepth = nodes.reduce((max, n) => Math.max(max, n.depth), 0);
+  return { nodes, edges, width: Math.max(1, nextLeafX), maxDepth };
+}
+
+const MORSE_TREE_LAYOUT = layoutMorseTree(MORSE_TREE);
+const TREE_SLOT_W = 26;
+const TREE_ROW_H = 34;
+
+const KOCH_ORDER = ['K', 'M', 'U', 'R', 'E', 'S', 'N', 'A', 'P', 'T', 'L', 'W', 'I', '.', 'J', 'Z', '=', 'F', 'O', 'Y', ',', 'V', 'G', '5', '/', 'Q', '9', '2', 'H', '3', '8', 'B', '?', '4', '7', 'C', '1', 'D', '6', '0', 'X'];
+
+const PREFS_KEY = 'portos-post-morse-prefs';
+// Base Koch level (K, M — the two-character start of the pool). localStorage is
+// now a write-through cache; the server holds the authoritative level. A fresh
+// install with no server level and no cache stays at this base (no regression).
+const DEFAULT_KOCH_LEVEL = 2;
+const DEFAULT_PREFS = { wpm: 18, effectiveWpm: 18, hz: 700, kochLevel: DEFAULT_KOCH_LEVEL, bestAccuracy: 0, adaptivePractice: true, materialMode: 'groups' };
+
+// Tone envelope ramp — fast enough to avoid clicks, slow enough to feel like a key
+const RAMP_SEC = 0.005;
+const TONE_GAIN = 0.25;
+
+// Mode ids map to the `morse-<id>` drill types, so the blurb lives once in
+// DRILL_DESCRIPTIONS (constants.js) and is read below — no second copy here.
+export const MODES = [
+  {
+    id: 'copy',
+    label: 'Copy',
+    icon: Headphones,
+    color: 'text-cyan-400',
+    bgColor: 'bg-cyan-500/20',
+    example: 'Koch progression: K, M → add letters as you hit 90%',
+  },
+  {
+    id: 'head-copy',
+    label: 'Head Copy',
+    icon: EyeOff,
+    color: 'text-purple-400',
+    bgColor: 'bg-purple-500/20',
+    example: 'Same Koch pool, pure recall — nothing to look at',
+  },
+  {
+    id: 'send',
+    label: 'Send',
+    icon: Hand,
+    color: 'text-amber-400',
+    bgColor: 'bg-amber-500/20',
+    example: 'Tap short for ·, hold long for —',
+  },
+];
+
+// Training log module name — passed as `module` on every submitTrainingEntry
+// call from this trainer so POST's training stats can group Morse practice
+// under one key regardless of which mode logged it.
+const TRAINING_MODULE = 'morse';
+
+function loadPrefs() {
+  const parsed = safeReadJsonStorage(PREFS_KEY);
+  return { ...DEFAULT_PREFS, ...parsed };
+}
+
+function savePrefs(prefs) {
+  safeWriteStorage(PREFS_KEY, JSON.stringify(prefs));
+}
+
+function scheduleTone(gain, startSec, durationSec) {
+  gain.gain.setValueAtTime(0, startSec);
+  gain.gain.linearRampToValueAtTime(TONE_GAIN, startSec + RAMP_SEC);
+  gain.gain.setValueAtTime(TONE_GAIN, startSec + durationSec - RAMP_SEC);
+  gain.gain.linearRampToValueAtTime(0, startSec + durationSec);
+}
+
+function playMorse(ctx, text, { wpm, effectiveWpm, hz }) {
+  const unit = 1.2 / wpm;
+  const charSpaceUnits = 3 * (wpm / Math.max(1, effectiveWpm));
+  const wordSpaceUnits = 7 * (wpm / Math.max(1, effectiveWpm));
+
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+  osc.type = 'sine';
+  osc.frequency.value = hz;
+  gain.gain.value = 0;
+  osc.connect(gain).connect(ctx.destination);
+
+  let t = ctx.currentTime + 0.05;
+  const chars = text.toUpperCase().split('');
+  for (let i = 0; i < chars.length; i++) {
+    const ch = chars[i];
+    if (ch === ' ') {
+      t += wordSpaceUnits * unit;
+      continue;
+    }
+    const pattern = MORSE_TABLE[ch];
+    if (!pattern) continue;
+    for (let j = 0; j < pattern.length; j++) {
+      const sym = pattern[j];
+      const dur = (sym === '.' ? 1 : 3) * unit;
+      scheduleTone(gain, t, dur);
+      t += dur;
+      if (j < pattern.length - 1) t += unit;
+    }
+    if (i < chars.length - 1 && chars[i + 1] !== ' ') {
+      t += charSpaceUnits * unit;
+    }
+  }
+
+  const endTime = t + 0.05;
+  osc.start();
+  osc.stop(endTime);
+
+  return new Promise((resolve) => {
+    osc.onended = () => {
+      osc.disconnect();
+      gain.disconnect();
+      resolve();
+    };
+  });
+}
+
+function useAudioContext() {
+  const ctxRef = useRef(null);
+  // MorseTrainer sounds through a PER-MOUNT AudioContext (it close()s it on
+  // unmount, which would kill a shared one for everyone else), so it can't
+  // inherit the shared lookahead transport's `audioSession` option — it claims
+  // the iOS `playback` session by hand instead. Every tone this component makes
+  // is output-only: the copy drill's prompt and the send-mode sidetone, which
+  // are never mounted at the same time, so one claim slot is enough. Callers
+  // `claim()` before the resume await (the context should come up on the right
+  // session) and `release()` when they stop sounding; unmount releases whatever
+  // is still held. See the audio-session note in lib/audioContext.js.
+  const { claim: claimSession, release: releaseSession } = useAudioSessionClaim('playback');
+  const ensureCtx = useCallback(async () => {
+    if (!ctxRef.current) {
+      const Ctor = window.AudioContext || window.webkitAudioContext;
+      ctxRef.current = new Ctor();
+    }
+    // Autoplay policy starts the context suspended until a user gesture — and on
+    // iOS Safari resume() is async, so we MUST await it before scheduling any
+    // oscillator. Firing resume() without awaiting (the old behavior) laid tones
+    // down against a still-suspended clock: silent on mobile Safari. The shared
+    // helper is the one gate every playback entry point uses (it also covers
+    // iOS's `'interrupted'`), and it no-ops on the closed context this component
+    // leaves behind on unmount.
+    await resumeAudioContext(ctxRef.current);
+    return ctxRef.current;
+  }, []);
+  useEffect(() => () => {
+    if (ctxRef.current) ctxRef.current.close();
+    ctxRef.current = null;
+  }, []);
+  return { ensureCtx, claimSession, releaseSession };
+}
+
+// `enabled` defaults to false so callers must explicitly opt in to attaching
+// the global spacebar listener — it's only safe in Send mode. In other modes
+// it would compete with text input and suppress the voice-widget push-to-talk
+// hotkey via stopImmediatePropagation.
+function useKeyingDecoder({ unitMs, hz, ensureCtx, claimSession, releaseSession, enabled = false }) {
+  const oscRef = useRef(null);
+  const gainRef = useRef(null);
+  const pressStartRef = useRef(0);
+  const lastReleaseRef = useRef(0);
+  const flushTimerRef = useRef(null);
+  const wordTimerRef = useRef(null);
+  const patternRef = useRef('');
+  // Per-letter completion log (send mode): each decoded letter's char + the
+  // performance.now() timestamp it flushed at, so SendDrill can derive a
+  // per-character response time (inter-letter delta) for the round it submits.
+  const letterLogRef = useRef([]);
+  // Mirror of `pressing` state read by beginPress/endPress so those callbacks
+  // don't have to re-derive it from state that lags a keystroke behind.
+  const pressingRef = useRef(false);
+  // Bumped once per beginPress so a startTone whose resume await settles after a
+  // newer press started can tell it's been superseded and bail.
+  const toneGenRef = useRef(0);
+
+  const [pattern, setPattern] = useState('');
+  const [decoded, setDecoded] = useState('');
+  const [pressing, setPressing] = useState(false);
+
+  const startTone = useCallback(async () => {
+    const gen = ++toneGenRef.current;
+    // Claimed BEFORE the resume await so the context comes up on the `playback`
+    // session — the sidetone is output-only and the iPhone's ring/silent switch
+    // would otherwise mute the whole send drill.
+    claimSession();
+    const ctx = await ensureCtx().catch((err) => {
+      // claimSession has one slot. A newer key press replaces this claim while
+      // the first resume is pending, so an older failure must not release the
+      // newer press's playback session.
+      if (gen === toneGenRef.current) {
+        releaseSession();
+        pressingRef.current = false;
+        setPressing(false);
+      }
+      console.error(`❌ Morse sidetone unavailable: ${err.message}`);
+      return null;
+    });
+    // Unmounting close()s and nulls the per-mount context, so a press parked in
+    // the unlock window resumes with nothing to sound into (same bail as
+    // CopyDrill.playPrompt). Release rather than throwing into createOscillator.
+    if (!ctx) {
+      if (gen === toneGenRef.current) {
+        releaseSession();
+        pressingRef.current = false;
+        setPressing(false);
+      }
+      return;
+    }
+    // A fast tap can release (endPress → stopTone), or a newer press can start,
+    // before the first-press-only resume await settles. Bail if the key is no
+    // longer held (`!pressingRef.current`) OR a newer press superseded this one
+    // (`gen !== toneGenRef.current`) — a bare boolean can't distinguish the two,
+    // so two overlapping starts would both create an oscillator and orphan the
+    // first, leaving it droning with no matching stop. Either bail leaves the
+    // session claim alone: a released key already ran stopTone (which releases),
+    // and a newer press's claimSession() now owns the slot — releasing here
+    // would silence the tone that superseded this one.
+    if (!pressingRef.current || gen !== toneGenRef.current) return;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.value = hz;
+    gain.gain.value = 0;
+    osc.connect(gain).connect(ctx.destination);
+    osc.start();
+    const now = ctx.currentTime;
+    gain.gain.setValueAtTime(0, now);
+    gain.gain.linearRampToValueAtTime(TONE_GAIN, now + RAMP_SEC);
+    oscRef.current = osc;
+    gainRef.current = gain;
+  }, [ensureCtx, hz, claimSession, releaseSession]);
+
+  const stopTone = useCallback(() => {
+    // Released FIRST, before the early return: a tap short enough to end before
+    // startTone's resume await settles has a claim but no oscillator yet, and
+    // that claim would otherwise be stranded until unmount. Presses are
+    // serialized by `pressingRef`, so this can only ever be releasing our own.
+    releaseSession();
+    const osc = oscRef.current;
+    const gain = gainRef.current;
+    if (!osc || !gain) return;
+    // Read the clock straight off the live oscillator's context — a tone is only
+    // playing on an already-running context, so there's nothing to resume here
+    // (and stopTone stays synchronous, which endPress/clear/cleanup rely on).
+    const now = osc.context.currentTime;
+    gain.gain.cancelScheduledValues(now);
+    gain.gain.setValueAtTime(gain.gain.value, now);
+    gain.gain.linearRampToValueAtTime(0, now + RAMP_SEC);
+    osc.stop(now + 0.02);
+    osc.onended = () => { osc.disconnect(); gain.disconnect(); };
+    oscRef.current = null;
+    gainRef.current = null;
+  }, [releaseSession]);
+
+  const flushLetter = useCallback(() => {
+    const buf = patternRef.current;
+    if (!buf) return;
+    const ch = MORSE_LOOKUP[buf] || '?';
+    letterLogRef.current.push({ char: ch, at: performance.now() });
+    setDecoded((d) => d + ch);
+    patternRef.current = '';
+    setPattern('');
+  }, []);
+
+  const beginPress = useCallback(() => {
+    if (pressingRef.current) return;
+    if (flushTimerRef.current) { clearTimeout(flushTimerRef.current); flushTimerRef.current = null; }
+    if (wordTimerRef.current) { clearTimeout(wordTimerRef.current); wordTimerRef.current = null; }
+    pressingRef.current = true;
+    setPressing(true);
+    pressStartRef.current = performance.now();
+    startTone();
+  }, [startTone]);
+
+  const endPress = useCallback(() => {
+    if (!pressingRef.current) return;
+    pressingRef.current = false;
+    setPressing(false);
+    stopTone();
+    const now = performance.now();
+    const duration = now - pressStartRef.current;
+    const sym = duration < 2 * unitMs ? '.' : '-';
+    patternRef.current += sym;
+    setPattern(patternRef.current);
+    lastReleaseRef.current = now;
+    flushTimerRef.current = setTimeout(flushLetter, 3 * unitMs);
+    wordTimerRef.current = setTimeout(() => setDecoded((d) => d.endsWith(' ') ? d : d + ' '), 7 * unitMs);
+  }, [stopTone, unitMs, flushLetter]);
+
+  // Reset every piece of keying state — including in-flight press tracking and
+  // the audible tone — so a missed keyup or a mid-keying mode switch can't leave
+  // `pressing` stuck true (which would block the next beginPress).
+  const clear = useCallback(() => {
+    if (flushTimerRef.current) clearTimeout(flushTimerRef.current);
+    if (wordTimerRef.current) clearTimeout(wordTimerRef.current);
+    flushTimerRef.current = null;
+    wordTimerRef.current = null;
+    patternRef.current = '';
+    letterLogRef.current = [];
+    pressStartRef.current = 0;
+    lastReleaseRef.current = 0;
+    stopTone();
+    pressingRef.current = false;
+    setPressing(false);
+    setPattern('');
+    setDecoded('');
+  }, [stopTone]);
+
+  // The keyer OWNS the spacebar while Send mode is up: useKeyCapture claims it
+  // in the capture phase, so other global spacebar handlers (notably the voice
+  // widget's push-to-talk hotkey) never fire mid-transmission. Only spacebar is
+  // claimed; the voice hotkey works normally everywhere else in the app.
+  useKeyCapture({
+    enabled,
+    onKeyDown: (e) => {
+      if (e.code !== 'Space') return false;
+      if (!e.repeat) beginPress();
+      return true;
+    },
+    onKeyUp: (e) => {
+      if (e.code !== 'Space') return false;
+      endPress();
+      return true;
+    },
+  });
+
+  // Tear down the tone and the pending flush timers when Send mode goes away.
+  useEffect(() => {
+    if (!enabled) return undefined;
+    return () => {
+      if (flushTimerRef.current) clearTimeout(flushTimerRef.current);
+      if (wordTimerRef.current) clearTimeout(wordTimerRef.current);
+      stopTone();
+      // If the user mode-switches mid-keydown, the matching keyup fires after
+      // the listener is gone — reset the press tracking so the next mode
+      // change doesn't leave beginPress permanently blocked by a stuck ref.
+      pressingRef.current = false;
+      setPressing(false);
+    };
+  }, [enabled, stopTone]);
+
+  // getLetterLog exposes the ref's current array without making it reactive —
+  // SendDrill reads it once at check time, so a ref (no re-render) is correct.
+  const getLetterLog = useCallback(() => letterLogRef.current, []);
+
+  return { pattern, decoded, pressing, beginPress, endPress, clear, getLetterLog };
+}
+
+// Valid `:mode` subroute segments. Anything else (stale/deleted deep link)
+// falls through to the mode grid rather than a blank panel.
+export const MORSE_MODE_IDS = MODES.map((m) => m.id);
+
+// `mode` is the routed `:mode` segment (`/post/morse/:mode`), validated by the
+// caller (PostTab) to one of MORSE_MODE_IDS or null — the URL is the single
+// source of truth for which drill is open, so there is no local mode state.
+export default function MorseTrainer({ mode = null, onSelectMode, onExitMode, onBack, onContinue }) {
+  const [prefs, setPrefs] = useState(loadPrefs);
+  const [morseProgress, setMorseProgress] = useState(null);
+  const [trainingStats, setTrainingStats] = useState(null);
+  // Bumped after each round submit so the progress panel refetches its trends /
+  // confusion matrix without a manual reload.
+  const [progressRefresh, setProgressRefresh] = useState(0);
+  const { ensureCtx, claimSession, releaseSession } = useAudioContext();
+  const unitMs = 1.2 / prefs.wpm * 1000;
+  const keying = useKeyingDecoder({
+    unitMs, hz: prefs.hz, ensureCtx, claimSession, releaseSession, enabled: mode === 'send',
+  });
+  // Head Copy reuses CopyDrill's whole pipeline (Koch pool, round scoring,
+  // level unlock) minus the on-screen morse hints and the reference cheat
+  // sheet — the only meaningful difference the issue asks for.
+  const showReference = mode !== 'head-copy';
+  // Reference tab lives in the `?ref=` search param so it's deep-linkable and
+  // survives reload/share; a stale value degrades to 'tree'. It's owned here
+  // rather than inside ReferenceWidget because it also decides the page layout:
+  // the tree needs the full width, the other two views sit in a side column.
+  const [refView, setRefView] = useDrawerTab('ref', 'tree', REFERENCE_VIEW_IDS);
+  const sideBySideReference = showReference && refView !== 'tree';
+
+  // Hydrate the authoritative Koch level from the server (localStorage is now a
+  // write-through cache). One-time adoption: if the server has never had a level
+  // and this browser's cached level is beyond the base, push it up (adopt:true —
+  // the server ignores it if another device already set a real level).
+  useEffect(() => {
+    let cancelled = false;
+    getMorseProgress(30, { silent: true })
+      .then(async (p) => {
+        if (cancelled || !p) return;
+        setMorseProgress(p);
+        if (!p.kochLevelSet) {
+          const cachedLevel = loadPrefs().kochLevel;
+          if (cachedLevel > DEFAULT_KOCH_LEVEL) {
+            const res = await updateMorseLevel({ kochLevel: cachedLevel, adopt: true }, { silent: true }).catch(() => null);
+            if (!cancelled && res?.kochLevel) {
+              setPrefs((prev) => { const n = { ...prev, kochLevel: res.kochLevel }; savePrefs(n); return n; });
+            }
+            return;
+          }
+        }
+        if (typeof p.kochLevel === 'number') {
+          setPrefs((prev) => { const n = { ...prev, kochLevel: p.kochLevel }; savePrefs(n); return n; });
+        }
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+
+  function updatePrefs(patch) {
+    setPrefs((prev) => {
+      const next = { ...prev, ...patch };
+      if (next.effectiveWpm > next.wpm) next.effectiveWpm = next.wpm;
+      savePrefs(next);
+      // Persist a level change to the server (write-through). Settings ride along
+      // so a level advance/reset also syncs the current speed/tone across devices.
+      if (patch.kochLevel != null && patch.kochLevel !== prev.kochLevel) {
+        updateMorseLevel(
+          { kochLevel: patch.kochLevel, settings: { wpm: next.wpm, farnsworthWpm: next.effectiveWpm, toneHz: next.hz } },
+          { silent: true },
+        ).catch(() => {});
+      }
+      return next;
+    });
+  }
+
+  function resetProgress() {
+    updatePrefs({ kochLevel: DEFAULT_KOCH_LEVEL, bestAccuracy: 0 });
+  }
+
+  // Persist per-item sent→guessed results for trends + confusion analysis.
+  // Completion actions await this promise and retry it if the first write fails.
+  const submitRound = useCallback((round) => {
+    return submitMorseRound(round)
+      .then(() => {
+        setProgressRefresh((n) => n + 1);
+        return getMorseProgress(30, { silent: true }).then(setMorseProgress);
+      });
+  }, []);
+
+  // Fetches the training log's 30-day view and reduces it to what this trainer
+  // shows: overall training streak (shared across every POST training-mode
+  // drill, not Morse-exclusive) plus a Morse-only practice count/accuracy.
+  // byDrill only reports a per-drill-type accuracy%, not raw correct/question
+  // counts, so morseAccuracy is a session-count-weighted average across the
+  // morse-copy/morse-head-copy/morse-send buckets — not a true question-level average.
+  const refreshTrainingStats = useCallback(() => {
+    getTrainingStats(30)
+      .then((stats) => {
+        const morseEntries = Object.entries(stats?.byDrill || {}).filter(([key]) => key.startsWith(`${TRAINING_MODULE}:`));
+        const morseSessions = morseEntries.reduce((sum, [, d]) => sum + (d.practiceCount || 0), 0);
+        const weightedAccuracySum = morseEntries.reduce((sum, [, d]) => sum + (d.accuracy || 0) * (d.practiceCount || 0), 0);
+        const morseAccuracy = morseSessions > 0 ? Math.round(weightedAccuracySum / morseSessions) : null;
+        setTrainingStats({ currentStreak: stats?.currentStreak ?? 0, morseSessions, morseAccuracy });
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => { refreshTrainingStats(); }, [refreshTrainingStats]);
+
+  // Completion actions await the training-log write and retry it if needed.
+  const logTraining = useCallback((patch) => {
+    return submitTrainingEntry({ module: TRAINING_MODULE, ...patch })
+      .then(() => refreshTrainingStats());
+  }, [refreshTrainingStats]);
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center gap-3">
+        <button
+          onClick={onBack}
+          className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center p-1.5 text-gray-400 hover:text-white bg-port-card border border-port-border rounded-lg transition-colors"
+          aria-label="Back"
+        >
+          <ArrowLeft size={16} />
+        </button>
+        <Radio size={24} className="text-port-accent" />
+        <div>
+          <h2 className="text-xl font-bold text-white">Morse Trainer</h2>
+          <p className="text-sm text-gray-400">Listen, type, and key your way through CW</p>
+        </div>
+      </div>
+
+      {/* In send mode the keyer owns the spacebar across BOTH columns — the
+          drill on the left and the practice key / reference tabs on the right —
+          so the guard belongs on the grid that holds them, not on either one.
+          Off send mode nothing owns Space and this is inert. */}
+      <div
+        className={`grid grid-cols-1 ${sideBySideReference ? 'xl:grid-cols-[minmax(0,1fr)_24rem]' : ''} gap-6`}
+        {...(mode === 'send' ? noPointerFocusSurfaceProps : null)}
+      >
+        <div className="space-y-6 min-w-0 max-w-2xl">
+          <SettingsPanel prefs={prefs} updatePrefs={updatePrefs} onResetProgress={resetProgress} trainingStats={trainingStats} progress={morseProgress} />
+          {!mode && <ModeGrid onPick={onSelectMode} />}
+          {mode === 'copy' && (
+            <CopyDrill prefs={prefs} progress={morseProgress} updatePrefs={updatePrefs} ensureCtx={ensureCtx} claimSession={claimSession} releaseSession={releaseSession} onExit={onExitMode} onContinue={onContinue} onSessionComplete={logTraining} onRoundSubmit={submitRound} />
+          )}
+          {mode === 'head-copy' && (
+            <CopyDrill prefs={prefs} progress={morseProgress} updatePrefs={updatePrefs} ensureCtx={ensureCtx} claimSession={claimSession} releaseSession={releaseSession} onExit={onExitMode} onContinue={onContinue} onSessionComplete={logTraining} onRoundSubmit={submitRound} headCopy />
+          )}
+          {mode === 'send' && (
+            <SendDrill keying={keying} prefs={prefs} progress={morseProgress} onExit={onExitMode} onContinue={onContinue} onSessionComplete={logTraining} onRoundSubmit={submitRound} />
+          )}
+          {!mode && <MorseProgressPanel refreshKey={progressRefresh} />}
+        </div>
+        {showReference && <ReferenceWidget keying={keying} mode={mode} view={refView} setView={setRefView} />}
+      </div>
+    </div>
+  );
+}
+
+function SettingsPanel({ prefs, updatePrefs, onResetProgress, trainingStats, progress }) {
+  const adaptiveId = useId();
+  const materialId = useId();
+  return (
+    <div className="bg-port-card border border-port-border rounded-lg p-4 grid grid-cols-1 sm:grid-cols-3 gap-4">
+      <SliderRow
+        label="WPM"
+        value={prefs.wpm}
+        min={5}
+        max={35}
+        onChange={(v) => updatePrefs({ wpm: v })}
+        suffix="wpm"
+      />
+      <SliderRow
+        label="Farnsworth"
+        value={prefs.effectiveWpm}
+        min={5}
+        max={prefs.wpm}
+        onChange={(v) => updatePrefs({ effectiveWpm: v })}
+        suffix="wpm"
+        hint="Effective speed (≤ WPM)"
+      />
+      <SliderRow
+        label="Tone"
+        value={prefs.hz}
+        min={400}
+        max={1000}
+        step={10}
+        onChange={(v) => updatePrefs({ hz: v })}
+        suffix="Hz"
+      />
+      <div>
+        <label htmlFor={materialId} className="block text-xs text-gray-400 uppercase tracking-wide mb-1">Material</label>
+        <select
+          id={materialId}
+          value={prefs.materialMode}
+          onChange={(e) => updatePrefs({ materialMode: e.target.value })}
+          className="w-full bg-port-bg border border-port-border rounded px-2 py-1.5 text-sm text-white"
+        >
+          {MORSE_MATERIAL_MODES.map((materialMode) => <option key={materialMode} value={materialMode}>{materialMode === 'qso' ? 'QSO phrases' : materialMode}</option>)}
+        </select>
+      </div>
+      <label htmlFor={adaptiveId} className="flex items-center gap-2 text-xs text-gray-300 pt-5 cursor-pointer">
+        <input id={adaptiveId} type="checkbox" checked={prefs.adaptivePractice} onChange={(e) => updatePrefs({ adaptivePractice: e.target.checked })} className="accent-port-accent" />
+        Adaptive practice
+      </label>
+      <div className="sm:col-span-3 flex flex-wrap items-center justify-between gap-x-3 gap-y-2 text-xs text-gray-500 border-t border-port-border pt-3">
+        <span>
+          Koch level: <span className="text-white font-mono">{prefs.kochLevel}</span> /{' '}
+          <span className="text-gray-400">{KOCH_ORDER.length}</span> ·{' '}
+          Best round: <span className="text-white font-mono">{prefs.bestAccuracy}%</span>
+          {trainingStats && (
+            <>
+              {' '}· <span aria-hidden="true">{streakGlyph(trainingStats.currentStreak)}</span> Training streak:{' '}
+              <span className="text-white font-mono">{trainingStats.currentStreak}</span>d
+              {trainingStats.morseSessions > 0 && (
+                <>
+                  {' '}· Morse logged: <span className="text-white font-mono">{trainingStats.morseSessions}</span>
+                  {trainingStats.morseAccuracy != null && (
+                    <> (<span className="text-white font-mono">{trainingStats.morseAccuracy}%</span> avg)</>
+                  )}
+                </>
+              )}
+            </>
+          )}
+          {progress?.practiceAccuracy?.targeted?.attempts > 0 && (
+            <> · Targeted: <span className="text-white font-mono">{progress.practiceAccuracy.targeted.accuracy}%</span> vs coverage <span className="text-white font-mono">{progress.practiceAccuracy.coverage.accuracy == null ? '—' : `${progress.practiceAccuracy.coverage.accuracy}%`}</span></>
+          )}
+        </span>
+        <button
+          onClick={onResetProgress}
+          className="flex items-center gap-1 text-gray-400 hover:text-port-error transition-colors"
+        >
+          <RefreshCw size={12} /> Reset progress
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function SliderRow({ label, value, min, max, step = 1, onChange, suffix = '', hint }) {
+  // The row already shows the label; pair it to the slider rather than
+  // duplicating it into an aria-label. Wrapping instead would pull the live
+  // value readout beside it into the accessible name.
+  const sliderId = useId();
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-1">
+        <label htmlFor={sliderId} className="text-xs text-gray-400 uppercase tracking-wide">{label}</label>
+        <span className="text-sm text-white font-mono">{value}{suffix && ` ${suffix}`}</span>
+      </div>
+      <input
+        id={sliderId}
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        onChange={(e) => onChange(Number(e.target.value))}
+        className="w-full accent-port-accent"
+      />
+      {hint && <p className="text-[10px] text-gray-500 mt-1">{hint}</p>}
+    </div>
+  );
+}
+
+// Exported for the same reason as MODES above: the Practice Library lists the
+// `?ref=` reference charts and must not keep its own copy of this list.
+export const REFERENCE_VIEWS = [
+  { id: 'tree', label: 'Tree', icon: GitBranch },
+  { id: 'length', label: 'Length', icon: Ruler },
+  { id: 'list', label: 'List', icon: ListIcon },
+];
+
+const REFERENCE_VIEW_IDS = REFERENCE_VIEWS.map((v) => v.id);
+
+function ReferenceWidget({ keying, mode, view, setView }) {
+  // Only show the in-progress key path in Send mode — in Copy mode the right
+  // widget is a passive cheat-sheet, not live feedback for the user.
+  const currentPath = mode === 'send' ? keying.pattern : '';
+
+  // The tree needs the whole page width to render all 41 characters legibly, so
+  // it stacks under the drill instead of sharing the sticky side column.
+  const sideColumn = view !== 'tree';
+
+  return (
+    <div className={`space-y-4 ${sideColumn ? 'xl:sticky xl:top-4 xl:self-start' : 'min-w-0'}`}>
+      <div className="bg-port-card border border-port-border rounded-lg overflow-hidden">
+        <div className="flex border-b border-port-border">
+          {REFERENCE_VIEWS.map((v) => {
+            const Icon = v.icon;
+            const active = view === v.id;
+            return (
+              <button
+                key={v.id}
+                onClick={() => setView(v.id)}
+                className={`flex-1 flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-medium transition-colors ${
+                  active ? 'bg-port-bg text-port-accent' : 'text-gray-400 hover:text-white'
+                }`}
+              >
+                <Icon size={12} />
+                {v.label}
+              </button>
+            );
+          })}
+        </div>
+        <div className="p-4">
+          {view === 'tree' && <TreeView currentPath={currentPath} mode={mode} />}
+          {view === 'length' && <LengthView currentPath={currentPath} />}
+          {view === 'list' && <ListView currentPath={currentPath} />}
+        </div>
+      </div>
+
+      {mode === 'send' && <KeyPad keying={keying} />}
+    </div>
+  );
+}
+
+export function isNodeOnPath(node, currentPath) {
+  // Root's placeholder char ('·') is truthy but isn't a real decoded
+  // character — gate on `currentPath.length > 0` too so an idle/empty path
+  // (reference-only view, or before the first key press) never lights up
+  // the root as if it were the live-keyed match.
+  const matched = !!node.char && currentPath.length > 0 && currentPath === node.code;
+  const onPath = currentPath.length > 0 && currentPath.startsWith(node.code) && node.code !== currentPath;
+  return { matched, onPath };
+}
+
+// Nodes are SVG (not absolutely-positioned divs) so the whole tree lives in one
+// `viewBox` and scales with its container — at the tree tab's full-width desktop
+// layout every one of the 41 characters is on screen at once instead of hiding
+// behind a horizontal scrollbar.
+function TreeNodeLabel({ x, depth, node, currentPath }) {
+  const { matched, onPath } = isNodeOnPath(node, currentPath);
+  const display = node.char || (node.code === '' ? '·' : '');
+  const cx = x * TREE_SLOT_W + TREE_SLOT_W / 2;
+  const cy = depth * TREE_ROW_H + TREE_ROW_H / 2;
+  const label = display || '·';
+  const boxW = label.length * 7 + 8;
+  return (
+    <g title={node.code || 'start'}>
+      <rect
+        x={cx - boxW / 2}
+        y={cy - 9}
+        width={boxW}
+        height={18}
+        rx={3}
+        className={matched ? 'fill-port-accent' : 'fill-port-bg'}
+      />
+      <text
+        x={cx}
+        y={cy}
+        textAnchor="middle"
+        dominantBaseline="central"
+        fontSize={11}
+        fontWeight={matched ? 700 : 400}
+        className={`font-mono ${
+          matched ? 'fill-white' :
+          onPath ? 'fill-port-accent' :
+          display ? 'fill-gray-300' : 'fill-gray-700'
+        }`}
+      >
+        {label}
+      </text>
+    </g>
+  );
+}
+
+function TreeView({ currentPath, mode }) {
+  const { nodes, edges, width, maxDepth } = MORSE_TREE_LAYOUT;
+  const pixelWidth = width * TREE_SLOT_W;
+  const pixelHeight = (maxDepth + 1) * TREE_ROW_H;
+
+  return (
+    <div>
+      <div className="flex items-center justify-between text-[10px] uppercase tracking-wide text-gray-500 mb-2">
+        <span>← dah</span>
+        <span>start</span>
+        <span>dit →</span>
+      </div>
+      <div className="pb-1">
+        {/* Capped at its natural pixel size so a wide viewport doesn't blow the
+            glyphs up; below that it shrinks to fit rather than overflowing. */}
+        <svg
+          className="block mx-auto w-full h-auto"
+          style={{ maxWidth: pixelWidth }}
+          viewBox={`0 0 ${pixelWidth} ${pixelHeight}`}
+          role="img"
+          aria-label="Morse code decoding tree"
+        >
+          {edges.map((e, i) => {
+            const highlighted = currentPath.length > 0 && currentPath.startsWith(e.childCode);
+            return (
+              <line
+                key={i}
+                x1={e.x1 * TREE_SLOT_W + TREE_SLOT_W / 2}
+                y1={e.y1 * TREE_ROW_H + TREE_ROW_H / 2}
+                x2={e.x2 * TREE_SLOT_W + TREE_SLOT_W / 2}
+                y2={e.y2 * TREE_ROW_H + TREE_ROW_H / 2}
+                className={highlighted ? 'stroke-port-accent' : 'stroke-port-border'}
+                strokeWidth={highlighted ? 2 : 1}
+              />
+            );
+          })}
+          {nodes.map(({ x, depth, node }) => (
+            <TreeNodeLabel key={node.code} x={x} depth={depth} node={node} currentPath={currentPath} />
+          ))}
+        </svg>
+      </div>
+      <p className="text-[10px] text-gray-500 mt-3">
+        {mode === 'send'
+          ? "Tap or hold space to key. The path you're on lights up."
+          : 'Reference only — start a Send drill to see your live keying path.'}
+      </p>
+    </div>
+  );
+}
+
+function LengthView({ currentPath }) {
+  const lengths = Object.keys(MORSE_BY_LENGTH).map(Number).sort((a, b) => a - b);
+  return (
+    <div className="space-y-3">
+      {lengths.map((len) => (
+        <div key={len}>
+          <div className="text-[10px] uppercase tracking-wide text-gray-500 mb-1">
+            {len} symbol{len > 1 ? 's' : ''}
+          </div>
+          <div className="grid grid-cols-3 gap-x-3 gap-y-1 text-sm">
+            {MORSE_BY_LENGTH[len].map(([ch, code]) => {
+              const matched = code === currentPath;
+              return (
+                <div key={ch} className="flex items-center gap-2">
+                  <span className={`font-mono w-4 ${matched ? 'text-port-accent font-bold' : 'text-white'}`}>{ch}</span>
+                  <span className={`font-mono text-xs ${matched ? 'text-port-accent' : 'text-gray-500'}`}>{code}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ListView({ currentPath }) {
+  return (
+    <div className="grid grid-cols-3 gap-x-3 gap-y-1.5 text-sm">
+      {MORSE_ENTRIES.map(([ch, code]) => {
+        const matched = code === currentPath;
+        return (
+          <div key={ch} className="flex items-center gap-2">
+            <span className={`font-mono w-4 ${matched ? 'text-port-accent font-bold' : 'text-white'}`}>{ch}</span>
+            <span className={`font-mono text-xs ${matched ? 'text-port-accent' : 'text-port-accent/60'}`}>{code}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+export function KeyPad({ keying }) {
+  return (
+    <div className="bg-port-card border border-port-border rounded-lg p-4 space-y-3">
+      <div className="flex items-center justify-between">
+        <div className="text-xs font-medium text-gray-400 uppercase tracking-wide">Practice Key</div>
+        <button
+          onClick={keying.clear}
+          className="flex items-center gap-1 text-[11px] text-gray-500 hover:text-port-error transition-colors"
+        >
+          <Eraser size={11} /> Clear
+        </button>
+      </div>
+      {/* Space on a focused button belongs to the browser (useKeyCapture stands
+          down for it), so the pad has to key on its OWN key events — otherwise
+          tapping it once with the mouse would leave focus here and make the
+          spacebar dead, on the very control labelled "TAP / HOLD SPACE".
+          preventDefault suppresses the native click-on-keyup too, so one press
+          is one press. */}
+      <button
+        type="button"
+        onMouseDown={keying.beginPress}
+        onMouseUp={keying.endPress}
+        onMouseLeave={keying.endPress}
+        onTouchStart={(e) => { e.preventDefault(); keying.beginPress(); }}
+        onTouchEnd={(e) => { e.preventDefault(); keying.endPress(); }}
+        onKeyDown={(e) => {
+          if (!isPressKey(e)) return;
+          e.preventDefault();
+          if (!e.repeat) keying.beginPress();
+        }}
+        onKeyUp={(e) => {
+          if (!isPressKey(e)) return;
+          e.preventDefault();
+          keying.endPress();
+        }}
+        className={`w-full select-none py-6 rounded-lg border-2 font-mono text-base transition-colors ${
+          keying.pressing ? 'border-port-accent bg-port-accent/20 text-port-accent' : 'border-port-border bg-port-bg text-gray-400 hover:border-port-accent'
+        }`}
+      >
+        {keying.pressing ? '▮ KEYING' : 'TAP / HOLD SPACE'}
+      </button>
+      <p className="text-[10px] text-gray-500 text-center">
+        Tap short for ·, hold for —. Your decoded text appears in the drill.
+      </p>
+    </div>
+  );
+}
+
+function ModeGrid({ onPick }) {
+  return (
+    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+      {MODES.map((m) => {
+        const Icon = m.icon;
+        return (
+          <button
+            key={m.id}
+            onClick={() => onPick(m.id)}
+            className={`text-left bg-port-card border border-port-border hover:border-port-accent rounded-lg p-4 transition-colors`}
+          >
+            <div className={`inline-flex items-center justify-center w-9 h-9 rounded-lg ${m.bgColor} mb-3`}>
+              <Icon size={18} className={m.color} />
+            </div>
+            <div className="text-white font-medium">{m.label}</div>
+            <div className="text-xs text-gray-400 mt-1">{DRILL_DESCRIPTIONS[`morse-${m.id}`]}</div>
+            <div className="text-[11px] text-gray-500 mt-2 font-mono">{m.example}</div>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+const ROUND_SIZE = 10;
+
+// Render a prompt or a guess as its Morse pattern. A guess can hold anything the
+// user typed, so an unknown character reads as `?` rather than vanishing.
+function toMorse(text) {
+  return text
+    .split('')
+    .map((char) => (char === ' ' ? '/' : MORSE_TABLE[char] || '?'))
+    .join('   ');
+}
+
+// Flatten per-question copy results ({ prompt, guess, correct, responseMs }) into
+// per-character sent→guessed items for the server's confusion matrix. Aligned
+// positionally over the LONGER of prompt/guess so nothing is silently dropped:
+//   - a missing/short guess char yields guessed '' (a miss, scored wrong);
+//   - an EXTRA typed char beyond the prompt yields sent '' (an insertion). An
+//     insertion has no transmitted character, so the server excludes empty-sent
+//     items from the confusion matrix / per-character mastery, but still counts
+//     them in the round's accuracy — so a `K`→`KM` round reads as an error, not a
+//     perfect copy. The question's responseMs is attributed to each character.
+export function resultsToItems(results) {
+  const items = [];
+  for (const r of results) {
+    const promptChars = (r.prompt || '').toUpperCase().replace(/\s/g, '').split('');
+    const guessChars = (r.guess || '').toUpperCase().replace(/\s/g, '').split('');
+    const len = Math.max(promptChars.length, guessChars.length);
+    for (let i = 0; i < len; i++) {
+      const sent = promptChars[i] ?? '';
+      const guessed = guessChars[i] ?? '';
+      items.push({ sent, guessed, correct: sent === guessed, responseMs: r.responseMs ?? 0 });
+    }
+  }
+  return items;
+}
+
+function CopyDrill({ prefs, progress, updatePrefs, ensureCtx, claimSession, releaseSession, onExit, onContinue, onSessionComplete, onRoundSubmit, headCopy = false }) {
+  const [prompt, setPrompt] = useState('');
+  const [input, setInput] = useState('');
+  const [results, setResults] = useState([]);
+  // Only whether the latest answer is still on screen — the answer itself is
+  // read back out of `results`, so there is one record per question, not two.
+  const [verdictOpen, setVerdictOpen] = useState(false);
+  const [playing, setPlaying] = useState(false);
+  const [playbackError, setPlaybackError] = useState(null);
+  const [done, setDone] = useState(false);
+  const [selection, setSelection] = useState(null);
+  const inputRef = useRef(null);
+  const roundStartRef = useRef(0);
+  // Set when a prompt finishes playing; drives per-question responseMs (time from
+  // "audio done" to the user's submit) recorded per character in the round.
+  const questionStartRef = useRef(0);
+  const saveRef = useRef(() => Promise.resolve());
+  // Re-entrancy guard. On the first play of a session `ensureCtx()` awaits the
+  // iOS audio-unlock, and `prompt`/`playing` aren't set until after it — so the
+  // Start Round / New Round button stays live during that window. A second tap
+  // would otherwise start a second overlapping playPrompt, scheduling two Morse
+  // prompts over each other with the UI tracking only whichever set state last.
+  // A ref (not `playing` state) because it must gate synchronously, before the
+  // first await, where a state update wouldn't have rendered yet.
+  const playingRef = useRef(false);
+
+  async function startRound() {
+    if (playingRef.current) return;
+    setResults([]);
+    setVerdictOpen(false);
+    setSelection(null);
+    setDone(false);
+    roundStartRef.current = Date.now();
+    await playPrompt(true);
+  }
+
+  async function playPrompt(isNew) {
+    if (playingRef.current) return;
+    playingRef.current = true;
+    setPlaybackError(null);
+    // Claimed BEFORE the resume await so the context comes up on the iOS
+    // `playback` session — this drill is pure synth with no media element, so
+    // on the default `auto` session the ring/silent switch mutes the prompt
+    // while the UI still says "playing...".
+    claimSession();
+    const ctx = await ensureCtx().catch((err) => {
+      console.error(`❌ Morse prompt audio unavailable: ${err.message}`);
+      return null;
+    });
+    // The per-mount context is close()d and nulled on unmount, so a play that
+    // was still inside the iOS unlock window when the trainer went away has
+    // nothing left to sound into. Bail rather than throwing into playMorse — and
+    // hand the claim back, since no teardown will run for this play.
+    if (!ctx) {
+      releaseSession();
+      setPlaying(false);
+      playingRef.current = false;
+      setPlaybackError('Audio playback could not start. Check your browser audio settings and try again.');
+      return;
+    }
+    const nextSelection = isNew ? selectMorsePrompt({
+      seed: `${roundStartRef.current}:${results.length}`,
+      pool: KOCH_ORDER.slice(0, Math.max(2, Math.min(prefs.kochLevel, KOCH_ORDER.length))),
+      progress,
+      materialMode: prefs.materialMode,
+      adaptive: prefs.adaptivePractice,
+      groupLength: prefs.kochLevel >= 5 ? 5 : 1,
+      recentChars: results.slice(-2).flatMap((result) => result.prompt.replace(/\s/g, '').split('')),
+    }) : selection;
+    const text = isNew ? nextSelection.text : prompt;
+    if (isNew) {
+      setPrompt(text);
+      setSelection(nextSelection);
+      setInput('');
+      setVerdictOpen(false);
+    }
+    setPlaying(true);
+    // Handle a synthesis failure locally: the handlers that call this function
+    // intentionally fire-and-forget, so rethrowing would create an unhandled
+    // rejection and strand the round's synchronous re-entrancy guard.
+    const played = await playMorse(ctx, text, prefs).then(
+      () => true,
+      (err) => {
+        console.error(`❌ Morse prompt playback failed: ${err.message}`);
+        setPlaybackError('Audio playback could not finish. Try replaying the prompt.');
+        return false;
+      },
+    ).finally(() => {
+      releaseSession();
+      setPlaying(false);
+      playingRef.current = false;
+    });
+    if (!played) return;
+    questionStartRef.current = Date.now();
+    setTimeout(() => inputRef.current?.focus(), 50);
+  }
+
+  function submit() {
+    if (!prompt) return;
+    const guess = input.trim().toUpperCase();
+    const correct = guess === prompt;
+    const responseMs = questionStartRef.current ? Date.now() - questionStartRef.current : 0;
+    const next = [...results, { prompt, guess, correct, responseMs, selection }];
+    setResults(next);
+    setVerdictOpen(true);
+    if (next.length >= ROUND_SIZE) {
+      finishRound(next);
+    }
+  }
+
+  function nextQuestion() {
+    setVerdictOpen(false);
+    playPrompt(true);
+  }
+
+  function finishRound(rs) {
+    const correctCount = rs.filter((r) => r.correct).length;
+    const accuracy = Math.round((correctCount / rs.length) * 100);
+    const patch = { bestAccuracy: Math.max(prefs.bestAccuracy, accuracy) };
+    const items = resultsToItems(rs);
+    if (canAdvanceMorseLevel({ items, accuracy, wpm: prefs.wpm, effectiveWpm: prefs.effectiveWpm }) && prefs.kochLevel < KOCH_ORDER.length) {
+      patch.kochLevel = prefs.kochLevel + 1;
+    }
+    updatePrefs(patch);
+    setDone(true);
+    const durationMs = roundStartRef.current ? Date.now() - roundStartRef.current : 0;
+    const trainingPayload = {
+      drillType: headCopy ? 'morse-head-copy' : 'morse-copy',
+      questionCount: rs.length,
+      correctCount,
+      totalMs: durationMs,
+    };
+    // Persist the round server-side with per-character sent→guessed pairs (each
+    // prompt/guess is aligned positionally so a 5-char group yields 5 items) —
+    // the raw material for the confusion matrix and per-character mastery.
+    const roundPayload = {
+      mode: headCopy ? 'head-copy' : 'copy',
+      kochLevel: prefs.kochLevel,
+      wpm: prefs.wpm,
+      farnsworthWpm: prefs.effectiveWpm,
+      durationMs,
+      items,
+      samplerVersion: rs[0]?.selection?.samplerVersion || selection?.samplerVersion,
+      materialMode: rs[0]?.selection?.materialMode || selection?.materialMode,
+      targetedChars: [...new Set(rs.flatMap((result) => result.selection?.targetedChars || selection?.targetedChars || []))],
+    };
+    saveRef.current = startRetryableSaves([
+      onSessionComplete && (() => onSessionComplete(trainingPayload)),
+      onRoundSubmit && (() => onRoundSubmit(roundPayload)),
+    ]);
+  }
+
+  function onKey(e) {
+    // A held Enter auto-repeats, which would answer and advance off one press.
+    if (e.key !== 'Enter' || e.repeat) return;
+    if (verdictOpen) nextQuestion();
+    else if (input) submit();
+  }
+
+  if (done) {
+    const correctCount = results.filter((r) => r.correct).length;
+    const accuracy = Math.round((correctCount / results.length) * 100);
+    const accColor = accuracy >= 90 ? 'text-port-success' : accuracy >= 70 ? 'text-port-warning' : 'text-port-error';
+    const unlocked = accuracy >= 90;
+    return (
+      <div className="bg-port-card border border-port-border rounded-lg p-6 space-y-4">
+        <div className="text-center">
+          <div className={`text-5xl font-mono font-bold ${accColor}`}>{accuracy}%</div>
+          <div className="text-gray-400 text-sm mt-1">{correctCount} / {results.length} correct</div>
+          {unlocked && prefs.kochLevel <= KOCH_ORDER.length && (
+            <div className="text-port-success text-sm mt-3">
+              ✓ Next letter unlocked: <span className="font-mono">{KOCH_ORDER[prefs.kochLevel - 1]}</span>
+            </div>
+          )}
+        </div>
+        <div className="grid grid-cols-2 sm:grid-cols-5 gap-1.5">
+          {results.map((r, i) => (
+            <div
+              key={i}
+              className={`text-xs font-mono px-2 py-1.5 rounded border ${r.correct ? 'border-port-success/40 text-port-success' : 'border-port-error/40 text-port-error'}`}
+            >
+              {r.prompt} → {r.guess || '—'}
+            </div>
+          ))}
+        </div>
+        <PostCompletionActions
+          saveLabel="Finish for Now"
+          onSave={() => saveRef.current().then(onExit)}
+          onContinue={() => saveRef.current().then(onContinue)}
+        />
+        <div className="flex justify-center">
+          <button onClick={startRound} className="px-4 py-2 text-sm text-gray-400 hover:text-white transition-colors">
+            Practice Again
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (!prompt) {
+    return (
+      <div className="bg-port-card border border-port-border rounded-lg p-6 space-y-4 text-center">
+        <Headphones size={32} className="text-cyan-400 mx-auto" />
+        <p className="text-gray-300">
+          Koch level <span className="font-mono text-white">{prefs.kochLevel}</span> — pool: {' '}
+          <span className="font-mono text-port-accent">{KOCH_ORDER.slice(0, prefs.kochLevel).join(' ')}</span>
+        </p>
+        <p className="text-xs text-gray-500">
+          {headCopy
+            ? 'Listen to a 10-question round. No code hints on the results screen — pure recall. Hit 90% to unlock the next letter.'
+            : 'Listen to a 10-question round. Hit 90% to unlock the next letter.'}
+        </p>
+        <p className="text-xs text-gray-500">{prefs.adaptivePractice ? 'Adaptive practice prioritizes repeated confusions while retaining full Koch-pool coverage.' : 'Balanced Koch-pool coverage is enabled.'}</p>
+        {playbackError && <p role="alert" className="text-sm text-port-error">{playbackError}</p>}
+        <button
+          onClick={startRound}
+          className="px-6 py-3 bg-port-accent hover:bg-port-accent/80 text-white font-medium rounded-lg transition-colors inline-flex items-center gap-2"
+        >
+          <Play size={16} /> Start Round
+        </button>
+      </div>
+    );
+  }
+
+  // The question just answered: shown as the verdict while it is open, then as
+  // a persistent recap under the next prompt.
+  const latest = results[results.length - 1];
+
+  return (
+    <div className="bg-port-card border border-port-border rounded-lg p-6 space-y-4">
+      {playbackError && <p role="alert" className="text-sm text-port-error">{playbackError}</p>}
+      <div className="flex items-center justify-between text-xs text-gray-500">
+        <span>Question {results.length + 1} / {ROUND_SIZE}</span>
+        <button
+          onClick={() => playPrompt(false)}
+          disabled={playing}
+          className="flex items-center gap-1 text-gray-400 hover:text-port-accent disabled:opacity-50 transition-colors"
+        >
+          <Volume2 size={14} /> Replay
+        </button>
+      </div>
+      {verdictOpen && selection && <p className="text-xs text-gray-500 text-center">{selection.reason}</p>}
+      <div className="text-center py-6">
+        {playing ? (
+          <div className="text-cyan-400 text-sm animate-pulse">▮ ▮ ▮ playing...</div>
+        ) : verdictOpen ? (
+          <div className="space-y-3" data-testid="morse-verdict">
+            {latest.correct ? (
+              <CheckCircle size={36} className="text-port-success mx-auto" />
+            ) : (
+              <XCircle size={36} className="text-port-error mx-auto" />
+            )}
+            <div className="text-3xl font-mono font-bold text-port-accent tracking-widest">
+              {latest.prompt}
+            </div>
+            {!headCopy && (
+              <div className="font-mono text-port-accent/70 text-base tracking-widest">
+                {toMorse(latest.prompt)}
+              </div>
+            )}
+            {!latest.correct && (
+              <div className="text-gray-400 text-xs pt-1">
+                You typed <span className="font-mono text-white">{latest.guess || '—'}</span>
+                {/* The guess's own pattern is what makes the miss teachable —
+                    seeing -.- against -- is how K/M stops being a coin flip. */}
+                {!headCopy && latest.guess && (
+                  <span className="font-mono text-gray-500"> ({toMorse(latest.guess)})</span>
+                )}
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="text-gray-500 text-sm">Type what you heard, then Enter</div>
+        )}
+      </div>
+      {/* Keeps the last answer readable through the next prompt, so a verdict
+          dismissed in a hurry is still learnable. */}
+      {!verdictOpen && latest && (
+        <div
+          className={`text-xs text-center font-mono ${latest.correct ? 'text-port-success' : 'text-port-error'}`}
+          data-testid="morse-previous-answer"
+        >
+          Previous: <span className="tracking-widest">{latest.prompt}</span>
+          {!headCopy && <span className="text-gray-500"> {toMorse(latest.prompt)}</span>}
+          {latest.correct ? ' ✓' : <> → you typed <span className="tracking-widest">{latest.guess || '—'}</span> ✗</>}
+        </div>
+      )}
+      {/* Stays mounted and focused through the verdict instead of handing focus
+          to an autofocused Next button: the Enter that submitted is still down,
+          and a focused button is activated natively by its own keypress/keyup or
+          first auto-repeat — dismissing the verdict in the tick it appeared.
+          readOnly, not disabled: disabled drops focus back to the button. */}
+      <input
+        ref={inputRef}
+        value={input}
+        onChange={(e) => setInput(e.target.value.toUpperCase().replace(/\s+/g, ' '))}
+        onKeyDown={onKey}
+        readOnly={verdictOpen}
+        autoFocus
+        className={`w-full px-4 py-3 bg-port-bg border rounded-lg text-white text-center font-mono text-lg uppercase tracking-widest outline-none ${verdictOpen ? 'border-port-border/50 opacity-60' : 'border-port-border focus:border-port-accent'}`}
+        placeholder="????"
+        aria-label="Decoded characters"
+      />
+      {verdictOpen && (
+        <button
+          onClick={nextQuestion}
+          className="w-full px-6 py-3 bg-port-accent hover:bg-port-accent/80 text-white font-medium rounded-lg transition-colors"
+        >
+          {results.length >= ROUND_SIZE ? 'See Results' : 'Next'}
+        </button>
+      )}
+    </div>
+  );
+}
+
+function SendDrill({ keying, prefs, progress, onExit, onContinue, onSessionComplete, onRoundSubmit }) {
+  const pickPrompt = useCallback((seed = Date.now()) => selectMorsePrompt({
+    seed,
+    pool: KOCH_ORDER.slice(0, Math.max(2, Math.min(prefs.kochLevel, KOCH_ORDER.length))),
+    progress,
+    materialMode: prefs.materialMode,
+    adaptive: prefs.adaptivePractice,
+    groupLength: prefs.kochLevel >= 5 ? 5 : 1,
+  }), [prefs, progress]);
+  const [selection, setSelection] = useState(() => pickPrompt());
+  const [prompt, setPrompt] = useState(() => selection.text);
+  const [feedback, setFeedback] = useState(null);
+  const promptStartRef = useRef(Date.now());
+  const saveRef = useRef(() => Promise.resolve());
+
+  // Drop any stale keying state from a prior session so "Your sending" starts empty.
+  const { clear: clearKeying } = keying;
+  useEffect(() => {
+    clearKeying();
+  }, [clearKeying]);
+
+  function decodeNow() {
+    const target = prompt.toUpperCase();
+    const got = keying.decoded.replace(/\s+/g, ' ').trim().toUpperCase();
+    const correct = got === target;
+    setFeedback({ correct, decoded: got, target });
+    const durationMs = Date.now() - promptStartRef.current;
+    const trainingPayload = {
+      drillType: 'morse-send',
+      questionCount: 1,
+      correctCount: correct ? 1 : 0,
+      totalMs: durationMs,
+    };
+    // Record per-character keying accuracy + timing. sent = target char, guessed =
+    // what the decoder resolved at that position. responseMs is the inter-letter
+    // keying interval (letterLog is on the same performance.now() clock, so only
+    // deltas between consecutive letters are meaningful — first char has none).
+    const targetChars = target.replace(/\s+/g, '').split('');
+    const decodedChars = got.replace(/\s+/g, '').split('');
+    const log = keying.getLetterLog?.() || [];
+    // Align over the LONGER sequence (like copy mode) so an over-long send —
+    // e.g. target `KM` keyed as `KMM` — records the surplus keyed character as an
+    // empty-sent insertion error instead of silently scoring a perfect send.
+    const len = Math.max(targetChars.length, decodedChars.length);
+    const items = [];
+    for (let i = 0; i < len; i++) {
+      const sent = targetChars[i] ?? '';
+      const guessed = decodedChars[i] ?? '';
+      const at = log[i]?.at;
+      const prevAt = log[i - 1]?.at;
+      const responseMs = at != null && prevAt != null ? Math.max(0, Math.round(at - prevAt)) : 0;
+      items.push({ sent, guessed, correct: sent === guessed, responseMs });
+    }
+    // Spacing is stripped for letter-level alignment (word gaps aren't Morse
+    // characters), so a send that keys every letter right but botches the word
+    // gap (e.g. `DE K1AB` sent as `DEK1AB`) would otherwise store as 100%. When
+    // the exact-match failed on spacing alone, append one non-letter error item
+    // (empty sent → excluded from the confusion matrix) so the round's accuracy
+    // matches the exact-match verdict.
+    if (!correct && items.length > 0 && items.every((it) => it.correct)) {
+      items.push({ sent: '', guessed: ' ', correct: false, responseMs: 0 });
+    }
+    if (items.length > 0) {
+      const roundPayload = { mode: 'send', durationMs, items, samplerVersion: selection.samplerVersion, materialMode: selection.materialMode, targetedChars: selection.targetedChars };
+      saveRef.current = startRetryableSaves([
+        onSessionComplete && (() => onSessionComplete(trainingPayload)),
+        onRoundSubmit && (() => onRoundSubmit(roundPayload)),
+      ]);
+    } else {
+      saveRef.current = startRetryableSaves([
+        onSessionComplete && (() => onSessionComplete(trainingPayload)),
+      ]);
+    }
+  }
+
+  function nextPrompt() {
+    keying.clear();
+    setFeedback(null);
+    const nextSelection = pickPrompt();
+    setSelection(nextSelection);
+    setPrompt(nextSelection.text);
+    promptStartRef.current = Date.now();
+  }
+
+  return (
+    <div className="bg-port-card border border-port-border rounded-lg p-6 space-y-5">
+      <div className="text-center">
+        <div className="text-xs text-gray-500 uppercase tracking-wide mb-1">Send this</div>
+        <div className="text-3xl font-mono font-bold text-white tracking-widest">{prompt}</div>
+      </div>
+
+      <p className="text-xs text-gray-500 text-center">
+        Hold space (or tap the practice key on the right) to send dits and dahs. Use the reference tabs if you need a hint.
+      </p>
+      <p className="text-xs text-gray-500 text-center">{selection.reason}</p>
+
+      <div className="bg-port-bg border border-port-border rounded-lg p-3 min-h-[3rem] flex flex-col items-center justify-center">
+        <div className="text-[10px] uppercase tracking-wide text-gray-500 mb-1">Your sending</div>
+        {keying.decoded ? (
+          <div className="font-mono text-white text-lg tracking-widest break-all">{keying.decoded}</div>
+        ) : (
+          <div className="text-[11px] text-gray-600 italic">waiting for your first key…</div>
+        )}
+      </div>
+
+      {feedback ? (
+        <div className="space-y-3">
+          <div className="text-center">
+            {feedback.correct ? (
+              <CheckCircle size={36} className="text-port-success mx-auto" />
+            ) : (
+              <XCircle size={36} className="text-port-error mx-auto" />
+            )}
+            <div className="text-xs text-gray-400 mt-2">
+              Decoded <span className="font-mono text-white">{feedback.decoded || '—'}</span>{' '}
+              vs target <span className="font-mono text-port-accent">{feedback.target}</span>
+            </div>
+          </div>
+          <PostCompletionActions
+            saveLabel="Finish for Now"
+            onSave={() => saveRef.current().then(onExit)}
+            onContinue={() => saveRef.current().then(onContinue)}
+          />
+          <button onClick={nextPrompt} className="w-full px-4 py-2 text-sm text-gray-400 hover:text-white transition-colors">
+            Practice Another Prompt
+          </button>
+        </div>
+      ) : (
+        <div className="flex gap-3">
+          <button onClick={decodeNow} className="flex-1 px-4 py-2.5 bg-port-accent hover:bg-port-accent/80 text-white font-medium rounded-lg transition-colors">
+            Check
+          </button>
+          <button onClick={keying.clear} className="px-4 py-2.5 bg-port-card border border-port-border hover:border-port-accent text-gray-300 rounded-lg transition-colors">
+            Clear
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}

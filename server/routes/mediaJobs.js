@@ -1,0 +1,470 @@
+/**
+ * Media Job Queue Routes — read + cancel access to the unified image/video
+ * render queue. The actual enqueueing happens in /api/video-gen and
+ * /api/image-gen routes; this surface lets the UI show what's pending and
+ * cancel something without going through provider-specific endpoints.
+ */
+
+import { Router } from 'express';
+import { z } from 'zod';
+import { asyncHandler, ServerError } from '../lib/errorHandler.js';
+import { validateRequest } from '../lib/validation.js';
+import { listJobs, listQueueJobs, getJob, cancelJob, cancelQueuedJobs, enqueueJob, removeArchivedJob, runJobNow, listVideoHolds, resumeVideoHold, JOB_KINDS, JOB_STATUSES, MEDIA_QUEUE_SHUTTING_DOWN } from '../services/mediaJobQueue/index.js';
+import { refineMediaPrompt } from '../services/mediaPromptRefiner.js';
+import { saveMediaPromptExamination, listMediaPromptExaminations, getMediaPromptExamination } from '../services/mediaPromptHistory.js';
+import { promptFromMedia } from '../services/mediaPromptFromMedia.js';
+import { CODEX_EFFORT_LEVELS } from '../lib/providerModels.js';
+import { sanitizeJob } from '../services/mediaJobQueue/sanitizeJob.js';
+import { isRemoteMediaJob } from '../services/mediaJobQueue/remoteMediaJob.js';
+import { validateVideoRetryParams } from '../services/videoGen/prepareParams.js';
+import { I2V_REFERENCE_MODES, isDefaultI2vReferenceMode } from '../lib/videoReferenceModes.js';
+import { DRAFT_DECODE_IDS, isFullDecode } from '../lib/videoDraftDecoders.js';
+
+const router = Router();
+
+const listQuerySchema = z.object({
+  status: z.enum(JOB_STATUSES).optional(),
+  kind: z.enum(JOB_KINDS).optional(),
+  owner: z.string().max(256).optional(),
+});
+
+// renderConfig is inlined into the LLM prompt via JSON.stringify, so an
+// unbounded object would inflate token cost / latency. Cap the serialized
+// payload at 4 KB — that's well above any legitimate render-config (which
+// is typically <500 bytes) but stops a malicious or buggy caller from
+// shipping arbitrarily nested objects through the refiner.
+const RENDER_CONFIG_MAX_BYTES = 4096;
+const refinePromptSchema = z.object({
+  kind: z.enum(JOB_KINDS),
+  // Trim before length check — without trim, "   " would slip past min(1)
+  // and arrive at the refiner where it'd be cleaned to an empty string, then
+  // surface as a confusing "LLM returned an empty prompt" error.
+  prompt: z.string().trim().min(1).max(8000),
+  negativePrompt: z.string().trim().max(8000).optional(),
+  feedback: z.string().trim().max(3000).optional(),
+  providerId: z.string().trim().min(1).max(128),
+  // Empty/whitespace model → undefined so the refiner's defaultModel /
+  // models[0] fallback chain kicks in, instead of a whitespace string
+  // bypassing the MODEL_REQUIRED guard and reaching the provider.
+  model: z.string().max(256).optional().transform((s) => {
+    const v = (s ?? '').trim();
+    return v.length > 0 ? v : undefined;
+  }),
+  effort: z.string().max(64).optional().transform((s) => {
+    const v = (s ?? '').trim();
+    return v.length > 0 ? v : undefined;
+  }),
+  // Hard character cap the SELECTED render backend enforces on the prompt it
+  // receives — reactor.inc's fast-h3 rejects a prompt over 800 characters
+  // outright instead of truncating it, so an enhancement that ignores the cap
+  // produces a prompt that cannot be rendered. The caller sends the budget
+  // (cap minus whatever a style preset prefixes), the refiner instructs the
+  // model with it and clamps the answer. Omitted when the backend has no cap.
+  maxPromptLength: z.number().int().positive().max(8000).optional(),
+  renderConfig: z.record(z.any())
+    .refine((obj) => {
+      // JSON.stringify throws on BigInt / circular refs. z.record(z.any())
+      // doesn't reject those at parse time, so wrap the size check so a
+      // bad payload surfaces as VALIDATION_ERROR (400), not a 500.
+      // Measure with the same pretty-printed format the refiner inlines
+      // into the LLM prompt (`JSON.stringify(obj, null, 2)`); minified
+      // measurement would under-count, letting an indented blob slip past
+      // the cap and still inflate the prompt.
+      let size;
+      try { size = Buffer.byteLength(JSON.stringify(obj, null, 2), 'utf8'); }
+      catch { return false; }
+      return size <= RENDER_CONFIG_MAX_BYTES;
+    }, {
+      message: `renderConfig must be JSON-serializable and ≤ ${RENDER_CONFIG_MAX_BYTES} bytes`,
+    })
+    .optional(),
+});
+
+const optionalTrimmed = z.string().max(256).optional().transform((s) => {
+  const v = (s ?? '').trim();
+  return v.length > 0 ? v : undefined;
+});
+
+const promptFromMediaSchema = z.object({
+  sourceKind: z.enum(['image', 'video', 'upload']),
+  filename: z.string().trim().min(1).max(256).optional(),
+  videoId: z.string().trim().min(1).max(64).optional(),
+  targets: z.array(z.enum(['image', 'video'])).min(1).max(2)
+    .refine((arr) => new Set(arr).size === arr.length, { message: 'targets must be unique' }),
+  providerId: z.string().trim().min(1).max(128),
+  model: optionalTrimmed,
+  effort: z.string().max(64).optional().transform((s) => {
+    const v = (s ?? '').trim();
+    return v.length > 0 ? v : undefined;
+  }),
+  // Same cap as `refinePromptSchema.maxPromptLength`, but scoped to the VIDEO
+  // prompt: the caller sends it when the video backend it is composing for
+  // rejects an over-length prompt (reactor.inc fast-h3). The image prompt has
+  // no equivalent cap on any current backend.
+  maxVideoPromptLength: z.number().int().positive().max(8000).optional(),
+}).superRefine((data, ctx) => {
+  // A gallery video resolves by history id (the gallery flow) OR by on-disk
+  // filename (a mood-board video item's `video:<filename>` ref — #4188).
+  if (data.sourceKind === 'video' && !data.videoId && !data.filename) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'videoId or filename is required for a gallery video', path: ['videoId'] });
+  }
+  if ((data.sourceKind === 'image' || data.sourceKind === 'upload') && !data.filename) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'filename is required', path: ['filename'] });
+  }
+});
+
+router.get('/', asyncHandler(async (req, res) => {
+  const filters = validateRequest(listQuerySchema, req.query);
+  // Live jobs preserve `listJobs` order — [running, codexRunning, ...queue] —
+  // so the UI reads top-to-bottom as "currently rendering, then next in line"
+  // (FIFO). A single timestamp DESC sort puts later-queued jobs ahead of an
+  // earlier-started running job and confuses the user.
+  // Terminal jobs sort by most-recent finish so the "recent" reel surfaces
+  // newest-first; the fallback chain handles canceled-while-queued jobs.
+  const jobs = listJobs(filters);
+  const live = jobs.filter((j) => j.status === 'queued' || j.status === 'running');
+  const terminal = jobs.filter((j) => j.status !== 'queued' && j.status !== 'running');
+  terminal.sort((a, b) => {
+    const ta = new Date(a.completedAt || a.startedAt || a.queuedAt || 0).getTime();
+    const tb = new Date(b.completedAt || b.startedAt || b.queuedAt || 0).getTime();
+    return tb - ta;
+  });
+  res.json([...live, ...terminal].map(sanitizeJob));
+}));
+
+const queueQuerySchema = z.object({
+  kind: z.enum(JOB_KINDS).optional(),
+  owner: z.string().max(256).optional(),
+  limit: z.coerce.number().int().min(0).max(100).optional(),
+});
+
+router.get('/queue', asyncHandler(async (req, res) => {
+  const filters = validateRequest(queueQuerySchema, req.query);
+  res.json(listQueueJobs(filters).map(sanitizeJob));
+}));
+
+router.post('/refine-prompt', asyncHandler(async (req, res) => {
+  const data = validateRequest(refinePromptSchema, req.body);
+  res.json(await refineMediaPrompt(data));
+}));
+
+router.get('/prompt-history', asyncHandler(async (req, res) => {
+  const { offset } = validateRequest(z.object({ offset: z.coerce.number().int().min(0).max(1000000).default(0) }), req.query);
+  res.json(await listMediaPromptExaminations(offset));
+}));
+router.get('/prompt-history/:id', asyncHandler(async (req, res) => {
+  const { id } = validateRequest(z.object({ id: z.string().uuid() }), req.params);
+  const record = await getMediaPromptExamination(id);
+  if (!record) throw new ServerError('Examination not found', { status: 404 });
+  res.json(record);
+}));
+
+router.post('/prompt-from-media', asyncHandler(async (req, res) => {
+  const data = validateRequest(promptFromMediaSchema, req.body);
+  const result = await promptFromMedia(data);
+  const source = { sourceKind: data.sourceKind, filename: data.filename, videoId: data.videoId };
+  const record = await saveMediaPromptExamination(source, result);
+  res.json({ ...result, examinationId: record.id });
+}));
+
+const resumeHoldParamsSchema = z.object({ holdId: z.string().uuid() });
+const resumeHoldBodySchema = z.object({}).strict();
+router.get('/holds', asyncHandler(async (_req, res) => {
+  res.json(listVideoHolds());
+}));
+
+router.post('/holds/:holdId/resume', asyncHandler(async (req, res) => {
+  const { holdId } = validateRequest(resumeHoldParamsSchema, req.params);
+  validateRequest(resumeHoldBodySchema, req.body ?? {});
+  if (!await resumeVideoHold(holdId)) {
+    throw new ServerError('Hold no longer exists', { status: 404, code: 'NOT_FOUND' });
+  }
+  res.json({ resumed: true });
+}));
+
+router.get('/:id', asyncHandler(async (req, res) => {
+  const job = getJob(req.params.id);
+  if (!job) {
+    // Speculative lookups (Pipeline `MediaJobThumb` hydration for old
+    // panel/scene jobIds that are past the queue's 24h archive TTL) hit
+    // this path constantly. Mark as `warning` so it doesn't surface as a
+    // global toast/console.error via useErrorNotifications — the body is
+    // unchanged, callers still get a 404 + NOT_FOUND code.
+    throw new ServerError('Not found', { status: 404, code: 'NOT_FOUND', severity: 'warning' });
+  }
+  res.json(sanitizeJob(job));
+}));
+
+router.post('/:id/cancel', asyncHandler(async (req, res) => {
+  const result = await cancelJob(req.params.id);
+  if (!result.ok) {
+    // Distinguish "no such id" (404) from "exists but already terminal"
+    // (409) so consumers can react appropriately — e.g. the UI doesn't
+    // need to display "Not found" when the user just clicked Cancel
+    // again on a job that already finished.
+    const status = result.code === 'ALREADY_TERMINAL' ? 409 : 404;
+    throw new ServerError(result.error || 'Cancel failed', { status, code: result.code || 'NOT_FOUND' });
+  }
+  res.json(result);
+}));
+
+// Params that point at multipart-staged temp files under PATHS.uploads. The
+// gen modules unlink these on completion/failure, so a job that ran is no
+// longer retryable from the persisted params alone (the files are gone, or
+// — worse — could collide with a fresh upload at the same path).
+const TEMP_UPLOAD_PARAMS = ['uploadedTempPath', 'uploadedTempPaths', 'audioFilePath'];
+function hasTempUploadParam(params) {
+  if (!params) return false;
+  return TEMP_UPLOAD_PARAMS.some((k) => {
+    const v = params[k];
+    if (Array.isArray(v)) return v.length > 0;
+    return typeof v === 'string' && v.length > 0;
+  });
+}
+
+// Whitelist of params the UI can edit on retry. Anything else (python paths,
+// session ids, internal flags) rides through unchanged from the original
+// job.params so a user can't escape the server's runtime config from the
+// retry path. Keep this set small and user-facing.
+//
+// String fields use a transform that collapses trimmed empty strings to
+// `undefined` — without that, an empty `modelId` (e.g. user cleared the
+// input) would override the original job's modelId with "" and the gen
+// would fail with "Unknown or unsupported model". Returning undefined makes
+// the override fall through to the original value at merge time.
+const emptyToUndef = (s) => {
+  const v = (s ?? '').trim();
+  return v.length > 0 ? v : undefined;
+};
+
+// Clear-to-default sentinel for the Codex reasoning-effort override. Unlike the
+// string fields above, an absent (`undefined`) effort override means "keep the
+// job's original effort" — so `emptyToUndef` alone can NEVER express "reset the
+// effort back to the shipped default", because the drop-undefined merge below
+// would silently retain the old value. This sentinel is a distinct signal: when
+// the retry payload sends `effort: 'default'`, the handler DELETES `params.effort`
+// so the render falls back to CODEX_IMAGEGEN_DEFAULT_EFFORT (`low`). A real job
+// never stores `'default'` as an effort (it's always a CODEX_EFFORT_LEVELS value),
+// so the sentinel can't collide with a legitimate level.
+const EFFORT_CLEAR_SENTINEL = 'default';
+const RETRY_OVERRIDE_SCHEMA = z.object({
+  prompt: z.string().trim().min(1).max(8000).optional(),
+  negativePrompt: z.string().trim().max(8000).optional(),
+  model: z.string().max(200).optional().transform(emptyToUndef),
+  modelId: z.string().max(200).optional().transform(emptyToUndef),
+  // Codex reasoning-effort override: a valid CODEX_EFFORT_LEVELS value pins the
+  // retry to that level; the EFFORT_CLEAR_SENTINEL (`'default'`) resets it to the
+  // shipped default; empty/whitespace → undefined (keep the original job's effort).
+  effort: z.string().max(20).optional().transform(emptyToUndef).refine(
+    (v) => v === undefined || v === EFFORT_CLEAR_SENTINEL || CODEX_EFFORT_LEVELS.includes(v),
+    { message: `effort must be one of ${CODEX_EFFORT_LEVELS.join(', ')} or '${EFFORT_CLEAR_SENTINEL}'` },
+  ),
+  width: z.number().int().min(64).max(4096).optional(),
+  height: z.number().int().min(64).max(4096).optional(),
+  steps: z.number().int().min(1).max(200).nullable().optional(),
+  guidance: z.number().min(0).max(30).optional(),
+  guidanceScale: z.number().min(0).max(30).nullable().optional(),
+  cfgScale: z.number().min(0).max(30).optional(),
+  seed: z.number().int().min(0).nullable().optional(),
+  numFrames: z.number().int().min(1).max(1024).optional(),
+  fps: z.number().int().min(1).max(60).optional(),
+  tiling: z.enum(['auto', 'none', 'spatial', 'temporal']).optional(),
+  disableAudio: z.boolean().optional(),
+  imageStrength: z.number().min(0).max(1).nullable().optional(),
+  // What the conditioning image promises (#4874). `null` clears it back to the
+  // default, like the numeric knobs above — the schema STRIPS unknown keys, so
+  // an override missing from here is silently dropped rather than rejected.
+  i2vReferenceMode: z.enum(I2V_REFERENCE_MODES).nullable().optional(),
+  textEncoderId: z.string().max(64).optional().transform(emptyToUndef),
+  // Nullable, unlike textEncoderId: a speed profile OUTRANKS steps/guidanceScale
+  // (resolveVideoSampler), so a retry that edits Steps on a profiled job would
+  // otherwise be silently ignored. `null` clears it back to the default sampler.
+  speedProfileId: z.string().max(64).nullable().optional().transform((v) => (v === '' ? null : v)),
+  // Preview-fidelity decode (#5423). Nullable for the same reason speedProfileId
+  // is: `null` clears the inherited request back to Full, which an absent key
+  // cannot express (the drop-undefined merge below would retain the old value).
+  // A closed enum, and never rejected downstream — the four gates in
+  // lib/videoDraftDecoders.js degrade a draft request to a full decode rather
+  // than failing the retry.
+  // An explicit 'full' is folded to the same clear, because absence and
+  // DRAFT_DECODE_FULL are the same request (lib/videoDraftDecoders.js) — merging
+  // it as a value would leave the requeued job carrying a knob that changed
+  // nothing, which the queue would then echo back into the next editor.
+  draftDecode: z.enum(DRAFT_DECODE_IDS).nullable().optional()
+    .transform((v) => (v === undefined ? undefined : (isFullDecode(v) ? null : v))),
+  chunks: z.number().int().min(1).max(8).optional(),
+  chunkPrompts: z.array(z.string().max(8000)).max(8).optional(),
+  contextFrames: z.number().int().min(0).max(64).optional(),
+  loras: z.array(z.object({
+    filename: z.string().min(1).max(255).regex(/^[^/\\]+\.safetensors$/i, 'filename must be a bare .safetensors basename'),
+    name: z.string().max(200).optional(),
+    scale: z.number().min(0).max(2).optional(),
+  })).max(8).optional(),
+}).partial();
+
+const VIDEO_RETRY_BOUNDS_SCHEMA = z.object({
+  width: z.number().int().min(64).max(2048).optional(),
+  height: z.number().int().min(64).max(2048).optional(),
+  seed: z.number().int().min(0).nullable().optional(),
+  numFrames: z.number().int().min(1).max(1024).optional(),
+  fps: z.number().int().min(1).max(60).optional(),
+}).passthrough();
+
+const retryBodySchema = z.object({
+  params: RETRY_OVERRIDE_SCHEMA.optional(),
+}).optional();
+
+// Re-enqueue a terminal job. Optional `body.params` overrides specific
+// user-facing fields (prompt, model, dimensions, etc.) so a user can edit
+// a failed job's config in the UI before retrying without losing the rest
+// of the original params. Non-listed params (interpreter paths, session ids)
+// always inherit from the original job.
+router.post('/:id/retry', asyncHandler(async (req, res) => {
+  const job = getJob(req.params.id);
+  if (!job) throw new ServerError('Not found', { status: 404, code: 'NOT_FOUND' });
+  if (job.status === 'queued' || job.status === 'running') {
+    throw new ServerError(
+      `Job is still ${job.status} — cancel it before retrying`,
+      { status: 409, code: 'JOB_NOT_TERMINAL' },
+    );
+  }
+  if (isRemoteMediaJob(job) && job.params?.remotePeerReservation === true) {
+    throw new ServerError(
+      'This peer render has an uncertain outcome — reconcile the original job before retrying',
+      { status: 409, code: 'JOB_REMOTE_OUTCOME_UNCERTAIN' },
+    );
+  }
+  // Reject retry when the original job referenced a multipart-staged upload —
+  // the gen modules unlink those files on completion/failure, so re-enqueueing
+  // would either fail with a missing-file error or, worse, act on a stale path
+  // that's since been reused by a different upload.
+  if (hasTempUploadParam(job.params)) {
+    throw new ServerError(
+      'Job referenced an uploaded file that has since been cleaned up — re-submit the original request with the file attached instead of retrying',
+      { status: 409, code: 'JOB_RETRY_TEMP_UPLOAD' },
+    );
+  }
+  const body = validateRequest(retryBodySchema, req.body ?? {});
+  const rawOverrides = body.params ?? {};
+  // A `effort: 'default'` override is a clear-to-default signal, not a value to
+  // merge — handled by deleting params.effort below so the render falls back to
+  // the shipped CODEX_IMAGEGEN_DEFAULT_EFFORT. Exclude it from the merge set.
+  const clearEffort = rawOverrides.effort === EFFORT_CLEAR_SENTINEL;
+  // Strip undefined override values before merging — Zod's emptyToUndef
+  // transform turns "" → undefined for model/modelId/effort, and a naive spread
+  // would still set those keys to undefined on the merged params (clobbering
+  // the original job's values). Filtering keeps unchanged fields intact.
+  const overrides = Object.fromEntries(
+    Object.entries(rawOverrides).filter(
+      ([k, v]) => v !== undefined && !(k === 'effort' && clearEffort),
+    ),
+  );
+  const params = { ...job.params, ...overrides };
+  if (job.kind === 'video') {
+    const bounds = VIDEO_RETRY_BOUNDS_SCHEMA.safeParse(rawOverrides);
+    if (!bounds.success) throw new ServerError('Video retry settings are outside the supported range', { status: 400, code: 'VALIDATION_ERROR' });
+  }
+  for (const key of ['seed', 'steps', 'guidanceScale', 'imageStrength', 'i2vReferenceMode', 'speedProfileId', 'draftDecode']) {
+    if (rawOverrides[key] === null) delete params[key];
+  }
+  if (rawOverrides.chunks === 1) delete params.chunkPrompts;
+  // Grok video jobs use `mode` as the cloud-dispatch discriminator, not the
+  // local semantic mode validated by prepareParams. They still need the
+  // reference-mode gate (#4874): the override schema accepts the field and the
+  // merge preserves it, but grok's image_to_video always anchors — so without
+  // this a retry would hand back an anchored clip wearing an Inspire label,
+  // the exact failure the local path is gated against.
+  if (job.kind === 'video') {
+    if (params.mode === 'grok') {
+      if (!isDefaultI2vReferenceMode(params.i2vReferenceMode)) {
+        throw new ServerError(
+          'The grok backend always anchors a reference image as frame one — retry this job with the Anchor reference mode, or render it locally on LTX-2.5.',
+          { status: 400, code: 'I2V_REFERENCE_MODE_UNSUPPORTED' },
+        );
+      }
+    } else {
+      await validateVideoRetryParams(params);
+    }
+  }
+  // Reset Codex effort to the shipped default: dropping the key lets codex.js's
+  // fallback (CODEX_IMAGEGEN_DEFAULT_EFFORT) take over, which a merged sentinel
+  // string could not do (it would fail the CODEX_EFFORT_LEVELS validation).
+  if (clearEffort) delete params.effort;
+  // enqueueJob re-normalizes any job carrying a `remoteMedia` marker, so a
+  // merged prompt/model override (which never reached the peer anyway — the
+  // remote executor renders from `remoteMedia.request`) cannot restore a
+  // locally-renderable shape. What the retry DOES have to reset is the marker's
+  // transient run state, which describes the finished attempt, not this one:
+  //   - `cancelRequested` — inherited from a canceled render, it makes the
+  //     executor's preflight abort the retry immediately, and the flag rides
+  //     along again on every further retry. That render could never be re-run.
+  //   - `reconcile` — "recover the provider job for this Idempotency-Key". The
+  //     retry gets a fresh queue id, which IS the key, so there is nothing to
+  //     recover; it must submit rather than skip preflight.
+  // Cleared here, not in routedJobParams — boot restoration re-enqueues an
+  // interrupted job under its ORIGINAL id and needs `reconcile: true` kept.
+  // `?? {}` because the predicate gates on PRESENCE, not truthiness — a
+  // hand-edited or peer-merged `remoteMedia: null` passes it, and this is the
+  // one marker consumer that would hard-crash rather than fail closed in the
+  // kind's remote module the way every other one does.
+  if (isRemoteMediaJob({ kind: job.kind, params })) {
+    const { cancelRequested: _canceled, reconcile: _reconcile, ...marker } = params.remoteMedia ?? {};
+    params.remoteMedia = { ...marker, cancelRequested: false, reconcile: false };
+  }
+  const result = await enqueueJob({ kind: job.kind, params, owner: job.owner });
+  // Drop the original failed/canceled row from archive — the new job inherits
+  // its work, and leaving both visible just lets users keep clicking Retry on
+  // the dead row and stacking duplicate jobs. If the prune returns false the
+  // archive doesn't have this id (unusual — getJob() found it above), so log
+  // a warning instead of silently masking duplicate history.
+  if (!removeArchivedJob(job.id)) {
+    console.log(`⚠️ media-job [${job.id.slice(0, 8)}] retry: archive prune found nothing to drop — old row may persist in /api/media-jobs`);
+  }
+  res.json({ ...result, retriedFrom: job.id });
+}));
+
+// Delete a terminal job from the failed/canceled archive. Live jobs
+// (queued/running) are rejected — those need cancel first. Returns 404 for
+// unknown ids so the UI can prune optimistically without worrying about a
+// race with another tab pruning the same row.
+router.delete('/:id', asyncHandler(async (req, res) => {
+  const job = getJob(req.params.id);
+  if (!job) throw new ServerError('Not found', { status: 404, code: 'NOT_FOUND' });
+  if (job.status === 'queued' || job.status === 'running') {
+    throw new ServerError(
+      `Job is still ${job.status} — cancel it before deleting`,
+      { status: 409, code: 'JOB_NOT_TERMINAL' },
+    );
+  }
+  if (isRemoteMediaJob(job) && job.params?.remotePeerReservation === true) {
+    throw new ServerError(
+      'This peer render has an uncertain outcome — reconcile the original job before deleting it',
+      { status: 409, code: 'JOB_REMOTE_OUTCOME_UNCERTAIN' },
+    );
+  }
+  const removed = removeArchivedJob(req.params.id);
+  if (!removed) throw new ServerError('Not found', { status: 404, code: 'NOT_FOUND' });
+  res.json({ ok: true });
+}));
+
+// Promote a queued Codex job past the lane's parallel limit. GPU jobs are
+// rejected — they serialize on the single MLX runtime.
+router.post('/:id/run-now', asyncHandler(async (req, res) => {
+  const result = runJobNow(req.params.id);
+  if (!result.ok) {
+    const status = result.code === 'NOT_FOUND' ? 404 : result.code === MEDIA_QUEUE_SHUTTING_DOWN ? 503 : 400;
+    throw new ServerError(result.error || 'Run-now failed', { status, code: result.code });
+  }
+  res.json(result);
+}));
+
+// Bulk-cancel every queued job (running jobs are left alone — they need a
+// per-id POST to trigger the SIGTERM path). Optional ?kind=image|video filter.
+const cancelQueuedSchema = z.object({ kind: z.enum(JOB_KINDS).optional() });
+router.post('/cancel-queued', asyncHandler(async (req, res) => {
+  const { kind } = validateRequest(cancelQueuedSchema, req.query);
+  const result = await cancelQueuedJobs({ kind });
+  res.json(result);
+}));
+
+export default router;

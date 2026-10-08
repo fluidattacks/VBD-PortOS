@@ -1,0 +1,307 @@
+/**
+ * Atlas layout sidecar + runtime-contract comparison (#2982). Pure module —
+ * no fs, no compiler; publish.test.js owns the write/serialization side.
+ */
+
+import { describe, it, expect } from 'vitest';
+import {
+  buildAtlasLayout, layoutSidecarPath, runtimeContractMismatch, ATLAS_LAYOUT_SCHEMA_VERSION, PREVIEW_FPS_NOTE,
+} from './atlasLayout.js';
+import { walkPhaseLabels } from './walkBounds.js';
+// The span math moved to atlasGrid.js (#3016) and is unit-tested there. This
+// file asserts it only THROUGH `buildAtlasLayout`, i.e. as the sidecar a
+// consumer actually reads.
+import { buildAtlasGrid } from './atlasGrid.js';
+import { ANIMATION_TRACKS } from './animationTracks.js';
+import { trackSpan as span } from './spriteTestFixtures.js';
+
+const DIRECTIONS = ['S', 'SE', 'E', 'NE', 'N', 'NW', 'W', 'SW'];
+
+// The grid the compiler emits today: idle + N walk phases (#2986 dropped the
+// trailing scanner placeholder).
+const geometryFor = (walkFrameCount, overrides = {}) => ({
+  columns: ['idle', ...walkPhaseLabels(walkFrameCount)],
+  directionOrder: DIRECTIONS,
+  rows: DIRECTIONS.length,
+  cellSize: 96,
+  walkFrameCount,
+  walkFps: 10,
+  ...overrides,
+});
+// A pre-#2986 / imported grid, which still carries the scanner column. The
+// sidecar is the READ side of the contract, so it must keep describing these.
+const legacyGeometryFor = (walkFrameCount, overrides = {}) =>
+  geometryFor(walkFrameCount, {
+    columns: ['idle', ...walkPhaseLabels(walkFrameCount), 'scanner'],
+    ...overrides,
+  });
+
+describe('layoutSidecarPath', () => {
+  it('swaps the .png extension for .layout.json', () => {
+    expect(layoutSidecarPath('assets/sprites/hero/hero-atlas.png'))
+      .toBe('assets/sprites/hero/hero-atlas.layout.json');
+    expect(layoutSidecarPath('assets/HERO.PNG')).toBe('assets/HERO.layout.json');
+  });
+});
+
+describe('buildAtlasLayout', () => {
+  it('describes the compiled grid, marking previewFps as authoring-only', () => {
+    const layout = buildAtlasLayout({
+      characterId: 'example-character',
+      geometry: geometryFor(8),
+      atlasSha256: 'abc123',
+      version: 4,
+      atlasDestPath: 'assets/sprites/hero/hero-atlas.png',
+    });
+    expect(layout).toMatchObject({
+      schemaVersion: ATLAS_LAYOUT_SCHEMA_VERSION,
+      kind: 'portos-sprite-atlas-layout',
+      characterId: 'example-character',
+      atlasFile: 'hero-atlas.png',
+      atlasVersion: 4,
+      sourceAtlasSha256: 'abc123',
+      cellSize: 96,
+      rows: 8,
+      rowOrder: DIRECTIONS,
+      columnCount: 9,
+      walkFrameCount: 8,
+      previewFps: 10,
+    });
+    expect(layout.columns).toEqual(['idle', ...walkPhaseLabels(8)]);
+    // The compiled grid has exactly two tracks — the scanner span is gone with
+    // the column it described (#2986).
+    expect(layout.tracks).toEqual({ idle: span(0, 1), walk: span(1, 8) });
+    expect(layout.previewFpsNote).toMatch(/do not use this as a runtime frame rate/);
+    // No timestamp: identical geometry must produce byte-identical content so
+    // an unchanged republish stays a no-op.
+    expect(JSON.stringify(layout)).not.toMatch(/publishedAt/);
+  });
+
+  it('still describes a pre-#2986 grid that carries a scanner column', () => {
+    const layout = buildAtlasLayout({
+      characterId: 'example-character',
+      geometry: legacyGeometryFor(8),
+      atlasSha256: 'abc123',
+      version: 2,
+      atlasDestPath: 'assets/sprites/hero/hero-atlas.png',
+    });
+    expect(layout.columnCount).toBe(10);
+    expect(layout.walkFrameCount).toBe(8);
+    expect(layout.tracks.scanner).toEqual(span(9, 1));
+  });
+
+  it('describes a two-track grid whose tracks differ in length (#3016)', () => {
+    // Built through the compiler's own span builder, against a SYNTHETIC
+    // registration order — only `walk` is registered today, so shipping a real
+    // second track is #3018's job (see atlasGrid.test.js for why the synthetic
+    // fixture is the point rather than a shortcut).
+    const grid = buildAtlasGrid(
+      [{ id: 'walk', frameCount: 12 }, { id: 'scanner', frameCount: 4 }],
+      { ...ANIMATION_TRACKS, scanner: { ...ANIMATION_TRACKS.walk, id: 'scanner' } },
+    );
+    const layout = buildAtlasLayout({
+      characterId: 'example-character',
+      geometry: geometryFor(12, { columns: grid.columns, tracks: grid.tracks }),
+      atlasSha256: 'abc123',
+      version: 7,
+      atlasDestPath: 'assets/sprites/hero/hero-atlas.png',
+    });
+    expect(layout.tracks).toEqual({
+      idle: span(0, 1),
+      walk: span(1, 12),
+      scanner: span(13, 4),
+    });
+    // columns, tracks and the atlas width stay mutually consistent: the spans
+    // tile the column list exactly, so a consumer sampling by span lands on the
+    // pixels the PNG's width accounts for.
+    expect(layout.columnCount).toBe(17);
+    expect(layout.columns).toHaveLength(layout.columnCount);
+    expect(Object.values(layout.tracks).reduce((n, s) => n + s.count, 0)).toBe(layout.columnCount);
+    // The walk span is still recoverable by name for a consumer that only knows
+    // about walk — a second track is additive, not a re-read.
+    expect(layout.walkFrameCount).toBe(12);
+  });
+
+  it('publishes every registry track frame count through its declared contract field', () => {
+    const animationTracks = {
+      walk: ANIMATION_TRACKS.walk,
+      jetpack: {
+        id: 'jetpack',
+        label: 'Jetpack burst',
+        contractFrameCountField: 'jetpackFrameCount',
+      },
+      unknown: {
+        id: 'unknown',
+        label: 'Unknown action',
+        contractFrameCountField: 'unknownFrameCount',
+      },
+    };
+    const layout = buildAtlasLayout({
+      characterId: 'example-character',
+      geometry: geometryFor(8, {
+        columns: ['idle', ...walkPhaseLabels(8), 'jetpack-00', 'jetpack-01', 'jetpack-02'],
+        tracks: {
+          idle: span(0, 1),
+          walk: span(1, 8),
+          jetpack: span(9, 3),
+        },
+      }),
+      atlasSha256: 'abc123',
+      version: 8,
+      atlasDestPath: 'assets/sprites/hero/hero-atlas.png',
+    }, animationTracks);
+
+    expect(layout.jetpackFrameCount).toBe(3);
+    expect(layout).not.toHaveProperty('unknownFrameCount');
+  });
+
+  it('keeps seeded scanner and ambient sidecars byte-identical', () => {
+    const geometry = geometryFor(8, {
+      scannerFrameCount: 4,
+      ambientFrameCount: 3,
+    });
+    const input = {
+      characterId: 'example-character',
+      geometry,
+      atlasSha256: 'abc123',
+      version: 4,
+      atlasDestPath: 'assets/sprites/hero/hero-atlas.png',
+    };
+    const legacy = {
+      schemaVersion: ATLAS_LAYOUT_SCHEMA_VERSION,
+      kind: 'portos-sprite-atlas-layout',
+      characterId: input.characterId,
+      atlasFile: 'hero-atlas.png',
+      atlasVersion: input.version,
+      sourceAtlasSha256: input.atlasSha256,
+      cellSize: geometry.cellSize,
+      rows: geometry.rows,
+      rowOrder: [...geometry.directionOrder],
+      columns: [...geometry.columns],
+      columnCount: geometry.columns.length,
+      tracks: {
+        idle: span(0, 1),
+        walk: span(1, 8),
+      },
+      walkFrameCount: geometry.walkFrameCount,
+      scannerFrameCount: geometry.scannerFrameCount,
+      ambientFrameCount: geometry.ambientFrameCount,
+      previewFps: geometry.walkFps,
+      previewFpsNote: PREVIEW_FPS_NOTE,
+    };
+
+    expect(JSON.stringify(buildAtlasLayout(input))).toBe(JSON.stringify(legacy));
+  });
+
+  it('refuses a persisted descriptor that contradicts its own column list', () => {
+    // A sidecar whose spans disagree with its columns would silently point a
+    // consumer at the wrong pixels — the exact failure #2982 exists to prevent.
+    expect(() => buildAtlasLayout({
+      characterId: 'example-character',
+      geometry: geometryFor(8, { tracks: { idle: { start: 0, count: 1 }, walk: { start: 1, count: 3 } } }),
+      atlasSha256: 'abc123',
+      atlasDestPath: 'assets/sprites/hero/hero-atlas.png',
+    })).toThrow(/describe 4 of 9 columns/);
+  });
+
+  it('refuses geometry with no column list', () => {
+    expect(() => buildAtlasLayout({ characterId: 'x', geometry: {}, atlasDestPath: 'a.png' }))
+      .toThrow(/no column list/);
+  });
+});
+
+describe('runtimeContractMismatch', () => {
+  const contract = { walkFrameCount: 8, cellSize: 96, columnCount: 9 };
+
+  it('passes an absent contract and a matching one', () => {
+    expect(runtimeContractMismatch(geometryFor(12), null)).toBeNull();
+    expect(runtimeContractMismatch(geometryFor(12), undefined)).toBeNull();
+    expect(runtimeContractMismatch(geometryFor(8), contract)).toBeNull();
+  });
+
+  it('names the registry track and both counts on a frame-count mismatch', () => {
+    const message = runtimeContractMismatch(geometryFor(12), contract, 'Example App');
+    expect(message).toContain('Atlas has 12 walk cycle frames');
+    expect(message).toContain('Example App expects 8');
+    expect(message).toMatch(/Approve the walk cycle set at that frame count/);
+  });
+
+  it('flags a column-count-only mismatch as a grid-shape change', () => {
+    // A pre-#2986 atlas (still carrying the scanner column) against a contract
+    // re-bound to the current 9-column grid: same walk frames, wrong shape.
+    const message = runtimeContractMismatch(legacyGeometryFor(8), contract, 'Example App');
+    expect(message).toContain('Atlas has 10 columns but Example App expects 9');
+    expect(message).toMatch(/grid shape changed/);
+  });
+
+  it('flags a cell-size mismatch', () => {
+    expect(runtimeContractMismatch(geometryFor(8, { cellSize: 64 }), contract, 'Example App')).toBe(
+      'Atlas cells are 64px but Example App expects 96px. '
+      + "Recompile this atlas at 96px cells, or update the app's cell-size constant before publishing.",
+    );
+  });
+
+  it('describes and validates an ambient-only grid without inventing walk frames', () => {
+    const geometry = {
+      columns: ['idle', 'ambient-00', 'ambient-01', 'ambient-02'],
+      tracks: { idle: span(0, 1, 1), ambient: span(1, 3, 1) },
+      directionOrder: DIRECTIONS,
+      rows: DIRECTIONS.length,
+      cellSize: 96,
+      walkFrameCount: null,
+      ambientFrameCount: 3,
+    };
+    const layout = buildAtlasLayout({
+      characterId: 'example-place', geometry, atlasSha256: 'abc123', atlasDestPath: 'assets/tree.png',
+    });
+    expect(layout.walkFrameCount).toBeNull();
+    expect(layout.ambientFrameCount).toBe(3);
+    expect(layout.tracks.ambient).toEqual(span(1, 3, 1));
+    expect(runtimeContractMismatch(geometry, { ambientFrameCount: 3 })).toBeNull();
+    expect(runtimeContractMismatch(geometry, { ambientFrameCount: 4 })).toMatch(/3 ambient loop frames.*expects 4/);
+  });
+
+  it('validates a user-defined track contract through the same registry loop', () => {
+    const jetpack = {
+      jetpack: {
+        id: 'jetpack',
+        label: 'Jetpack burst',
+        contractFrameCountField: 'jetpackFrameCount',
+      },
+    };
+    const geometry = {
+      ...geometryFor(8),
+      tracks: { jetpack: span(9, 5, DIRECTIONS.length) },
+    };
+    expect(runtimeContractMismatch(
+      geometry,
+      { jetpackFrameCount: 5 },
+      'Example App',
+      jetpack,
+    )).toBeNull();
+    expect(runtimeContractMismatch(
+      geometry,
+      { jetpackFrameCount: 7 },
+      'Example App',
+      jetpack,
+    )).toMatch(/5 jetpack burst frames.*expects 7/);
+  });
+
+  it('checks the STORED tracks\' contract fields with no table injected (#3152)', () => {
+    // The case the injected-table test above cannot cover. `scanner`/`ambient` are
+    // no longer compiled rows, so this function's DEFAULT table has to be the
+    // effective registry (compiled + store). With the compiled-only default it
+    // returns null here — every stored track's `contractFrameCountField` is simply
+    // absent from the loop, so a scanner span that disagrees with the app's
+    // contract publishes unchecked, which is exactly the mismatch this refuses.
+    const geometry = {
+      ...geometryFor(8),
+      columns: ['idle', ...walkPhaseLabels(8), 'scanner-00', 'scanner-01', 'scanner-02', 'scanner-03'],
+      tracks: { idle: span(0, 1, 8), walk: span(1, 8, 8), scanner: span(9, 4, 8) },
+      scannerFrameCount: 4,
+    };
+    expect(runtimeContractMismatch(geometry, { walkFrameCount: 8, scannerFrameCount: 4 })).toBeNull();
+    expect(runtimeContractMismatch(geometry, { walkFrameCount: 8, scannerFrameCount: 6 }, 'Example App'))
+      .toMatch(/4 scanner action frames.*expects 6/);
+  });
+});

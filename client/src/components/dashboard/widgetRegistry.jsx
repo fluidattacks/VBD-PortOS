@@ -1,0 +1,105 @@
+import { lazyWithReload } from '../../utils/lazyWithReload';
+
+// Widgets are lazy-loaded so a layout only downloads the widgets it actually
+// uses. The Dashboard render path wraps each <Component> in <Suspense> with a
+// per-cell skeleton so a slow widget can't stall sibling cells in the grid.
+const BackupWidget          = lazyWithReload(() => import('../BackupWidget'));
+const NetworkExposureWidget = lazyWithReload(() => import('../NetworkExposureWidget'));
+const SystemHealthWidget    = lazyWithReload(() => import('../SystemHealthWidget'));
+const CosDashboardWidget    = lazyWithReload(() => import('../CosDashboardWidget'));
+const GoalProgressWidget    = lazyWithReload(() => import('../GoalProgressWidget'));
+const UpcomingTasksWidget   = lazyWithReload(() => import('../UpcomingTasksWidget'));
+const DecisionLogWidget     = lazyWithReload(() => import('../DecisionLogWidget'));
+const DeathClockWidget      = lazyWithReload(() => import('../DeathClockWidget'));
+const DailyPostWidget       = lazyWithReload(() => import('../DailyPostWidget'));
+const TribeCareWidget       = lazyWithReload(() => import('../TribeCareWidget'));
+const ProactiveAlertsWidget = lazyWithReload(() => import('../ProactiveAlertsWidget'));
+const QuickBrainCapture     = lazyWithReload(() => import('../QuickBrainCapture'));
+const QuickIdeaCapture      = lazyWithReload(() => import('../QuickIdeaCapture'));
+const QuickImagePrompt      = lazyWithReload(() => import('../QuickImagePrompt'));
+const QuickTaskWidget       = lazyWithReload(() => import('../QuickTaskWidget'));
+const ReviewHubCard         = lazyWithReload(() => import('../ReviewHubCard'));
+const WhileAwayWidget        = lazyWithReload(() => import('../WhileAwayWidget'));
+const AppsGridWidget        = lazyWithReload(() => import('./builtins/AppsGridWidget'));
+const QuickStatsWidget      = lazyWithReload(() => import('./builtins/QuickStatsWidget'));
+const FeedsWidget           = lazyWithReload(() => import('./builtins/FeedsWidget'));
+const MeatSpaceStreakWidget = lazyWithReload(() => import('./builtins/MeatSpaceStreakWidget'));
+const AutoFixMetricsWidget  = lazyWithReload(() => import('./builtins/AutoFixMetricsWidget'));
+const DailyDriverWidget     = lazyWithReload(() => import('./builtins/DailyDriverWidget'));
+const TodayAgendaWidget     = lazyWithReload(() => import('./builtins/TodayAgendaWidget'));
+const OnThisDayWidget       = lazyWithReload(() => import('./builtins/OnThisDayWidget'));
+const OpenThreadsWidget     = lazyWithReload(() => import('./builtins/OpenThreadsWidget'));
+const ActiveProcessingWidget = lazyWithReload(() => import('./ActiveProcessingWidget'));
+const DailyActionsWidget   = lazyWithReload(() => import('../DailyActionsWidget'));
+
+const postFeatureEnabled = (state) => state?.instanceFeatures?.features?.some(
+  (feature) => feature.id === 'post' && feature.enabled === true
+) === true;
+
+// Each entry: { id, label, Component, width, defaultH?, gate? }.
+// `gate(state) => bool` skips the widget when it has nothing useful to show.
+// The Apps tile waits for its first read before rendering so a slow response
+// cannot flash the empty-state CTA over an existing installation. It still
+// renders its own empty-state CTA after a successful empty response.
+//
+// `defaultH` is the row count (each row ≈ 80px) used when a widget is first
+// auto-placed into a grid. It is a STARTING size, not the rendered height:
+// dashboard cells measure their content and float up (see DashboardGrid), so
+// this only has to be in the right ballpark for the first paint.
+export const WIDGETS = [
+  { id: 'actions',           label: 'Actions',                Component: ReviewHubCard,          width: 'full',    defaultH: 4 },
+  { id: 'daily-actions',      label: 'Today\'s Actions',        Component: DailyActionsWidget,      width: 'full',    defaultH: 4 },
+  // Daily Driver self-hides once the day is handled — gated on the per-day
+  // first-visit/handled state so a handled day reserves no grid cell (#2666).
+  { id: 'daily-driver',      label: 'Daily Driver',          Component: DailyDriverWidget,      width: 'third',   defaultH: 6, gate: (s) => !!s.dailyDriver && !s.dailyDriver.handledToday },
+  { id: 'quick-brain',       label: 'Quick Brain Capture',   Component: QuickBrainCapture,      width: 'half',    defaultH: 4 },
+  { id: 'quick-idea',        label: 'Quick Idea (Catalog)',  Component: QuickIdeaCapture,       width: 'half',    defaultH: 4 },
+  { id: 'quick-image',       label: 'Quick Image Prompt',    Component: QuickImagePrompt,       width: 'half',    defaultH: 6 },
+  { id: 'quick-task',        label: 'Quick Task',            Component: QuickTaskWidget,        width: 'half',    defaultH: 5 },
+  { id: 'apps',              label: 'Apps Grid',             Component: AppsGridWidget,         width: 'full',    defaultH: 5, gate: (s) => s.appsLoading === false },
+  { id: 'cos',               label: 'Chief of Staff',        Component: CosDashboardWidget,     width: 'third',   defaultH: 6 },
+  { id: 'goal-progress',     label: 'Goal Progress',         Component: GoalProgressWidget,     width: 'third',   defaultH: 5 },
+  { id: 'upcoming-tasks',    label: 'Upcoming Tasks',        Component: UpcomingTasksWidget,    width: 'third',   defaultH: 5 },
+  { id: 'proactive-alerts',  label: 'Proactive Alerts',      Component: ProactiveAlertsWidget,  width: 'quarter', defaultH: 4 },
+  { id: 'review-hub',        label: 'Review Hub',            Component: ReviewHubCard,          width: 'quarter', defaultH: 4 },
+  { id: 'while-away',        label: 'While You Were Away',   Component: WhileAwayWidget,        width: 'third',   defaultH: 5 },
+  { id: 'system-health',     label: 'System Health',         Component: SystemHealthWidget,     width: 'quarter', defaultH: 8 },
+  { id: 'network-exposure',  label: 'Network Exposure',      Component: NetworkExposureWidget,  width: 'quarter', defaultH: 5 },
+  { id: 'backup',            label: 'Backup',                Component: BackupWidget,           width: 'quarter', defaultH: 5 },
+  { id: 'death-clock',       label: 'Meatspace Time Remaining', Component: DeathClockWidget,    width: 'quarter', defaultH: 4 },
+  { id: 'daily-post',        label: 'Daily POST',            Component: DailyPostWidget,        width: 'quarter', defaultH: 3, gate: postFeatureEnabled },
+  { id: 'tribe-care',        label: 'Tribe Care',            Component: TribeCareWidget,        width: 'quarter', defaultH: 4, gate: (s) => !!s.tribeCare?.hasPeople },
+  { id: 'quick-stats',       label: 'Quick Stats',           Component: QuickStatsWidget,       width: 'quarter', defaultH: 3, gate: (s) => s.apps.length > 0 },
+  { id: 'decision-log',      label: 'Decision Log',          Component: DecisionLogWidget,      width: 'quarter', defaultH: 4 },
+  { id: 'feeds',             label: 'Feeds Digest',          Component: FeedsWidget,            width: 'quarter', defaultH: 4, gate: (s) => (s.feeds?.totalFeeds ?? 0) > 0 },
+  { id: 'meatspace-streak',  label: 'Health Logging Streak', Component: MeatSpaceStreakWidget,  width: 'third',   defaultH: 4, gate: (s) => (s.meatspaceLogging?.totalLogged ?? 0) > 0 },
+  { id: 'today-agenda',      label: 'Today\'s Agenda',       Component: TodayAgendaWidget,      width: 'third',   defaultH: 4, gate: (s) => (s.calendarAgenda?.accountCount ?? 0) > 0 },
+  { id: 'on-this-day',       label: 'On This Day',           Component: OnThisDayWidget,        width: 'third',   defaultH: 4, gate: (s) => (s.brainOnThisDay?.total ?? 0) > 0 },
+  { id: 'open-threads',      label: 'Open Threads',          Component: OpenThreadsWidget,      width: 'third',   defaultH: 4 },
+  { id: 'autofix-metrics',   label: 'Auto-Fix Telemetry',    Component: AutoFixMetricsWidget,   width: 'quarter', defaultH: 5 },
+  { id: 'active-processing', label: 'Active Processing',     Component: ActiveProcessingWidget, width: 'half',    defaultH: 5 },
+];
+
+export const WIDGETS_BY_ID = Object.fromEntries(WIDGETS.map((w) => [w.id, w]));
+
+// Local fallback used when the layouts endpoint is unreachable. Keeps the
+// dashboard usable during a transient server outage instead of rendering a
+// blank page. Intentionally minimal — the full built-ins live server-side.
+export const FALLBACK_LAYOUT = Object.freeze({
+  id: '_fallback',
+  name: 'Default (offline)',
+  builtIn: true,
+  widgets: ['apps', 'cos', 'upcoming-tasks', 'system-health'],
+});
+
+// Width keyword → 12-column grid units. Used when synthesizing a default
+// grid for a layout that hasn't been positionally edited yet.
+export const WIDTH_TO_COLS = {
+  full:    12,
+  half:    6,
+  third:   4,
+  quarter: 3,
+};
+
+export const GRID_COLS = 12;
+export const GRID_DEFAULT_H = 4;

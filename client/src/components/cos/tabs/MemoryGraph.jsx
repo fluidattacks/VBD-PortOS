@@ -1,0 +1,341 @@
+import { useState, useMemo, useRef, useCallback } from 'react';
+import { Canvas } from '@react-three/fiber';
+import { Info } from 'lucide-react';
+import * as api from '../../../services/api';
+import { MEMORY_TYPES, MEMORY_TYPE_COLORS } from '../constants';
+import { buildGraph } from '../../../lib/graphSimulation';
+import GraphScene, { graphMotionSettings } from '../../graph3d/GraphScene';
+import useGraphCanvasInteraction from '../../graph3d/useGraphCanvasInteraction';
+import TouchDragHint from '../../graph3d/TouchDragHint';
+import BrailleSpinner from '../../BrailleSpinner';
+import { useSocketResource } from '../../../hooks/useSocketResource';
+import usePrefersReducedMotion from '../../../hooks/usePrefersReducedMotion';
+import { formatDateNumeric, formatPercent } from '../../../utils/formatters';
+
+const TYPE_HEX = {
+  fact: '#3b82f6',
+  learning: '#22c55e',
+  observation: '#a855f7',
+  decision: '#f97316',
+  preference: '#ec4899',
+  context: '#6b7280'
+};
+
+// Scene-appearance callbacks handed to the shared graph3d/GraphScene.
+// memoryEdgeColor/memoryEdgeIntensity are exported so the extraction's
+// behavior split from BrainGraph's own per-edge-type palette and weight
+// fallback is pinned directly (see MemoryGraph.test.jsx) — unlike BrainGraph,
+// every edge kind here scales by weight (including "linked", which
+// BrainGraph holds at a flat intensity). memoryNodeColor is a plain lookup
+// with no distinct per-page behavior worth pinning, so it stays
+// module-private.
+const memoryNodeColor = (node) => TYPE_HEX[node.type] || '#6b7280';
+// Typed links (#10493) get their own hue; an untyped/legacy 'related' link stays blue.
+const LINK_TYPE_HEX = {
+  supersedes: '#a855f7',
+  contradicts: '#ef4444',
+  'derived-from': '#f59e0b',
+  'applies-to': '#10b981'
+};
+export const memoryEdgeColor = (edge) => (
+  edge.type === 'linked' ? (LINK_TYPE_HEX[edge.linkType] || '#3b82f6') : '#6b7280'
+);
+export const memoryEdgeIntensity = (edge, dimmed) =>
+  dimmed ? 0.06 : (edge.type === 'linked' ? 0.6 * edge.weight : 0.3 * edge.weight);
+
+const MEMORY_EVENTS = ['cos:memory:created', 'cos:memory:updated', 'cos:memory:deleted', 'cos:memory:extracted'];
+
+// --- Outer component ---
+
+export default function MemoryGraph() {
+  const { data: graphData, loading, error, refetch } = useSocketResource(
+    async ({ signal }) => {
+      const result = await api.getMemoryGraph({ signal, silent: true });
+      if (!Array.isArray(result?.nodes) || !Array.isArray(result?.edges)) throw new Error('Invalid memory graph response');
+      return result;
+    },
+    { namespace: 'cos', events: MEMORY_EVENTS }
+  );
+  const [selection, setSelectedNode] = useState(null);
+  const selectedNode = graphData?.nodes?.find(node => node.id === selection?.id) || null;
+  const detail = useSocketResource(
+    ({ signal }) => api.getMemory(selectedNode.id, { signal, silent: true }),
+    {
+      namespace: 'cos', events: MEMORY_EVENTS, resourceKey: selectedNode?.id,
+      enabled: !!selectedNode, matchesEvent: payload => payload?.id === selectedNode?.id
+    }
+  );
+  const fullMemory = detail.data;
+  const [layoutKey, setLayoutKey] = useState(0);
+  // Mobile-only: the legend auto-shows on a roomy viewport (CSS, not this flag).
+  const [legendOpen, setLegendOpen] = useState(false);
+  const reducedMotion = usePrefersReducedMotion();
+  const motionSettings = graphMotionSettings(reducedMotion);
+
+  const graphRef = useRef(null);
+
+  const graph = useMemo(() => {
+    if (!graphData?.nodes?.length) { graphRef.current = null; return null; }
+    const g = buildGraph(graphData.nodes, graphData.edges);
+    graphRef.current = g;
+    return g;
+  }, [graphData, layoutKey]);
+
+  const adjacentIds = useMemo(() => {
+    if (!selectedNode || !graph) return null;
+    const set = new Set();
+    for (const e of graph.simEdges) {
+      if (e.source === selectedNode.id) set.add(e.target);
+      if (e.target === selectedNode.id) set.add(e.source);
+    }
+    return set;
+  }, [selectedNode, graph]);
+
+  const connectedEdges = selectedNode && graph
+    ? graph.simEdges.filter(e => e.source === selectedNode.id || e.target === selectedNode.id)
+    : [];
+  const connectedNodes = selectedNode && graph
+    ? connectedEdges.map(e => {
+        const otherId = e.source === selectedNode.id ? e.target : e.source;
+        const n = graph.idMap.get(otherId);
+        return n ? { ...n, edgeType: e.type, linkType: e.linkType, weight: e.weight } : null;
+      }).filter(Boolean)
+    : [];
+
+
+  // A null node clears the selection (an empty-space tap, or a touch pick
+  // that landed on nothing — see useGraphCanvasInteraction); re-selecting the
+  // current node toggles it off.
+  const handleSelect = useCallback((node) => {
+    setSelectedNode(prev => (node && prev?.id !== node.id ? node : null));
+  }, []);
+
+  // Pointer/tap/tooltip wiring shared with BrainGraph — see
+  // graph3d/useGraphCanvasInteraction.js.
+  const {
+    pickRef,
+    touchGestureRef,
+    hoveredNode,
+    tooltipStyle,
+    handleHover,
+    handlePointerMove,
+    touchHintVisible,
+    handlePointerDown,
+    handlePointerUp,
+    handlePointerMissed
+  } = useGraphCanvasInteraction({ onSelect: handleSelect });
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center py-12">
+        <BrailleSpinner text="Loading" />
+      </div>
+    );
+  }
+
+  if (error && !graphData) {
+    return <div role="alert">Unable to load memory graph. <button onClick={refetch}>Retry</button></div>;
+  }
+
+  if (!graphData || !graphData.nodes?.length) {
+    return (
+      <div className="text-center py-12 text-gray-500">
+        No memory graph data available. Add more memories to see relationships.
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-3">
+      {error && <div role="alert">Unable to refresh memory graph. <button onClick={refetch}>Retry</button></div>}
+      {/* Stats bar */}
+      <div className="flex items-center justify-between bg-port-card border border-port-border rounded-lg px-4 py-2">
+        <span className="text-sm text-gray-400">
+          {graphData.nodes.length} nodes &middot; {graphData.edges.length} connections
+        </span>
+        <button
+          onClick={() => { setSelectedNode(null); setLayoutKey(k => k + 1); }}
+          className="px-3 py-1.5 min-h-[36px] text-xs bg-port-border text-gray-400 hover:text-white rounded-lg transition-colors"
+        >
+          Re-layout
+        </button>
+      </div>
+
+      {/* 3D Canvas. Viewport-relative rather than a flat 500px: the canvas is a
+          touch-action:none dead zone for page scrolling, so on a phone (and
+          especially in landscape, where 500px overflowed the whole viewport) it
+          has to leave room to scroll past. Caps at the original 500px on
+          desktop, floors at 240px so it stays usable on a short viewport. */}
+      <div
+        className="relative bg-port-card border border-port-border rounded-lg overflow-hidden h-[clamp(240px,45vh,500px)]"
+        onPointerDown={handlePointerDown}
+        onPointerUp={handlePointerUp}
+        onPointerMove={handlePointerMove}
+      >
+        {graph && (
+          <Canvas
+            camera={{ position: [0, 0, 80], fov: 50 }}
+            frameloop={motionSettings.frameloop}
+            dpr={[1, 1.5]}
+            style={{ background: 'rgb(var(--port-bg))' }}
+            gl={{ antialias: true }}
+            onPointerMissed={handlePointerMissed}
+          >
+            <GraphScene
+              graph={graph}
+              selectedId={selectedNode?.id}
+              adjacentIds={adjacentIds}
+              nodeColor={memoryNodeColor}
+              edgeColor={memoryEdgeColor}
+              edgeIntensity={memoryEdgeIntensity}
+              onSelect={handleSelect}
+              onHover={handleHover}
+              pickRef={pickRef}
+              touchGestureRef={touchGestureRef}
+              reducedMotion={reducedMotion}
+            />
+          </Canvas>
+        )}
+
+        <TouchDragHint visible={touchHintVisible} />
+
+        {/* Legend. Its ~200px blankets a short canvas, so it auto-shows only on
+            a `roomy-viewport` (wide AND tall — see index.css); otherwise it
+            collapses behind a toggle and expands upward from the corner. The
+            height half of that variant is what makes a landscape phone work: it
+            is wider than `sm` but only ~390px tall, so a width-only rule
+            force-showed the legend over a floored 240px canvas AND hid the
+            toggle — blanketing the graph with no way out.
+            (The edge colours exist nowhere else in this tab, hence a toggle
+            rather than dropping the legend on small screens.) */}
+        {/* pointer-events-none on the WRAPPER, not just the panel: it covers a
+            corner of the canvas, and as a hit-testable box it would swallow the
+            orbit drags the panel alone used to let through (pointer-events is
+            inherited, so the panel needs no declaration of its own; the toggle
+            opts back in). */}
+        <div className="absolute bottom-3 left-3 z-10 flex flex-col items-start gap-1.5 pointer-events-none">
+          <div
+            data-testid="graph-legend"
+            className={`${legendOpen ? 'block' : 'hidden'} roomy-viewport:block bg-port-bg/90 border border-port-border rounded-lg p-3 text-xs space-y-1.5`}
+          >
+            {MEMORY_TYPES.map(t => (
+              <div key={t} className="flex items-center gap-2">
+                <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ backgroundColor: TYPE_HEX[t] }} />
+                <span className="text-gray-400">{t}</span>
+              </div>
+            ))}
+            <div className="border-t border-port-border pt-1.5 mt-1.5 space-y-1">
+              <div className="flex items-center gap-2">
+                {/* Stays a fixed blue (not port-accent) to match GraphEdges' hardcoded
+                    #3b82f6 three.js edge color below — theming just the legend would
+                    desync it from the actual rendered edge color on non-blue themes. */}
+                <span className="inline-block w-4 h-0 border-t border-blue-400" />
+                <span className="text-gray-500">linked</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="inline-block w-4 h-0 border-t border-gray-500" />
+                <span className="text-gray-500">similar</span>
+              </div>
+            </div>
+          </div>
+          <button
+            onClick={() => setLegendOpen(o => !o)}
+            aria-expanded={legendOpen}
+            className="roomy-viewport:hidden pointer-events-auto flex items-center gap-1.5 px-2.5 py-1.5 min-h-[32px] text-[11px] bg-port-bg/90 border border-port-border text-gray-400 hover:text-white rounded-lg transition-colors"
+          >
+            <Info size={12} />
+            Legend
+          </button>
+        </div>
+
+        {/* Hover tooltip. Suppressed on a coarse pointer: there is no hover to
+            preview with — a tap selects the node and the detail panel below
+            already shows the same record — and it would otherwise flash under
+            the user's own finger. Position is clamped
+            (useGraphCanvasInteraction's `tooltipStyle`) so it can't run off
+            the right edge of a narrow window, where `x + 12` alone would clip
+            it. */}
+        {hoveredNode && (
+          <div
+            className="fixed z-50 pointer-events-none pointer-coarse:hidden bg-port-bg border border-port-border rounded-lg px-3 py-2 shadow-lg"
+            style={tooltipStyle}
+          >
+            <div className="flex items-center gap-2 mb-1">
+              <span className={`px-1.5 py-0.5 text-[10px] rounded-full border ${MEMORY_TYPE_COLORS[hoveredNode.type] || 'border-port-border text-gray-400'}`}>
+                {hoveredNode.type}
+              </span>
+              <span className="text-[10px] text-gray-500">{hoveredNode.category}</span>
+            </div>
+            <p className="text-xs text-white leading-snug">{hoveredNode.summary}</p>
+            <p className="text-[10px] text-gray-500 mt-1">importance: {formatPercent((hoveredNode.importance ?? 0.5) * 100, { decimals: 0 })}</p>
+          </div>
+        )}
+      </div>
+
+      {/* Detail panel */}
+      {selectedNode && (
+        <div className="bg-port-card border border-port-border rounded-lg p-4">
+          <div className="flex items-start justify-between gap-3 mb-3">
+            <div>
+              <div className="flex items-center gap-2 mb-2">
+                <span className={`px-2 py-1 text-xs rounded-full border ${MEMORY_TYPE_COLORS[selectedNode.type] || 'border-port-border text-gray-400'}`}>
+                  {selectedNode.type}
+                </span>
+                <span className="text-xs text-gray-500">{selectedNode.category}</span>
+                <span className="text-xs text-gray-500">importance: {formatPercent((selectedNode.importance ?? 0.5) * 100, { decimals: 0 })}</span>
+              </div>
+              {fullMemory ? (
+                <div className="space-y-3">
+                  <p className="text-sm text-white whitespace-pre-wrap">{fullMemory.content}</p>
+                  {fullMemory.tags?.length > 0 && (
+                    <div className="flex flex-wrap gap-1">
+                      {fullMemory.tags.map(tag => (
+                        <span key={tag} className="px-2 py-1 text-xs bg-port-border rounded text-gray-400">{tag}</span>
+                      ))}
+                    </div>
+                  )}
+                  <div className="text-xs text-gray-500 flex flex-wrap gap-3">
+                    <span>Created: {formatDateNumeric(fullMemory.createdAt)}</span>
+                    {fullMemory.accessCount > 0 && <span>Accessed: {fullMemory.accessCount}x</span>}
+                    {fullMemory.confidence != null && <span>Confidence: {formatPercent(fullMemory.confidence * 100, { decimals: 0 })}</span>}
+                  </div>
+                </div>
+              ) : (
+                <p className="text-sm text-white">{selectedNode.summary}</p>
+              )}
+            </div>
+            <button
+              onClick={() => setSelectedNode(null)}
+              className="text-gray-500 hover:text-white transition-colors p-1 shrink-0"
+            >
+              &times;
+            </button>
+          </div>
+          {connectedNodes.length > 0 && (
+            <div>
+              <p className="text-xs text-gray-500 mb-2">{connectedNodes.length} connections</p>
+              <div className="space-y-1.5 max-h-48 overflow-y-auto">
+                {connectedNodes.map(cn => (
+                  <button
+                    key={cn.id}
+                    onClick={() => {
+                      const node = graphRef.current?.idMap.get(cn.id);
+                      if (node) setSelectedNode(node);
+                    }}
+                    className="w-full text-left flex items-center gap-2 px-2 py-1.5 rounded hover:bg-port-border/50 transition-colors"
+                  >
+                    <span className="inline-block w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: TYPE_HEX[cn.type] }} />
+                    <span className="text-xs text-gray-300 truncate flex-1">{cn.summary}</span>
+                    <span className="text-[10px] text-gray-600 shrink-0">
+                      {cn.edgeType === 'linked' ? (cn.linkType && cn.linkType !== 'related' ? cn.linkType : 'linked') : `${formatPercent(cn.weight * 100, { decimals: 0 })}`}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}

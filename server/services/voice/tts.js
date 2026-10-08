@@ -1,0 +1,190 @@
+// TTS façade — dispatches on cfg.tts.engine ('piper' default | 'qwen3-tts').
+
+import { join } from 'node:path';
+import { getVoiceConfig, piperVoiceTildePath } from './config.js';
+import { synthesizePiper, listPiperVoices } from './tts-piper.js';
+import { synthesizeQwen3, listQwen3Voices } from './tts-qwen3.js';
+import { findPiperVoice } from './piper-voices.js';
+import { getProfileForSynthesis, profileArtifactDirectory } from './profiles.js';
+import { whichFirst } from '../../lib/processEnv.js';
+import { ServerError } from '../../lib/errorHandler.js';
+
+import { TTS_ENGINE_IDS, TTS_ENGINE_REGISTRY, VALID_ENGINES } from '../../lib/voiceEngines.js';
+export { VALID_ENGINES } from '../../lib/voiceEngines.js';
+
+// Qwen3 preset ids shipped with the shorter prefix before the engine registry
+// standardized on `qwen3-tts`. Keep those persisted ids readable while every
+// new catalog entry uses the canonical engine name.
+export const normalizeVoiceEngine = (engine) => engine === 'qwen3' ? 'qwen3-tts' : engine;
+
+let voiceTransformProbe = null;
+
+const probeVoiceTransforms = () => {
+  if (!voiceTransformProbe) {
+    voiceTransformProbe = whichFirst('rubberband').then((rubberband) => ({
+      rubberband: Boolean(rubberband),
+    }));
+  }
+  return voiceTransformProbe;
+};
+
+export const listVoiceEngines = async () => {
+  const transforms = await probeVoiceTransforms();
+  const unavailableControls = transforms.rubberband
+    ? 'Rubber Band is installed, but PortOS has no approved formant-preserving adapter yet. Pitch and formant controls remain disabled until that adapter is enabled.'
+    : 'Install Rubber Band to enable a future formant-preserving transform. Pitch and formant controls remain disabled rather than approximated by sample-rate changes.';
+  return TTS_ENGINE_IDS.map((id) => ({
+    id,
+    ...TTS_ENGINE_REGISTRY[id],
+    unavailableControls: id === 'auk' ? 'Pitch edits run in Voice Studio; formant controls are unavailable.' : unavailableControls,
+    transformProbe: transforms,
+  }));
+};
+
+// Normalize `engine` against the allowlist so an invalid value can't silently
+// produce Piper audio while the response reports `engine: 'elevenlabs'`.
+const resolveEngine = (engine) => {
+  const norm = normalizeVoiceEngine(engine);
+  return VALID_ENGINES.has(norm) ? norm : 'piper';
+};
+
+const backend = (engine) => {
+  if (engine === 'auk') return {
+    synth: async (...args) => (await import('./aukRuntime.js')).synthesizeAuk(...args),
+    list: async () => [],
+  };
+  if (engine === 'piper') return { synth: synthesizePiper, list: listPiperVoices };
+  if (engine === 'qwen3-tts') return { synth: synthesizeQwen3, list: listQwen3Voices };
+  return { synth: synthesizePiper, list: listPiperVoices };
+};
+
+/**
+ * Synthesize text with the active TTS engine or profile binding.
+ * @param {string} text
+ * @param {object} [opts]
+ * @param {AbortSignal} [opts.signal]
+ * @param {string} [opts.voice]  transient voice override
+ * @param {string} [opts.engine] transient engine override ('piper'|'qwen3-tts')
+ * @param {number} [opts.rate]   transient speech-rate override (0.25–4)
+ * @param {string} [opts.profileId] profile ID to synthesize against
+ * @param {string} [opts.route] 'studio' | 'interactive'
+ * @returns {Promise<{ wav: Buffer, latencyMs: number, engine: string }>}
+ */
+export const synthesize = async (text, opts = {}) => {
+  const cfg = await getVoiceConfig();
+  const profile = opts.profileId
+    ? await getProfileForSynthesis(opts.profileId, opts.route || 'studio')
+    : null;
+  if (opts.engine === 'kokoro' || profile?.engine === 'kokoro') {
+    throw new ServerError('Kokoro has been retired. Open Settings → Voice, set up Piper, and select a new voice or promote a Piper profile.', {
+      status: 409, code: 'VOICE_ENGINE_RETIRED',
+    });
+  }
+  const profileVoice = profile?.voiceId?.split(':')[1] || null;
+  const engine = profile ? profile.engine : resolveEngine(opts.engine || cfg.tts.engine);
+  const { synth } = backend(engine);
+
+  let ttsCfg = profile ? { ...cfg.tts, rate: profile.delivery.rate } : cfg.tts;
+  if (typeof opts.rate === 'number' && Number.isFinite(opts.rate)) {
+    ttsCfg = { ...ttsCfg, rate: Math.min(4, Math.max(0.25, opts.rate)) };
+  }
+
+  let synthOpts = { ...opts, rate: ttsCfg.rate };
+
+  if (profile) {
+    if (profile.kind === 'designed') {
+      synthOpts = {
+        ...synthOpts,
+        mode: 'design',
+        instructions: profile.inference?.instructions,
+        seed: profile.inference?.seed,
+        modelId: profile.inference?.modelId || profile.modelRevision,
+      };
+    } else if (profile.kind === 'cloned') {
+      const sourceAsset = profile.sourceAssets?.[0];
+      const sourcePath = sourceAsset?.filename
+        ? join(profileArtifactDirectory(profile.id), 'source', sourceAsset.filename)
+        : null;
+      synthOpts = {
+        ...synthOpts,
+        mode: 'clone',
+        referenceAudio: sourcePath,
+        referenceTranscript: sourceAsset?.transcript,
+        modelId: profile.inference?.modelId || profile.modelRevision,
+      };
+    } else if (profile.kind === 'fine-tuned') {
+      synthOpts = {
+        ...synthOpts,
+        mode: 'fine-tuned',
+        checkpointPath: profile.inference?.checkpointPath,
+        modelId: profile.modelRevision,
+      };
+    }
+  }
+
+  if (profile?.engine === 'auk') {
+    const sample = profile.sourceAssets?.[0];
+    synthOpts = { ...synthOpts, instructions: profile.inference.instructions, seed: profile.inference.seed,
+      referenceAudio: sample ? join(profileArtifactDirectory(profile.id), 'source', sample.filename) : null,
+      // The approved reference already contains the pitch edit. Never apply it twice.
+      pitchSemitones: sample ? 0 : profile.inference.pitchSemitones,
+    };
+  }
+
+  const voice = profileVoice || opts.voice;
+  if (voice) {
+    if (engine === 'piper') {
+      const catalog = findPiperVoice(voice);
+      if (!catalog) {
+        throw new ServerError(`unknown piper voice: ${voice}`, {
+          status: 400,
+          code: 'UNKNOWN_VOICE',
+        });
+      }
+      ttsCfg = {
+        ...ttsCfg,
+        piper: {
+          ...ttsCfg.piper,
+          voice,
+          voicePath: piperVoiceTildePath(voice),
+          speakerId: null,
+        },
+      };
+    }
+  }
+
+  const result = engine === 'qwen3-tts' || engine === 'auk'
+    ? await synth(text, synthOpts, opts.signal)
+    : await synth(text, ttsCfg, opts.signal);
+
+  const modelRevision = engine === 'piper' ? `piper:${ttsCfg.piper?.voice || 'default'}` : (profile?.modelRevision || result.modelRevision);
+
+  return {
+    ...result,
+    engine,
+    ...(profile ? {
+      profileId: profile.id,
+      profileRevision: profile.version,
+      provenance: {
+        profileId: profile.id,
+        profileRevision: profile.version,
+        engine,
+        modelRevision,
+        effectiveControls: { rate: ttsCfg.rate },
+        mastering: profile.mastering,
+      },
+    } : {}),
+  };
+};
+
+/**
+ * Enumerate voices available for the given engine (or the configured one).
+ * @param {string} [engineOverride] 'piper' | 'qwen3-tts'
+ * @returns {Promise<{ engine: string, voices: Array }>}
+ */
+export const listVoices = async (engineOverride) => {
+  const cfg = await getVoiceConfig();
+  const engine = resolveEngine(engineOverride || cfg.tts.engine);
+  const { list } = backend(engine);
+  return { engine, voices: await list() };
+};

@@ -1,0 +1,830 @@
+/**
+ * System Resources report + AI-assisted cleanup triage.
+ *
+ * The report is deliberately bounded to storage PortOS already understands:
+ * classified data categories, PostgreSQL, model stores, package caches,
+ * runtime dependencies, and aggregate browser-download usage. It never walks
+ * arbitrary home-directory files and never sends filesystem paths or personal
+ * record names to an AI provider.
+ */
+
+import os from 'os';
+import { scanModelDuplicates } from './modelDeduplication.js';
+import { statfs } from 'fs/promises';
+import { parseFilesystemStats } from '../lib/fileCore.js';
+import { join } from 'path';
+import { z } from 'zod';
+import { query } from '../lib/db.js';
+import { PATHS, dirSize } from '../lib/fileUtils.js';
+import { ServerError } from '../lib/errorHandler.js';
+import { assertProvider, resolveProviderAndModel, runPromptThroughProvider } from './promptRunner.js';
+import { getDataOverview } from './dataManager.js';
+import { listHfModelStorage, listLoraStorage } from './mediaModelStorage.js';
+import { listModelStore } from './modelStoreStorage.js';
+import * as ollamaManager from './ollamaManager.js';
+import * as lmStudioManager from './lmStudioManager.js';
+import { getQueueCapacity } from './mediaJobQueue/index.js';
+import * as cos from './cos.js';
+import { runningAgentsByTaskId, countSpawningTasks } from '../lib/cosSpawnWindow.js';
+import { getSettings } from './settings.js';
+import {
+  hfInventoryRow,
+  localModelInventoryRow,
+  loraInventoryRow,
+  modelInventoryId,
+  modelStoreInventoryRow,
+  MODEL_STORE_BACKENDS,
+} from '../lib/modelInventory.js';
+import { getModelManifest, reconcileModelManifest } from './modelManifest.js';
+
+export const REPORT_CACHE_TTL_MS = 30_000;
+
+const LOW_RISK_DATA_CATEGORIES = new Set([
+  'autofixer',
+  'browser-downloads',
+  'browser-profile',
+  'cache',
+  'conflict-journal',
+  'image-clean-tmp',
+  'insights',
+  'jira-reports',
+  'review',
+  'runs',
+  'screenshots',
+  'tools',
+  'update-detached',
+  'video-thumbnails',
+]);
+
+const TRIAGE_RESPONSE_SCHEMA = z.object({
+  summary: z.string().trim().min(1).max(1400),
+  recommendations: z.array(z.object({
+    candidateId: z.string().trim().min(1).max(320),
+    priority: z.enum(['first', 'next', 'optional']),
+    reason: z.string().trim().min(1).max(600),
+    tradeoff: z.string().trim().min(1).max(600),
+  }).strict()).max(8),
+  cautions: z.array(z.string().trim().min(1).max(500)).max(8),
+}).strict();
+
+const finiteOrNull = (value) => {
+  if (value == null || value === '') return null;
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : null;
+};
+
+const sumBytes = (values) => values.reduce(
+  (sum, value) => sum + (Number.isFinite(value) ? value : 0),
+  0,
+);
+
+const sumKnownBytes = (values) => {
+  const known = values.filter(Number.isFinite);
+  return known.length > 0 ? sumBytes(known) : null;
+};
+
+const backendState = (value) => (value == null ? 'unavailable' : 'ready');
+
+function dataCleanupCandidates(categories) {
+  if (!Array.isArray(categories)) return [];
+  return categories
+    .filter((category) => category.deletable && category.size > 0)
+    .map((category) => {
+      const oneClick = category.purgeScope === 'category'
+        && !category.busy
+        && LOW_RISK_DATA_CATEGORIES.has(category.key);
+      const manualReview = category.purgeScope === 'items';
+      return {
+        id: `data:${category.key}`,
+        label: category.label,
+        kind: 'data',
+        estimatedBytes: category.size,
+        risk: oneClick ? 'low' : manualReview ? 'high' : 'medium',
+        reason: category.description,
+        loaded: false,
+        busy: Boolean(category.busy),
+        manualOnly: !oneClick,
+        managePath: '/data',
+        action: oneClick ? { type: 'data-category', key: category.key } : null,
+      };
+    });
+}
+
+/**
+ * The cleanup candidate for each downloaded-model row.
+ *
+ * Exported because the manifest-backed inventory (`getTrackedModelInventory`)
+ * has to describe its rows exactly as a scan would — the Status page renders both
+ * through one component, and a second copy of this risk/`manualOnly` logic is how
+ * a delete button ends up armed on a tracked row the scan would have refused.
+ *
+ * @param {Array<Object>} downloaded Downloaded-model inventory rows
+ * @returns {Array<Object>}
+ */
+export function modelCleanupCandidates(downloaded) {
+  return downloaded.map((model) => ({
+    id: model.id,
+    label: model.name,
+    kind: 'model',
+    estimatedBytes: model.sizeBytes,
+    risk: model.risk || 'medium',
+    reason: model.loaded
+      ? 'Model weights are installed and the model is currently resident in memory.'
+      : model.residencyUnknown
+        ? 'PortOS could not verify whether this model is resident. Refresh the backend before deleting it.'
+        : model.inventoryUnknown
+          ? 'The backend reported this model, but its on-disk folder could not be verified for safe cleanup.'
+          : model.cleanupReason || 'Downloaded model weights can be installed again later, but re-downloading may be slow or bandwidth-intensive.',
+    loaded: model.loaded,
+    busy: model.loaded || model.residencyUnknown,
+    manualOnly: model.loaded || model.residencyUnknown || model.inventoryUnknown,
+    managePath: model.managePath,
+    action: model.loaded || model.residencyUnknown || model.inventoryUnknown ? null : model.action,
+  }));
+}
+
+/**
+ * Build a sorted array of cleanup candidates from data categories, downloaded models, and package caches.
+ *
+ * @param {Object} options
+ * @param {Array<Object>} options.categories Data categories from dataManager
+ * @param {Array<Object>} options.downloadedModels Model inventory objects
+ * @param {number|null} options.npmCacheBytes Size of npm cache in bytes
+ * @returns {Array<Object>} Sorted cleanup candidates by estimated size descending
+ */
+export function buildCleanupCandidates({ categories, downloadedModels, npmCacheBytes }) {
+  const candidates = [
+    ...dataCleanupCandidates(categories),
+    ...modelCleanupCandidates(downloadedModels),
+  ];
+  if (Number.isFinite(npmCacheBytes) && npmCacheBytes > 0) {
+    candidates.push({
+      id: 'cache:npm',
+      label: 'npm download cache',
+      kind: 'cache',
+      estimatedBytes: npmCacheBytes,
+      risk: 'low',
+      reason: 'Package tarballs are re-downloadable. PortOS reports this cache but does not delete global package-manager state in-app.',
+      loaded: false,
+      busy: false,
+      manualOnly: true,
+      managePath: null,
+      action: null,
+    });
+  }
+  return candidates.sort((a, b) => (b.estimatedBytes || 0) - (a.estimatedBytes || 0));
+}
+
+const normalizeLmStudioRepo = (value) => String(value || '')
+  .split('/').pop()
+  .trim()
+  .toLowerCase()
+  .replace(/[-.]gguf$/i, '')
+  .replace(/[-.]mlx[-.].*$/i, '');
+
+// File-system model stores beyond the HF hub cache and `data/loras/`; one
+// storage area, one inventory backend, one totals key each.
+const MODEL_STORES = [
+  { backend: 'mtplx', total: 'mtplx', label: 'MTPLX models', note: 'MTPLX checkpoints and the session bank.' },
+  { backend: 'hy3dgen', total: 'hy3dgen', label: 'Hunyuan3D models', note: 'Image-to-3D weights in the hy3dgen cache.' },
+  { backend: 'hf-xet-cache', total: 'hfXetCache', label: 'Hugging Face xet cache', note: 'Regenerable download chunk cache and xet logs older than 7 days; counted separately from the Hub cache.' },
+  { backend: 'pixie-forge', total: 'pixieForge', label: 'Pixie Forge LoRAs', note: 'LoRA adapters outside PortOS data.' },
+];
+
+const MODEL_STORE_MANAGE_PATH = Object.fromEntries(Object.entries(MODEL_STORE_BACKENDS).map(([id, store]) => [id, store.managePath]));
+
+const modelStoreRows = (stores) => MODEL_STORES.flatMap(({ backend }) => (stores?.[backend]?.items || []).map((entry) => ({
+  ...modelStoreInventoryRow({
+    backend,
+    key: entry.key,
+    name: entry.name,
+    detail: entry.detail,
+    sizeBytes: entry.size,
+    risk: entry.risk,
+    cleanupReason: entry.cleanupReason,
+  }),
+  loaded: false,
+})));
+
+function downloadedModelInventory({
+  hf,
+  loraStorage,
+  stores,
+  ollamaStatus,
+  ollamaStored,
+  ollamaLoaded,
+  ollamaResidencyError,
+  lmStudioModels,
+  lmStudioStored,
+  lmStudioLoaded,
+  lmStudioResidencyError,
+}) {
+  const ollamaLoadedIds = new Set((ollamaLoaded || []).flatMap((model) => [model.id, model.name]).filter(Boolean));
+  const lmStudioLoadedIds = new Set((lmStudioLoaded || []).flatMap((model) => [
+    model.id,
+    normalizeLmStudioRepo(model.id),
+  ]).filter(Boolean));
+
+  // The durable half of every row comes from the shared builders in
+  // `lib/modelInventory.js`, which the install chokepoints call too — so a row's
+  // risk, manage path, delete action and cleanup sentence cannot drift between the
+  // scan and the manifest. Only the LIVE half (residency, whether the on-disk
+  // folder could be verified) is added here, because only a scan can know it.
+  const huggingFace = (hf?.models || []).map((model) => ({
+    ...hfInventoryRow({
+      dirName: model.id,
+      name: model.label || model.repo,
+      detail: model.repo,
+      sizeBytes: model.size,
+    }),
+    loaded: false,
+  }));
+  const loras = (loraStorage?.loras || []).map((model) => ({
+    ...loraInventoryRow({ filename: model.filename, name: model.name, sizeBytes: model.size }),
+    loaded: false,
+  }));
+  const ollamaApi = new Map((ollamaStatus?.models || []).map((model) => [model.id, model]));
+  const ollamaDiskModels = Array.isArray(ollamaStored) ? ollamaStored : [];
+  const ollamaRows = [
+    ...ollamaDiskModels,
+    ...(ollamaStatus?.models || []).filter((model) => !ollamaDiskModels.some((stored) => stored.id === model.id))
+      .map((model) => ({ ...model, inventoryUnknown: true })),
+  ];
+  const ollama = ollamaRows.map((stored) => {
+    const model = ollamaApi.get(stored.id) || stored;
+    return {
+      ...localModelInventoryRow({
+        backend: 'ollama',
+        modelId: stored.id,
+        name: model.name || stored.name || stored.id,
+        detail: [model.params, model.quantization, model.family].filter(Boolean).join(' · '),
+        sizeBytes: finiteOrNull(stored.size ?? model.size),
+        // A backend that is not running cannot be asked to delete anything.
+        deletable: Boolean(ollamaStatus?.available),
+      }),
+      loaded: !ollamaResidencyError && ollamaLoadedIds.has(stored.id),
+      residencyUnknown: Boolean(ollamaResidencyError),
+      inventoryUnknown: !Array.isArray(ollamaStored) || Boolean(stored.inventoryUnknown),
+    };
+  });
+
+  const lmStudioApiGroups = new Map();
+  for (const model of (lmStudioModels || [])) {
+    const key = normalizeLmStudioRepo(model.id);
+    const group = lmStudioApiGroups.get(key) || { models: [], ids: new Set(), quantizations: new Set() };
+    group.models.push(model);
+    group.ids.add(model.id);
+    if (model.quantization) group.quantizations.add(model.quantization);
+    lmStudioApiGroups.set(key, group);
+  }
+  const lmStudioDiskModels = Array.isArray(lmStudioStored) ? lmStudioStored : [];
+  const diskKeys = new Set(lmStudioDiskModels.map((model) => normalizeLmStudioRepo(model.id)));
+  const lmStudioRows = [
+    ...lmStudioDiskModels,
+    ...[...lmStudioApiGroups.entries()]
+      .filter(([key]) => !diskKeys.has(key))
+      .map(([, group]) => ({
+        id: [...group.ids][0],
+        name: [...group.ids][0],
+        size: group.models.map((model) => finiteOrNull(model.size)).find(Number.isFinite) ?? null,
+        inventoryUnknown: true,
+      })),
+  ];
+  const lmstudio = lmStudioRows.map((stored) => {
+    const group = lmStudioApiGroups.get(normalizeLmStudioRepo(stored.id));
+    const quantizations = group ? [...group.quantizations] : [];
+    const loaded = !lmStudioResidencyError && (
+      lmStudioLoadedIds.has(stored.id)
+      || lmStudioLoadedIds.has(normalizeLmStudioRepo(stored.id))
+      || group?.models.some((model) => model.state === 'loaded')
+    );
+    return {
+      ...localModelInventoryRow({
+        backend: 'lmstudio',
+        modelId: stored.id,
+        name: stored.name || stored.id,
+        detail: [
+          quantizations.length ? `${quantizations.length} quantization${quantizations.length === 1 ? '' : 's'}: ${quantizations.join(', ')}` : null,
+          'removes the whole model folder',
+        ].filter(Boolean).join(' · '),
+        sizeBytes: finiteOrNull(stored.size),
+      }),
+      // A row the API reported but the disk listing did not is sized from the
+      // API's own number, which is a claim rather than a measurement.
+      sizeIsEstimate: Boolean(stored.inventoryUnknown),
+      loaded,
+      residencyUnknown: Boolean(lmStudioResidencyError),
+      inventoryUnknown: !Array.isArray(lmStudioStored) || Boolean(stored.inventoryUnknown),
+    };
+  });
+  return [...huggingFace, ...loras, ...modelStoreRows(stores), ...ollama, ...lmstudio]
+    .sort((a, b) => (b.sizeBytes || 0) - (a.sizeBytes || 0));
+}
+
+function loadedModelInventory({ ollamaLoaded, lmStudioLoaded }) {
+  return [
+    ...(ollamaLoaded || []).map((model) => ({
+      id: modelInventoryId('ollama', model.id),
+      backend: 'ollama',
+      name: model.name || model.id,
+      memoryBytes: finiteOrNull(model.sizeVram ?? model.size),
+      expiresAt: model.expiresAt || null,
+    })),
+    ...(lmStudioLoaded || []).map((model) => ({
+      id: modelInventoryId('lmstudio', model.id),
+      backend: 'lmstudio',
+      name: model.id,
+      memoryBytes: null,
+      expiresAt: null,
+    })),
+  ];
+}
+
+/**
+ * Queue depth vs work in flight, settled against the agent list.
+ *
+ * A mid-spawn task moves from the pending counts to `inProgress` rather than
+ * being counted on both sides (lib/cosSpawnWindow.js), so the two halves move
+ * together and the summary's queued+running total never dips while a spawn
+ * lands. `awaitingApproval` needs no settling: approval is a pre-spawn gate
+ * (`forceSpawnTask` refuses an unapproved task and approving clears the flag),
+ * so no live agent can hold one.
+ */
+function agentQueueSummary(tasks, status, agents) {
+  if (!tasks) return null;
+  const runningAgents = runningAgentsByTaskId(agents);
+  const pendingUser = tasks.user?.grouped?.pending || [];
+  const pendingSystem = tasks.cos?.grouped?.pending || [];
+  const spawningUser = countSpawningTasks(pendingUser, runningAgents);
+  const spawningSystem = countSpawningTasks(pendingSystem, runningAgents);
+  return {
+    pendingUser: pendingUser.length - spawningUser,
+    pendingSystem: pendingSystem.length - spawningSystem,
+    awaitingApproval: tasks.cos?.awaitingApproval?.length || 0,
+    inProgress: (tasks.user?.grouped?.in_progress?.length || 0)
+      + (tasks.cos?.grouped?.in_progress?.length || 0)
+      + spawningUser + spawningSystem,
+    activeAgents: status ? status.activeAgents || 0 : null,
+    pausedAgents: status ? status.pausedAgents || 0 : null,
+    daemonRunning: status?.running ?? null,
+    daemonPaused: status?.paused ?? null,
+  };
+}
+
+export async function buildSystemResourceReport() {
+  const npmCachePath = process.env.npm_config_cache || join(os.homedir(), '.npm');
+  const dependencyPaths = [
+    join(PATHS.root, 'node_modules'),
+    join(PATHS.root, 'client', 'node_modules'),
+    join(PATHS.root, 'server', 'node_modules'),
+  ];
+
+  const [
+    diskStats,
+    dataDiskStats,
+    dataOverview,
+    databaseRow,
+    hf,
+    loraStorage,
+    mtplxStore,
+    hy3dgenStore,
+    xetStore,
+    pixieForgeStore,
+    ollamaStatus,
+    ollamaStored,
+    ollamaLoaded,
+    ollamaBytes,
+    lmStudioAvailable,
+    lmStudioModels,
+    lmStudioStored,
+    lmStudioLoaded,
+    lmStudioBytes,
+    settings,
+    npmCacheBytes,
+    dependencySizes,
+    browserDownloadsBytes,
+    cosTasks,
+    cosStatus,
+    cosAgents,
+    modelDuplicates,
+  ] = await Promise.all([
+    statfs('/').catch(() => null),
+    statfs(PATHS.data).catch(() => null),
+    getDataOverview({ strict: true }).catch(() => null),
+    query('SELECT pg_database_size(current_database()) AS bytes')
+      .then((result) => result.rows[0] || null)
+      .catch(() => null),
+    listHfModelStorage({ strict: true }).catch(() => null),
+    listLoraStorage({ strict: true }).catch(() => null),
+    ...MODEL_STORES.map(({ backend }) => listModelStore(backend).catch(() => null)),
+    ollamaManager.getStatus(true).catch(() => null),
+    ollamaManager.listStoredModels().catch(() => null),
+    ollamaManager.getLoadedModels().catch(() => null),
+    dirSize(ollamaManager.getModelsDir(), { strict: true }).catch(() => null),
+    lmStudioManager.checkLMStudioAvailable(true).catch(() => null),
+    lmStudioManager.getAvailableModels(true).catch(() => null),
+    lmStudioManager.listStoredModels().catch(() => null),
+    lmStudioManager.getLoadedModels(true).catch(() => null),
+    lmStudioManager.getModelsDir().then((path) => dirSize(path, { strict: true })).catch(() => null),
+    getSettings().catch(() => null),
+    dirSize(npmCachePath, { strict: true }).catch(() => null),
+    Promise.all(dependencyPaths.map((path) => dirSize(path, { strict: true }).catch(() => null))),
+    dirSize(PATHS.browserDownloads, { strict: true }).catch(() => null),
+    cos.getAllTasks().catch(() => null),
+    cos.getStatus().catch(() => null),
+    cos.getAgents().catch(() => null),
+    scanModelDuplicates().catch(() => ({ pinokioDetected: null, items: [], totalReclaimableBytes: 0, error: 'Duplicate model scan unavailable' })),
+  ]);
+
+  const parsedFilesystem = parseFilesystemStats(diskStats);
+  const filesystem = parsedFilesystem && {
+    totalBytes: parsedFilesystem.totalBytes,
+    usedBytes: parsedFilesystem.usedBytes,
+    freeBytes: parsedFilesystem.freeBytes,
+    usagePercent: parsedFilesystem.usagePercent,
+  };
+  const parsedDataFilesystem = parseFilesystemStats(dataDiskStats);
+  const dataFilesystem = parsedDataFilesystem && {
+    totalBytes: parsedDataFilesystem.totalBytes,
+    usedBytes: parsedDataFilesystem.usedBytes,
+    freeBytes: parsedDataFilesystem.freeBytes,
+    usagePercent: parsedDataFilesystem.usagePercent,
+  };
+  const databaseBytes = finiteOrNull(databaseRow?.bytes);
+  const dependenciesBytes = sumKnownBytes(dependencySizes);
+  const ollamaResidencyError = ollamaLoaded == null
+    ? 'Ollama residency probe failed'
+    : ollamaManager.getLastLoadedModelsError();
+  const lmStudioResidencyError = lmStudioLoaded == null
+    ? 'LM Studio residency probe failed'
+    : lmStudioManager.getLastLoadedModelsError();
+  const lmStudioListError = lmStudioModels == null
+    ? 'LM Studio model inventory failed'
+    : lmStudioManager.getLastListError();
+  const disabledSources = [
+    ...(settings?.localLlm?.ollama?.disabled ? ['ollama'] : []),
+    ...(settings?.localLlm?.lmstudio?.disabled ? ['lmstudio'] : []),
+  ];
+  const stores = {
+    mtplx: mtplxStore,
+    hy3dgen: hy3dgenStore,
+    'hf-xet-cache': xetStore,
+    'pixie-forge': pixieForgeStore,
+  };
+  const downloadedModels = downloadedModelInventory({
+    hf,
+    loraStorage,
+    stores,
+    ollamaStatus,
+    ollamaStored,
+    ollamaLoaded,
+    ollamaResidencyError,
+    lmStudioModels,
+    lmStudioStored,
+    lmStudioLoaded,
+    lmStudioResidencyError,
+  });
+  const loadedModels = loadedModelInventory({ ollamaLoaded, lmStudioLoaded });
+  const categories = dataOverview?.categories || null;
+  const cleanupCandidates = buildCleanupCandidates({
+    categories,
+    downloadedModels,
+    npmCacheBytes,
+  });
+  const capacity = getQueueCapacity();
+  const mediaQueue = {
+    queued: capacity.totals.queued,
+    running: capacity.totals.running,
+    byKind: capacity.byKind,
+  };
+  const agentQueue = agentQueueSummary(cosTasks, cosStatus, cosAgents);
+  const modelBytes = sumKnownBytes([
+    hf?.totalBytes,
+    loraStorage?.totalBytes,
+    ...MODEL_STORES.map(({ backend }) => stores[backend]?.totalBytes),
+    ollamaBytes,
+    lmStudioBytes,
+  ]);
+  const storageAreas = [
+    {
+      id: 'portos-data', label: 'PortOS data', kind: 'data',
+      sizeBytes: finiteOrNull(dataOverview?.totalSize), status: backendState(dataOverview),
+      managePath: '/data', protected: false,
+      note: 'Generated media, records, backups, worktrees, caches, and other classified app data.',
+    },
+    {
+      id: 'postgres', label: 'PostgreSQL', kind: 'database',
+      sizeBytes: databaseBytes, status: backendState(databaseRow),
+      managePath: '/settings/database', protected: true,
+      note: 'Primary relational records and vector indexes.',
+    },
+    {
+      id: 'huggingface', label: 'Hugging Face models', kind: 'model',
+      sizeBytes: finiteOrNull(hf?.totalBytes), status: backendState(hf),
+      managePath: '/models/media', protected: false,
+      note: 'Image, video, audio, and text-encoder weights in the shared Hub cache.',
+    },
+    {
+      id: 'loras', label: 'LoRA adapters', kind: 'model',
+      sizeBytes: finiteOrNull(loraStorage?.totalBytes), status: backendState(loraStorage),
+      managePath: '/models/loras', protected: false,
+      note: 'Fine-tuning adapters in PortOS data. This total also appears inside PortOS data.',
+    },
+    ...MODEL_STORES.map(({ backend, label, note }) => ({
+      id: backend, label, kind: 'model',
+      sizeBytes: finiteOrNull(stores[backend]?.totalBytes), status: backendState(stores[backend]),
+      managePath: MODEL_STORE_MANAGE_PATH[backend], protected: false,
+      note,
+    })),
+    {
+      id: 'ollama', label: 'Ollama models', kind: 'model',
+      sizeBytes: finiteOrNull(ollamaBytes), status: backendState(ollamaBytes),
+      managePath: '/models/llms', protected: false,
+      note: 'Local language-model manifests and shared blobs.',
+    },
+    {
+      id: 'lmstudio', label: 'LM Studio models', kind: 'model',
+      sizeBytes: finiteOrNull(lmStudioBytes), status: backendState(lmStudioBytes),
+      managePath: '/models/llms', protected: false,
+      note: 'Downloaded GGUF or MLX model directories.',
+    },
+    {
+      id: 'npm-cache', label: 'npm cache', kind: 'cache',
+      sizeBytes: finiteOrNull(npmCacheBytes), status: backendState(npmCacheBytes),
+      managePath: null, protected: false,
+      note: 'Global package download cache; reported only, never deleted in-app.',
+    },
+    {
+      id: 'dependencies', label: 'PortOS dependencies', kind: 'runtime',
+      sizeBytes: dependenciesBytes,
+      status: dependencySizes.every(Number.isFinite) ? 'ready' : 'unavailable',
+      managePath: null, protected: true,
+      note: 'Installed Node.js dependencies required by the running app.',
+    },
+    {
+      id: 'browser-downloads', label: 'Browser downloads', kind: 'personal',
+      sizeBytes: finiteOrNull(browserDownloadsBytes), status: backendState(browserDownloadsBytes),
+      managePath: null, protected: true,
+      note: 'Aggregate Downloads-folder usage. File names are never inspected or sent to AI.',
+    },
+  ];
+  const storageErrors = storageAreas
+    .filter((area) => area.status === 'unavailable')
+    .map((area) => area.id);
+  const sourceErrors = [...new Set([
+    ...storageErrors,
+    ...(!filesystem ? ['filesystem'] : []),
+    ...(!dataFilesystem ? ['data-filesystem'] : []),
+    ...(!ollamaStatus?.available ? ['ollama-backend'] : []),
+    ...(ollamaStored == null ? ['ollama-inventory'] : []),
+    ...(ollamaResidencyError ? ['ollama-residency'] : []),
+    ...(lmStudioAvailable !== true ? ['lmstudio-backend'] : []),
+    ...(lmStudioStored == null ? ['lmstudio-inventory'] : []),
+    ...(lmStudioListError ? ['lmstudio-catalog'] : []),
+    ...(lmStudioResidencyError ? ['lmstudio-residency'] : []),
+    ...(cosTasks == null ? ['agent-queue'] : []),
+    ...(cosStatus == null ? ['agent-status'] : []),
+  ])];
+  const managedReclaimableBytes = sumBytes(cleanupCandidates
+    .filter((candidate) => candidate.risk === 'low' && candidate.action)
+    .map((candidate) => candidate.estimatedBytes));
+  const queuedAgents = agentQueue
+    // Awaiting-approval tasks are already part of pendingSystem. Keep the
+    // review count as a useful breakdown without counting those tasks twice in
+    // the top-line queued total.
+    ? agentQueue.pendingUser + agentQueue.pendingSystem
+    : 0;
+
+  // Every full scan heals the persisted manifest, so Models → Status has a fresh
+  // answer to fall back on next time without walking the model stores again, and
+  // weights installed or deleted outside PortOS get picked up. Scoped to the
+  // backends this scan could actually see — `reconcileModelManifest` will not
+  // prune against a disabled or unreachable one.
+  const manifest = await reconcileModelManifest(downloadedModels, { sourceErrors, disabledSources });
+
+  return {
+    generatedAt: new Date().toISOString(),
+    inventorySource: 'scan',
+    manifestReconciledAt: manifest?.reconciledAt || null,
+    filesystem,
+    dataFilesystem,
+    summary: {
+      knownFootprintBytes: sumKnownBytes(storageAreas.map((area) => area.sizeBytes)),
+      footprintMayOverlap: true,
+      portosDataBytes: finiteOrNull(dataOverview?.totalSize),
+      databaseBytes,
+      modelBytes,
+      managedReclaimableBytes,
+      loadedModels: loadedModels.length,
+      queuedJobs: agentQueue ? mediaQueue.queued + queuedAgents : null,
+      runningJobs: agentQueue ? mediaQueue.running + agentQueue.inProgress : null,
+    },
+    storageAreas,
+    dataCategories: categories,
+    models: {
+      downloaded: downloadedModels,
+      loaded: loadedModels,
+      totals: {
+        huggingface: finiteOrNull(hf?.totalBytes),
+        loras: finiteOrNull(loraStorage?.totalBytes),
+        ...Object.fromEntries(MODEL_STORES.map(({ backend, total }) => [total, finiteOrNull(stores[backend]?.totalBytes)])),
+        ollama: finiteOrNull(ollamaBytes),
+        lmstudio: finiteOrNull(lmStudioBytes),
+        all: modelBytes,
+      },
+    },
+    queues: { media: mediaQueue, agents: agentQueue },
+    cleanupCandidates,
+    modelDuplicates,
+    sourceErrors,
+    disabledSources,
+  };
+}
+
+let reportCache = null;
+let reportCacheAt = 0;
+let reportInFlight = null;
+
+export function resetSystemResourceReportCache() {
+  reportCache = null;
+  reportCacheAt = 0;
+  reportInFlight = null;
+}
+
+/**
+ * Fetch or compute the cached system resource report.
+ *
+ * @param {Object} [options]
+ * @param {boolean} [options.force=false] Force bypassing the 30-second report cache
+ * @returns {Promise<Object>} System resource report containing storage breakdown, queues, and cleanup candidates
+ */
+export function getSystemResourceReport({ force = false } = {}) {
+  if (!force && reportCache && Date.now() - reportCacheAt < REPORT_CACHE_TTL_MS) {
+    return Promise.resolve(reportCache);
+  }
+  if (!reportInFlight) {
+    reportInFlight = buildSystemResourceReport().then(
+      (report) => {
+        reportCache = report;
+        reportCacheAt = Date.now();
+        reportInFlight = null;
+        return report;
+      },
+      (error) => {
+        reportInFlight = null;
+        throw error;
+      },
+    );
+  }
+  return reportInFlight;
+}
+
+/**
+ * The downloaded-model inventory as the manifest already knows it — no disk scan.
+ *
+ * This is what Models → Status loads on arrival. It is shaped as a PARTIAL system
+ * resource report rather than a bespoke payload so the page renders it through the
+ * same component that renders a live scan: the two differ in `inventorySource` and
+ * in the fields only a scan can supply — live residency, and the duplicate-weight
+ * report, whose scan is the most expensive walk of them all.
+ *
+ * `reconciledAt: null` means no scan has ever reconciled this install — the page
+ * shows its "run the inventory" prompt rather than claiming an empty machine.
+ *
+ * @returns {Promise<Object>} Partial report: `{ inventorySource: 'manifest', … }`
+ */
+export async function getTrackedModelInventory() {
+  const manifest = await getModelManifest();
+  const downloaded = manifest.models;
+  // `sumKnownBytes` already answers null for a list with no finite sizes, which
+  // covers a backend with no tracked rows at all.
+  const backendTotal = (backend) => sumKnownBytes(
+    downloaded.filter((model) => model.backend === backend).map((model) => model.sizeBytes),
+  );
+  return {
+    inventorySource: 'manifest',
+    generatedAt: manifest.reconciledAt,
+    reconciledAt: manifest.reconciledAt,
+    models: {
+      downloaded,
+      loaded: [],
+      totals: {
+        huggingface: backendTotal('huggingface'),
+        loras: backendTotal('lora'),
+        ...Object.fromEntries(MODEL_STORES.map(({ backend, total }) => [total, backendTotal(backend)])),
+        ollama: backendTotal('ollama'),
+        lmstudio: backendTotal('lmstudio'),
+        all: sumKnownBytes(downloaded.map((model) => model.sizeBytes)),
+      },
+    },
+    cleanupCandidates: modelCleanupCandidates(downloaded),
+    // A duplicate-weight scan is exactly the expensive walk this endpoint exists to
+    // avoid, so the panel renders nothing for it until the user asks for a refresh.
+    modelDuplicates: null,
+    sourceErrors: [],
+    disabledSources: [],
+  };
+}
+
+export function buildSystemResourceTriagePrompt(report) {
+  const candidates = report.cleanupCandidates.slice(0, 50).map((candidate, index) => ({
+    // Deliberately opaque. A model id or LoRA filename can contain a personal
+    // project name, so even candidate identifiers stay machine-local.
+    id: `candidate-${index + 1}`,
+    kind: candidate.kind,
+    estimatedBytes: candidate.estimatedBytes,
+    risk: candidate.risk,
+    reason: candidate.reason,
+    loaded: candidate.loaded,
+    busy: candidate.busy,
+    manualOnly: candidate.manualOnly,
+    actionable: Boolean(candidate.action),
+  }));
+  const context = {
+    filesystem: report.filesystem,
+    summary: report.summary,
+    queues: report.queues,
+    unavailableSources: report.sourceErrors,
+    candidates,
+  };
+  return `You are triaging disk pressure for a private, single-user PortOS installation.
+
+Rank only the cleanup candidates supplied below. Never invent a path, file, command, candidate id, or deletion action. Treat byte counts as estimates: model layers and hardlinks can overlap, and deleting one tagged model may reclaim less than its displayed size. Do not recommend deleting a loaded or busy item until it is unloaded or idle. Respect risk: prefer low-risk reproducible caches, explain rebuild/download costs, and put protected or user-authored data behind manual review. If free space is healthy, say so and keep recommendations conservative.
+
+Return ONLY JSON with this exact shape:
+{
+  "summary": "short assessment",
+  "recommendations": [
+    { "candidateId": "one supplied id", "priority": "first|next|optional", "reason": "why it helps", "tradeoff": "what is lost or rebuilt" }
+  ],
+  "cautions": ["important caveat"]
+}
+
+SYSTEM REPORT (no filesystem paths or personal filenames):
+${JSON.stringify(context, null, 2)}`;
+}
+
+/**
+ * Perform AI-assisted system storage triage based on the current system resource report.
+ *
+ * @param {Object} [options]
+ * @param {string} [options.providerId] AI provider identifier
+ * @param {string} [options.model] Specific AI model to use
+ * @param {string} [options.effort] Effort level for supported reasoning models
+ * @param {Function} [options.onRunCreated] Callback invoked when an AI run is spawned
+ * @param {Function} [options.onRunSettled] Callback invoked when an AI run settles
+ * @returns {Promise<Object>} Triage result containing structured recommendations and cautions
+ */
+export async function triageSystemResources({
+  providerId,
+  model,
+  effort,
+  onRunCreated,
+  onRunSettled,
+} = {}) {
+  const report = await getSystemResourceReport();
+  const triageCandidates = report.cleanupCandidates.slice(0, 50);
+  const { provider, selectedModel } = await resolveProviderAndModel({ providerId, model });
+  assertProvider(provider, {
+    message: 'No AI provider is configured for system-resource triage',
+    code: 'NO_PROVIDER',
+  });
+
+  const result = await runPromptThroughProvider({
+    provider,
+    model: selectedModel,
+    effort,
+    prompt: buildSystemResourceTriagePrompt(report),
+    source: 'system-resource-triage',
+    responseSchema: TRIAGE_RESPONSE_SCHEMA,
+    onRunCreated,
+    onRunSettled,
+  });
+  const parsed = TRIAGE_RESPONSE_SCHEMA.parse(JSON.parse(result.text));
+  const candidatesById = new Map(triageCandidates.map((candidate, index) => [`candidate-${index + 1}`, candidate]));
+  const seen = new Set();
+  const recommendations = parsed.recommendations.flatMap((recommendation) => {
+    const candidate = candidatesById.get(recommendation.candidateId);
+    if (!candidate || seen.has(candidate.id)) return [];
+    seen.add(candidate.id);
+    return [{ ...recommendation, candidateId: candidate.id, candidate }];
+  });
+  if (parsed.recommendations.length > 0 && recommendations.length === 0) {
+    throw new ServerError('AI triage did not reference any known cleanup candidate', {
+      status: 502,
+      code: 'LLM_OUTPUT_CONTRACT',
+    });
+  }
+
+  return {
+    report,
+    triage: {
+      summary: parsed.summary,
+      recommendations,
+      cautions: parsed.cautions,
+      runId: result.runId,
+      providerId: result.provider?.id || provider.id,
+      model: result.model || selectedModel,
+    },
+  };
+}

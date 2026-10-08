@@ -1,0 +1,298 @@
+import { describe, it, expect } from 'vitest';
+import { render, screen, fireEvent } from '@testing-library/react';
+import TabSheetView from './TabSheetView.jsx';
+import { parseTabSheet } from '../../lib/tabNotation.js';
+import { sheetChordOccurrences } from '../../lib/chordPlayback.js';
+
+// Invented placeholder content only (privacy convention) — nonsense lyrics.
+const SAMPLE = `[Verse 1]
+C        G
+Nonsense lyric line
+e|--3--2--|
+B|--0-----|
+[C]Hello [G]world`;
+
+describe('TabSheetView', () => {
+  it('renders section labels as headings', () => {
+    render(<TabSheetView text={SAMPLE} />);
+    expect(screen.getByText('Verse 1')).toBeTruthy();
+  });
+
+  it('highlights chord tokens on chords lines', () => {
+    const { container } = render(<TabSheetView text={SAMPLE} />);
+    const highlighted = [...container.querySelectorAll('.text-port-accent.font-semibold')]
+      .map((el) => el.textContent.trim());
+    expect(highlighted).toContain('C');
+    expect(highlighted).toContain('G');
+  });
+
+  it('renders the lyric line under the chords', () => {
+    render(<TabSheetView text={SAMPLE} />);
+    expect([...document.querySelectorAll('[data-chord-lyric-pair]')][0].querySelectorAll('[data-chord-lyric-chunk]')[0].lastChild.textContent).toBe('Nonsense ');
+    expect(screen.getByText('lyric')).toBeTruthy();
+    expect(screen.getByText('line')).toBeTruthy();
+  });
+
+  it('groups consecutive tabstaff lines into one horizontally-scrollable block', () => {
+    const { container } = render(<TabSheetView text={SAMPLE} />);
+    const staffBlocks = [...container.querySelectorAll('.overflow-x-auto')]
+      .filter((el) => el.textContent.includes('e|--3--2--|'));
+    expect(staffBlocks.length).toBe(1);
+    // Both staff lines live in the same block so they scroll together.
+    expect(staffBlocks[0].textContent).toContain('B|--0-----|');
+  });
+
+  it('toggles the tab articulation legend when a tab staff is present', () => {
+    render(<TabSheetView text={SAMPLE} format="tab" />);
+    const toggle = screen.getByRole('button', { name: 'Legend' });
+    const panelId = toggle.getAttribute('aria-controls');
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(document.getElementById(panelId)).toBeNull();
+
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    const panel = document.getElementById(panelId);
+    expect(panel).toBeTruthy();
+    expect(panel.textContent).toContain('Hammer-on');
+    expect(panel.textContent).toContain('Muted note');
+
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(document.getElementById(panelId)).toBeNull();
+  });
+
+  it('only offers the articulation legend when parsed content has a tab staff', () => {
+    const { rerender } = render(<TabSheetView text={'C G\nNonsense lyric line'} format="tab" />);
+    expect(screen.queryByRole('button', { name: 'Legend' })).toBeNull();
+
+    rerender(<TabSheetView text={`{start_of_tab}\n${SAMPLE}`} format="chordpro" />);
+    expect(screen.getByRole('button', { name: 'Legend' })).toBeTruthy();
+
+    rerender(<TabSheetView text={SAMPLE} format="plain" />);
+    expect(screen.queryByRole('button', { name: 'Legend' })).toBeNull();
+  });
+
+  it('wraps ChordPro words with their chord row at the original columns', () => {
+    const { container } = render(<TabSheetView text="[C]Hello [G]world" />);
+    const chunks = [...container.querySelectorAll('[data-chord-lyric-chunk]')];
+    expect(chunks.map((chunk) => [chunk.firstChild.textContent, chunk.lastChild.textContent]))
+      .toEqual([['C     ', 'Hello '], ['G', 'world']]);
+  });
+
+  it('moves focus into the chord diagram, traps Tab, and restores focus on Escape', () => {
+    render(<TabSheetView text="C G" />);
+    const trigger = screen.getByRole('button', { name: 'C' });
+    trigger.focus();
+    fireEvent.click(trigger);
+
+    const dialog = screen.getByRole('dialog', { name: 'C chord voicing' });
+    const close = screen.getByRole('button', { name: 'Close chord diagram' });
+    expect(document.activeElement).toBe(close);
+
+    const tab = new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true });
+    dialog.dispatchEvent(tab);
+    expect(tab.defaultPrevented).toBe(true);
+    expect(document.activeElement).toBe(close);
+
+    fireEvent.keyDown(dialog, { key: 'Escape' });
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it('keeps mid-word chords, rhythm marks and trailing changes intact in pasted pairs', () => {
+    const { container } = render(<TabSheetView text={'  Am     | G/B          F\nPaper lanterns glow'} />);
+    const chunks = [...container.querySelectorAll('[data-chord-lyric-chunk]')];
+    expect(chunks.map((chunk) => chunk.lastChild.textContent).join('')).toBe('Paper lanterns glow');
+    expect(chunks.map((chunk) => chunk.firstChild.textContent).join('')).toBe('  Am     | G/B          F');
+    expect(screen.getByRole('button', { name: 'Am' }).closest('[data-chord-lyric-chunk]').lastChild.textContent).toBe('Paper ');
+    expect(screen.getByRole('button', { name: 'G/B' }).closest('[data-chord-lyric-chunk]').lastChild.textContent).toBe('lanterns ');
+    fireEvent.click(screen.getByRole('button', { name: 'G/B' }));
+    const dialog = screen.getByRole('dialog', { name: 'G/B chord voicing' });
+    expect(dialog.parentElement).toBe(document.body);
+    expect(dialog.querySelector('svg')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Close chord diagram' }));
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'G/B' }));
+  });
+
+  it('makes room for adjacent ChordPro changes without moving their syllables apart', () => {
+    const { container } = render(<TabSheetView text="[Cmaj7]a[Am]b glows" />);
+    const chunks = [...container.querySelectorAll('[data-chord-lyric-chunk]')];
+    expect(chunks[0].firstChild.textContent).toBe('Cmaj7 Am');
+    expect(chunks[0].lastChild.textContent).toBe(`a${'\u00a0'.repeat(5)}b `);
+  });
+
+  it('applies the font size scale', () => {
+    const { container } = render(<TabSheetView text="plain words" fontSizeRem={1.25} />);
+    expect(container.firstChild.style.fontSize).toBe('1.25rem');
+  });
+
+  it('renders empty text without crashing', () => {
+    const { container } = render(<TabSheetView text="" />);
+    expect(container.firstChild).toBeTruthy();
+  });
+
+  it('hides ChordPro meta directives — values belong in badges, not the sheet', () => {
+    const { container } = render(
+      <TabSheetView text={'{title: Example Song}\n{capo: 3}\nC G\nNonsense line'} />,
+    );
+    expect(container.textContent).not.toContain('{title: Example Song}');
+    expect(container.textContent).not.toContain('{capo: 3}');
+    expect(container.textContent).toContain('Nonsense line');
+  });
+
+  it("format='plain' renders verbatim: no headings, no chord highlighting, no chord UI", () => {
+    const { container } = render(
+      <TabSheetView text={SAMPLE} format="plain" instrumentView="piano" />,
+    );
+    // The raw [Verse 1] marker stays literal text (not a styled heading)...
+    expect(container.textContent).toContain('[Verse 1]');
+    expect(container.querySelector('.uppercase.tracking-wide')).toBeNull();
+    // ...and no chord token gets the accent highlight.
+    expect(container.querySelector('.text-port-accent.font-semibold')).toBeNull();
+    // plain is the opt-out of ALL notation UI: no popover buttons, and tab
+    // staffs stay verbatim (no collapse note) even in a non-guitar view.
+    expect(container.querySelector('[aria-haspopup="dialog"]')).toBeNull();
+    expect(container.textContent).toContain('e|--3--2--|');
+    expect(screen.queryByText(/switch to Guitar view/)).toBeNull();
+  });
+
+  describe('chord popover (instrument views, #2656)', () => {
+    it('renders chord tokens as keyboard-accessible popover buttons', () => {
+      render(<TabSheetView text={SAMPLE} />);
+      const button = screen.getAllByRole('button', { name: 'C' })[0];
+      expect(button.getAttribute('aria-haspopup')).toBe('dialog');
+      expect(button.getAttribute('aria-expanded')).toBe('false');
+    });
+
+    it('opens a voicing popover for the active instrument on tap and closes on Escape', () => {
+      render(<TabSheetView text={SAMPLE} instrumentView="ukulele" />);
+      const button = screen.getAllByRole('button', { name: 'C' })[0];
+      fireEvent.click(button);
+      const dialog = screen.getByRole('dialog', { name: 'C chord voicing' });
+      expect(dialog.textContent).toContain('ukulele');
+      expect(dialog.querySelector('svg')).toBeTruthy();
+      expect(button.getAttribute('aria-expanded')).toBe('true');
+      fireEvent.keyDown(document, { key: 'Escape' });
+      expect(screen.queryByRole('dialog')).toBeNull();
+      expect(button.getAttribute('aria-expanded')).toBe('false');
+    });
+
+    it('toggles the popover closed when the same chord is tapped again', () => {
+      render(<TabSheetView text={SAMPLE} />);
+      const button = screen.getAllByRole('button', { name: 'G' })[0];
+      fireEvent.click(button);
+      expect(screen.getByRole('dialog')).toBeTruthy();
+      fireEvent.click(button);
+      expect(screen.queryByRole('dialog')).toBeNull();
+    });
+
+    it('shows piano note chips in the popover for the piano view', () => {
+      render(<TabSheetView text={SAMPLE} instrumentView="piano" />);
+      fireEvent.click(screen.getAllByRole('button', { name: 'G' })[0]);
+      const dialog = screen.getByRole('dialog');
+      expect(dialog.querySelector('svg')).toBeNull();
+      expect(dialog.textContent).toContain('B');
+      expect(dialog.textContent).toContain('D');
+    });
+  });
+
+  describe('tabstaff collapse in non-guitar views', () => {
+    it('keeps tab staffs visible in the guitar view', () => {
+      render(<TabSheetView text={SAMPLE} instrumentView="guitar" />);
+      expect(screen.getByText('e|--3--2--|')).toBeTruthy();
+      expect(screen.queryByText(/switch to Guitar view/)).toBeNull();
+    });
+
+    it('piano view collapses every staff (piano has no tablature) with an inline expand', () => {
+      render(<TabSheetView text={SAMPLE} instrumentView="piano" />);
+      expect(screen.queryByText('e|--3--2--|')).toBeNull();
+      // The 2-line SAMPLE staff isn't identifiably guitar — generic label.
+      expect(screen.getByText(/tablature — switch to Guitar or Ukulele view/)).toBeTruthy();
+      const expand = screen.getByRole('button', { name: 'Show tablature staff (section 3)' });
+      const staffId = expand.getAttribute('aria-controls');
+      expect(expand.getAttribute('aria-expanded')).toBe('false');
+      expect(document.getElementById(staffId)).toBeNull();
+
+      fireEvent.click(expand);
+      expect(screen.getByText('e|--3--2--|')).toBeTruthy();
+      expect(screen.getByText('B|--0-----|')).toBeTruthy();
+      expect(document.getElementById(staffId)).toBeTruthy();
+    });
+
+    const SIX_LINE_STAFF = ['e|--0--|', 'B|--1--|', 'G|--0--|', 'D|--2--|', 'A|--3--|', 'E|-----|'].join('\n');
+    const FOUR_LINE_STAFF = ['A|--0--|', 'E|--0--|', 'C|--0--|', 'G|--2--|'].join('\n');
+
+    it('ukulele view collapses guitar staffs (≥5 lines) but keeps ≤4-line staffs — a uke song\'s own tab stays visible', () => {
+      render(<TabSheetView text={`${SIX_LINE_STAFF}\n\n${FOUR_LINE_STAFF}`} instrumentView="ukulele" />);
+      // Guitar staff collapsed with the guitar-specific label…
+      expect(screen.queryByText('D|--2--|')).toBeNull();
+      expect(screen.getByText(/guitar tab — switch to Guitar view/)).toBeTruthy();
+      // …while the 4-line (plausibly ukulele) staff renders in place.
+      expect(screen.getByText('G|--2--|')).toBeTruthy();
+    });
+
+    it('gives each collapsed staff a unique accessible disclosure name and target', () => {
+      render(
+        <TabSheetView
+          text={`${SIX_LINE_STAFF}\n\n[Solo]\n${SIX_LINE_STAFF}`}
+          instrumentView="piano"
+        />,
+      );
+
+      const expanders = screen.getAllByRole('button', { name: /Show guitar tablature staff \(section \d+\)/ });
+      expect(expanders).toHaveLength(2);
+      expect(expanders[0].getAttribute('aria-label')).not.toBe(expanders[1].getAttribute('aria-label'));
+      expect(expanders.map((button) => button.getAttribute('aria-expanded'))).toEqual(['false', 'false']);
+      expect(new Set(expanders.map((button) => button.getAttribute('aria-controls'))).size).toBe(2);
+    });
+  });
+});
+
+// --- Play-along highlight (#4104) -------------------------------------------
+// The coordinates come from `sheetChordOccurrences` (lib/chordPlayback.js), so
+// these use that function rather than hand-counted indices — a test that
+// mirrored the addressing would keep agreeing with a broken renderer.
+describe('TabSheetView — sounding-chord highlight', () => {
+  // Two chord lines: line 0 is "C  G", line 2 is the ChordPro inline row.
+  const SHEET = 'C        G\nNonsense lyric line\n[Am]Hello [F]world';
+  const occurrences = sheetChordOccurrences(parseTabSheet(SHEET).lines);
+  const lit = (container) => [...container.querySelectorAll('[data-sounding]')]
+    .map((el) => el.textContent.trim());
+
+  it('lights nothing when no chord is sounding', () => {
+    const { container } = render(<TabSheetView text={SHEET} />);
+    expect(lit(container)).toEqual([]);
+  });
+
+  it.each([0, 1, 2, 3])('lights exactly the token occurrence %i addresses', (i) => {
+    const { lineIndex, chordIndex, name } = occurrences[i];
+    const { container } = render(
+      <TabSheetView text={SHEET} soundingChord={{ lineIndex, chordIndex }} />,
+    );
+    expect(lit(container)).toEqual([name]);
+  });
+
+  it('never lights the same-numbered token on a different line', () => {
+    // Chord index 0 exists on both chord lines; only the addressed line lights.
+    const { container } = render(
+      <TabSheetView text={SHEET} soundingChord={{ lineIndex: 2, chordIndex: 0 }} />,
+    );
+    expect(lit(container)).toEqual(['Am']);
+    expect(lit(container)).not.toContain('C');
+  });
+
+  it('ignores a stale coordinate that no longer addresses a chord', () => {
+    const { container } = render(
+      <TabSheetView text={SHEET} soundingChord={{ lineIndex: 99, chordIndex: 0 }} />,
+    );
+    expect(lit(container)).toEqual([]);
+  });
+
+  it('lights nothing in plain format, which opts out of all notation UI', () => {
+    const { container } = render(
+      <TabSheetView text={SHEET} format="plain" soundingChord={{ lineIndex: 0, chordIndex: 0 }} />,
+    );
+    expect(lit(container)).toEqual([]);
+  });
+});

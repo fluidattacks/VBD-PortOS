@@ -1,0 +1,267 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { pinPlatform } from './testHelper.js';
+
+vi.mock('fs', () => ({
+  existsSync: vi.fn()
+}));
+
+vi.mock('./childProcess.js', () => ({
+  execFile: vi.fn()
+}));
+
+import { existsSync } from 'fs';
+import { execFile } from './childProcess.js';
+import {
+  findTailscale,
+  isSandboxedTailscale,
+  hasOnlySandboxedTailscale,
+  __resetTailscaleStatusCache,
+  getTailscaleStatus,
+  isTailscaleUp,
+  MACOS_TAILSCALE_APP_BUNDLE
+} from './tailscale.js';
+
+// The candidate list findTailscale walks is platform-dependent, so a test that
+// wants "a Tailscale binary is installed" has to name the candidate for the
+// platform it is running on — a hardcoded POSIX path is simply absent from the
+// Windows list and reads back as not-installed.
+const INSTALLED_CANDIDATE = process.platform === 'win32'
+  ? 'C:\\Program Files\\Tailscale\\tailscale.exe'
+  : '/opt/homebrew/bin/tailscale';
+
+describe('findTailscale', () => {
+  let originalPath;
+
+  beforeEach(() => {
+    originalPath = process.env.PATH;
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    process.env.PATH = originalPath;
+  });
+
+  it('returns the first matching candidate path', () => {
+    existsSync.mockImplementation((p) => p === INSTALLED_CANDIDATE);
+    expect(findTailscale()).toBe(INSTALLED_CANDIDATE);
+  });
+
+  it('falls back to a later candidate when earlier ones are missing', () => {
+    const isWin = process.platform === 'win32';
+    const target = isWin
+      ? 'C:\\Program Files (x86)\\Tailscale\\tailscale.exe'
+      : '/Applications/Tailscale.app/Contents/MacOS/Tailscale';
+    existsSync.mockImplementation((p) => p === target);
+    expect(findTailscale()).toBe(target);
+  });
+
+  it('scans PATH directories when no candidate is found', () => {
+    const isWin = process.platform === 'win32';
+    const sep = isWin ? ';' : ':';
+    const dir = isWin ? 'D:\\custom\\bin' : '/custom/bin';
+    const bin = isWin ? 'tailscale.exe' : 'tailscale';
+    process.env.PATH = `${dir}${sep}${isWin ? 'D:\\foo' : '/foo'}`;
+    existsSync.mockImplementation((p) => p === `${dir}${isWin ? '\\' : '/'}${bin}`);
+    expect(findTailscale()).toContain(bin);
+  });
+
+  it('returns null when no tailscale binary is anywhere on the system', () => {
+    process.env.PATH = '/nowhere';
+    existsSync.mockReturnValue(false);
+    expect(findTailscale()).toBeNull();
+  });
+
+  it('handles an empty PATH gracefully', () => {
+    process.env.PATH = '';
+    existsSync.mockReturnValue(false);
+    expect(findTailscale()).toBeNull();
+  });
+
+  it('skips empty path segments produced by adjacent separators', () => {
+    const sep = process.platform === 'win32' ? ';' : ':';
+    process.env.PATH = `${sep}${sep}`;
+    existsSync.mockReturnValue(false);
+    expect(findTailscale()).toBeNull();
+    const callsWithBin = existsSync.mock.calls.filter(([p]) => /tailscale(\.exe)?$/.test(p));
+    expect(callsWithBin.length).toBeGreaterThan(0);
+  });
+});
+
+describe('isSandboxedTailscale', () => {
+  it('returns true for the App bundle path', () => {
+    expect(isSandboxedTailscale(MACOS_TAILSCALE_APP_BUNDLE)).toBe(true);
+  });
+
+  it('returns false for Homebrew, /usr/bin, and arbitrary paths', () => {
+    expect(isSandboxedTailscale('/opt/homebrew/bin/tailscale')).toBe(false);
+    expect(isSandboxedTailscale('/usr/local/bin/tailscale')).toBe(false);
+    expect(isSandboxedTailscale('/usr/bin/tailscale')).toBe(false);
+    expect(isSandboxedTailscale('/some/random/path/tailscale')).toBe(false);
+    expect(isSandboxedTailscale(null)).toBe(false);
+  });
+});
+
+describe('hasOnlySandboxedTailscale', () => {
+  let originalPath;
+  let restorePlatform = () => {};
+
+  beforeEach(() => {
+    originalPath = process.env.PATH;
+    restorePlatform = pinPlatform('darwin');
+    process.env.PATH = '';
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    process.env.PATH = originalPath;
+    restorePlatform();
+  });
+
+  it('returns false on non-darwin platforms', () => {
+    pinPlatform('linux'); // afterEach restores the pristine descriptor
+    existsSync.mockReturnValue(true);
+    expect(hasOnlySandboxedTailscale()).toBe(false);
+  });
+
+  it('returns false when the App bundle is absent', () => {
+    existsSync.mockReturnValue(false);
+    expect(hasOnlySandboxedTailscale()).toBe(false);
+  });
+
+  it('returns true when only the App bundle exists', () => {
+    existsSync.mockImplementation((p) => p === MACOS_TAILSCALE_APP_BUNDLE);
+    expect(hasOnlySandboxedTailscale()).toBe(true);
+  });
+
+  it('returns false when Homebrew tailscale is also present', () => {
+    existsSync.mockImplementation((p) =>
+      p === MACOS_TAILSCALE_APP_BUNDLE || p === '/opt/homebrew/bin/tailscale'
+    );
+    expect(hasOnlySandboxedTailscale()).toBe(false);
+  });
+
+  it('returns false when an unsandboxed tailscale is on PATH and no App-bundle is present', () => {
+    // findTailscale walks candidates first, App-bundle last; PATH scan only
+    // runs if NO candidate matches. So this case (no candidates + PATH match)
+    // resolves to the PATH binary and the helper reports unsandboxed.
+    process.env.PATH = '/some/custom/bin';
+    existsSync.mockImplementation((p) => p === '/some/custom/bin/tailscale');
+    expect(hasOnlySandboxedTailscale()).toBe(false);
+  });
+});
+
+describe('getTailscaleStatus / isTailscaleUp', () => {
+  let originalPath;
+
+  beforeEach(() => {
+    originalPath = process.env.PATH;
+    vi.clearAllMocks();
+    __resetTailscaleStatusCache();
+    // Default: a Tailscale binary exists at a known candidate path.
+    existsSync.mockImplementation((p) => p === INSTALLED_CANDIDATE);
+  });
+
+  afterEach(() => {
+    process.env.PATH = originalPath;
+  });
+
+  // promisify(execFile) with no custom symbol resolves with the value passed as
+  // the callback's first non-error arg — so returning { stdout } matches how the
+  // real (custom-promisified) execFile resolves { stdout, stderr }.
+  const mockStatusJSON = (obj) => {
+    execFile.mockImplementation((cmd, args, opts, cb) => cb(null, { stdout: JSON.stringify(obj) }));
+  };
+
+  it('reports not-installed when no binary is found', async () => {
+    existsSync.mockReturnValue(false);
+    process.env.PATH = '';
+    const status = await getTailscaleStatus();
+    expect(status).toEqual({
+      available: false,
+      running: false,
+      state: null,
+      reason: 'tailscale-not-installed',
+      sandboxed: false,
+      dnsName: null,
+      magicDnsSuffix: null,
+      peers: [],
+    });
+    expect(execFile).not.toHaveBeenCalled();
+    expect(await isTailscaleUp()).toBe(false);
+  });
+
+  it('reports running when BackendState is Running', async () => {
+    mockStatusJSON({ BackendState: 'Running' });
+    const status = await getTailscaleStatus();
+    expect(status).toMatchObject({ available: true, running: true, state: 'Running', reason: 'running' });
+    expect(await isTailscaleUp()).toBe(true);
+  });
+
+  it('shares and briefly caches local status probes', async () => {
+    let finishProbe;
+    execFile.mockImplementation((cmd, args, opts, cb) => {
+      finishProbe = () => cb(null, { stdout: JSON.stringify({ BackendState: 'Running' }) });
+    });
+
+    const first = getTailscaleStatus();
+    const concurrent = getTailscaleStatus();
+    expect(execFile).toHaveBeenCalledTimes(1);
+    finishProbe();
+    await expect(Promise.all([first, concurrent])).resolves.toEqual([
+      expect.objectContaining({ running: true }),
+      expect.objectContaining({ running: true }),
+    ]);
+
+    await getTailscaleStatus();
+    expect(execFile).toHaveBeenCalledTimes(1);
+    const forced = getTailscaleStatus({ force: true });
+    expect(execFile).toHaveBeenCalledTimes(2);
+    finishProbe();
+    await forced;
+  });
+
+  it('normalizes the local MagicDNS name, suffix, and peer suggestions', async () => {
+    mockStatusJSON({
+      BackendState: 'Running',
+      Self: { DNSName: 'host-alpha.example-tailnet.ts.net.' },
+      CurrentTailnet: { MagicDNSSuffix: 'example-tailnet.ts.net.' },
+      Peer: {
+        peer1: {
+          DNSName: 'host-beta.example-tailnet.ts.net.',
+          HostName: 'host-beta',
+          TailscaleIPs: ['100.64.0.50'],
+        },
+      },
+    });
+
+    await expect(getTailscaleStatus()).resolves.toMatchObject({
+      running: true,
+      dnsName: 'host-alpha.example-tailnet.ts.net',
+      magicDnsSuffix: 'example-tailnet.ts.net',
+      peers: [{
+        dnsName: 'host-beta.example-tailnet.ts.net',
+        hostName: 'host-beta',
+        ips: ['100.64.0.50'],
+      }],
+    });
+  });
+
+  it('reports not-running when Tailscale is installed but Stopped', async () => {
+    mockStatusJSON({ BackendState: 'Stopped' });
+    const status = await getTailscaleStatus();
+    expect(status).toMatchObject({ available: true, running: false, state: 'Stopped', reason: 'tailscale-stopped' });
+    expect(await isTailscaleUp()).toBe(false);
+  });
+
+  it('degrades to not-running when the CLI errors', async () => {
+    execFile.mockImplementation((cmd, args, opts, cb) => cb(new Error('boom')));
+    const status = await getTailscaleStatus();
+    expect(status).toMatchObject({ available: true, running: false, state: null, reason: 'tailscale-status-failed' });
+  });
+
+  it('degrades to not-running on non-JSON output', async () => {
+    execFile.mockImplementation((cmd, args, opts, cb) => cb(null, { stdout: 'not json at all' }));
+    const status = await getTailscaleStatus();
+    expect(status).toMatchObject({ available: true, running: false, state: null, reason: 'tailscale-parse-error' });
+  });
+});

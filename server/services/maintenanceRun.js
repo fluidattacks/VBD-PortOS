@@ -1,0 +1,560 @@
+import { isLegacyDeepAudit, EXTENDED_AUDIT_WORKFLOW } from '../lib/auditWorkflow.js';
+/**
+ * Manual maintenance runs — the Schedule tab's "Run maintenance now".
+ *
+ * A run walks the maintenance ladder (`lib/maintenanceSequence.js`) against ONE
+ * managed app, pinned to the provider/model/effort the user chose, and it walks
+ * it to the END: each audit is dispatched when the previous step finishes, and
+ * every `claim-issue` drain repeats until the app's issue backlog is empty.
+ *
+ * It is deliberately NOT a quota burn. The Quota Burn page offers the same
+ * ladder as a family plan to be walked later, under that family's window gates
+ * — and a run started here used to be written INTO that plan and force-started,
+ * which coupled "run it now" to everything the plan is for: the master switch
+ * had to be on, the family plan had to be empty, only the first step bypassed
+ * the reset-window / reserve / cap gates (every later step waited on them), and
+ * running again meant re-arming the plan. A manual run keeps its own record,
+ * its own completion ledger and its own continuation, so none of that applies:
+ * it runs whether or not Quota Burn is enabled, beside whatever plan the family
+ * holds, and a second run is just a second record.
+ *
+ * What it shares with a burn is the INVOCATION: every step is dispatched through
+ * `quotaBurnInvoke.invokeQuotaBurnStep`. Manual runs bypass schedule switches;
+ * master Improve, target scope and duplicate-request guards still apply, each
+ * handler is pinned to the provider the user named, and the task carries the
+ * provenance that makes it cooldown-exempt. When that provider belongs to a
+ * subscription family the family rides along too, so an observed refusal is
+ * credited to the window it actually spent; when it belongs to none — an
+ * OpenCode TUI, a local-model wrapper — the run dispatches UNFAMILIED and
+ * credits nothing, because it spent no window (`manualBurnFamily`). The
+ * `maintenanceRunId` provenance field is what tells the quota-burn loop to leave
+ * these agents alone (`quotaBurnRunner.js#onBurnAgentCompleted`), and on an
+ * unfamilied run it is also the only attribution the task carries.
+ *
+ * Pacing is by completion: `agent:completed` for one of the run's tasks
+ * re-evaluates the run, and a slow interval re-evaluates every running run as
+ * the safety net for holds that no agent completion will lift — a transient
+ * claim probe, a queued request an engine refused, a task setting the user
+ * fixes after the fact. A hold never ends a run: it is re-tried until it
+ * clears, or the user stops the run.
+ *
+ * AI-policy posture (AGENTS.md): every dispatch traces to the user's click on
+ * "Run now", which names the app, provider and model. Boot arms the listener
+ * and the interval; neither dispatches anything on an install with no running
+ * run, and a fresh install has none.
+ *
+ * Storage: `data/cos/maintenance-runs.json`, machine-local and `ephemeral-file`
+ * — a capped list of run records, newest first. No `data.reference/` seed: an
+ * absent file is "no runs yet".
+ */
+
+import { join } from 'path';
+import { ServerError } from '../lib/errorHandler.js';
+import { atomicWrite, PATHS, readJSONFile } from '../lib/fileUtils.js';
+import { createFileWriteQueue } from '../lib/fileWriteQueue.js';
+import { createKeyCachedQueue } from '../lib/createKeyCachedQueue.js';
+import { buildMaintenanceSteps, MAINTENANCE_TASK_ORDER } from '../lib/maintenanceSequence.js';
+import { familyForProvider } from '../lib/providerFamilies.js';
+import { quotaBurnProvenance } from '../lib/quotaBurnOrigin.js';
+import { QUOTA_BURN_UNAVAILABLE } from '../lib/quotaBurnTaskRef.js';
+import { pluralize } from '../lib/textUtils.js';
+import { isQueuedContinuation } from '../lib/agentOutcome.js';
+import { cosEvents } from './cosEvents.js';
+import { getOnDemandHandoffs } from './onDemandHandoff.js';
+import { getQuotaBurnTaskCatalog, invokeQuotaBurnStep } from './quotaBurnInvoke.js';
+import { ACTIVE_TASK_STATUSES, probeSequenceDrain, sequenceStepShapeReason } from './quotaBurnSequence.js';
+
+const runsFile = () => join(PATHS.cos, 'maintenance-runs.json');
+
+/** Finished runs kept for the page's history; running ones are never pruned. */
+const RUN_HISTORY_LIMIT = 20;
+/** The safety-net re-evaluation cadence for holds no agent completion will lift. */
+const RETRY_MS = 2 * 60_000;
+
+export const MAINTENANCE_RUN_STATUS = Object.freeze({ RUNNING: 'running', COMPLETED: 'completed', STOPPED: 'stopped' });
+
+const activeRunError = (appId, runId) => new ServerError(`a maintenance run is already in progress for "${appId}" (${runId})`, { status: 409, code: 'MAINTENANCE_RUN_ACTIVE' });
+
+/**
+ * The burn identity one step of THIS run dispatches under.
+ *
+ * A manual run is not a burn: it walks a ladder the user asked for, on the
+ * provider the user named. Most of the time that provider belongs to a
+ * subscription family and the family rides along, so a refusal is still credited
+ * to the window it actually spent. But the picker offers every enabled process
+ * provider (`enabledProcessProviderFilter`), and an OpenCode TUI or a
+ * local-model wrapper belongs to no family at all — there is no window, so there
+ * is nothing to credit. That is a legitimate state, not a failed resolution, and
+ * this is the ONLY place that says so: the automatic burn sweep hands
+ * `providerForFamily` a plan's family record and can never construct this.
+ */
+const manualBurnFamily = (familyId) => (familyId ? { id: familyId } : { id: null, unfamilied: true });
+
+/** One wording for the refusal, whichever of the three gates raised it. */
+const unavailableProvider = (providerId) => `provider "${providerId}" is not an enabled CLI/TUI provider`;
+
+/**
+ * A run/step's own family, read by PRESENCE rather than truthiness.
+ *
+ * `null` means "this one is pinned outside every family"; only an ABSENT key
+ * means "nothing recorded here, inherit". Collapsing the two with `||` would
+ * make a step edited onto a family-less provider silently inherit the run's real
+ * family — and then be refused for not belonging to it.
+ */
+const inherited = (record, key, fallback) => (record && Object.hasOwn(record, key) ? record[key] : fallback);
+const stepBurnFamily = (step, run) => manualBurnFamily(inherited(step, 'familyId',
+  step.drain ? inherited(run, 'claimFamilyId', run.familyId) : run.familyId));
+
+const writeQueue = createFileWriteQueue();
+// One operation at a time PER RUN — evaluations, the completion ledger, stop
+// and resume all queue here. A completion and the interval can land together,
+// and two concurrent walks of one ladder would dispatch its next step twice; a
+// Stop landing mid-walk must take effect before the walk's next dispatch.
+const perRun = createKeyCachedQueue();
+let retryTimer = null;
+
+export async function listMaintenanceRuns() {
+  const loaded = await readJSONFile(runsFile(), null, { strict: true });
+  return Array.isArray(loaded?.runs) ? loaded.runs : [];
+}
+
+/**
+ * Persist the list, pruning finished history past the cap. Running records are
+ * never pruned — a run the user can still see progressing must not vanish
+ * because twenty others finished.
+ */
+async function writeRuns(runs) {
+  let finished = 0;
+  await atomicWrite(runsFile(), { runs: runs.filter((entry) => entry.archivedAt || entry.historyRetained || entry.status === MAINTENANCE_RUN_STATUS.RUNNING || (entry.auditDepth === 'deep' && entry.status !== MAINTENANCE_RUN_STATUS.COMPLETED) || ++finished <= RUN_HISTORY_LIMIT) });
+}
+
+const insertRun = (run) => writeQueue(async () => {
+  await writeRuns([run, ...(await listMaintenanceRuns())]);
+  cosEvents.emit('maintenance:updated', run);
+  return run;
+});
+
+/**
+ * Apply a PATCH to the stored record — re-read inside the write queue and
+ * merged, never a whole-record replace from a caller's snapshot. An evaluation
+ * holds its snapshot across several awaits (task read, catalog, claim probe,
+ * dispatch), and a replace from that snapshot would carry a stale `status` or
+ * `completed` back over a Stop or a completion that landed meanwhile. The
+ * completion ledger merges key-wise for the same reason: it only ever grows.
+ */
+const patchRun = (id, patch, { historyOnly = false } = {}) => writeQueue(async () => {
+  const runs = await listMaintenanceRuns();
+  const current = runs.find((entry) => entry.id === id);
+  if (!current) return null;
+  const updated = {
+    ...current,
+    ...patch,
+    completed: { ...current.completed, ...(patch.completed || {}) },
+    updatedAt: new Date().toISOString(),
+  };
+  await writeRuns(runs.map((entry) => (entry.id === id ? updated : entry)));
+  cosEvents.emit('maintenance:updated', historyOnly ? { ...updated, historyOnly: true } : updated);
+  return updated;
+});
+
+export async function getMaintenanceRun(id) {
+  return (await listMaintenanceRuns()).find((run) => run.id === id) || null;
+}
+
+/** Two ladders against one app would file and claim each other's findings. */
+async function assertNoRunningRun(appId) {
+  const active = (await listMaintenanceRuns()).find((run) => run.appId === appId && run.status === MAINTENANCE_RUN_STATUS.RUNNING);
+  if (active) throw activeRunError(appId, active.id);
+}
+
+/**
+ * Start a run. Refused (with a thrown, coded error the route maps to a 4xx)
+ * when the app is unknown or archived, the provider is not an enabled CLI/TUI
+ * provider — the SAME gate every dispatch re-applies (`resolveBurnProvider`), so
+ * a run can never start on a provider its steps would then refuse — or a full
+ * ladder targets an app with a running run. Belonging to a subscription family
+ * is NOT part of that gate: the picker offers every enabled process provider,
+ * and one outside every family runs unfamilied (see `manualBurnFamily`).
+ * Explicit quality selections may run alongside other runs; they never claim backlog issues.
+ *
+ * The first evaluation runs before this returns, so the caller learns whether
+ * step one actually went out (or why it is holding) in the same response.
+ */
+export async function startMaintenanceRun({ appId, providerId, model = null, effort = null, mode = 'file-issues', prCompletion = null, claimBetweenAudits = true, claimHandler = null, taskTypes = null, explicitCheck = false, auditDepth = 'quick' }) {
+  const [{ getAppById }, { getProviderById }, { resolveBurnProvider }] = await Promise.all([
+    import('./apps.js'), import('./providers.js'), import('./scheduledHandlers/providerPick.js'),
+  ]);
+  const [app, provider] = await Promise.all([getAppById(appId), getProviderById(providerId)]);
+  if (!app || app.archived === true) throw new ServerError(`managed app "${appId}" is not available`, { status: 400, code: 'MAINTENANCE_RUN_APP_UNAVAILABLE' });
+  const familyId = familyForProvider(provider);
+  const pinned = await resolveBurnProvider({ job: { providerId }, family: manualBurnFamily(familyId) });
+  if (!pinned) throw new ServerError(unavailableProvider(providerId), { status: 400, code: 'MAINTENANCE_RUN_PROVIDER_UNAVAILABLE' });
+  // Deep launches never drain unrelated work, and a checkpoint requires explicit resume.
+  if (auditDepth === 'deep') taskTypes = taskTypes || [...MAINTENANCE_TASK_ORDER];
+  // File-only runs never validate or retain a hidden claim selection.
+  const effectiveClaimHandler = !taskTypes && (mode === 'fix' || claimBetweenAudits) ? claimHandler : null;
+  let claimFamilyId = familyId;
+  if (effectiveClaimHandler) {
+    claimFamilyId = familyForProvider(await getProviderById(effectiveClaimHandler.providerId));
+    const claimProvider = await resolveBurnProvider({ job: effectiveClaimHandler, family: manualBurnFamily(claimFamilyId) });
+    if (!claimProvider) throw new ServerError(unavailableProvider(effectiveClaimHandler.providerId), { status: 400, code: 'MAINTENANCE_RUN_PROVIDER_UNAVAILABLE' });
+  }
+  if (!taskTypes) await assertNoRunningRun(appId);
+
+  // Older clients may omit this field. An explicit quality fix must fail safe
+  // to drafts; inheriting a potentially merging policy requires a named choice.
+  prCompletion = prCompletion === 'inherit' ? null : prCompletion ?? (taskTypes && mode === 'fix' ? 'draft' : null);
+
+  const id = `maint-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  const now = new Date().toISOString();
+  const pins = { providerId, model: model || null, effort: effort || null };
+  const run = await insertRun({
+    id, appId, familyId, claimFamilyId, ...pins, prCompletion,
+    taskTypes, ...(auditDepth === 'deep' ? { auditDepth, auditWorkflow: EXTENDED_AUDIT_WORKFLOW } : {}),
+    status: MAINTENANCE_RUN_STATUS.RUNNING,
+    steps: buildMaintenanceSteps({ appId, idPrefix: id, ...pins, mode, prCompletion, claimBetweenAudits, claimHandler: effectiveClaimHandler, taskTypes, explicitCheck, auditDepth }),
+    completed: {},
+    active: null,
+    reason: null,
+    startedAt: now, updatedAt: now, finishedAt: null,
+  });
+  console.log(`🧹 Maintenance run ${id} started for ${appId} via ${providerId}`);
+  const result = await evaluateOrHold(id);
+  return { run: await getMaintenanceRun(id) || run, result };
+}
+
+/**
+ * The evaluation a route awaits. A throw inside the walk (an unreadable
+ * schedule, a failed request write) is recorded as the run's hold instead of
+ * escaping: the record is already on disk as `running`, so a 500 here would
+ * leave a run the page never showed, that the sweep then dispatches.
+ */
+const evaluateOrHold = (id) => evaluateMaintenanceRun(id).catch(async (err) => {
+  console.error(`❌ Maintenance run ${id} evaluation failed: ${err.message}`);
+  await patchRun(id, { reason: err.message });
+  return { dispatched: false, reason: err.message };
+});
+
+/**
+ * Stop dispatching. A task already queued or running is NOT recalled — the
+ * daemon owns it — so the run's last step may still finish; it just advances
+ * nothing afterwards. `resume` picks the ladder up from its completion ledger.
+ */
+export function stopMaintenanceRun(id) {
+  return perRun(id, async () => {
+    const run = await getMaintenanceRun(id);
+    if (!run) return null;
+    if (run.status !== MAINTENANCE_RUN_STATUS.RUNNING) return run;
+    console.log(`🧹 Maintenance run ${id} stopped by the user`);
+    return patchRun(id, { status: MAINTENANCE_RUN_STATUS.STOPPED, finishedAt: new Date().toISOString(), reason: 'stopped by the user' });
+  });
+}
+
+/** Archiving only hides history; restoration never resumes execution. */
+export function setMaintenanceRunArchived(id, { appId, archived }) {
+  return perRun(id, async () => {
+    const run = await getMaintenanceRun(id);
+    if (!run || run.appId !== appId) return null;
+    if (run.status === MAINTENANCE_RUN_STATUS.RUNNING) throw new ServerError('Stop the run before archiving its history', { status: 409, code: 'MAINTENANCE_RUN_ACTIVE' });
+    if (archived) {
+      const [{ getAllTasks }, { getOnDemandRequests }] = await Promise.all([import('./cosTaskStore.js'), import('./taskSchedule.js')]);
+      // Match dispatch's queue -> handoff -> task read order across preparation.
+      const queued = (await getOnDemandRequests()).some(request => request?.burn?.maintenanceRunId === id);
+      const preparing = Object.values(await getOnDemandHandoffs()).some(claim => claim.request.burn?.maintenanceRunId === id && claim.status === 'preparing');
+      const { user, cos } = await getAllTasks();
+      const outstanding = [...(user?.tasks || []), ...(cos?.tasks || [])].some(task => quotaBurnProvenance(task.metadata).maintenanceRunId === id && ACTIVE_TASK_STATUSES.has(task.status));
+      if (queued || preparing || outstanding) throw new ServerError('Wait for this run’s outstanding work to finish before archiving', { status: 409, code: 'MAINTENANCE_RUN_ACTIVE' });
+    }
+    if (Boolean(run.archivedAt) === archived) return run;
+    return patchRun(id, { archivedAt: archived ? new Date().toISOString() : null, historyRetained: true }, { historyOnly: true });
+  });
+}
+
+/** Editing shares the dispatch queue: a stale browser cannot change a started step. */
+export function updateMaintenanceStep(id, stepId, { providerId, model, effort = null }) {
+  return perRun(id, async () => {
+    const run = await getMaintenanceRun(id);
+    const step = run?.steps.find(entry => entry.id === stepId);
+    if (!step) return null;
+    if (run.status !== MAINTENANCE_RUN_STATUS.RUNNING || run.completed?.[stepId] || step.startedAt || run.active?.stepId === stepId) {
+      throw new ServerError('Only pending stages in a running maintenance run can be edited', { status: 409, code: 'MAINTENANCE_STEP_STARTED' });
+    }
+    const [{ getProviderById }, { resolveBurnProvider }] = await Promise.all([
+      import('./providers.js'), import('./scheduledHandlers/providerPick.js'),
+    ]);
+    const familyId = familyForProvider(await getProviderById(providerId));
+    const provider = await resolveBurnProvider({ job: { providerId }, family: manualBurnFamily(familyId) });
+    if (!provider) throw new ServerError(unavailableProvider(providerId), { status: 400, code: 'MAINTENANCE_RUN_PROVIDER_UNAVAILABLE' });
+    // `familyId` is written even when null (`familyForProvider` returns string
+    // or null, never undefined) — the step is now pinned OUTSIDE every family,
+    // and `stepBurnFamily` reads a present-but-null key as that decision rather
+    // than as "nothing recorded here, inherit the run's family".
+    return patchRun(id, { steps: run.steps.map(entry => entry.id === stepId
+      ? { ...entry, familyId, overrides: { ...entry.overrides, providerId, model, effort } }
+      : entry) });
+  });
+}
+
+// Prefer the exact request recorded by this run. Timestamp order is only a
+// recovery fallback for a crash between enqueue and recording run.active.
+function latestRunHandoff(run, handoffs) {
+  if (run.active?.requestId) return handoffs[run.active.requestId] ?? null;
+  return Object.values(handoffs).filter(claim => claim.request.burn?.maintenanceRunId === run.id)
+    .sort((a, b) => b.claimedAt.localeCompare(a.claimedAt))[0] ?? null;
+}
+
+export async function resumeMaintenanceRun(id) {
+  const resumed = await perRun(id, async () => {
+    const run = await getMaintenanceRun(id);
+    if (run?.archivedAt) throw new ServerError('Restore archived history before resuming', { status: 409, code: 'MAINTENANCE_RUN_ARCHIVED' });
+    if (run && isLegacyDeepAudit(run)) throw new ServerError('Historical Deep certification runs are read-only; start a new Deep audit', { status: 409, code: 'DEEP_AUDIT_HISTORICAL' });
+    if (!run || run.status === MAINTENANCE_RUN_STATUS.RUNNING) return { run, alreadyRunning: true };
+    if (!run.taskTypes) await assertNoRunningRun(run.appId);
+    console.log(`🧹 Maintenance run ${id} resumed`);
+    const prior = latestRunHandoff(run, await getOnDemandHandoffs());
+    const acknowledgedRequestId = prior
+      ? (['refused', 'interrupted'].includes(prior.status) ? prior.request.id : run.acknowledgedRequestId ?? null)
+      : run.active?.requestId ?? run.acknowledgedRequestId ?? null;
+    return { run: await patchRun(id, {
+      status: MAINTENANCE_RUN_STATUS.RUNNING, finishedAt: null, reason: null, acknowledgedRequestId,
+    }) };
+  });
+  if (!resumed.run) return null;
+  if (resumed.alreadyRunning) return { run: resumed.run, result: { dispatched: false, reason: 'Maintenance run is already running' } };
+  const result = await evaluateOrHold(id);
+  return { run: await getMaintenanceRun(id), result };
+}
+
+/**
+ * Evaluate one run: dispatch its next step if nothing of its own is still
+ * queued, running or blocked, mark a drained claim step done, or record why it
+ * is holding. Serialized per run with every other transition; the returned
+ * promise is the outcome of THIS caller's evaluation. `completeStepId` records
+ * an audit step's successful agent in the same queued turn, so no walk can read
+ * the ledger between the completion and the evaluation it triggers.
+ */
+export const evaluateMaintenanceRun = (id, { ignoreTaskId = null, completeStepId = null } = {}) => perRun(id, async () => {
+  if (completeStepId) {
+    const run = await getMaintenanceRun(id);
+    if (isLegacyDeepAudit(run) && run.deepAudits?.[completeStepId]?.complete !== true) {
+      return { dispatched: false, reason: 'Deep coverage and delivery are incomplete' };
+    }
+    await patchRun(id, { completed: { [completeStepId]: new Date().toISOString() }, active: null });
+  }
+  return evaluate(id, { ignoreTaskId });
+});
+
+async function holdRun(id, run, reason, patch = null) {
+  if (patch || run.reason !== reason) await patchRun(id, { ...patch, reason });
+  return { dispatched: false, reason };
+}
+
+async function holdForOutstandingWork(id, run, ignoreTaskId) {
+  const [{ getAllTasks }, { getOnDemandRequests }] = await Promise.all([import('./cosTaskStore.js'), import('./taskSchedule.js')]);
+  // Observe queue -> handoff -> task in causal order: preparation may advance
+  // between reads, but cannot disappear between two snapshots.
+  const queued = (await getOnDemandRequests()).find((request) => request?.burn?.maintenanceRunId === id);
+  const handoffs = await getOnDemandHandoffs();
+  const { user, cos } = await getAllTasks();
+  const ownTask = [...(user?.tasks || []), ...(cos?.tasks || [])].find((task) => task.id !== ignoreTaskId
+    && !(task.status === 'blocked' && run.deepCheckpointTaskIds?.includes(task.id))
+    && quotaBurnProvenance(task.metadata).maintenanceRunId === id && ACTIVE_TASK_STATUSES.has(task.status));
+  if (ownTask) {
+    const { loadState } = await import('./cosState.js');
+    const state = await loadState();
+    const agent = Object.values(state.agents || {}).find(entry => entry.taskId === ownTask.id && entry.status === 'running');
+    return holdRun(id, run, `waiting for ${ownTask.status.replace('_', ' ')} task ${ownTask.id}`, {
+      active: { ...run.active, taskId: ownTask.id, agentId: agent?.id || run.active?.agentId || null, status: ownTask.status },
+    });
+  }
+  if (queued) return holdRun(id, run, `waiting for the CoS daemon to accept request ${queued.id} (${queued.taskType})`);
+  const preparing = Object.values(handoffs).find(claim => claim.request.burn?.maintenanceRunId === id && claim.status === 'preparing');
+  if (preparing) return holdRun(id, run, `waiting for request preparation ${preparing.request.id}`);
+  const outcome = latestRunHandoff(run, handoffs);
+  if (outcome && ['refused', 'interrupted'].includes(outcome.status) && run.acknowledgedRequestId !== outcome.request.id) {
+    return holdRun(id, run, outcome.reason, { status: MAINTENANCE_RUN_STATUS.STOPPED, finishedAt: new Date().toISOString() });
+  }
+  // Pre-upgrade requests have no handoff receipt. Absence is uncertainty,
+  // never proof that it is safe to automatically repeat a Deep invocation.
+  if (run.auditDepth === 'deep' && run.active?.status === 'queued' && run.active.requestId && run.acknowledgedRequestId !== run.active.requestId && !outcome) {
+    return holdRun(id, run, 'Request outcome is unavailable; resume explicitly.', {
+      status: MAINTENANCE_RUN_STATUS.STOPPED, finishedAt: new Date().toISOString(),
+    });
+  }
+  return null;
+}
+
+/** Advance a step already completed in the ledger, or a drain proven empty. */
+async function advanceCompletedOrDrainedStep(step, { completed, catalog, ignoreTaskId }) {
+  if (completed[step.id]) return { advanced: true };
+  const shape = sequenceStepShapeReason(step);
+  if (shape) return { hold: true, reason: shape };
+  if (step.drain) {
+    const probe = await probeSequenceDrain(step, { catalog, ignoreTaskId });
+    if (probe.drained) {
+      completed[step.id] = new Date().toISOString();
+      return { advanced: true };
+    }
+    if (!probe.job) return { hold: true, reason: probe.reason };
+  }
+  return { advanced: false };
+}
+
+/** Dispatch one applicable step, recording skips or the queued active step. */
+async function dispatchApplicableStep(id, run, step, { completed, skipped, catalog }) {
+  const result = await invokeQuotaBurnStep({ step, family: stepBurnFamily(step, run), catalog, maintenanceRunId: id });
+  // An audit this repository cannot have findings for is COMPLETED as
+  // skipped: holding on it would leave the step pending forever, since the
+  // verdict will not change on the next evaluation.
+  if (result.code === QUOTA_BURN_UNAVAILABLE.NOT_APPLICABLE) {
+    completed[step.id] = new Date().toISOString();
+    skipped[step.id] = result.reason;
+    console.log(`⏭️ Maintenance run ${id}: skipped ${step.taskRef.taskType} (${step.id}) — ${result.reason}`);
+    return { skipped: true };
+  }
+  if (!result.dispatched) return holdRun(id, run, result.reason, { completed, skipped });
+  const taskType = step.taskRef.taskType;
+  await patchRun(id, {
+    completed,
+    skipped,
+    steps: run.steps.map(entry => entry.id === step.id ? { ...entry, startedAt: entry.startedAt || new Date().toISOString() } : entry),
+    reason: null,
+    active: { stepId: step.id, taskType, status: 'queued', requestId: result.awaiting?.requestId ?? null, at: new Date().toISOString() },
+  });
+  console.log(`🧹 Maintenance run ${id}: dispatched ${taskType} (${step.id})`);
+  return { dispatched: true, stepId: step.id, taskType, summary: result.summary };
+}
+
+async function finishExhaustedSequence(id, run, { completed, skipped }) {
+  // Name the skips in the reason the run view shows: a run whose only selected
+  // check did not apply would otherwise finish as a bare "complete" with no
+  // explanation of why nothing ran.
+  const skippedCount = Object.keys(skipped).length;
+  const reason = skippedCount
+    ? `maintenance sequence complete — skipped ${pluralize(skippedCount, 'check that does', 'checks that do')} not apply to this repository`
+    : 'maintenance sequence complete';
+  await patchRun(id, {
+    completed, skipped, active: null, reason,
+    status: MAINTENANCE_RUN_STATUS.COMPLETED, finishedAt: new Date().toISOString(),
+  });
+  console.log(`🧹 Maintenance run ${id} complete for ${run.appId}`);
+  return { dispatched: false, completed: true, reason };
+}
+
+async function evaluate(id, { ignoreTaskId }) {
+  const run = await getMaintenanceRun(id);
+  if (!run) return { skipped: 'unknown run' };
+  if (isLegacyDeepAudit(run)) return holdRun(id, run, 'Historical Deep certification run; no further dispatch. Evidence remains available.');
+  if (run.status !== MAINTENANCE_RUN_STATUS.RUNNING) return { skipped: run.status };
+
+  const outstanding = await holdForOutstandingWork(id, run, ignoreTaskId);
+  if (outstanding) return outstanding;
+
+  const catalog = await getQuotaBurnTaskCatalog({ manual: true });
+  const completed = { ...run.completed };
+  // Persist advances already made in this pass if a later step holds, while
+  // an unchanged hold costs no write or broadcast.
+  const skipped = { ...run.skipped };
+  const ledger = () => (Object.keys(completed).length !== Object.keys(run.completed || {}).length ? { completed, skipped } : null);
+  for (const step of run.steps) {
+    const advance = await advanceCompletedOrDrainedStep(step, { completed, catalog, ignoreTaskId });
+    if (advance.advanced) continue;
+    if (advance.hold) return holdRun(id, run, advance.reason, ledger());
+    const result = await dispatchApplicableStep(id, run, step, { completed, skipped, catalog });
+    if (result.skipped) continue;
+    return result;
+  }
+  return finishExhaustedSequence(id, run, { completed, skipped });
+}
+
+/**
+ * Continuation. An audit step is done when its agent SUCCEEDS; a failed agent
+ * leaves its task blocked, which the next evaluation reports as a hold until
+ * the user retries or dismisses it. A drain step is never completed here — the
+ * claim probe decides that on the evaluation this triggers.
+ */
+function onMaintenanceAgentCompleted(agent) {
+  const id = agent?.metadata?.taskQuotaBurnMaintenanceRunId;
+  if (!id) return null;
+  // A relaunch hands this step's task to a continuation rather than ending it.
+  // Evaluating here would report the step as a hold the user has to retry or
+  // dismiss, for a run that is already on its way back out on a new provider.
+  // The continuation's own completion is the one that advances the run.
+  //
+  // Gated on `isQueuedContinuation`, not the bare `isAgentHandoff`: a stranded
+  // pause retirement also stamps `resumed: true` with nothing requeued, so
+  // there is no continuation completion coming to advance this run — returning
+  // `null` here left the step (and the whole run) stuck on hold (#7469).
+  if (isQueuedContinuation(agent)) return null;
+  const stepId = agent.metadata?.taskQuotaBurnStepId;
+  const success = agent.result?.success === true;
+  return getMaintenanceRun(id)
+    .then(async (run) => {
+      if (!run) return { skipped: 'unknown run' };
+      if (isLegacyDeepAudit(run)) {
+        return perRun(id, async () => {
+          const current = await getMaintenanceRun(id);
+          const proof = agent.result?.deepAudit || agent.metadata?.deepAudit || { complete: false, reason: 'Deep checkpoint missing' };
+          // Duplicate events cannot stop a resumed run or regress its newer proof.
+          if (agent.id && current.deepCheckpointAgentIds?.includes(agent.id)) return { skipped: 'checkpoint already recorded' };
+          return patchRun(id, { status: MAINTENANCE_RUN_STATUS.STOPPED, active: null,
+            deepAudits: { ...current.deepAudits, [stepId]: proof },
+            deepCheckpointTaskIds: [...new Set([...(current.deepCheckpointTaskIds || []), agent.taskId].filter(Boolean))],
+            deepCheckpointAgentIds: [...(current.deepCheckpointAgentIds || []), agent.id].filter(Boolean),
+            ...(proof.complete && success ? { completed: { [stepId]: new Date().toISOString() } } : {}),
+            reason: proof.complete && success ? 'Deep step complete; resume to continue remaining checks' : `Deep audit partial — ${proof.reason || 'required evidence or delivery missing'}. Resume explicitly to continue.`,
+            finishedAt: new Date().toISOString() });
+        });
+      }
+      const step = run.steps.find((entry) => entry.id === stepId);
+      const completeStepId = success && step && !step.drain ? step.id : null;
+      return evaluateMaintenanceRun(id, { ignoreTaskId: success ? agent.taskId || null : null, completeStepId });
+    })
+    .catch((err) => console.error(`❌ Maintenance run ${id} continuation failed: ${err.message}`));
+}
+
+function onMaintenanceAgentSpawned(agent) {
+  const id = agent?.metadata?.taskQuotaBurnMaintenanceRunId;
+  if (!id) return;
+  return perRun(id, async () => {
+    const run = await getMaintenanceRun(id);
+    if (!run) return;
+    await patchRun(id, {
+      active: { ...run.active, stepId: agent.metadata.taskQuotaBurnStepId, agentId: agent.id, taskId: agent.taskId, status: 'running' },
+      reason: run.status === MAINTENANCE_RUN_STATUS.RUNNING ? null : run.reason,
+    });
+  }).catch(err => console.error(`❌ Maintenance agent status update failed: ${err.message}`));
+}
+
+async function retryRunningRuns() {
+  const running = (await listMaintenanceRuns()).filter((run) => run.status === MAINTENANCE_RUN_STATUS.RUNNING);
+  for (const run of running) {
+    await evaluateMaintenanceRun(run.id).catch((err) => console.error(`❌ Maintenance run ${run.id} retry failed: ${err.message}`));
+  }
+}
+
+/** Arm the continuation listener and the safety-net interval. Called once at boot. */
+export function startMaintenanceRunScheduler() {
+  if (retryTimer) return;
+  // Both run outside the request lifecycle: the listener never rethrows and the
+  // timer's callback owns its rejections, so neither can take the process down.
+  cosEvents.on('agent:completed', onMaintenanceAgentCompleted);
+  cosEvents.on('agent:spawned', onMaintenanceAgentSpawned);
+  retryTimer = setInterval(() => {
+    retryRunningRuns().catch((err) => console.error(`❌ Maintenance run retry sweep failed: ${err.message}`));
+  }, RETRY_MS);
+  retryTimer.unref?.();
+  console.log('🧹 Maintenance run loop armed (idle until a run is started from the Schedule tab)');
+}
+
+/** Test seams. */
+export const __onMaintenanceAgentSpawned = onMaintenanceAgentSpawned;
+export const __onMaintenanceAgentCompleted = onMaintenanceAgentCompleted;
+export const __retryMaintenanceRuns = retryRunningRuns;
+export function __resetMaintenanceRunScheduler() {
+  if (retryTimer) clearInterval(retryTimer);
+  retryTimer = null;
+  cosEvents.off('agent:completed', onMaintenanceAgentCompleted);
+  cosEvents.off('agent:spawned', onMaintenanceAgentSpawned);
+  perRun.clear();
+}

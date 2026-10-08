@@ -1,0 +1,95 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+const mockReadJSONFile = vi.fn();
+const mockAtomicWrite = vi.fn();
+const mockEnsureDir = vi.fn();
+
+vi.mock('../../lib/fileUtils.js', () => ({
+tryReadFile: vi.fn().mockResolvedValue(null),
+  PATHS: { data: '/fake/data' },
+  readJSONFile: (...args) => mockReadJSONFile(...args),
+  atomicWrite: (...args) => mockAtomicWrite(...args),
+  ensureDir: (...args) => mockEnsureDir(...args),
+}));
+
+vi.mock('../mediaCollections.js', () => ({
+  createCollection: vi.fn(async () => ({ id: 'col-smoke' })),
+}));
+
+// Mock the platform-default model resolver — real one reads
+// data/media-models.json which doesn't exist in tests.
+vi.mock('../../lib/mediaModels.js', () => ({
+  getDefaultVideoModelId: () => 'ltx23_distilled_q4',
+}));
+
+// createProject (via local.js) now imports catalogDB for the #1808 catalog-seed
+// path; mock it so the smoke test doesn't pull in the real Postgres/instances/
+// peer-sync chain (the smoke project passes no catalogIngredientIds).
+vi.mock('../catalogDB.js', () => ({
+  resolveIngredientsByIds: vi.fn(async () => []),
+  linkIngredientsToCreativeDirector: vi.fn(async () => []),
+  cdRefRoleForType: (type) => type,
+}));
+
+const { createSmokeTestProject } = await import('./smokeTest.js');
+
+beforeEach(() => {
+  // Persisted file starts empty; each save returns the latest snapshot.
+  let snapshot = [];
+  mockReadJSONFile.mockReset().mockImplementation(async () => snapshot);
+  mockAtomicWrite.mockReset().mockImplementation(async (_path, data) => {
+    snapshot = data;
+  });
+  mockEnsureDir.mockReset().mockResolvedValue(undefined);
+});
+
+describe('createSmokeTestProject', () => {
+  it('creates a deterministic 3-scene project with disableAudio=true and autoAcceptScenes=true', async () => {
+    const project = await createSmokeTestProject();
+    expect(project.disableAudio).toBe(true);
+    expect(project.autoAcceptScenes).toBe(true);
+    expect(project.aspectRatio).toBe('1:1-small');
+    expect(project.quality).toBe('draft');
+    expect(project.targetDurationSeconds).toBe(6);
+    expect(project.treatment.scenes).toHaveLength(3);
+    // Lock per-scene durations so a future tweak (e.g. 2s → 3s) gets caught.
+    // Smoke run total compute is O(scenes × duration² × resolution²) — drift
+    // here makes the health check silently expensive without anyone noticing.
+    for (const scene of project.treatment.scenes) {
+      expect(scene.durationSeconds).toBe(2);
+    }
+  });
+
+  it('scene 1 is text-to-video (no continuation, no source image)', async () => {
+    const project = await createSmokeTestProject();
+    const scene1 = project.treatment.scenes.find((s) => s.sceneId === 'scene-1');
+    expect(scene1.useContinuationFromPrior).toBe(false);
+    expect(scene1.sourceImageFile).toBeNull();
+    expect(scene1.prompt.toLowerCase()).toContain('red');
+  });
+
+  it('scene 2 continues from scene 1 with a color-change prompt', async () => {
+    const project = await createSmokeTestProject();
+    const scene2 = project.treatment.scenes.find((s) => s.sceneId === 'scene-2');
+    expect(scene2.useContinuationFromPrior).toBe(true);
+    expect(scene2.prompt.toLowerCase()).toContain('blue');
+    // Negative prompt should explicitly reject the prior color so the i2v
+    // doesn't drift back to red.
+    expect(scene2.negativePrompt.toLowerCase()).toContain('red');
+  });
+
+  it('scene 3 is a pure continuation of scene 2 (same prompt)', async () => {
+    const project = await createSmokeTestProject();
+    const scene2 = project.treatment.scenes.find((s) => s.sceneId === 'scene-2');
+    const scene3 = project.treatment.scenes.find((s) => s.sceneId === 'scene-3');
+    expect(scene3.useContinuationFromPrior).toBe(true);
+    expect(scene3.prompt).toBe(scene2.prompt);
+  });
+
+  it('respects overrides (e.g. flip autoAcceptScenes off for a real-evaluator dry run)', async () => {
+    const project = await createSmokeTestProject({ autoAcceptScenes: false });
+    expect(project.autoAcceptScenes).toBe(false);
+    // Other defaults still applied.
+    expect(project.disableAudio).toBe(true);
+  });
+});

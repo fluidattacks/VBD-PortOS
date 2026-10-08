@@ -1,0 +1,526 @@
+const deep = vi.hoisted(() => ({ checkpointDeepAudit: vi.fn(async () => ({ id: 'deep-1', complete: false, reason: 'Checkpoint partial' })), settleDeepAuditDelivery: vi.fn(async () => ({ id: 'deep-1', complete: false, reason: 'Checkpoint partial' })) }));
+vi.mock('./deepAudit.js', () => deep);
+vi.mock('../lib/gitCommitProbe.js', () => ({ committedDuringRun: vi.fn(async () => false) }));
+vi.mock('./appQuality.js', () => ({ recordAuditQuality: vi.fn(async () => true) }));
+import { recordAuditQuality } from './appQuality.js';
+// Hoisted doubles rather than static imports: the audit path reaches both modules
+// lazily, and importing them here would drag their subtrees into this suite's closure.
+const appsRegistry = vi.hoisted(() => ({ getAppById: vi.fn(async () => null) }));
+vi.mock('./apps.js', () => appsRegistry);
+const snapshotFile = vi.hoisted(() => ({ publishAppQualitySnapshot: vi.fn(async () => ({ published: true, hash: 'abc1234' })) }));
+vi.mock('./appQualitySnapshotFile.js', () => snapshotFile);
+// The goal-fidelity gate (#5994) reaches a local model at completion. Pinned OFF
+// here so these tests exercise the path they are about without depending on the
+// developer's own reviewer settings — and so a machine that HAS a local reviewer
+// configured never has its suite dispatch a real review request.
+vi.mock('./codeReview.js', async (importOriginal) => ({
+  ...(await importOriginal()),
+  getGoalFidelityConfig: vi.fn(async () => null),
+}));
+
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { readFileSync } from 'fs';
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
+
+vi.mock('./cosAgentLifecycle.js', () => ({
+  getAgent: vi.fn(),
+  getAgentRecord: vi.fn(async () => null),
+  updateAgent: vi.fn(),
+  completeAgent: vi.fn(),
+}));
+
+vi.mock('./taskTypeHooks.js', () => ({
+  canRunTaskOutputHookWithoutPayload: vi.fn(() => true),
+  getTaskOutputHook: vi.fn(),
+  getTaskOutputPayloadPredicate: vi.fn(async () => null),
+  declaresNoCommitCriterion: vi.fn(() => false),
+  isClaimFlowDispatch: vi.fn(() => false),
+  isProgrammaticIoTaskType: vi.fn(() => true),
+  resolveTaskHookType: vi.fn(task => task?.metadata?.analysisType || null),
+}));
+
+import { getAgent, getAgentRecord, updateAgent, completeAgent } from './cosAgentLifecycle.js';
+import { canRunTaskOutputHookWithoutPayload, getTaskOutputHook, isProgrammaticIoTaskType } from './taskTypeHooks.js';
+import {
+  finalizeAgent,
+  dispatchRecoveredTaskOutputHook,
+  dispatchTaskOutputHookOnce,
+} from './agentFinalization.js';
+
+
+vi.mock('./cos.js', () => ({
+  updateTask: vi.fn(async () => ({})),
+  addTask: vi.fn(async () => ({ id: 'investigation-test' })),
+}));
+vi.mock('./investigationTaskProducer.js', () => ({
+  investigationCircuitOpen: vi.fn(() => false),
+  noteInvestigationFiled: vi.fn(),
+  readAllTasksFlat: vi.fn(async () => []),
+  recentInvestigationCreations: vi.fn(() => []),
+}));
+vi.mock('./agentErrorAnalysis.js', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, resolveFailedTaskUpdate: vi.fn(actual.resolveFailedTaskUpdate) };
+});
+vi.mock('./agentRunTracking.js', () => ({ completeAgentRun: vi.fn(async () => null) }));
+vi.mock('./agentCompletion.js', () => ({ processAgentCompletion: vi.fn(async () => null) }));
+vi.mock('./cosEvents.js', () => ({ emitLog: vi.fn(), cosEvents: { emit: vi.fn(), on: vi.fn() } }));
+import { emitLog } from './cosEvents.js';
+vi.mock('./taskSchedule.js', () => ({
+  recordTaskTypeFailure: vi.fn(async () => null),
+  recordTaskTypeSuccess: vi.fn(async () => null),
+}));
+import { updateTask, addTask } from './cos.js';
+import { completeAgentRun } from './agentRunTracking.js';
+import { MAX_TASK_RETRIES, resolveFailedTaskUpdate } from './agentErrorAnalysis.js';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const MANAGEMENT_SOURCE = readFileSync(join(__dirname, 'agentManagement.js'), 'utf8');
+const LIFECYCLE_SOURCE = readFileSync(join(__dirname, 'agentLifecycle.js'), 'utf8');
+// The orphan sweep and post-restart recovery both retire through the shared
+// `retireDeadAgent` (#8440) now, so its own ordering is the thing to pin — see
+// the source-text tests just below.
+const FINALIZATION_SOURCE = readFileSync(join(__dirname, 'agentFinalization.js'), 'utf8');
+const TASK = {
+  id: 'sys-example',
+  taskType: 'internal',
+  metadata: {
+    analysisType: 'example-output-hook',
+    app: 'app-example',
+    repoPath: '/example/repo',
+  },
+};
+
+describe('recovery output-hook dispatch (#3182)', () => {
+  let persistedAgent;
+  let hook;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    persistedAgent = {
+      id: 'agent-example',
+      status: 'running',
+      startedAt: '2026-09-10T00:00:00Z',
+      metadata: {},
+    };
+    getAgent.mockImplementation(async () => persistedAgent);
+    getAgentRecord.mockImplementation(async () => persistedAgent);
+    updateAgent.mockImplementation(async (_agentId, updates) => {
+      persistedAgent = {
+        ...persistedAgent,
+        metadata: { ...persistedAgent.metadata, ...updates.metadata },
+      };
+      return persistedAgent;
+    });
+    hook = vi.fn().mockResolvedValue({ recorded: true });
+    getTaskOutputHook.mockResolvedValue(hook);
+  });
+
+  it('captures audit telemetry on the shared completion path without waiving fix-mode delivery criteria', async () => {
+    const task = { ...TASK, metadata: { ...TASK.metadata, analysisType: 'better-complexity' } };
+    await expect(dispatchTaskOutputHookOnce({ agentId: 'agent-audit', task, success: true, workspacePath: '/worktree' }))
+      .resolves.toEqual({ ran: false, auditAssessment: { status: 'recorded' } });
+    expect(recordAuditQuality).toHaveBeenCalledWith({ task, taskType: 'better-complexity', agentId: 'agent-audit', success: true, workspacePath: '/worktree', assessedAt: persistedAgent.startedAt });
+    expect(hook).not.toHaveBeenCalled();
+    expect(updateAgent).toHaveBeenCalledWith('agent-audit', { metadata: { auditAssessment: { status: 'recorded' } } });
+  });
+
+  // Landing the app's `.quality.json` PR is opt-in and runs outside the request
+  // lifecycle, so it must never fire for an un-opted app nor fail a completion.
+  // Each dispatch needs its own agent id — dispatchTaskOutputHookOnce caches by id.
+  it.each(['draft', 'leave-open'])('retains measurements without publishing snapshots for %s, on completion', async prCompletion => {
+    const task = { ...TASK, metadata: { ...TASK.metadata, analysisType: 'security', prCompletion } };
+    appsRegistry.getAppById.mockResolvedValue({ id: 'app-example', repoPath: '/repo', publishQualitySnapshot: true });
+    snapshotFile.publishAppQualitySnapshot.mockClear();
+    await dispatchTaskOutputHookOnce({ agentId: `review-only-${prCompletion}`, task, success: true, workspacePath: '/worktree' });
+    expect(recordAuditQuality).toHaveBeenCalledWith(expect.objectContaining({ task, success: true }));
+    expect(snapshotFile.publishAppQualitySnapshot).not.toHaveBeenCalled();
+    await dispatchRecoveredTaskOutputHook({ agentId: persistedAgent.id, task, success: true });
+    expect(snapshotFile.publishAppQualitySnapshot).not.toHaveBeenCalled();
+  });
+
+  it('commits a repo snapshot only for an opted-in app that just recorded a measurement', async () => {
+    const task = { ...TASK, metadata: { ...TASK.metadata, analysisType: 'better-complexity' } };
+    let run = 0;
+    const dispatch = () => { persistedAgent.metadata = {}; return dispatchTaskOutputHookOnce({ agentId: `agent-snapshot-${run += 1}`, task, success: true, workspacePath: '/worktree' }); };
+    const optedIn = { id: 'app-example', repoPath: '/repo/example-app', publishQualitySnapshot: true };
+
+    appsRegistry.getAppById.mockResolvedValue(optedIn);
+    await expect(dispatch()).resolves.toEqual({ ran: false, auditAssessment: { status: 'recorded' } });
+    expect(snapshotFile.publishAppQualitySnapshot).toHaveBeenCalledWith(optedIn);
+
+    for (const app of [{ ...optedIn, publishQualitySnapshot: false }, { ...optedIn, publishQualitySnapshot: 'true' },
+      { id: 'app-example' }, null]) {
+      snapshotFile.publishAppQualitySnapshot.mockClear();
+      appsRegistry.getAppById.mockResolvedValue(app);
+      await dispatch();
+      expect(snapshotFile.publishAppQualitySnapshot).not.toHaveBeenCalled();
+    }
+
+    // A missing or invalid report records nothing, so there is nothing new to publish.
+    appsRegistry.getAppById.mockResolvedValue(optedIn);
+    recordAuditQuality.mockResolvedValueOnce(false);
+    await dispatch();
+    expect(snapshotFile.publishAppQualitySnapshot).not.toHaveBeenCalled();
+
+    // A locked index or an unreadable registry must not fail the completion.
+    snapshotFile.publishAppQualitySnapshot.mockRejectedValueOnce(new Error('index.lock exists'));
+    await expect(dispatch()).resolves.toEqual({ ran: false, auditAssessment: { status: 'recorded' } });
+    appsRegistry.getAppById.mockRejectedValueOnce(new Error('registry unreadable'));
+    await expect(dispatch()).resolves.toEqual({ ran: false, auditAssessment: { status: 'recorded' } });
+    for (const reason of ['index.lock exists', 'registry unreadable']) {
+      expect(emitLog).toHaveBeenCalledWith('error', `❌ Quality snapshot publish failed for app app-example: ${reason}`, { appId: 'app-example' });
+    }
+  });
+
+  it('records assessment failure independently and allows recovery to persist it later', async () => {
+    const task = { ...TASK, metadata: { ...TASK.metadata, analysisType: 'security' } };
+    recordAuditQuality.mockRejectedValueOnce(new Error('storage unavailable'));
+    const first = await dispatchTaskOutputHookOnce({ agentId: 'audit-recovery', task, success: true, workspacePath: '/worktree' });
+    expect(first).toEqual({ ran: false, auditAssessment: { status: 'persistence-failed' } });
+    expect(persistedAgent.metadata.auditAssessment.status).toBe('persistence-failed');
+    await expect(dispatchRecoveredTaskOutputHook({ agentId: 'audit-recovery', task, success: true, workspacePath: '/worktree' }))
+      .resolves.toEqual({ ran: false, auditAssessment: { status: 'recorded' } });
+    expect(persistedAgent.metadata.auditAssessment.status).toBe('recorded');
+    recordAuditQuality.mockClear();
+    await dispatchRecoveredTaskOutputHook({ agentId: 'audit-recovery', task, success: true });
+    expect(recordAuditQuality).not.toHaveBeenCalled();
+  });
+
+  it('retains a saved result when an older failure marker survived a metadata write error', async () => {
+    const task = { ...TASK, metadata: { ...TASK.metadata, analysisType: 'security' } };
+    persistedAgent.metadata.auditAssessment = { status: 'persistence-failed' };
+    persistedAgent.result = { auditAssessment: { status: 'recorded' } };
+    await expect(dispatchRecoveredTaskOutputHook({ agentId: 'saved-result', task, success: true }))
+      .resolves.toEqual({ ran: false, auditAssessment: { status: 'recorded' } });
+    expect(recordAuditQuality).not.toHaveBeenCalled();
+  });
+
+  it('persists assessment and delivery verdicts without rewriting a clean execution', async () => {
+    isProgrammaticIoTaskType.mockImplementation(type => type !== 'security');
+    const task = { ...TASK, metadata: { ...TASK.metadata, analysisType: 'security' } };
+    recordAuditQuality.mockResolvedValueOnce(false);
+    await finalizeAgent({ agentId: 'audit-final', task, success: true, exitCode: 0, duration: 1000,
+      workspacePath: '/missing-audit-worktree', startedAt: Date.now() - 1000, outputBuffer: 'Audit complete' });
+    expect(completeAgent).toHaveBeenCalledWith('audit-final', expect.objectContaining({
+      success: true, validationPassed: false, auditAssessment: { status: 'not-recorded' },
+    }));
+    isProgrammaticIoTaskType.mockReturnValue(true);
+  });
+
+  it.each([
+    ['markdown checkpoint', 'Reviewed this batch. Deep coverage remains incomplete.', 'Reviewed this batch. Deep coverage remains incomplete.'],
+    ['structured checkpoint', JSON.stringify({ summary: 'Saved a partial checkpoint.', payload: null }), 'Saved a partial checkpoint.'],
+    ['missing summary', null, null],
+    ['terminal result fallback', null, 'Explicit terminal result.', 'Explicit terminal result.'],
+    ['sentinel precedence', 'Saved checkpoint.', 'Saved checkpoint.', 'Provider terminal response.'],
+    ['fenced valid envelope', '```json\n{"summary":"Fenced completion."}\n```', 'Fenced completion.'],
+    ['fenced malformed envelope', '```json\n{"summary":\n```', null],
+    ['malformed envelope', '{"summary":', null],
+    ['invalid summary', JSON.stringify({ summary: { text: 'not a string' } }), null],
+  ])('persists only explicit completion text for a resumed Deep %s', async (_label, sentinel, expected, finalSummary = null) => {
+    const { mkdtemp, writeFile, rm } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const workspacePath = await mkdtemp(join(tmpdir(), 'completion-summary-'));
+    try {
+      if (sentinel !== null) await writeFile(join(workspacePath, '.agent-done-summary-example'), sentinel);
+      const task = { ...TASK, metadata: { ...TASK.metadata, auditDepth: 'deep', simplify: false } };
+      await finalizeAgent({ agentId: 'summary-example', task, success: true, exitCode: 0,
+        duration: 1000, workspacePath, finalSummary, outputBuffer: 'Thinking: inspect files\nexec\npython command output' });
+      expect(persistedAgent.metadata.taskSummary).toBe(expected);
+      expect(persistedAgent.metadata.simplifySummary).toBeNull();
+      expect(deep.checkpointDeepAudit).toHaveBeenCalled();
+    } finally {
+      await rm(workspacePath, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['sentinel', 'terminal-result', 'legacy'])('retains only authoritative %s summaries on repeat finalization after cleanup', async (source) => {
+    const { mkdtemp, writeFile, rm } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const workspacePath = await mkdtemp(join(tmpdir(), 'completion-replay-'));
+    const sentinelPath = join(workspacePath, '.agent-done-summary-replay');
+    persistedAgent.id = 'summary-replay';
+    const task = { ...TASK, metadata: { ...TASK.metadata, auditDepth: 'deep' } };
+    const finish = (finalSummary = null) => finalizeAgent({ agentId: 'summary-replay', task, success: true,
+      exitCode: 0, duration: 1000, workspacePath, finalSummary, outputBuffer: 'exec: tool output' });
+    try {
+      if (source === 'legacy') {
+        persistedAgent.metadata.taskSummary = 'Old heuristic tool transcript';
+      } else {
+        if (source === 'sentinel') await writeFile(sentinelPath, 'Saved partial completion.');
+        await finish(source === 'terminal-result' ? 'Saved partial completion.' : null);
+        expect(persistedAgent.metadata).toMatchObject({ taskSummary: 'Saved partial completion.', taskSummarySource: source });
+        await rm(sentinelPath, { force: true });
+      }
+      await finish();
+      expect(persistedAgent.metadata.taskSummary).toBe(source === 'legacy' ? null : 'Saved partial completion.');
+      expect(persistedAgent.metadata.taskSummarySource).toBe(source === 'legacy' ? null : source);
+    } finally {
+      await rm(workspacePath, { recursive: true, force: true });
+    }
+  });
+
+
+it('finishes extended Deep with an honest partial summary through ordinary completion without ledger gates', async () => {
+  const task = { ...TASK, metadata: { ...TASK.metadata, analysisType: 'security', auditDepth: 'deep', auditWorkflow: 'extended-v1', simplify: false } };
+  recordAuditQuality.mockResolvedValue(true);
+  await finalizeAgent({ agentId: 'extended-summary', task, success: true, exitCode: 0, duration: 1000,
+    workspacePath: '/example/repo', finalSummary: 'Investigated high-risk paths and fixed two coherent defects. Coverage remains partial.', outputBuffer: 'tool transcript' });
+  expect(deep.checkpointDeepAudit).not.toHaveBeenCalled();
+  expect(deep.settleDeepAuditDelivery).not.toHaveBeenCalled();
+  expect(updateTask).toHaveBeenCalledWith(task.id, expect.objectContaining({ status: 'completed' }), expect.anything());
+  expect(persistedAgent.metadata.taskSummary).toContain('Coverage remains partial');
+  expect(persistedAgent.metadata.taskSummarySource).toBe('terminal-result');
+});
+
+  it('parks a failed Deep attempt without the normal automatic retry path', async () => {
+    const task = { ...TASK, metadata: { ...TASK.metadata, analysisType: 'security', auditDepth: 'deep' } };
+    await finalizeAgent({ agentId: 'deep-failed', task, success: false, exitCode: 1, duration: 1000,
+      workspacePath: '/example/repo', startedAt: Date.now() - 1000, outputBuffer: 'Context exhausted',
+      errorAnalysis: { type: 'transient', retryable: true, error: 'context exhausted' } });
+    expect(resolveFailedTaskUpdate).not.toHaveBeenCalled();
+    expect(updateTask).toHaveBeenCalledWith(task.id, expect.objectContaining({ status: 'in_progress', metadata: expect.objectContaining({ retryPendingCleanup: expect.any(String) }) }), expect.anything());
+    expect(deep.checkpointDeepAudit).toHaveBeenCalledWith(expect.objectContaining({ success: false }));
+  });
+
+  it('distinguishes a clean execution with no usable assessment from a failed execution', async () => {
+    const task = { ...TASK, metadata: { ...TASK.metadata, analysisType: 'security' } };
+    recordAuditQuality.mockResolvedValue(false);
+    await expect(dispatchTaskOutputHookOnce({ agentId: 'audit-no-report', task, success: true, workspacePath: '/worktree' }))
+      .resolves.toEqual({ ran: false, auditAssessment: { status: 'not-recorded' } });
+    await expect(dispatchTaskOutputHookOnce({ agentId: 'audit-execution-failed', task, success: false, workspacePath: '/worktree' }))
+      .resolves.toEqual({ ran: false, auditAssessment: { status: 'not-attempted' } });
+    recordAuditQuality.mockResolvedValue(true);
+  });
+
+  it.each([
+    ['orphan cleanup', false],
+    ['post-restart completion', true],
+  ])('runs a registered processTaskOutput hook for %s with no stale sentinel payload', async (_path, success) => {
+    const result = await dispatchRecoveredTaskOutputHook({
+      agentId: persistedAgent.id,
+      task: TASK,
+      success,
+    });
+
+    expect(result).toEqual({ ran: true, outcome: { recorded: true } });
+    expect(hook).toHaveBeenCalledOnce();
+    expect(hook).toHaveBeenCalledWith(expect.objectContaining({
+      agentId: persistedAgent.id,
+      task: TASK,
+      appId: 'app-example',
+      success,
+      payload: null,
+      workspacePath: null,
+    }));
+    expect(updateAgent).toHaveBeenCalledWith(
+      persistedAgent.id,
+      { metadata: { outputHookDispatchedAt: expect.any(String) } },
+    );
+  });
+
+  it('deduplicates concurrent normal/recovery completion and persists the gate', async () => {
+    let finishHook;
+    hook.mockReturnValueOnce(new Promise(resolve => { finishHook = resolve; }));
+
+    const normal = dispatchTaskOutputHookOnce({
+      agentId: persistedAgent.id,
+      task: TASK,
+      success: true,
+      workspacePath: '/example/worktree',
+    });
+    const recovery = dispatchRecoveredTaskOutputHook({
+      agentId: persistedAgent.id,
+      task: TASK,
+      success: false,
+    });
+
+    expect(recovery).toBe(normal);
+    await vi.waitFor(() => expect(hook).toHaveBeenCalledOnce());
+    finishHook({ recorded: true });
+    await expect(normal).resolves.toEqual({ ran: true, outcome: { recorded: true } });
+
+    await expect(dispatchRecoveredTaskOutputHook({
+      agentId: persistedAgent.id,
+      task: TASK,
+      success: false,
+    })).resolves.toEqual({ ran: false, alreadyDispatched: true });
+    expect(hook).toHaveBeenCalledOnce();
+  });
+
+  it('keeps a timed-out hook recoverable until the original dispatch settles', async () => {
+    vi.useFakeTimers();
+    let finishHook;
+    hook.mockReturnValueOnce(new Promise(resolve => { finishHook = resolve; }));
+
+    const original = dispatchTaskOutputHookOnce({
+      agentId: persistedAgent.id,
+      task: TASK,
+      success: true,
+    });
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+
+    await expect(original).resolves.toEqual({ ran: false, timedOut: true });
+    expect(updateAgent).not.toHaveBeenCalled();
+    expect(dispatchRecoveredTaskOutputHook({
+      agentId: persistedAgent.id,
+      task: TASK,
+      success: false,
+    })).toBe(original);
+
+    finishHook({ recorded: true });
+    await vi.waitFor(() => expect(updateAgent).toHaveBeenCalledWith(
+      persistedAgent.id,
+      { metadata: { outputHookDispatchedAt: expect.any(String) } },
+    ));
+    vi.useRealTimers();
+
+    await expect(dispatchRecoveredTaskOutputHook({
+      agentId: persistedAgent.id,
+      task: TASK,
+      success: false,
+    })).resolves.toEqual({ ran: false, alreadyDispatched: true });
+    expect(hook).toHaveBeenCalledOnce();
+  });
+
+  it('does not dispatch after finalizeAgent persisted the explicit hook marker', async () => {
+    persistedAgent.metadata.outputHookDispatchedAt = new Date().toISOString();
+
+    await expect(dispatchRecoveredTaskOutputHook({
+      agentId: persistedAgent.id,
+      task: TASK,
+      success: false,
+    })).resolves.toEqual({ ran: false, alreadyDispatched: true });
+    expect(hook).not.toHaveBeenCalled();
+  });
+
+  it('still dispatches for an agent completed early by terminate/kill before finalizeAgent', async () => {
+    persistedAgent.status = 'completed';
+
+    await expect(dispatchTaskOutputHookOnce({
+      agentId: persistedAgent.id,
+      task: TASK,
+      success: false,
+    })).resolves.toEqual({ ran: true, outcome: { recorded: true } });
+    expect(hook).toHaveBeenCalledOnce();
+  });
+
+  it('does not persist a dispatch marker when recovery has no registered hook', async () => {
+    getTaskOutputHook.mockResolvedValueOnce(null);
+
+    await expect(dispatchRecoveredTaskOutputHook({
+      agentId: persistedAgent.id,
+      task: TASK,
+      success: false,
+    })).resolves.toEqual({ ran: false });
+    expect(updateAgent).not.toHaveBeenCalled();
+  });
+
+  it('does not invoke a payload-dependent hook when recovery cannot read a sentinel', async () => {
+    canRunTaskOutputHookWithoutPayload.mockReturnValueOnce(false);
+
+    await expect(dispatchRecoveredTaskOutputHook({
+      agentId: persistedAgent.id,
+      task: TASK,
+      success: true,
+    })).resolves.toEqual({ ran: false, recoveryPayloadUnavailable: true });
+    expect(hook).not.toHaveBeenCalled();
+    expect(updateAgent).not.toHaveBeenCalled();
+  });
+
+  it('reads a live completion from task.metadata.repoPath but denies a recovery run that fallback', async () => {
+    await dispatchTaskOutputHookOnce({ agentId: 'agent-live', task: TASK, success: true });
+    expect(hook).toHaveBeenCalledWith(expect.objectContaining({ workspacePath: '/example/repo' }));
+
+    persistedAgent.metadata = {};
+    canRunTaskOutputHookWithoutPayload.mockReturnValueOnce(false);
+    await expect(dispatchRecoveredTaskOutputHook({ agentId: 'agent-recovered', task: TASK, success: true }))
+      .resolves.toEqual({ ran: false, recoveryPayloadUnavailable: true });
+    expect(hook).toHaveBeenCalledOnce();
+  });
+});
+
+describe('recovery path wiring (#3182, #8440)', () => {
+  // Both recovery paths (the orphan sweep in agentManagement.js and post-restart
+  // recovery in agentLifecycle.js) call the shared `retireDeadAgent` (#8440) for
+  // this step list now, so the ordering guard moved to pin ITS body instead of
+  // each caller's inlined copy.
+  it('retireDeadAgent dispatches the output hook before marking the agent complete', () => {
+    const start = FINALIZATION_SOURCE.indexOf('export async function retireDeadAgent');
+    expect(start, 'retireDeadAgent must exist').toBeGreaterThan(-1);
+    const end = FINALIZATION_SOURCE.indexOf('\n}', start);
+    const body = FINALIZATION_SOURCE.slice(start, end);
+    expect(body.indexOf('dispatchRecoveredTaskOutputHook({')).toBeGreaterThan(-1);
+    expect(body.indexOf('dispatchRecoveredTaskOutputHook({')).toBeLessThan(body.indexOf('await completeAgent(agent.id'));
+  });
+
+  it('both recovery paths retire through the shared retireDeadAgent', () => {
+    const sweepStart = MANAGEMENT_SOURCE.indexOf('async function runCleanupOrphanedAgents');
+    const sweepBody = MANAGEMENT_SOURCE.slice(sweepStart, sweepStart + 12_000);
+    expect(sweepBody).toMatch(/await retireDeadAgent\(/);
+
+    const recoveryStart = LIFECYCLE_SOURCE.indexOf('Completing untracked agent');
+    const recoveryBody = LIFECYCLE_SOURCE.slice(recoveryStart, recoveryStart + 2_000);
+    expect(recoveryBody).toMatch(/await retireDeadAgent\(/);
+  });
+});
+
+// #6124: the escalation the old `hookRejected && success` guard could not reach.
+// The pr-reviewer stage that produced no output exited NON-zero with no captured
+// error, so the run was already `success === false` and the permanent verdict
+// never applied — the task consumed its retries and the pipeline re-spawned.
+describe('permanent output-hook rejection (#6124)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    getAgent.mockResolvedValue({ id: 'agent-rejected', metadata: {} });
+    updateAgent.mockResolvedValue(null);
+    getTaskOutputHook.mockResolvedValue(async () => ({
+      accepted: false, permanent: true, reason: 'output-missing', message: 'No parseable output',
+    }));
+  });
+
+  const finish = (errorAnalysis, metadata = {}) => finalizeAgent({
+    agentId: 'agent-rejected',
+    task: { ...TASK, metadata: { ...TASK.metadata, ...metadata } },
+    runId: 'run-rejected', success: false, exitCode: 1, duration: 1000,
+    outputBuffer: '', errorAnalysis,
+  });
+
+  it('blocks an already-failed unknown run and records failure for cleanup and run history', async () => {
+    expect(await finish({ category: 'unknown' })).toMatchObject({ success: false });
+    expect(updateTask).toHaveBeenCalledWith(TASK.id, expect.objectContaining({
+      status: 'blocked', metadata: expect.objectContaining({ blockedCategory: 'output-missing' }),
+    }), 'internal');
+    expect(completeAgent).toHaveBeenCalledWith('agent-rejected', expect.objectContaining({
+      success: false, completionReason: 'output-missing', error: 'No parseable output',
+      errorAnalysis: expect.objectContaining({ permanent: true, origin: 'task-output-hook' }),
+    }));
+    expect(completeAgentRun).toHaveBeenCalledWith('run-rejected', '', 1, 1000,
+      expect.objectContaining({ category: 'output-missing', permanent: true }), false);
+    expect(addTask).not.toHaveBeenCalled();
+    // The task's retry decision is resolved once, against the final verdict —
+    // not once for the run's own failure and again for the escalation (#9645).
+    expect(resolveFailedTaskUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  it('leaves a named failure on its ordinary retry path', async () => {
+    await finish({ category: 'rate-limit', message: 'Try later' });
+    expect(updateTask).toHaveBeenCalledWith(TASK.id, expect.objectContaining({
+      status: 'in_progress', metadata: expect.objectContaining({ lastErrorCategory: 'rate-limit' }),
+    }), 'internal');
+    expect(completeAgent).toHaveBeenCalledWith('agent-rejected', expect.objectContaining({
+      error: 'Try later', completionReason: 'rate-limit',
+      errorAnalysis: { category: 'rate-limit', message: 'Try later' },
+    }));
+    expect(resolveFailedTaskUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not re-resolve an already-blocked task or duplicate its investigation', async () => {
+    await finish({ category: 'unknown' }, { failureCount: MAX_TASK_RETRIES - 1 });
+    expect(updateTask).toHaveBeenCalledWith(TASK.id, expect.objectContaining({ status: 'blocked' }), 'internal');
+    expect(resolveFailedTaskUpdate).toHaveBeenCalledTimes(1);
+    expect(addTask).toHaveBeenCalledTimes(1);
+  });
+});

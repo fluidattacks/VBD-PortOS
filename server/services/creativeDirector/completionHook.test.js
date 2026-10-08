@@ -1,0 +1,258 @@
+/**
+ * CD completion hook — deliverable verification (#4146).
+ *
+ * A `plan`/`treatment` agent's deliverable is the PATCH its prompt describes, not
+ * its exit code. These lock the finalization semantics: an exit-0 run that never
+ * PATCHed is recorded `failed` (so the live re-dispatch guard reaps it instead of
+ * boot recovery), a run that DID PATCH is recorded `completed`, and the bounded
+ * gate parks the project once the treatment stage has come back empty too often.
+ *
+ * The scene-loop behaviour of `advanceAfterSceneSettled` is covered in
+ * orchestrator.test.js; this file only exercises the completion/gate paths.
+ */
+
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { MAX_CONSECUTIVE_MISSED_DELIVERABLES } from '../../lib/creativeDirectorPresets.js';
+
+const mockGetProject = vi.fn();
+const mockUpdateProject = vi.fn(async () => undefined);
+const mockUpdateScene = vi.fn(async () => undefined);
+const mockUpdateRun = vi.fn(async () => ({}));
+const mockRecordRun = vi.fn(async () => ({}));
+const mockEnqueueTreatmentTask = vi.fn(async () => undefined);
+const mockAdvancePlan = vi.fn(async () => undefined);
+const mockRunSceneRender = vi.fn(async () => undefined);
+
+vi.mock('./local.js', () => ({
+  getProject: (...a) => mockGetProject(...a),
+  updateProject: (...a) => mockUpdateProject(...a),
+  updateScene: (...a) => mockUpdateScene(...a),
+  updateRun: (...a) => mockUpdateRun(...a),
+  recordRun: (...a) => mockRecordRun(...a),
+}));
+vi.mock('./agentBridge.js', () => ({ enqueueTreatmentTask: (...a) => mockEnqueueTreatmentTask(...a) }));
+vi.mock('./planAdvance.js', () => ({ advanceAfterPlanStepSettled: (...a) => mockAdvancePlan(...a) }));
+vi.mock('./sceneEvaluator.js', () => ({ dispatchSceneEvaluation: vi.fn(async () => undefined) }));
+vi.mock('./sceneRunner.js', () => ({ runSceneRender: (...a) => mockRunSceneRender(...a) }));
+vi.mock('./stitchRunner.js', () => ({ runStitch: vi.fn(async () => undefined) }));
+vi.mock('../videoGen/local.js', () => ({ sampleEvaluationFrames: vi.fn(async () => []) }));
+vi.mock('../mediaJobQueue/index.js', () => ({
+  listJobs: vi.fn(() => []),
+  mediaJobEvents: { on: vi.fn(), off: vi.fn() },
+}));
+
+const { handleCreativeDirectorCompletion, advanceAfterSceneSettled, startCreativeDirectorProject, __resetInflightState } = await import('./completionHook.js');
+
+import { hasCreativeDirectorProjectStarter, registerCreativeDirectorProjectStarter } from './projectStartSink.js';
+
+// #5920: `pipeline/episodeVideo.js` starts a CD project through the sink instead of
+// importing this module, so importing this module MUST arm the sink. Nothing else
+// registers a starter — if this side effect is ever dropped, every pipeline episode
+// silently stops advancing, and only this assertion notices.
+describe('registers the pipeline-facing project starter (#5920)', () => {
+  it('arms the project-start sink on import', () => {
+    expect(hasCreativeDirectorProjectStarter()).toBe(true);
+    // And it is THIS module's starter, not some other registrant: re-registering the
+    // same function is the sink's one idempotent case, so a no-throw here is an
+    // identity check on what is wired.
+    expect(() => registerCreativeDirectorProjectStarter(startCreativeDirectorProject)).not.toThrow();
+  });
+});
+
+const planTask = (runId = 'run-1') => ({
+  id: 'task-1',
+  metadata: { creativeDirector: { projectId: 'cd-1', kind: 'plan', runId } },
+});
+
+const planProject = (over = {}) => ({
+  id: 'cd-1',
+  status: 'planning',
+  directive: { goal: 'g', deliverables: [], constraints: {} },
+  plan: null,
+  runs: [{ runId: 'run-1', kind: 'plan', status: 'running', deliverableMark: null }],
+  ...over,
+});
+
+const missedTreatmentRun = (runId) => ({ runId, kind: 'treatment', status: 'failed', deliverableMissing: true });
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  __resetInflightState();
+});
+
+describe('handleCreativeDirectorCompletion — plan deliverable', () => {
+  it('settles the planner that wrote the current Video plan but rejects a later revision', async () => {
+    const task = planTask();
+    task.metadata.creativeDirector.productionRevision = 2;
+    const project = planProject({ workspace: 'video', videoWorkRevision: 3,
+      plan: { submittedProductionRevision: 2, replanRounds: 0, updatedAt: 'later', steps: [{ stepId: 'a', status: 'pending' }] } });
+    mockGetProject.mockResolvedValue(project);
+    await handleCreativeDirectorCompletion(task, 'agent-1', true);
+    expect(mockUpdateRun).toHaveBeenCalledWith('cd-1', 'run-1', expect.objectContaining({ status: 'completed' }));
+    mockUpdateRun.mockClear();
+    mockGetProject.mockResolvedValue({ ...project, videoWorkRevision: 4 });
+    await handleCreativeDirectorCompletion(task, 'agent-1', true);
+    expect(mockUpdateRun).not.toHaveBeenCalled();
+  });
+
+  it('marks an exit-0 plan run FAILED when no plan was PATCHed', async () => {
+    mockGetProject.mockResolvedValue(planProject());
+    await handleCreativeDirectorCompletion(planTask(), 'agent-1', true);
+    expect(mockUpdateRun).toHaveBeenCalledWith('cd-1', 'run-1', expect.objectContaining({
+      status: 'failed',
+      deliverableMissing: true,
+      failureReason: expect.stringMatching(/never wrote the plan/),
+    }));
+    // The PROJECT is not failed — the advance loop still gets to re-dispatch once.
+    expect(mockUpdateProject).not.toHaveBeenCalled();
+    expect(mockAdvancePlan).toHaveBeenCalledWith('cd-1');
+  });
+
+  it.each([['failed'], ['completed']])('ignores a completion whose run row is already %s', async (status) => {
+    // The echo of a deliberate kill: stopProject/retireRuns settles the row and
+    // THEN SIGKILLs the agent. Without the guard the `!success` branch below would
+    // flip the whole project to `failed`, clobbering the stop's `paused` + reason
+    // (or killing a project being restarted under a new provider).
+    mockGetProject.mockResolvedValue(planProject({
+      runs: [{ runId: 'run-1', kind: 'plan', status, failureReason: 'Creative commission paused' }],
+    }));
+    await handleCreativeDirectorCompletion(planTask(), 'agent-1', false);
+    expect(mockUpdateRun).not.toHaveBeenCalled();
+    expect(mockRecordRun).not.toHaveBeenCalled();
+    expect(mockUpdateProject).not.toHaveBeenCalled();
+    expect(mockAdvancePlan).not.toHaveBeenCalled();
+  });
+
+  it.each([['paused'], ['complete'], ['failed']])('records the run but never re-stamps a project that is already %s', async (status) => {
+    // A failed agent exit is not the project's verdict when the project already
+    // has one: the exit may be the echo of any deliberate kill (the CoS Kill
+    // button, the idle/max-runtime reapers, a stop). Flipping a paused project to
+    // `failed` here would clobber its reason and make it un-Resumable.
+    mockGetProject.mockResolvedValue(planProject({ status }));
+    await handleCreativeDirectorCompletion(planTask(), 'agent-1', false);
+    expect(mockUpdateRun).toHaveBeenCalledWith('cd-1', 'run-1', expect.objectContaining({ status: 'failed' }));
+    expect(mockUpdateProject).not.toHaveBeenCalled();
+  });
+
+  it('marks a plan run COMPLETED when the plan did land', async () => {
+    mockGetProject.mockResolvedValue(planProject({ plan: { steps: [{ stepId: 'a' }], replanRounds: 0 } }));
+    await handleCreativeDirectorCompletion(planTask(), 'agent-1', true);
+    expect(mockUpdateRun).toHaveBeenCalledWith('cd-1', 'run-1', expect.objectContaining({ status: 'completed' }));
+    expect(mockUpdateRun.mock.calls[0][2]).not.toHaveProperty('deliverableMissing');
+    expect(mockAdvancePlan).toHaveBeenCalledWith('cd-1');
+  });
+
+  it('marks a RE-plan run failed when it left the existing plan untouched', async () => {
+    mockGetProject.mockResolvedValue(planProject({
+      plan: { steps: [{ stepId: 'a' }], replanRounds: 1 },
+      runs: [{ runId: 'run-1', kind: 'plan', status: 'running', deliverableMark: 'plan:1' }],
+    }));
+    await handleCreativeDirectorCompletion(planTask(), 'agent-1', true);
+    expect(mockUpdateRun).toHaveBeenCalledWith('cd-1', 'run-1', expect.objectContaining({ status: 'failed', deliverableMissing: true }));
+  });
+
+  it('marks a RE-plan run completed when replanRounds advanced (a new plan landed)', async () => {
+    mockGetProject.mockResolvedValue(planProject({
+      plan: { steps: [{ stepId: 'a' }], replanRounds: 2 },
+      runs: [{ runId: 'run-1', kind: 'plan', status: 'running', deliverableMark: 'plan:1' }],
+    }));
+    await handleCreativeDirectorCompletion(planTask(), 'agent-1', true);
+    expect(mockUpdateRun).toHaveBeenCalledWith('cd-1', 'run-1', expect.objectContaining({ status: 'completed' }));
+  });
+
+  it('does not manufacture a failure for a legacy run that recorded no baseline', async () => {
+    // Run row predates the mark (no `deliverableMark` key at all) — presence of a
+    // plan is all we can honestly check.
+    mockGetProject.mockResolvedValue(planProject({
+      plan: { steps: [{ stepId: 'a' }], replanRounds: 1 },
+      runs: [{ runId: 'run-1', kind: 'plan', status: 'running' }],
+    }));
+    await handleCreativeDirectorCompletion(planTask(), 'agent-1', true);
+    expect(mockUpdateRun).toHaveBeenCalledWith('cd-1', 'run-1', expect.objectContaining({ status: 'completed' }));
+  });
+
+  it('leaves a genuinely failed run on the project-failed path (unchanged)', async () => {
+    mockGetProject.mockResolvedValue(planProject());
+    await handleCreativeDirectorCompletion(planTask(), 'agent-1', false);
+    expect(mockUpdateRun).toHaveBeenCalledWith('cd-1', 'run-1', expect.objectContaining({ status: 'failed' }));
+    expect(mockUpdateRun.mock.calls[0][2]).not.toHaveProperty('deliverableMissing');
+    expect(mockUpdateProject).toHaveBeenCalledWith('cd-1', expect.objectContaining({ status: 'failed' }));
+    expect(mockAdvancePlan).not.toHaveBeenCalled();
+  });
+
+  it('does not deliverable-check an evaluate run (no verifiable PATCH deliverable)', async () => {
+    mockGetProject.mockResolvedValue({
+      id: 'cd-1', status: 'rendering', directive: null, treatment: { scenes: [] },
+      runs: [{ runId: 'run-1', kind: 'evaluate', status: 'running' }],
+    });
+    await handleCreativeDirectorCompletion({
+      id: 'task-1', metadata: { creativeDirector: { projectId: 'cd-1', kind: 'evaluate', runId: 'run-1', sceneId: 's1' } },
+    }, 'agent-1', true);
+    expect(mockUpdateRun).toHaveBeenCalledWith('cd-1', 'run-1', expect.objectContaining({ status: 'completed' }));
+  });
+
+  it('falls back to recordRun (carrying the miss) when the run row is gone', async () => {
+    mockUpdateRun.mockResolvedValueOnce(null);
+    mockGetProject.mockResolvedValue(planProject());
+    await handleCreativeDirectorCompletion(planTask(), 'agent-1', true);
+    expect(mockRecordRun).toHaveBeenCalledWith('cd-1', expect.objectContaining({ status: 'failed', deliverableMissing: true }));
+  });
+});
+
+describe('advanceAfterSceneSettled — bounded treatment gate', () => {
+  const noTreatment = (runs) => ({ id: 'cd-1', name: 'p', status: 'planning', directive: null, treatment: null, runs });
+
+  it('re-enqueues the treatment task while the empty streak is under the bound', async () => {
+    mockGetProject.mockResolvedValue(noTreatment([missedTreatmentRun('t1')]));
+    await advanceAfterSceneSettled('cd-1');
+    expect(mockEnqueueTreatmentTask).toHaveBeenCalledTimes(1);
+    expect(mockUpdateProject).toHaveBeenCalledWith('cd-1', { status: 'planning' });
+  });
+
+  it('pauses the project instead of re-dispatching once the bound is reached', async () => {
+    const runs = Array.from({ length: MAX_CONSECUTIVE_MISSED_DELIVERABLES }, (_, i) => missedTreatmentRun(`t${i}`));
+    mockGetProject.mockResolvedValue(noTreatment(runs));
+    await advanceAfterSceneSettled('cd-1');
+    expect(mockEnqueueTreatmentTask).not.toHaveBeenCalled();
+    expect(mockUpdateProject).toHaveBeenCalledWith('cd-1', {
+      status: 'paused',
+      failureReason: expect.stringMatching(/tool-capable model/),
+    });
+    // Streak closed so a Resume after switching models gets a fresh budget.
+    for (const run of runs) {
+      expect(mockUpdateRun).toHaveBeenCalledWith('cd-1', run.runId, { deliverableStreakClosed: true });
+    }
+  });
+
+  it('re-dispatches again after the streak was closed (Resume gets a fresh budget)', async () => {
+    const runs = Array.from({ length: MAX_CONSECUTIVE_MISSED_DELIVERABLES }, (_, i) => ({
+      ...missedTreatmentRun(`t${i}`), deliverableStreakClosed: true,
+    }));
+    mockGetProject.mockResolvedValue(noTreatment(runs));
+    await advanceAfterSceneSettled('cd-1');
+    expect(mockEnqueueTreatmentTask).toHaveBeenCalledTimes(1);
+  });
+});
+
+it('keeps Video drafts inert through both direct starts and background scene advancement', async () => {
+  mockGetProject.mockResolvedValue({ id: 'cd-video', workspace: 'video', status: 'planning', runs: [], directive: { goal: 'Example' } });
+  await startCreativeDirectorProject('cd-video');
+  await advanceAfterSceneSettled('cd-video');
+  expect(mockAdvancePlan).not.toHaveBeenCalled();
+  expect(mockEnqueueTreatmentTask).not.toHaveBeenCalled();
+  expect(mockRunSceneRender).not.toHaveBeenCalled();
+  expect(mockUpdateProject).not.toHaveBeenCalled();
+});
+
+it('resumes an authorized stale Video treatment by rewriting it before rendering', async () => {
+  const review = await import('./videoReview.js');
+  const gate = vi.spyOn(review, 'videoReviewAllowsDispatch').mockResolvedValue(true);
+  const project = { id: 'cd-video', workspace: 'video', status: 'rendering', runs: [],
+    directive: { goal: 'Example' }, treatment: { artifact: { stale: true }, scenes: [{ sceneId: 'one', status: 'pending' }] } };
+  mockGetProject.mockResolvedValue(project);
+  await startCreativeDirectorProject(project.id);
+  expect(mockEnqueueTreatmentTask).toHaveBeenCalledWith(project);
+  expect(mockRunSceneRender).not.toHaveBeenCalled();
+  expect(mockAdvancePlan).not.toHaveBeenCalled();
+  gate.mockRestore();
+});

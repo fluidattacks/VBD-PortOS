@@ -1,0 +1,606 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+
+// The tool-use annotation unions the server's authoritative capability list into
+// the client id regex, so the picker fetches it whenever `highlightToolUse` is on.
+const getToolUseModels = vi.fn();
+vi.mock('../services/apiLocalLlm', () => ({ getToolUseModels: (...a) => getToolUseModels(...a) }));
+
+import ProviderModelSelector from './ProviderModelSelector';
+import { providerModeSelectionPolicy } from '../utils/providers.js';
+import { __resetToolUseModelIdsCache } from '../hooks/useToolUseModelIds.js';
+import SHIPPED_PROVIDERS from '../../../data.reference/providers.json';
+import { COMPOSE_OPTION_VALUE } from '../utils/providerSelection.js';
+
+// The preset-first select ends in a "Custom combination…" action entry
+// (#7566); these assertions are about the PRESET rows, so drop it.
+const presetOptions = (select) => [...select.querySelectorAll('option')].filter((o) => o.value !== COMPOSE_OPTION_VALUE);
+
+const PROVIDERS = [
+  { id: 'p1', name: 'Provider One' },
+  { id: 'p2', name: 'Provider Two' },
+];
+
+function renderSelector(props = {}) {
+  return render(
+    <ProviderModelSelector
+      providers={PROVIDERS}
+      selectedProviderId="p1"
+      selectedModel="m1"
+      availableModels={['m1', 'm2']}
+      onProviderChange={() => {}}
+      onModelChange={() => {}}
+      {...props}
+    />
+  );
+}
+
+describe('ProviderModelSelector', () => {
+  it('alphabetizes string and named model options without changing the selected model or catalog', () => {
+    const models = Object.freeze(['Zulu', { id: 'z-id', name: 'alpha' }, 'Beta']);
+    const onModelChange = vi.fn();
+    renderSelector({ availableModels: models, selectedModel: 'Beta', emptyModelOption: 'Default model', onModelChange });
+    const select = screen.getByRole('combobox', { name: 'Model' });
+    expect([...select.options].map(option => option.textContent)).toEqual(['Default model', 'alpha', 'Beta', 'Zulu']);
+    expect(select.value).toBe('Beta');
+    expect(onModelChange).not.toHaveBeenCalled();
+    fireEvent.change(select, { target: { value: 'z-id' } });
+    expect(onModelChange).toHaveBeenCalledWith('z-id');
+  });
+
+  it('shows inherited provider, model and effort without writing overrides on mount', () => {
+    const onProviderChange = vi.fn();
+    const onModelChange = vi.fn();
+    const onEffortChange = vi.fn();
+    renderSelector({
+      providers: [{ id: 'codex', name: 'Codex', type: 'cli', command: 'codex', defaultModel: 'gpt-5', effort: 'high' }],
+      selectedProviderId: '', effectiveProviderId: 'codex', selectedModel: '',
+      availableModels: ['gpt-5'], emptyProviderOption: 'Auto', emptyModelOption: 'Default model',
+      effort: '', onProviderChange, onModelChange, onEffortChange,
+    });
+    expect(screen.getByRole('option', { name: 'Auto — Codex' }).selected).toBe(true);
+    expect(screen.getByRole('option', { name: 'Default model — gpt-5' }).selected).toBe(true);
+    expect(screen.getByRole('option', { name: 'Default effort — high' }).selected).toBe(true);
+    expect(onProviderChange).not.toHaveBeenCalled();
+    expect(onModelChange).not.toHaveBeenCalled();
+    expect(onEffortChange).not.toHaveBeenCalled();
+    fireEvent.change(screen.getByRole('combobox', { name: 'Thinking effort' }), { target: { value: 'low' } });
+    expect(onEffortChange).toHaveBeenCalledWith('low');
+  });
+
+  it('lets a required form pin a default omitted from the catalog without changing it on mount', () => {
+    const onModelChange = vi.fn();
+    const props = {
+      providers: [{ id: 'codex', name: 'Codex', defaultModel: 'gpt-6-astra' }],
+      selectedProviderId: 'codex', selectedModel: '',
+      availableModels: ['another-model'], emptyModelOption: 'Select a model', includeDefaultModel: true,
+      onModelChange,
+    };
+    const { rerender } = renderSelector(props);
+    const select = screen.getByRole('combobox', { name: 'Model' });
+    expect(select.value).toBe('');
+    expect(onModelChange).not.toHaveBeenCalled();
+    expect(screen.getByRole('option', { name: 'gpt-6-astra', exact: true }).disabled).toBe(false);
+    fireEvent.change(select, { target: { value: 'gpt-6-astra' } });
+    expect(onModelChange).toHaveBeenCalledWith('gpt-6-astra');
+    rerender(<ProviderModelSelector {...props} selectedModel="gpt-6-astra" onProviderChange={() => {}} />);
+    expect(select.value).toBe('gpt-6-astra');
+  });
+
+  it('does not duplicate catalog defaults or offer a policy-disallowed default', () => {
+    const props = {
+      providers: [{ id: 'p1', defaultModel: 'm1' }], selectedProviderId: 'p1',
+      selectedModel: '', availableModels: [{ id: 'm1', name: 'Model One' }], includeDefaultModel: true,
+      emptyModelOption: 'Default model', onProviderChange: () => {}, onModelChange: () => {},
+    };
+    const { rerender } = renderSelector(props);
+    expect(screen.getAllByRole('option').filter(option => option.value === 'm1')).toHaveLength(1);
+    rerender(<ProviderModelSelector {...props} availableModels={['m2']}
+      selectionPolicy={{ model: model => model !== 'm1' }} />);
+    expect(screen.getAllByRole('option').some(option => option.value === 'm1')).toBe(false);
+  });
+
+  it('preserves caller-filtered catalogs unless the form opts into default pins', () => {
+    renderSelector({ providers: [{ id: 'p1', defaultModel: 'text-only' }], availableModels: ['vision-model'], selectedModel: '' });
+    expect(screen.getAllByRole('option').some(option => option.value === 'text-only')).toBe(false);
+  });
+
+  it('renders only the provider options by default (no empty sentinel)', () => {
+    renderSelector();
+    const options = screen.getAllByRole('option').map((o) => o.textContent);
+    expect(options).toEqual(['Provider One', 'Provider Two', 'Custom combination…', 'm1', 'm2']);
+  });
+
+  it('keeps both execution modes independently selectable when the settings page groups their card', () => {
+    const onProviderChange = vi.fn();
+    const executionModes = [{ id: 'example-cli', type: 'cli' }, { id: 'example-tui', type: 'tui' }];
+    renderSelector({ providers: [
+      { id: 'example-cli', name: 'Example CLI', type: 'cli', enabled: true, executionModes },
+      { id: 'example-tui', name: 'Example TUI', type: 'tui', enabled: true, executionModes },
+    ], selectedProviderId: 'example-cli', onProviderChange });
+    const select = screen.getByRole('combobox', { name: 'Provider' });
+    expect(presetOptions(select).map(option => [option.value, option.textContent])).toEqual([
+      ['example-cli', 'Example CLI'], ['example-tui', 'Example TUI'],
+    ]);
+    fireEvent.change(select, { target: { value: 'example-tui' } });
+    expect(onProviderChange).toHaveBeenCalledWith('example-tui');
+  });
+
+  it('renders every current Codex fallback choice, including GPT-6.1 Sol', () => {
+    const codexModels = SHIPPED_PROVIDERS.providers.codex.models;
+    expect(codexModels).toContain('gpt-6.1-sol');
+    renderSelector({
+      providers: [{ id: 'codex', name: 'Codex CLI', type: 'cli', models: codexModels }],
+      selectedProviderId: 'codex',
+      selectedModel: 'gpt-6.1-sol',
+      availableModels: codexModels,
+    });
+    const modelSelect = screen.getAllByRole('combobox')[1];
+    expect([...modelSelect.querySelectorAll('option')].map((option) => option.value)).toEqual([...codexModels].sort((a, b) => a.localeCompare(b, 'en', { sensitivity: 'base' })));
+    expect(modelSelect.value).toBe('gpt-6.1-sol');
+  });
+
+  it('prepends empty options with value "" when emptyProviderOption/emptyModelOption are set', () => {
+    renderSelector({ emptyProviderOption: 'Use default', emptyModelOption: 'Default model' });
+    const providerSelect = screen.getAllByRole('combobox')[0];
+    const firstProviderOption = providerSelect.querySelector('option');
+    expect(firstProviderOption.value).toBe('');
+    expect(firstProviderOption.textContent).toBe('Use default');
+
+    const modelSelect = screen.getAllByRole('combobox')[1];
+    const firstModelOption = modelSelect.querySelector('option');
+    expect(firstModelOption.value).toBe('');
+    expect(firstModelOption.textContent).toBe('Default model');
+  });
+
+  it('hides the model select when availableModels is empty (default)', () => {
+    renderSelector({ availableModels: [] });
+    expect(screen.getAllByRole('combobox')).toHaveLength(1);
+  });
+
+  it('renders the model select even when empty if alwaysShowModel is set', () => {
+    renderSelector({ availableModels: [], alwaysShowModel: true, emptyModelOption: 'Default model' });
+    const combos = screen.getAllByRole('combobox');
+    expect(combos).toHaveLength(2);
+    expect(combos[1].querySelector('option').textContent).toBe('Default model');
+  });
+
+  it('normalizes object-shaped model entries to value/label', () => {
+    renderSelector({
+      availableModels: [{ id: 'mid', name: 'Pretty Name' }, { id: 'bare' }],
+      selectedModel: 'mid',
+    });
+    const modelSelect = screen.getAllByRole('combobox')[1];
+    const opts = [...modelSelect.querySelectorAll('option')];
+    expect(opts.map((o) => o.value)).toEqual(['bare', 'mid']);
+    // `{ id }` with no name falls back to the id as the label.
+    expect(opts.map((o) => o.textContent)).toEqual(['bare', 'Pretty Name']);
+  });
+
+  it('skips nullish model entries instead of crashing (sparse/empty provider list)', () => {
+    // useProviderModels can pass `[undefined]` for a provider with no models;
+    // modelOption must tolerate it and the map must skip it.
+    expect(() =>
+      renderSelector({ availableModels: [undefined, 'm2', null], alwaysShowModel: true })
+    ).not.toThrow();
+    const modelSelect = screen.getAllByRole('combobox')[1];
+    expect([...modelSelect.querySelectorAll('option')].map((o) => o.value)).toEqual(['m2']);
+  });
+
+  it('fires onProviderChange/onModelChange with the selected value', () => {
+    const onProviderChange = vi.fn();
+    const onModelChange = vi.fn();
+    renderSelector({ onProviderChange, onModelChange });
+    const [providerSelect, modelSelect] = screen.getAllByRole('combobox');
+    fireEvent.change(providerSelect, { target: { value: 'p2' } });
+    expect(onProviderChange).toHaveBeenCalledWith('p2');
+    fireEvent.change(modelSelect, { target: { value: 'm2' } });
+    expect(onModelChange).toHaveBeenCalledWith('m2');
+  });
+
+  it('filters out disabled providers from the dropdown', () => {
+    renderSelector({
+      providers: [
+        { id: 'p1', name: 'Provider One' },
+        { id: 'p2', name: 'Provider Two', enabled: false },
+        { id: 'p3', name: 'Provider Three', enabled: true },
+      ],
+    });
+    const providerSelect = screen.getAllByRole('combobox')[0];
+    const labels = presetOptions(providerSelect).map((o) => o.textContent);
+    expect(labels).toEqual(['Provider One', 'Provider Three']);
+  });
+
+  it('keeps a disabled provider visible when it is the current selection', () => {
+    renderSelector({
+      selectedProviderId: 'p2',
+      providers: [
+        { id: 'p1', name: 'Provider One' },
+        { id: 'p2', name: 'Provider Two', enabled: false },
+      ],
+    });
+    const providerSelect = screen.getAllByRole('combobox')[0];
+    const labels = presetOptions(providerSelect).map((o) => o.textContent);
+    expect(labels).toEqual(['Provider One', 'Provider Two']);
+  });
+
+  it('applies one selection policy to providers, models, and effort options', () => {
+    const policy = {
+      provider: (provider) => provider.id === 'local',
+      model: (model) => (typeof model === 'string' ? model : model.id) === 'safe-model',
+      effort: (level) => level === 'low',
+    };
+    renderSelector({
+      providers: [{ id: 'local', name: 'Local', type: 'cli', command: 'codex', models: ['gpt-5'] }, { id: 'cloud', name: 'Cloud' }],
+      selectedProviderId: 'local',
+      selectedModel: 'safe-model',
+      availableModels: [{ id: 'safe-model', capabilities: ['chat'] }, { id: 'tool-model', capabilities: ['tools'] }],
+      effort: 'low',
+      onEffortChange: () => {},
+      selectionPolicy: policy,
+    });
+
+    const [providerSelect, modelSelect, effortSelect] = screen.getAllByRole('combobox');
+    expect(presetOptions(providerSelect).map((option) => option.value)).toEqual(['local']);
+    expect([...modelSelect.options].map((option) => option.value)).toEqual(['safe-model']);
+    expect([...effortSelect.options].map((option) => option.value)).toEqual(['', 'low']);
+  });
+
+it('keeps a saved TUI pin visible with a reason under a CLI/API-only caller policy', () => {
+    // Acceptance for #6368: an ineligible saved value is never hidden and never
+    // silently replaced — the user must be able to SEE what is pinned and why it
+    // cannot run before choosing something else. The sibling CLI route stays a
+    // separate, selectable option, so collapsing the pair would fail this too.
+    renderSelector({
+      providers: [
+        { id: 'claude-code', name: 'Claude Code', type: 'cli' },
+        { id: 'claude-code-tui', name: 'Claude Code TUI', type: 'tui' },
+        { id: 'ollama', name: 'Ollama', type: 'api' },
+      ],
+      selectedProviderId: 'claude-code-tui',
+      availableModels: [],
+      selectionPolicy: providerModeSelectionPolicy('cli-harness'),
+    });
+    const providerSelect = screen.getAllByRole('combobox')[0];
+    const options = presetOptions(providerSelect);
+    // The eligible CLI route and the INELIGIBLE SAVED PIN are both offered;
+    // an ineligible route nobody pinned is simply not offered at all.
+    expect(options.map((option) => option.value)).toEqual(['claude-code', 'claude-code-tui']);
+    expect(options.find((option) => option.value === 'claude-code').disabled).toBe(false);
+    const pinned = options.find((option) => option.value === 'claude-code-tui');
+    expect(pinned.disabled).toBe(true);
+    expect(pinned.textContent).toMatch(/not permitted/i);
+    // The select still SHOWS the saved pin rather than snapping to a legal one.
+    expect(providerSelect.value).toBe('claude-code-tui');
+  });
+
+  it('keeps a disallowed saved model visible only as a disabled stale option', () => {
+    renderSelector({
+      providers: [{ id: 'local', name: 'Local' }],
+      selectedProviderId: 'local',
+      selectedModel: 'tool-model',
+      availableModels: ['safe-model', 'tool-model'],
+      selectionPolicy: { model: (model) => model !== 'tool-model' },
+    });
+    const modelSelect = screen.getAllByRole('combobox')[1];
+    expect([...modelSelect.options].map((option) => option.value)).toEqual(['safe-model', 'tool-model']);
+    expect(modelSelect.querySelector('option[value="tool-model"]').disabled).toBe(true);
+    expect(modelSelect.querySelector('option[value="tool-model"]').textContent).toMatch(/not permitted/i);
+  });
+
+  it('hides incompatible providers and models while preserving selected pins', () => {
+    renderSelector({
+      providers: [
+        { id: 'p1', name: 'Provider One', modelHardwareCompatibility: { 'too-large': { state: 'unavailable' } } },
+        { id: 'p2', name: 'Provider Two', hardwareCompatibility: { state: 'unavailable' } },
+        { id: 'p3', name: 'Provider Three' },
+      ],
+      selectedModel: 'too-large',
+      availableModels: ['too-large', 'small'],
+    });
+    const [providerSelect, modelSelect] = screen.getAllByRole('combobox');
+    expect(presetOptions(providerSelect).map((option) => option.value)).toEqual(['p1', 'p3']);
+    expect([...modelSelect.querySelectorAll('option')].map((option) => option.value)).toEqual(['small', 'too-large']);
+    expect(modelSelect.querySelector('option[value="too-large"]').disabled).toBe(true);
+  });
+
+  it('stacks the selects vertically when layout="stacked"', () => {
+    const { container } = renderSelector({ layout: 'stacked' });
+    expect(container.firstChild.className).toContain('flex-col');
+  });
+
+  describe('highlightToolUse (agent pickers)', () => {
+    const OLLAMA = [{ id: 'ollama', name: 'Ollama' }];
+    const modelLabels = () =>
+      [...screen.getAllByRole('combobox')[1].querySelectorAll('option')].map((o) => o.textContent);
+
+    beforeEach(() => {
+      vi.clearAllMocks();
+      __resetToolUseModelIdsCache();
+      // Default: the capability scan finds nothing extra, so every assertion
+      // below is about the id regex unless the case says otherwise.
+      getToolUseModels.mockResolvedValue({ models: [] });
+    });
+
+    it('marks local model options with a tool-use indicator', async () => {
+      renderSelector({
+        providers: OLLAMA,
+        selectedProviderId: 'ollama',
+        selectedModel: 'qwen3.6:35b',
+        availableModels: ['qwen3.6:35b', 'gemma3:4b'],
+        highlightToolUse: true,
+      });
+      await waitFor(() =>
+        expect(modelLabels()).toEqual(['gemma3:4b · ⚠ no known tool use', 'qwen3.6:35b · 🔧 tool use']));
+    });
+
+    it('warns when the selected LOCAL model cannot call tools', async () => {
+      renderSelector({
+        providers: OLLAMA,
+        selectedProviderId: 'ollama',
+        selectedModel: 'gemma3:4b',
+        availableModels: ['qwen3.6:35b', 'gemma3:4b'],
+        highlightToolUse: true,
+      });
+      expect(await screen.findByText(/recognized tool-calling model/i)).toBeInTheDocument();
+    });
+
+    it('warns on the provider default when the model selection is blank', async () => {
+      // "Default model" (blank) isn't a no-op — the resolver runs the provider's
+      // defaultModel, which here is a non-tool local model.
+      renderSelector({
+        providers: [{ id: 'ollama', name: 'Ollama', defaultModel: 'gemma3:4b' }],
+        selectedProviderId: 'ollama',
+        selectedModel: '',
+        availableModels: ['qwen3.6:35b', 'gemma3:4b'],
+        alwaysShowModel: true,
+        emptyModelOption: 'Default model',
+        highlightToolUse: true,
+      });
+      expect(await screen.findByText(/recognized tool-calling model/i)).toBeInTheDocument();
+    });
+
+    it('does not warn when the selected local model is tool-capable', async () => {
+      renderSelector({
+        providers: OLLAMA,
+        selectedProviderId: 'ollama',
+        selectedModel: 'qwen3.6:35b',
+        availableModels: ['qwen3.6:35b', 'gemma3:4b'],
+        highlightToolUse: true,
+      });
+      await waitFor(() => expect(getToolUseModels).toHaveBeenCalled());
+      expect(screen.queryByText(/recognized tool-calling model/i)).not.toBeInTheDocument();
+    });
+
+    it('is a no-op for cloud providers (ids do not encode family)', async () => {
+      renderSelector({
+        providers: [{ id: 'openai', name: 'OpenAI', endpoint: 'https://api.openai.com/v1' }],
+        selectedProviderId: 'openai',
+        selectedModel: 'gpt-4o',
+        availableModels: ['gpt-4o', 'o1'],
+        highlightToolUse: true,
+      });
+      await waitFor(() => expect(getToolUseModels).toHaveBeenCalled());
+      expect(modelLabels()).toEqual(['gpt-4o', 'o1']);
+      expect(screen.queryByText(/recognized tool-calling model/i)).not.toBeInTheDocument();
+    });
+
+    it('leaves options unannotated when highlightToolUse is off (default)', () => {
+      renderSelector({
+        providers: OLLAMA,
+        selectedProviderId: 'ollama',
+        selectedModel: 'gemma3:4b',
+        availableModels: ['qwen3.6:35b', 'gemma3:4b'],
+      });
+      expect(modelLabels()).toEqual(['gemma3:4b', 'qwen3.6:35b']);
+      expect(screen.queryByText(/recognized tool-calling model/i)).not.toBeInTheDocument();
+      // An unannotated picker must not pay for the capability scan either.
+      expect(getToolUseModels).not.toHaveBeenCalled();
+    });
+
+    it('trusts the server over the id regex for a family the regex predates', async () => {
+      // `phi4-mini` reports Ollama's `tools` capability but matches no
+      // TOOL_USE_RE alternative — the mislabel this union exists to fix.
+      getToolUseModels.mockResolvedValue({
+        models: [{ providerId: 'ollama', id: 'phi4-mini:latest', toolUse: true }],
+      });
+      renderSelector({
+        providers: OLLAMA,
+        selectedProviderId: 'ollama',
+        selectedModel: 'phi4-mini:latest',
+        availableModels: ['phi4-mini:latest', 'gemma3:4b'],
+        highlightToolUse: true,
+      });
+      await waitFor(() =>
+        expect(modelLabels()).toEqual(['gemma3:4b · ⚠ no known tool use', 'phi4-mini:latest · 🔧 tool use']));
+      expect(screen.queryByText(/recognized tool-calling model/i)).not.toBeInTheDocument();
+    });
+
+    it('asserts nothing until the capability scan settles', async () => {
+      let resolveScan;
+      getToolUseModels.mockReturnValue(new Promise((r) => { resolveScan = r; }));
+      renderSelector({
+        providers: OLLAMA,
+        selectedProviderId: 'ollama',
+        selectedModel: 'phi4-mini:latest',
+        availableModels: ['phi4-mini:latest'],
+        highlightToolUse: true,
+      });
+      // Mid-scan the regex would say "⚠ no known tool use" — showing it here
+      // just to retract it a beat later is the bug, so hold the annotation.
+      expect(modelLabels()).toEqual(['phi4-mini:latest']);
+      expect(screen.queryByText(/recognized tool-calling model/i)).not.toBeInTheDocument();
+
+      resolveScan({ models: [{ providerId: 'ollama', id: 'phi4-mini:latest', toolUse: true }] });
+      await waitFor(() => expect(modelLabels()).toEqual(['phi4-mini:latest · 🔧 tool use']));
+    });
+
+    it('falls back to the id regex when the capability scan fails', async () => {
+      getToolUseModels.mockRejectedValue(new Error('ollama down'));
+      renderSelector({
+        providers: OLLAMA,
+        selectedProviderId: 'ollama',
+        selectedModel: 'gemma3:4b',
+        availableModels: ['qwen3.6:35b', 'gemma3:4b'],
+        highlightToolUse: true,
+      });
+      // A failed scan still settles, so the annotation appears — regex-only is
+      // the best answer available, not a reason to go silent forever.
+      await waitFor(() =>
+        expect(modelLabels()).toEqual(['gemma3:4b · ⚠ no known tool use', 'qwen3.6:35b · 🔧 tool use']));
+      expect(screen.getByText(/recognized tool-calling model/i)).toBeInTheDocument();
+    });
+  });
+
+  describe('effort select', () => {
+    const AGY = [{
+      id: 'antigravity-cli',
+      name: 'Antigravity',
+      command: 'agy',
+      models: ['gemini-3.6-flash-high', 'gemini-3.6-flash-medium', 'gemini-3.6-flash-low', 'gemini-3.1-pro-high', 'gemini-3.1-pro-low', 'claude-sonnet-4-6'],
+    }];
+
+    const renderEffort = (props = {}) => renderSelector({
+      providers: AGY,
+      selectedProviderId: 'antigravity-cli',
+      selectedModel: 'gemini-3.6-flash',
+      availableModels: ['gemini-3.6-flash', 'gemini-3.1-pro', 'claude-sonnet-4-6'],
+      effort: '',
+      onEffortChange: () => {},
+      ...props,
+    });
+
+    it('is absent unless onEffortChange is supplied', () => {
+      renderEffort({ effort: undefined, onEffortChange: undefined });
+      expect(screen.getAllByRole('combobox')).toHaveLength(2);
+      expect(screen.queryByLabelText('Thinking effort')).not.toBeInTheDocument();
+    });
+
+    it('renders a labeled effort select for an effort-capable provider', () => {
+      renderEffort();
+      const effortSelect = screen.getByLabelText('Thinking effort');
+      const options = [...effortSelect.querySelectorAll('option')].map((o) => o.value);
+      expect(options).toEqual(['', 'low', 'medium', 'high']);
+    });
+
+    it('narrows the options to the tiers the selected Antigravity model offers', () => {
+      // agy rejects `--model gemini-3.1-pro --effort medium`.
+      renderEffort({ selectedModel: 'gemini-3.1-pro' });
+      const options = [...screen.getByLabelText('Thinking effort').querySelectorAll('option')].map((o) => o.value);
+      expect(options).toEqual(['', 'low', 'high']);
+    });
+
+    it('still offers the full ladder on the configured-default sentinel', () => {
+      // The sentinel is the shipped agy defaultModel, so the picker auto-selects
+      // it — the effort control must not hide until a model is chosen.
+      renderEffort({ selectedModel: 'antigravity-configured-default' });
+      const options = [...screen.getByLabelText('Thinking effort').querySelectorAll('option')].map((o) => o.value);
+      expect(options).toEqual(['', 'low', 'medium', 'high']);
+    });
+
+    it('hides itself (label and all) for an Antigravity model with no tiers', () => {
+      renderEffort({ selectedModel: 'claude-sonnet-4-6' });
+      expect(screen.queryByLabelText('Thinking effort')).not.toBeInTheDocument();
+      expect(screen.queryByText('Thinking effort')).not.toBeInTheDocument();
+    });
+
+    it('hides itself for a provider with no effort control', () => {
+      renderSelector({
+        providers: [{ id: 'ollama', name: 'Ollama', endpoint: 'http://localhost:11434' }],
+        selectedProviderId: 'ollama',
+        selectedModel: 'qwen3',
+        availableModels: ['qwen3'],
+        effort: '',
+        onEffortChange: () => {},
+      });
+      expect(screen.queryByLabelText('Thinking effort')).not.toBeInTheDocument();
+    });
+
+    it('reports the picked level to onEffortChange', () => {
+      const onEffortChange = vi.fn();
+      renderEffort({ onEffortChange });
+      fireEvent.change(screen.getByLabelText('Thinking effort'), { target: { value: 'high' } });
+      expect(onEffortChange).toHaveBeenCalledWith('high');
+    });
+  });
+});
+
+describe('ProviderModelSelector — provider list still loading', () => {
+  it('names the in-flight fetch instead of offering the empty sentinel as the only choice', () => {
+    // Mid-fetch `providers` is [], so "Default (active provider)" would be the
+    // select's only option — a slow control that reads as a broken one.
+    renderSelector({ providers: [], selectedProviderId: '', emptyProviderOption: 'Default (active provider)', loading: true });
+    const provider = screen.getByLabelText('Provider');
+    expect([...provider.options].map((o) => o.textContent)).toEqual(['Loading providers…']);
+    expect(provider.disabled).toBe(true);
+  });
+
+  it('says so even when the caller forces a selection, since there is nothing else to show', () => {
+    renderSelector({ providers: [], selectedProviderId: '', loading: true });
+    expect(screen.getByRole('option', { name: 'Loading providers…' })).toBeTruthy();
+  });
+
+  it('disables the model select too, so a pin cannot be retargeted against a list that has not arrived', () => {
+    renderSelector({ loading: true });
+    expect(screen.getByLabelText('Model').disabled).toBe(true);
+  });
+
+  it('restores the caller\'s own sentinel once the list settles', () => {
+    renderSelector({ selectedProviderId: '', emptyProviderOption: 'Default (active provider)' });
+    const provider = screen.getByLabelText('Provider');
+    expect(screen.getByRole('option', { name: 'Default (active provider)' })).toBeTruthy();
+    expect(screen.queryByRole('option', { name: 'Loading providers…' })).toBeNull();
+    expect(provider.disabled).toBe(false);
+  });
+});
+
+// A provider-only picker keeps its own model field (a table cell, a free-text
+// pin the selector has no shape for). Rendering a model select there hands the
+// user a control whose `onChange` reaches nobody — and a COMPOSITE resolved
+// from the shared catalog supplies its own model list, so the list alone could
+// conjure that dead select beside the caller's live one (#7585).
+describe('ProviderModelSelector provider-only mode', () => {
+  it('renders no model select when the caller wired no onModelChange', () => {
+    render(
+      <ProviderModelSelector
+        providers={PROVIDERS}
+        selectedProviderId="p1"
+        availableModels={['m1', 'm2']}
+        onProviderChange={() => {}}
+      />
+    );
+    expect(screen.getByLabelText('Provider')).toBeTruthy();
+    expect(screen.queryByLabelText('Model')).toBeNull();
+  });
+
+  it('honors alwaysShowModel only when the model change is actually wired', () => {
+    const { rerender } = render(
+      <ProviderModelSelector
+        providers={PROVIDERS}
+        selectedProviderId="p1"
+        alwaysShowModel
+        emptyModelOption="Default model"
+        onProviderChange={() => {}}
+      />
+    );
+    expect(screen.queryByLabelText('Model')).toBeNull();
+
+    rerender(
+      <ProviderModelSelector
+        providers={PROVIDERS}
+        selectedProviderId="p1"
+        alwaysShowModel
+        emptyModelOption="Default model"
+        onProviderChange={() => {}}
+        onModelChange={() => {}}
+      />
+    );
+    expect(screen.getByLabelText('Model')).toBeTruthy();
+  });
+
+  it('names the model select for its form, so two pickers on a page stay distinguishable', () => {
+    renderSelector({ modelLabel: 'Embedding Model' });
+    expect(screen.getByLabelText('Embedding Model')).toBeTruthy();
+    expect(screen.queryByLabelText('Model')).toBeNull();
+  });
+});

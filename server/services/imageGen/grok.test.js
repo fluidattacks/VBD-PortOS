@@ -1,0 +1,532 @@
+import { acquireBackupSnapshotCut } from '../../lib/backupSnapshotBoundary.js';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { posixPath } from '../../lib/testHelper.js';
+
+const admissionFault = vi.hoisted(() => ({ error: null }));
+vi.mock('../../lib/backupSnapshotBoundary.js', async original => {
+  const actual = await original();
+  return { ...actual, withBackupAssetPublication: (...args) => {
+    if (admissionFault.error) return Promise.reject(admissionFault.error);
+    return actual.withBackupAssetPublication(...args);
+  } };
+});
+
+import { mkdir, writeFile, rm, readFile } from 'fs/promises';
+import { existsSync } from 'fs';
+import { join } from 'path';
+import { tmpdir } from 'os';
+import { EventEmitter } from 'events';
+import { ChildProcess } from '../../lib/childProcess.js';
+
+// Spawn mock — capture every spawn call so tests can assert args, drive
+// stdout/stderr, capture the stdin-delivered prompt, and trigger the close
+// event whenever they want. Grok reads the prompt via `--prompt-file
+// /dev/stdin`, so unlike codex the prompt is captured from stdin writes,
+// not argv.
+const spawnCalls = [];
+const makeFakeChild = () => {
+  const child = new EventEmitter();
+  // killProcessTree tells a spawned child from a node-pty session by
+  // `instanceof ChildProcess` (a pty takes a different kill shape), so the fake
+  // has to carry the prototype the way a real spawn() result does.
+  Object.setPrototypeOf(child, ChildProcess.prototype);
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.stdin = { written: '', on: vi.fn(), write: vi.fn(function (s) { child.stdin.written += s; }), end: vi.fn() };
+  child.kill = vi.fn();
+  child.exitCode = null;
+  child.signalCode = null;
+  return child;
+};
+vi.mock('../../lib/childProcess.js', async (importOriginal) => {
+  const actual = await importOriginal();
+  const { readFileSync } = await import('fs');
+  return {
+    ...actual,
+    spawn: vi.fn((bin, args) => {
+      const child = makeFakeChild();
+      // On Windows grok cannot read /dev/stdin, so prepareGrokPromptFile writes
+      // the prompt to a temp file and rewrites --prompt-file to point at it —
+      // then unlinks that file once the run closes. Capture its contents HERE,
+      // between the write and the cleanup, so promptOf() can report the prompt
+      // on both platforms instead of reading an always-empty stdin buffer.
+      let promptFromFile = null;
+      const pfIdx = args?.indexOf?.('--prompt-file');
+      const pfPath = pfIdx >= 0 ? args[pfIdx + 1] : null;
+      if (pfPath && pfPath !== '/dev/stdin') {
+        try { promptFromFile = readFileSync(pfPath, 'utf8'); } catch { promptFromFile = null; }
+      }
+      spawnCalls.push({ bin, args, child, promptFromFile });
+      return child;
+    }),
+  };
+});
+
+// Stable PATHS.images under a test dir so the success-path copyFile lands in
+// a predictable place we can read back (mirrors codex.test.js).
+const TEST_ROOT = join(tmpdir(), `portos-grok-test-${process.pid}-${Date.now()}`);
+const FAKE_IMAGES_DIR = join(TEST_ROOT, 'data-images');
+vi.mock('../../lib/fileUtils.js', async () => {
+  const actual = await vi.importActual('../../lib/fileUtils.js');
+  actual.PATHS.images = FAKE_IMAGES_DIR;
+  return {
+    ...actual,
+    ensureDir: vi.fn(async (dir) => mkdir(dir, { recursive: true })),
+  };
+});
+
+const grok = await import('./grok.js');
+const { imageGenEvents } = await import('../imageGenEvents.js');
+
+const flush = () => new Promise((r) => setImmediate(r));
+const stagingPathFor = (jobId) => join(tmpdir(), `portos-grok-${jobId}`, 'output.png');
+// POSIX delivers the prompt over stdin; Windows through the rewritten
+// --prompt-file temp file (captured at spawn time above).
+const promptOf = (i = 0) => spawnCalls[i].promptFromFile ?? spawnCalls[i].child.stdin.written;
+const closeChild = async (i = 0, code = 1) => {
+  spawnCalls[i].child.exitCode = code;
+  spawnCalls[i].child.emit('close', code, null);
+  await flush();
+};
+
+beforeEach(async () => {
+  spawnCalls.length = 0;
+  imageGenEvents.removeAllListeners();
+  grok._internals.setHarvestTimeoutForTests(10);
+  await rm(TEST_ROOT, { recursive: true, force: true }).catch(() => {});
+  await mkdir(TEST_ROOT, { recursive: true });
+});
+
+afterEach(async () => {
+  vi.useRealTimers();
+  grok._internals.setHarvestTimeoutForTests();
+  await rm(TEST_ROOT, { recursive: true, force: true }).catch(() => {});
+});
+
+describe('grok provider — deriveAspectRatio', () => {
+  it('does not signal a live-child error as settled before physical close', async () => {
+    const failed = vi.fn();
+    imageGenEvents.on('failed', failed);
+    await grok.generateImage({ prompt: 'a fox' });
+    const child = spawnCalls[0].child;
+    child.pid = 9876;
+    child.emit('error', new Error('signal delivery failed'));
+    await flush();
+    expect(failed).not.toHaveBeenCalled();
+    await closeChild(0, 1);
+    expect(failed).toHaveBeenCalledTimes(1);
+  });
+
+  it('maps common dimension pairs to the closest supported ratio', () => {
+    expect(grok.deriveAspectRatio(1024, 1024)).toBe('1:1');
+    expect(grok.deriveAspectRatio(1920, 1080)).toBe('16:9');
+    expect(grok.deriveAspectRatio(1080, 1920)).toBe('9:16');
+    expect(grok.deriveAspectRatio(1024, 1536)).toBe('2:3');
+    expect(grok.deriveAspectRatio(1536, 1024)).toBe('3:2');
+  });
+
+  it('returns null for absent or invalid dimensions', () => {
+    expect(grok.deriveAspectRatio(undefined, undefined)).toBe(null);
+    expect(grok.deriveAspectRatio(0, 512)).toBe(null);
+    expect(grok.deriveAspectRatio('nope', 512)).toBe(null);
+  });
+});
+
+describe('grok provider — generateImage', () => {
+  it('spawns grok with headless args and delivers the prompt over stdin', async () => {
+    const job = await grok.generateImage({ prompt: 'a small fox' });
+    expect(job.mode).toBe('grok');
+    expect(job.filename).toMatch(/^[0-9a-f-]{36}\.png$/);
+    expect(job.status).toBe('running');
+    expect(spawnCalls.length).toBe(1);
+    const { bin, args } = spawnCalls[0];
+    expect(bin).toBe('grok');
+    // ensureGrokHeadlessArgs contract: plain output, bypassed permissions,
+    // prompt via /dev/stdin (POSIX), no --model pin.
+    expect(args).toEqual(expect.arrayContaining(['--output-format', 'plain']));
+    expect(args).toEqual(expect.arrayContaining(['--permission-mode', 'bypassPermissions']));
+    // Windows has no /dev/stdin, so prepareGrokPromptFile rewrites the sentinel
+    // to a real temp file. Assert the per-platform value — both ship.
+    expect(args).toEqual(expect.arrayContaining([
+      '--prompt-file',
+      process.platform === 'win32' ? expect.stringMatching(/grok-prompt-.*\.txt$/) : '/dev/stdin',
+    ]));
+    expect(args).not.toContain('--model');
+    // The agent prompt names the tool, the image prompt, and the directed path.
+    const prompt = promptOf();
+    expect(prompt).toContain('image_gen');
+    expect(prompt).toContain('a small fox');
+    expect(prompt).toContain(stagingPathFor(job.jobId));
+    await closeChild();
+  });
+
+  it('derives the aspect ratio from width/height and puts it in the prompt', async () => {
+    await grok.generateImage({ prompt: 'a fox', width: 1920, height: 1080 });
+    expect(promptOf()).toContain('aspect_ratio "16:9"');
+    await closeChild();
+  });
+
+  it('falls back to the configured default ratio when no dimensions are sent', async () => {
+    await grok.generateImage({ prompt: 'a fox', aspectRatio: '9:16' });
+    expect(promptOf()).toContain('aspect_ratio "9:16"');
+    await closeChild();
+  });
+
+  it('ignores an unsupported configured ratio (no injection into the prompt)', async () => {
+    await grok.generateImage({ prompt: 'a fox', aspectRatio: '99:1; rm -rf /' });
+    expect(promptOf()).not.toContain('99:1');
+    expect(promptOf()).not.toContain('aspect_ratio');
+    await closeChild();
+  });
+
+  it('honors grokPath override (custom binary)', async () => {
+    await grok.generateImage({ prompt: 'a fox', grokPath: '/opt/custom/grok' });
+    expect(posixPath(spawnCalls[0].bin)).toBe('/opt/custom/grok');
+    await closeChild();
+  });
+
+  it('appends the negative prompt as an Avoid line', async () => {
+    await grok.generateImage({ prompt: 'a fox', negativePrompt: 'watermark, text' });
+    expect(promptOf()).toContain('Avoid: watermark, text');
+    await closeChild();
+  });
+
+  it('rejects when prompt is empty and there is no init image', async () => {
+    await expect(grok.generateImage({ prompt: '   ' })).rejects.toThrow(/Prompt is required/);
+  });
+
+  it('switches to image_edit and the fidelity phrase for an init image', async () => {
+    await mkdir(FAKE_IMAGES_DIR, { recursive: true });
+    await writeFile(join(FAKE_IMAGES_DIR, 'proof.png'), 'fake');
+    await grok.generateImage({ prompt: 'cover art', initImagePath: 'proof.png', initImageStrength: 0.2 });
+    const prompt = promptOf();
+    expect(prompt).toContain('image_edit');
+    expect(prompt).toContain(join(FAKE_IMAGES_DIR, 'proof.png'));
+    // Low strength → composition-preserving fidelity phrase (shared with codex).
+    expect(prompt).toMatch(/preserve composition/i);
+    expect(prompt).toContain('cover art');
+    await closeChild();
+  });
+
+  it('routes a reference-only render to image_edit — image_gen takes no input image', async () => {
+    await mkdir(FAKE_IMAGES_DIR, { recursive: true });
+    await writeFile(join(FAKE_IMAGES_DIR, 'ref-a.png'), 'fake');
+    await writeFile(join(FAKE_IMAGES_DIR, 'ref-b.png'), 'fake');
+    await grok.generateImage({ prompt: 'a fox', referenceImagePaths: ['ref-a.png', 'ref-b.png'] });
+    const prompt = promptOf();
+    expect(prompt).toContain('image_edit');
+    expect(prompt).toContain('`image` array');
+    expect(prompt).toContain(join(FAKE_IMAGES_DIR, 'ref-a.png'));
+    expect(prompt).toContain(join(FAKE_IMAGES_DIR, 'ref-b.png'));
+    // No source image, so no fidelity phrase — these are references, not an edit.
+    expect(prompt).not.toMatch(/transform the source image/i);
+    await closeChild();
+  });
+
+  it('puts the init image first and the references after it', async () => {
+    await mkdir(FAKE_IMAGES_DIR, { recursive: true });
+    await writeFile(join(FAKE_IMAGES_DIR, 'proof.png'), 'fake');
+    await writeFile(join(FAKE_IMAGES_DIR, 'ref-a.png'), 'fake');
+    await grok.generateImage({
+      prompt: 'cover art', initImagePath: 'proof.png', initImageStrength: 0.2,
+      referenceImagePaths: ['ref-a.png'],
+    });
+    const prompt = promptOf();
+    expect(prompt).toMatch(/source image at .*proof\.png/);
+    expect(prompt).toContain('FIRST in the tool');
+    expect(prompt.indexOf(join(FAKE_IMAGES_DIR, 'proof.png')))
+      .toBeLessThan(prompt.indexOf(join(FAKE_IMAGES_DIR, 'ref-a.png')));
+    await closeChild();
+  });
+
+  it('drops a reference path that escapes the gallery (defense-in-depth)', async () => {
+    await grok.generateImage({ prompt: 'a fox', referenceImagePaths: ['/etc/passwd'] });
+    const prompt = promptOf();
+    expect(posixPath(prompt)).not.toContain('/etc/passwd');
+    // Nothing survived, so it falls back to plain text-to-image.
+    expect(prompt).not.toContain('image_edit');
+    await closeChild();
+  });
+
+  it('drops an initImagePath that escapes the gallery (defense-in-depth)', async () => {
+    await grok.generateImage({ prompt: 'cover art', initImagePath: '/etc/passwd', initImageStrength: 0.2 });
+    const prompt = promptOf();
+    expect(prompt).not.toContain('image_edit');
+    expect(posixPath(prompt)).not.toContain('/etc/passwd');
+    await closeChild();
+  });
+
+  it('allows an empty prompt when editing an init image', async () => {
+    await mkdir(FAKE_IMAGES_DIR, { recursive: true });
+    await writeFile(join(FAKE_IMAGES_DIR, 'editme.png'), 'fake');
+    await grok.generateImage({ prompt: '', initImagePath: 'editme.png' });
+    expect(promptOf()).toContain('image_edit');
+    await closeChild();
+  });
+
+  it('allows concurrent generations (parallel cloud lane)', async () => {
+    const a = await grok.generateImage({ prompt: 'one' });
+    const b = await grok.generateImage({ prompt: 'two' });
+    expect(a.jobId).not.toBe(b.jobId);
+    expect(spawnCalls.length).toBe(2);
+    await closeChild(0);
+    await closeChild(1);
+  });
+});
+
+describe('grok provider — directed-path harvest', () => {
+  it('copies the staged file into PATHS.images and emits completed', async () => {
+    const completedListener = vi.fn();
+    imageGenEvents.on('completed', completedListener);
+
+    const job = await grok.generateImage({ prompt: 'a fox' });
+    // Grok "writes" the directed staging file before the child exits. The
+    // harvest signature-sniffs the bytes, so the fixture needs a real PNG
+    // magic header.
+    const fakePngBytes = Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      Buffer.from('fakepngbody'),
+    ]);
+    await mkdir(join(tmpdir(), `portos-grok-${job.jobId}`), { recursive: true });
+    await writeFile(stagingPathFor(job.jobId), fakePngBytes);
+    const releaseCut = await acquireBackupSnapshotCut();
+    try {
+    await closeChild(0, 0);
+      await new Promise(resolve => setImmediate(resolve));
+      expect(existsSync(join(FAKE_IMAGES_DIR, job.filename)), 'provider completion must wait outside a held snapshot').toBe(false);
+    } finally { releaseCut(); }
+
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline && completedListener.mock.calls.length === 0) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+
+    expect(completedListener).toHaveBeenCalledTimes(1);
+    const finalPath = join(FAKE_IMAGES_DIR, job.filename);
+    expect(existsSync(finalPath)).toBe(true);
+    const written = await readFile(finalPath);
+    expect(Buffer.compare(written, fakePngBytes)).toBe(0);
+    // The whole per-job scratch dir is cleaned up after the move.
+    expect(existsSync(join(tmpdir(), `portos-grok-${job.jobId}`))).toBe(false);
+    // Sidecar metadata exists too.
+    const sidecar = join(FAKE_IMAGES_DIR, `${job.generationId}.metadata.json`);
+    expect(existsSync(sidecar)).toBe(true);
+    // …and carries this render's own wall-clock cost (#5878), which is what the
+    // gallery card humanizes. The span is bounded by `createdAt`→`now` rather
+    // than asserted against a literal, so this stays a contract test and not a
+    // timing flake.
+    const meta = JSON.parse(await readFile(sidecar, 'utf8'));
+    expect(meta.renderMs).toBeGreaterThanOrEqual(0);
+    expect(Date.parse(meta.renderStartedAt)).toBeLessThanOrEqual(Date.parse(meta.renderCompletedAt));
+    expect(Date.parse(meta.renderCompletedAt) - Date.parse(meta.renderStartedAt)).toBe(meta.renderMs);
+  });
+
+  it('transcodes a staged JPEG to PNG instead of shipping mislabeled bytes', async () => {
+    const { default: sharp } = await import('sharp');
+    const completedListener = vi.fn();
+    imageGenEvents.on('completed', completedListener);
+
+    const job = await grok.generateImage({ prompt: 'a fox' });
+    const jpegBytes = await sharp({ create: { width: 2, height: 2, channels: 3, background: '#fff' } }).jpeg().toBuffer();
+    await mkdir(join(tmpdir(), `portos-grok-${job.jobId}`), { recursive: true });
+    await writeFile(stagingPathFor(job.jobId), jpegBytes);
+    await closeChild(0, 0);
+
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline && completedListener.mock.calls.length === 0) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    expect(completedListener).toHaveBeenCalledTimes(1);
+    const written = await readFile(join(FAKE_IMAGES_DIR, job.filename));
+    // PNG magic — the gallery file matches its .png extension.
+    expect(written.subarray(0, 4)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+  }, 10000);
+
+  it('rejects a staged file that is not a real image (signature sniff)', async () => {
+    const failedListener = vi.fn();
+    imageGenEvents.on('failed', failedListener);
+
+    const job = await grok.generateImage({ prompt: 'a fox' });
+    // Grok wrote a text error where the PNG should be.
+    await mkdir(join(tmpdir(), `portos-grok-${job.jobId}`), { recursive: true });
+    await writeFile(stagingPathFor(job.jobId), 'Error: could not generate');
+    spawnCalls[0].child.exitCode = 0;
+    spawnCalls[0].child.emit('close', 0, null);
+    await vi.waitFor(() => expect(failedListener).toHaveBeenCalledTimes(1));
+    expect(failedListener.mock.calls[0][0].error).toMatch(/non-image file/);
+    // The rejected junk never reaches the gallery. Scratch-dir removal is
+    // fire-and-forget alongside the 'failed' event (not awaited before it),
+    // so give it a moment to land on disk rather than racing it.
+    expect(existsSync(join(FAKE_IMAGES_DIR, job.filename))).toBe(false);
+    const scratchDir = join(tmpdir(), `portos-grok-${job.jobId}`);
+    await vi.waitFor(() => expect(existsSync(scratchDir)).toBe(false));
+    expect(existsSync(scratchDir)).toBe(false);
+  });
+
+  it('fails with the stdout narration when grok exits 0 but wrote no file', async () => {
+    const failedListener = vi.fn();
+    imageGenEvents.on('failed', failedListener);
+
+    await grok.generateImage({ prompt: 'a fox' });
+    const child = spawnCalls[0].child;
+    child.stdout.emit('data', Buffer.from('I cannot generate that image.\n'));
+    child.exitCode = 0;
+    child.emit('close', 0, null);
+    await vi.waitFor(() => expect(failedListener).toHaveBeenCalledTimes(1));
+    expect(failedListener.mock.calls[0][0].error).toMatch(/I cannot generate that image/);
+  });
+
+  it('fails with the stderr tail on a non-zero exit', async () => {
+    const failedListener = vi.fn();
+    imageGenEvents.on('failed', failedListener);
+
+    await grok.generateImage({ prompt: 'a fox' });
+    const child = spawnCalls[0].child;
+    child.stderr.emit('data', Buffer.from('boom: auth expired\n'));
+    await closeChild(0, 1);
+
+    expect(failedListener).toHaveBeenCalledTimes(1);
+    expect(failedListener.mock.calls[0][0].error).toMatch(/Exit code 1/);
+    expect(failedListener.mock.calls[0][0].error).toMatch(/auth expired/);
+  });
+
+  it('fails cleanly when the binary cannot be spawned', async () => {
+    const failedListener = vi.fn();
+    imageGenEvents.on('failed', failedListener);
+
+    await grok.generateImage({ prompt: 'a fox' });
+    const child = spawnCalls[0].child;
+    child.emit('error', new Error('ENOENT'));
+    await flush();
+
+    expect(failedListener).toHaveBeenCalledTimes(1);
+    expect(failedListener.mock.calls[0][0].error).toMatch(/Failed to spawn grok/);
+  });
+
+  // Regression (#8915): the success-path tail dispatches its terminal SSE
+  // frame and its `imageGenEvents.emit('completed', ...)` INDEPENDENTLY via
+  // `dispatchTerminalEvent` — a throwing subscriber's res.write (a dead SSE
+  // client) must not suppress the 'completed' event, which is what drives the
+  // gallery index / peer-sync / job-queue settlement. (This used to instead
+  // hit the shared finalizer's `force` escape hatch and flip a successful
+  // render into a spurious 'failed' — see #6830 history — which was itself
+  // only correct for a REAL post-processing throw, not a merely-best-effort
+  // SSE write failing on an already-successful render.)
+  it('still emits completed when a connected SSE client throws on the terminal complete frame', async () => {
+    const completedListener = vi.fn();
+    const failedListener = vi.fn();
+    imageGenEvents.on('completed', completedListener);
+    imageGenEvents.on('failed', failedListener);
+
+    const job = await grok.generateImage({ prompt: 'a fox' });
+    const fakePngBytes = Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      Buffer.from('fakepngbody'),
+    ]);
+    await mkdir(join(tmpdir(), `portos-grok-${job.jobId}`), { recursive: true });
+    await writeFile(stagingPathFor(job.jobId), fakePngBytes);
+
+    // A subscriber whose res.write throws ONLY on the terminal 'complete'
+    // frame — the exact window this regression covers. The earlier 'status'
+    // replay-on-attach write must succeed so the render reaches that frame.
+    const throwingClient = {
+      writeHead: vi.fn(),
+      write: vi.fn((msg) => {
+        if (msg.includes('"type":"complete"')) throw new Error('subscriber write failed');
+      }),
+      end: vi.fn(),
+      req: { on: vi.fn() },
+    };
+    grok.attachSseClient(job.jobId, throwingClient);
+
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    await closeChild(0, 0);
+
+    await vi.waitFor(() => expect(completedListener).toHaveBeenCalledTimes(1), { timeout: 5000, interval: 50 });
+    expect(failedListener).not.toHaveBeenCalled();
+    expect(errSpy).toHaveBeenCalledWith(expect.stringContaining('SSE client write failed'));
+    errSpy.mockRestore();
+  }, 10000);
+});
+
+describe('grok provider — noImageReason', () => {
+  it('falls back to the enablement hint when grok said nothing usable', () => {
+    expect(grok.noImageReason('')).toMatch(/Enable Grok Imagegen/);
+    expect(grok.noImageReason('----\n12,345\n')).toMatch(/Enable Grok Imagegen/);
+  });
+
+  it('surfaces the last narration lines', () => {
+    expect(grok.noImageReason('working…\nThat prompt violates policy.\n')).toMatch(/violates policy/);
+  });
+});
+
+describe('grok provider — cancel', () => {
+  it('cancel() requires a jobId', () => {
+    expect(() => grok.cancel()).toThrow(/requires a jobId/);
+  });
+
+  it('cancel(jobId) SIGTERMs the matching child; cancelAll() sweeps every one', async () => {
+    const a = await grok.generateImage({ prompt: 'one' });
+    const b = await grok.generateImage({ prompt: 'two' });
+    expect(grok.cancel(a.jobId)).toBe(true);
+    expect(spawnCalls[0].child.kill).toHaveBeenCalledWith('SIGTERM');
+    expect(spawnCalls[1].child.kill).not.toHaveBeenCalled();
+    expect(grok.cancelAll()).toBe(true);
+    expect(spawnCalls[1].child.kill).toHaveBeenCalledWith('SIGTERM');
+    expect(grok.cancel(b.jobId)).toBe(true);
+    await closeChild(0);
+    await closeChild(1);
+    // Everything finished — nothing left to cancel.
+    expect(grok.cancel(a.jobId)).toBe(false);
+    expect(grok.cancelAll()).toBe(false);
+  });
+});
+
+describe('grok provider — checkConnection', () => {
+  it('reports connected with the parsed version on exit 0', async () => {
+    const p = grok.checkConnection({});
+    await flush();
+    const probe = spawnCalls[0];
+    expect(probe.bin).toBe('grok');
+    expect(probe.args).toEqual(['--version']);
+    probe.child.stdout.emit('data', Buffer.from('grok 0.2.7\n'));
+    probe.child.emit('close', 0, null);
+    const status = await p;
+    expect(status).toEqual({ connected: true, mode: 'grok', model: 'grok-cli 0.2.7' });
+  });
+
+  it('reports not-found when the spawn errors', async () => {
+    const p = grok.checkConnection({ grokPath: '/nope/grok' });
+    await flush();
+    spawnCalls[0].child.emit('error', new Error('ENOENT'));
+    const status = await p;
+    expect(status.connected).toBe(false);
+    expect(status.reason).toMatch(/not found/);
+  });
+
+  it('reports the exit code on a non-zero probe', async () => {
+    const p = grok.checkConnection({});
+    await flush();
+    spawnCalls[0].child.emit('close', 3, null);
+    const status = await p;
+    expect(status.connected).toBe(false);
+    expect(status.reason).toMatch(/exited 3/);
+  });
+});
+
+
+it('settles admission rejection from the actual close event and clears the active slot', async () => {
+  const job = await grok.generateImage({ prompt: 'admission failure' });
+  const child = spawnCalls[0].child;
+  const failed = new Promise(resolve => imageGenEvents.once('failed', resolve));
+  admissionFault.error = new Error('injected publication admission refusal');
+  try {
+    child.emit('close', 0, null);
+    expect((await failed).error).toContain('injected publication admission refusal');
+    expect(grok.getActiveJob()).toBeNull();
+    const response = { writeHead: vi.fn(), write: vi.fn(), end: vi.fn(), req: new EventEmitter() };
+    expect(grok.attachSseClient(job.jobId, response)).toBe(true);
+    expect(response.write.mock.calls[0][0]).toContain('injected publication admission refusal');
+    response.req.emit('close');
+  } finally { admissionFault.error = null; }
+});

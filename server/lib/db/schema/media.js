@@ -1,0 +1,246 @@
+// Media-project DDL — creative-director projects, music-video projects, mood
+// boards, and media assets. Extracted verbatim from ensureSchemaImpl() in
+// server/lib/db.js (#2832); idempotent, runs on every boot.
+export const mediaDdl = [
+    `CREATE TABLE IF NOT EXISTS media_prompt_examinations (
+      id TEXT PRIMARY KEY,
+      source_key TEXT NOT NULL,
+      data JSONB NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_media_prompt_examinations_created ON media_prompt_examinations (created_at DESC, id DESC)`,
+    // Creative Director projects (Phase 3, issue #997). One row per project;
+    // the full record lives in `data` JSONB, with status/created_at/updated_at
+    // mirrored into columns (kept in lockstep on every write) for future
+    // queries. `listProjects` sorts by created_at. `status` is app-layer gated
+    // (PROJECT_STATUSES), no DB CHECK. As of #1564 projects FEDERATE across peers
+    // via the per-record peer-sync push pipeline (record kind
+    // `creativeDirectorProject`, sync category `creativeDirectorProjects`), so
+    // the soft-delete tombstone trio (deleted/deleted_at + LWW updated_at) mirrors
+    // the authors table — a delete is a tombstone the merge keeps an out-of-date
+    // peer from resurrecting. Mirrors the creative_director_projects block in
+    // init-db.sql; the ADD COLUMN upgrades below backfill existing installs.
+    `CREATE TABLE IF NOT EXISTS creative_director_projects (
+      id TEXT PRIMARY KEY,
+      status VARCHAR(32) NOT NULL DEFAULT 'draft',
+      data JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW(),
+      deleted BOOLEAN DEFAULT FALSE,
+      deleted_at TIMESTAMPTZ
+    )`,
+    // Backfill the tombstone columns on installs created before #1564 (the
+    // CREATE above is a no-op once the table exists). The partial index serves
+    // the live-list filter (deleted = FALSE).
+    `ALTER TABLE creative_director_projects ADD COLUMN IF NOT EXISTS deleted BOOLEAN DEFAULT FALSE`,
+    `ALTER TABLE creative_director_projects ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ`,
+    `CREATE INDEX IF NOT EXISTS idx_creative_director_projects_live ON creative_director_projects (deleted) WHERE deleted = FALSE`,
+
+    // Three.js procedural models. The user-authored/generative record (gallery
+    // image reference, provider/model attribution, validated scene spec, status,
+    // and refinement history) lives in JSONB; generated image bytes remain in
+    // data/images and are referenced by filename. Soft deletes keep recovery and
+    // future peer-sync additive. Mirrors init-db.sql.
+    `CREATE TABLE IF NOT EXISTS threejs_models (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      status VARCHAR(32) NOT NULL DEFAULT 'draft',
+      data JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW(),
+      deleted BOOLEAN DEFAULT FALSE,
+      deleted_at TIMESTAMPTZ
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_threejs_models_live_updated ON threejs_models (updated_at DESC) WHERE deleted = FALSE`,
+
+    // Image-to-3D models (issue #2952). The neural image→GLB record — distinct
+    // from the procedural threejs_models above (that authors JS source; this
+    // lands a real .glb mesh). Source gallery image reference, selected target
+    // (trellis2 today), status, run history, and the exported GLB's served path
+    // live in JSONB; the binary GLB stays on disk at data/image-to-3d/<id>/
+    // model.glb and is referenced by path. Soft deletes keep recovery and future
+    // peer-sync additive (the GLB is a local, host-specific render, so this is
+    // NOT federated in this phase — like threejs_models). Mirrors init-db.sql.
+    `CREATE TABLE IF NOT EXISTS image_to_3d_models (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      status VARCHAR(32) NOT NULL DEFAULT 'draft',
+      data JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW(),
+      deleted BOOLEAN DEFAULT FALSE,
+      deleted_at TIMESTAMPTZ
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_image_to_3d_models_live_updated ON image_to_3d_models (updated_at DESC) WHERE deleted = FALSE`,
+
+    // Music Video projects (issue #1760). The director scene board's db-primary
+    // record: id/status/created_at/updated_at mirrored as columns, the full
+    // project (track link, cached audioAnalysis, scenes[]) in `data` JSONB —
+    // same shape as creative_director_projects. The soft-delete tombstone trio is
+    // present so peer-sync federation (a follow-up) is additive. Mirrors the
+    // music_video_projects block in init-db.sql.
+    `CREATE TABLE IF NOT EXISTS music_video_projects (
+      id TEXT PRIMARY KEY,
+      status VARCHAR(32) NOT NULL DEFAULT 'draft',
+      data JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW(),
+      deleted BOOLEAN DEFAULT FALSE,
+      deleted_at TIMESTAMPTZ
+    )`,
+    `ALTER TABLE music_video_projects ADD COLUMN IF NOT EXISTS deleted BOOLEAN DEFAULT FALSE`,
+    `ALTER TABLE music_video_projects ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ`,
+    `CREATE INDEX IF NOT EXISTS idx_music_video_projects_live ON music_video_projects (deleted) WHERE deleted = FALSE`,
+
+    // Mood boards (issue #911). A dedicated inspiration/mood-board canvas,
+    // distinct from raw Media History, for collecting visual + textual
+    // references that feed the Create suite. One row per board, the full record
+    // (name/description/items[]) in `data` JSONB. Items (image-by-media-key or
+    // external URL, or a text note + optional caption/source backref) live
+    // inline in the board's JSONB rather than a child table — a board is read/
+    // written whole, has a small bounded item list, and there are no cross-board
+    // item queries. `name` mirrors a column for the live-list sort. As of #1564
+    // mood boards FEDERATE across peers via the per-record peer-sync push pipeline
+    // (record kind `moodBoard`, sync category `moodBoards`), so the soft-delete
+    // tombstone trio (deleted/deleted_at + LWW updated_at) mirrors
+    // creative_director_projects — a delete is a tombstone the merge keeps an
+    // out-of-date peer from resurrecting. Mirrors the mood_boards block in
+    // init-db.sql; the ADD COLUMN upgrades below backfill existing installs.
+    `CREATE TABLE IF NOT EXISTS mood_boards (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      data JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW(),
+      deleted BOOLEAN DEFAULT FALSE,
+      deleted_at TIMESTAMPTZ
+    )`,
+    // Backfill the tombstone columns on installs created before #1564 (the
+    // CREATE above is a no-op once the table exists).
+    `ALTER TABLE mood_boards ADD COLUMN IF NOT EXISTS deleted BOOLEAN DEFAULT FALSE`,
+    `ALTER TABLE mood_boards ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ`,
+    // updated_at DESC is the board-list "recently touched" sort.
+    `CREATE INDEX IF NOT EXISTS idx_mood_boards_updated ON mood_boards (updated_at DESC)`,
+    // Partial index for the live-list filter (deleted = FALSE).
+    `CREATE INDEX IF NOT EXISTS idx_mood_boards_live ON mood_boards (deleted) WHERE deleted = FALSE`,
+
+    // Sprite records (issue #2895, phase 1). One row per sprite subject — a
+    // character or a props atlas family; the full record (spec, chromaKey,
+    // publishBinding, importedFrom) in `data` JSONB with kind/status mirrored
+    // for queries. Binary assets live under data/sprites/<id>/ — the row is
+    // metadata + workflow state only. Not federated in phase 1; the tombstone
+    // trio keeps peer-sync additive later.
+    `CREATE TABLE IF NOT EXISTS sprite_records (
+      id TEXT PRIMARY KEY,
+      kind VARCHAR(16) NOT NULL DEFAULT 'character',
+      status VARCHAR(32) NOT NULL DEFAULT 'draft',
+      data JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW(),
+      deleted BOOLEAN DEFAULT FALSE,
+      deleted_at TIMESTAMPTZ
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_sprite_records_live ON sprite_records (deleted) WHERE deleted = FALSE`,
+
+    // Game studio (#3177). One row per managed-app asset plan; reusable sprite
+    // and music bindings, compile pointers/history, and user-requested AI
+    // feedback history live in `data` JSONB. app_id/name/updated_at are mirrored
+    // for list and relationship queries. Compiled manifests stay on disk under
+    // data/games/<id>/manifests. Machine-local: app registry and referenced
+    // asset bytes are machine-local, so there is no peer-sync/tombstone shape.
+    `CREATE TABLE IF NOT EXISTS games (
+      id TEXT PRIMARY KEY,
+      app_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      data JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_games_app_updated ON games (app_id, updated_at DESC)`,
+
+    // Media asset index (Phase 3.2, issue #1000). One row per generated image
+    // or video; the bytes stay on disk (data/images, data/videos) and the
+    // sidecar/.json history files remain authoritative — this table is a
+    // DERIVED, queryable index, reconciled from disk at boot + kept warm by a
+    // generation-completed hook. `media_key` is the shared `<kind>:<ref>`
+    // vocabulary (mediaItemKey.js); `kind`/`ref` are mirrored into columns for
+    // queries, the full metadata record lives in `data` JSONB. created_at is
+    // the asset's own timestamp; indexed_at is when this index row was written.
+    // No sync_sequence/tombstone: the index is local-only (rebuilt from disk),
+    // not federated — a row vanishes when its file does (prune on reconcile).
+    // Mirrors the media_assets block in init-db.sql.
+    `CREATE TABLE IF NOT EXISTS media_assets (
+      media_key TEXT PRIMARY KEY,
+      kind VARCHAR(16) NOT NULL,
+      ref TEXT NOT NULL,
+      data JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      indexed_at TIMESTAMPTZ DEFAULT NOW()
+    )`,
+    // created_at DESC is the gallery/history sort order; kind narrows
+    // images-vs-videos. A composite (kind, created_at DESC) serves both.
+    `CREATE INDEX IF NOT EXISTS idx_media_assets_kind_created ON media_assets (kind, created_at DESC)`,
+
+    // Code Animation jobs. The searchable gallery fields are mirrored into
+    // columns; the full brief/provider/status record lives in JSONB, while the
+    // generated HTML is a managed file at data/code-animations/<id>.html.
+    // Machine-local generated work: it has no peer-sync cursor or tombstone.
+    `CREATE TABLE IF NOT EXISTS code_animation_jobs (
+      id TEXT PRIMARY KEY,
+      status VARCHAR(16) NOT NULL,
+      title TEXT NOT NULL DEFAULT '',
+      concept TEXT NOT NULL DEFAULT '',
+      provider_id TEXT,
+      model TEXT,
+      data JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_code_animation_jobs_created ON code_animation_jobs (created_at DESC, id DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_code_animation_jobs_status_created ON code_animation_jobs (status, created_at DESC)`,
+
+    // Machine-local Production metadata; immutable bytes remain managed assets.
+    `CREATE TABLE IF NOT EXISTS code_animation_projects (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL DEFAULT '',
+  data JSONB NOT NULL,
+  accepted_revision_id TEXT,
+  candidate_revision_id TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)`,
+    `CREATE INDEX IF NOT EXISTS idx_code_animation_projects_created ON code_animation_projects (created_at DESC, id DESC)`,
+    `CREATE TABLE IF NOT EXISTS code_animation_project_revisions (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES code_animation_projects(id) ON DELETE CASCADE,
+  package_hash TEXT NOT NULL,
+  source_hash TEXT NOT NULL,
+  total_bytes BIGINT NOT NULL,
+  data JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (project_id, id)
+)`,
+    `CREATE INDEX IF NOT EXISTS idx_code_animation_project_revisions_project ON code_animation_project_revisions (project_id, created_at DESC, id DESC)`,
+    `CREATE TABLE IF NOT EXISTS code_animation_project_runs (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES code_animation_projects(id) ON DELETE CASCADE,
+  revision_id TEXT,
+  status VARCHAR(16) NOT NULL,
+  data JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  completed_at TIMESTAMPTZ,
+  FOREIGN KEY (project_id, revision_id) REFERENCES code_animation_project_revisions(project_id, id)
+)`,
+    `CREATE INDEX IF NOT EXISTS idx_code_animation_project_runs_project ON code_animation_project_runs (project_id, created_at DESC, id DESC)`,
+    `DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'code_animation_projects_accepted_fk' AND conrelid = 'code_animation_projects'::regclass) THEN
+    ALTER TABLE code_animation_projects ADD CONSTRAINT code_animation_projects_accepted_fk
+      FOREIGN KEY (id, accepted_revision_id) REFERENCES code_animation_project_revisions(project_id, id) DEFERRABLE INITIALLY DEFERRED;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'code_animation_projects_candidate_fk' AND conrelid = 'code_animation_projects'::regclass) THEN
+    ALTER TABLE code_animation_projects ADD CONSTRAINT code_animation_projects_candidate_fk
+      FOREIGN KEY (id, candidate_revision_id) REFERENCES code_animation_project_revisions(project_id, id) DEFERRABLE INITIALLY DEFERRED;
+  END IF;
+END $$`,
+
+];

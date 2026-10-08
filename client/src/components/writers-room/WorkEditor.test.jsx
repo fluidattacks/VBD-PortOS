@@ -1,0 +1,448 @@
+import { useState } from 'react';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { act, fireEvent, render, screen, within } from '@testing-library/react';
+import { createMemoryRouter, RouterProvider } from 'react-router';
+
+// Header layout contract for #3568: on a ~375px phone the WorkEditor header
+// used to wrap into 4-5 rows and push the prose textarea below the fold. The
+// fix moves the status select and view-mode toggle into a full-width sub-bar
+// that `sm:contents` dissolves back into the single header row on desktop —
+// so DOM order stays the desktop order and only the phone layout changes.
+// jsdom doesn't apply Tailwind, so these assert the class contract that drives
+// the layout plus the behaviour that must survive the regroup.
+
+vi.mock('./StoryboardPanel', () => ({
+  default: function StoryboardPanelStub() { return <div data-testid="storyboard-panel" />; },
+  STORYBOARD_TAB: {
+    CHARACTERS: 'characters', WORLD: 'world', OBJECTS: 'objects',
+    SCENES: 'scenes', BOARDS: 'boards', CONFIG: 'config',
+  },
+  STORYBOARD_TAB_VALUES: ['characters', 'world', 'objects', 'scenes', 'boards', 'config'],
+}));
+
+// Socket.IO auto-connects on import (useImageGenQueue / LiveRenderPanel).
+vi.mock('../../services/socket', () => ({
+  default: { on: vi.fn(), off: vi.fn(), emit: vi.fn(), connected: false },
+}));
+
+vi.mock('../../services/apiWritersRoom', async (importOriginal) => ({
+  ...(await importOriginal()),
+  listWritersRoomFolders: vi.fn(async () => []),
+  listWritersRoomWorks: vi.fn(async () => []),
+  getWritersRoomWork: vi.fn(),
+  saveWritersRoomDraft: vi.fn(),
+  runWritersRoomAnalysis: vi.fn(),
+  listWritersRoomCharacters: vi.fn(async () => []),
+  listWritersRoomPlaces: vi.fn(async () => []),
+  listWritersRoomObjects: vi.fn(async () => []),
+}));
+
+vi.mock('./PolishPanel', () => ({
+  default: function PolishPanelStub({ onBodyChanged }) {
+    return <button onClick={() => onBodyChanged?.()}>Stub polish refresh</button>;
+  },
+}));
+vi.mock('../CatalogCastPanel', () => ({ default: () => <div>Catalog cast controls</div> }));
+vi.mock('./LibraryPane', () => ({ default: () => <div>Library controls</div> }));
+
+import WorkEditor from './WorkEditor';
+import WritersRoom from '../../pages/WritersRoom';
+import { getWritersRoomWork, runWritersRoomAnalysis, saveWritersRoomDraft } from '../../services/apiWritersRoom';
+
+const work = {
+  id: 'wr-work-1',
+  title: 'Example Work',
+  status: 'drafting',
+  kind: 'novel',
+  activeDraftBody: 'The hero wakes.',
+  activeDraftVersionId: 'wr-draft-1',
+  drafts: [{ id: 'wr-draft-1', label: 'v1', wordCount: 3 }],
+};
+
+// A DATA router: WorkEditor's unsaved-changes guard uses `useBlocker`, which
+// throws under a plain <MemoryRouter> (#3995).
+const editorRouter = () => createMemoryRouter([
+  { path: '/writers-room', element: <WorkEditor work={work} onChange={() => {}} /> },
+  { path: '/dashboard', element: <div>dashboard</div> },
+], { initialEntries: ['/writers-room'] });
+
+async function renderEditor() {
+  const router = editorRouter();
+  const view = render(<RouterProvider router={router} />);
+  await act(async () => {});
+  return { ...view, router };
+}
+
+function headerControls() {
+  const title = screen.getByLabelText('Work title');
+  return {
+    header: title.parentElement,
+    title,
+    status: screen.getByLabelText('Status'),
+    viewGroup: screen.getByRole('group', { name: 'View mode' }),
+    save: screen.getByRole('button', { name: /^Sav/ }),
+    snapshot: screen.getByRole('button', { name: 'Snapshot' }),
+    // The `relative` wrapper that positions the dropdown, not the button.
+    menu: screen.getByLabelText('Work menu').parentElement,
+  };
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+});
+
+describe('WorkEditor header layout (#3568)', () => {
+  it('gives the secondary controls their own row under sm and none of their own on desktop', async () => {
+    await renderEditor();
+    const { status, viewGroup } = headerControls();
+    const secondary = screen.getByTestId('work-header-secondary');
+
+    // Its own full-width row, ordered after the primary actions, under `sm`…
+    expect(secondary.className).toContain('w-full');
+    expect(secondary.className).toContain('order-last');
+    // …dissolved into the header row at `sm+`.
+    expect(secondary.className).toContain('sm:contents');
+    for (const el of [status, viewGroup]) {
+      expect(secondary.contains(el)).toBe(true);
+    }
+  });
+
+  it('leaves title, Save, Snapshot and the Work menu on the first mobile row', async () => {
+    await renderEditor();
+    const { header, title, save, snapshot, menu } = headerControls();
+    const secondary = screen.getByTestId('work-header-secondary');
+
+    expect([...header.children]).toEqual([title, secondary, save, snapshot, menu]);
+    // Let a long title yield to the fixed-width Save control on narrow phones.
+    expect(title).toHaveClass('min-w-0', 'w-0');
+    expect(save).toHaveClass('w-24', 'shrink-0');
+    // Only the sub-bar is re-ordered; anything else carrying an `order-*` class
+    // would either break the row split or desync tab order from the layout.
+    for (const el of [title, save, snapshot, menu]) {
+      expect(el.className).not.toMatch(/(?:^|\s)(?:sm:)?order-/);
+    }
+  });
+
+  it('keeps DOM order equal to the desktop left-to-right order', async () => {
+    await renderEditor();
+    const { title, status, viewGroup, save, snapshot, menu } = headerControls();
+
+    // title · status · view mode · Save · Snapshot · menu — the pre-#3568
+    // desktop sequence, and (because nothing sets `order` on desktop) the tab
+    // order a keyboard user gets.
+    const sequence = [title, status, viewGroup, save, snapshot, menu];
+    for (let i = 0; i < sequence.length - 1; i += 1) {
+      const relation = sequence[i].compareDocumentPosition(sequence[i + 1]);
+      expect(relation & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    }
+  });
+
+  it('renders every control exactly once — nothing is duplicated per breakpoint', async () => {
+    await renderEditor();
+    expect(screen.getAllByLabelText('Status')).toHaveLength(1);
+    expect(screen.getAllByLabelText('Work menu')).toHaveLength(1);
+    expect(screen.getAllByRole('button', { name: 'Snapshot' })).toHaveLength(1);
+    expect(screen.getAllByRole('group', { name: 'View mode' })).toHaveLength(1);
+  });
+
+  it('keeps buttons named when their labels collapse to icons under sm', async () => {
+    await renderEditor();
+    const { viewGroup, snapshot } = headerControls();
+
+    for (const name of ['Edit', 'Read', 'Review']) {
+      const button = within(viewGroup).getByRole('button', { name });
+      expect(button).toHaveAttribute('aria-label', name);
+      expect(within(button).getByText(name).className).toContain('hidden sm:inline');
+    }
+    expect(snapshot).toHaveAttribute('aria-label', 'Snapshot');
+    expect(within(snapshot).getByText('Snapshot').className).toContain('hidden sm:inline');
+  });
+
+  it('exposes the storyboard resizer as a bounded separator', async () => {
+    class ResizeObserverStub {
+      constructor(callback) { this.callback = callback; }
+      observe() { this.callback(); }
+      disconnect() {}
+    }
+    const rect = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({ width: 1000 });
+    vi.stubGlobal('ResizeObserver', ResizeObserverStub);
+
+    try {
+      await renderEditor();
+      const separator = screen.getByRole('separator', { name: 'Resize storyboard sidebar' });
+
+      expect(separator).toHaveAttribute('aria-orientation', 'vertical');
+      expect(separator).toHaveAttribute('aria-valuemax', '600');
+      expect(Number(separator.getAttribute('aria-valuemin'))).toBeLessThanOrEqual(Number(separator.getAttribute('aria-valuenow')));
+      expect(Number(separator.getAttribute('aria-valuenow'))).toBeLessThanOrEqual(Number(separator.getAttribute('aria-valuemax')));
+    } finally {
+      rect.mockRestore();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('gives the header controls a 44px touch target on mobile', async () => {
+    await renderEditor();
+    const { title, status, save, snapshot } = headerControls();
+    const menuButton = screen.getByLabelText('Work menu');
+
+    for (const el of [title, status, save, snapshot, menuButton]) {
+      expect(el.className).toContain('min-h-[44px]');
+      expect(el.className).toContain('sm:min-h-0');
+    }
+  });
+
+  it('still switches view mode from the regrouped toggle', async () => {
+    const { container } = await renderEditor();
+    const { viewGroup } = headerControls();
+    expect(container.querySelector('textarea')).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.click(within(viewGroup).getByRole('button', { name: 'Read' }));
+    });
+
+    expect(within(viewGroup).getByRole('button', { name: 'Read' })).toHaveAttribute('aria-pressed', 'true');
+    expect(within(viewGroup).getByRole('button', { name: 'Edit' })).toHaveAttribute('aria-pressed', 'false');
+    expect(container.querySelector('textarea')).toBeNull();
+  });
+});
+
+describe('WorkEditor unsaved-changes route guard (#3995)', () => {
+  const CONFIRM = 'Discard your unsaved changes to this work?';
+  const typeUnsaved = async (container, next) => {
+    const area = container.querySelector('textarea');
+    await act(async () => { fireEvent.change(area, { target: { value: next } }); });
+  };
+
+  it('blocks an in-app navigation while the draft is dirty', async () => {
+    const { container, router } = await renderEditor();
+    await typeUnsaved(container, 'The hero wakes, then hesitates.');
+
+    await act(async () => { await router.navigate('/dashboard'); });
+    expect(screen.getByText(CONFIRM)).toBeInTheDocument();
+    expect(screen.queryByText('dashboard')).not.toBeInTheDocument();
+  });
+
+  it('discards the draft and runs the parked navigation', async () => {
+    const { container, router } = await renderEditor();
+    await typeUnsaved(container, 'The hero wakes, then hesitates.');
+    await act(async () => { await router.navigate('/dashboard'); });
+
+    await act(async () => { fireEvent.click(screen.getByText('Discard')); });
+    expect(screen.getByText('dashboard')).toBeInTheDocument();
+  });
+
+  it('keeps the editor and the draft on cancel', async () => {
+    const { container, router } = await renderEditor();
+    await typeUnsaved(container, 'The hero wakes, then hesitates.');
+    await act(async () => { await router.navigate('/dashboard'); });
+
+    await act(async () => { fireEvent.click(screen.getByText('Keep editing')); });
+    expect(screen.queryByText(CONFIRM)).not.toBeInTheDocument();
+    expect(container.querySelector('textarea').value).toBe('The hero wakes, then hesitates.');
+    expect(screen.queryByText('dashboard')).not.toBeInTheDocument();
+  });
+
+  it('lets a navigation through while the draft is clean', async () => {
+    const { router } = await renderEditor();
+    await act(async () => { await router.navigate('/dashboard'); });
+    expect(screen.getByText('dashboard')).toBeInTheDocument();
+  });
+});
+
+// A sibling panel (the sprint "Add to draft" action, #5300) saves a new body
+// server-side and pushes the result back down as `work.activeDraftBody`. The
+// body-sync effect has to adopt that on a clean editor without clobbering
+// whatever the writer has half-typed on a dirty one.
+describe('WorkEditor server-pushed draft body (#5300)', () => {
+  const renderWith = async (initial) => {
+    const router = createMemoryRouter([
+      { path: '/writers-room', element: <WorkEditor work={initial} onChange={() => {}} /> },
+    ], { initialEntries: ['/writers-room'] });
+    const view = render(<RouterProvider router={router} />);
+    await act(async () => {});
+    return view;
+  };
+
+  const rerenderWith = async (rerender, next) => {
+    const router = createMemoryRouter([
+      { path: '/writers-room', element: <WorkEditor work={next} onChange={() => {}} /> },
+    ], { initialEntries: ['/writers-room'] });
+    await act(async () => { rerender(<RouterProvider router={router} />); });
+  };
+
+  it('adopts a new activeDraftBody while the editor is clean', async () => {
+    const { container, rerender } = await renderWith(work);
+    expect(container.querySelector('textarea').value).toBe('The hero wakes.');
+
+    await rerenderWith(rerender, { ...work, activeDraftBody: 'The hero wakes.\n\nThen he runs.\n' });
+    expect(container.querySelector('textarea').value).toBe('The hero wakes.\n\nThen he runs.\n');
+  });
+
+  it('keeps the unsaved buffer when the editor is dirty', async () => {
+    const { container, rerender } = await renderWith(work);
+    const area = container.querySelector('textarea');
+    await act(async () => { fireEvent.change(area, { target: { value: 'The hero waits.' } }); });
+
+    await rerenderWith(rerender, { ...work, activeDraftBody: 'The hero wakes.\n\nThen he runs.\n' });
+    expect(container.querySelector('textarea').value).toBe('The hero waits.');
+  });
+});
+
+
+describe('Writers Room focused writing', () => {
+  it('preserves edits through header collapse and shows accurate save states during continued typing and retry', async () => {
+    getWritersRoomWork.mockResolvedValue(work);
+    const router = createMemoryRouter([
+      { path: '/writers-room/works/:workId', element: <WritersRoom /> },
+    ], { initialEntries: ['/writers-room/works/wr-work-1'] });
+    const { container } = render(<RouterProvider router={router} />);
+    await act(async () => {});
+    const area = container.querySelector('textarea');
+    await act(async () => { fireEvent.change(area, { target: { value: 'First edit.' } }); });
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Collapse writing header' })); });
+    expect(screen.getByRole('button', { name: 'Expand writing header' })).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.getByText('Catalog cast controls').parentElement).toHaveClass('hidden');
+    expect(screen.queryByText('Library controls')).not.toBeInTheDocument();
+    expect(screen.getByTestId('work-header-secondary')).toHaveClass('hidden');
+    expect(container.querySelector('textarea')).toBe(area);
+    expect(area.value).toBe('First edit.');
+
+    let finishSave;
+    saveWritersRoomDraft.mockImplementationOnce(() => new Promise((resolve) => { finishSave = resolve; }));
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Save' })); });
+    expect(screen.getByRole('button', { name: 'Saving…' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Saving…' })).toHaveAttribute('aria-busy', 'true');
+    await act(async () => { fireEvent.change(area, { target: { value: 'Second edit.' } }); });
+    await act(async () => { finishSave({ ...work, activeDraftBody: 'First edit.' }); });
+    expect(area.value).toBe('Second edit.');
+    expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled();
+
+    saveWritersRoomDraft.mockRejectedValueOnce(new Error('Example failure'));
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Save' })); });
+    expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled();
+    expect(area.value).toBe('Second edit.');
+    saveWritersRoomDraft.mockResolvedValueOnce({ ...work, activeDraftBody: 'Second edit.' });
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Save' })); });
+    expect(screen.getByRole('button', { name: 'Saved' })).toBeDisabled();
+    expect(saveWritersRoomDraft).toHaveBeenLastCalledWith(work.id, 'Second edit.', { silent: true });
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Expand writing header' })); });
+    expect(screen.getByText('Catalog cast controls').parentElement).not.toHaveClass('hidden');
+    expect(screen.getByTestId('work-header-secondary')).not.toHaveClass('hidden');
+    expect(container.querySelector('textarea')).toBe(area);
+    expect(area.value).toBe('Second edit.');
+  });
+});
+
+// #9738: async Format / Polish results must not clobber newer local edits.
+describe('WorkEditor async buffer ownership (#9738)', () => {
+  const deferred = () => {
+    let resolve;
+    const promise = new Promise((r) => { resolve = r; });
+    return { promise, resolve };
+  };
+  const type = (area, value) => act(async () => { fireEvent.change(area, { target: { value } }); });
+  const openMenuItem = async (name) => {
+    await act(async () => { fireEvent.click(screen.getByLabelText('Work menu')); });
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name }) ); });
+  };
+  // Mirrors the real parent: onChange feeds the saved work back down as the prop.
+  function StatefulParent() {
+    const [w, setW] = useState(work);
+    return <WorkEditor work={w} onChange={setW} />;
+  }
+  const renderStateful = async () => {
+    const router = createMemoryRouter([
+      { path: '/writers-room', element: <StatefulParent /> },
+    ], { initialEntries: ['/writers-room'] });
+    const view = render(<RouterProvider router={router} />);
+    await act(async () => {});
+    return view;
+  };
+  const formatResult = { status: 'complete', result: { formattedBody: 'Old formatted text.' } };
+
+  it('applies the format result to a clean, untouched editor', async () => {
+    const { container } = await renderEditor();
+    runWritersRoomAnalysis.mockResolvedValueOnce(formatResult);
+    await openMenuItem(/Format pass/);
+    expect(container.querySelector('textarea').value).toBe('Old formatted text.');
+  });
+
+  it('keeps text typed while the format pass is pending', async () => {
+    const { container } = await renderEditor();
+    const d = deferred();
+    runWritersRoomAnalysis.mockReturnValueOnce(d.promise);
+    await openMenuItem(/Format pass/);
+    const area = container.querySelector('textarea');
+    await type(area, 'Newest prose.');
+    await act(async () => { d.resolve(formatResult); });
+    expect(area.value).toBe('Newest prose.');
+    expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled();
+  });
+
+  it('keeps newer prose that was edited and saved before the format response', async () => {
+    const { container } = await renderStateful();
+    const d = deferred();
+    runWritersRoomAnalysis.mockReturnValueOnce(d.promise);
+    await openMenuItem(/Format pass/);
+    const area = container.querySelector('textarea');
+    await type(area, 'Saved newer prose.');
+    saveWritersRoomDraft.mockResolvedValueOnce({ ...work, activeDraftBody: 'Saved newer prose.' });
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Save' })); });
+    expect(screen.getByRole('button', { name: 'Saved' })).toBeDisabled();
+    await act(async () => { d.resolve(formatResult); });
+    expect(area.value).toBe('Saved newer prose.');
+  });
+
+  it('ignores a format result for a work the editor has since swapped away from', async () => {
+    const d = deferred();
+    runWritersRoomAnalysis.mockReturnValueOnce(d.promise);
+    const router = (w) => createMemoryRouter([
+      { path: '/writers-room', element: <WorkEditor work={w} onChange={() => {}} /> },
+    ], { initialEntries: ['/writers-room'] });
+    const { container, rerender } = render(<RouterProvider router={router(work)} />);
+    await act(async () => {});
+    await openMenuItem(/Format pass/);
+    const other = { ...work, id: 'wr-work-2', activeDraftVersionId: 'wr-draft-2', activeDraftBody: 'Other work.' };
+    await act(async () => { rerender(<RouterProvider router={router(other)} />); });
+    await act(async () => { d.resolve(formatResult); });
+    expect(container.querySelector('textarea').value).toBe('Other work.');
+  });
+
+  const refresh = async () => {
+    await act(async () => { fireEvent.click(screen.getByLabelText('Work menu')); });
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: /Polish/ })); });
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Stub polish refresh' })); });
+  };
+
+  it('keeps edits made during the polish refresh GET and moves the baseline to the server body', async () => {
+    const { container } = await renderEditor();
+    const d = deferred();
+    getWritersRoomWork.mockReturnValueOnce(d.promise);
+    await refresh();
+    const area = container.querySelector('textarea');
+    await type(area, 'Typed during GET.');
+    await act(async () => { d.resolve({ ...work, activeDraftBody: 'Polished body.' }); });
+    expect(area.value).toBe('Typed during GET.');
+    // Still unsaved relative to the server's polished body.
+    expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled();
+  });
+
+  it('keeps edits that were already dirty when the polish refresh began', async () => {
+    const { container } = await renderEditor();
+    const area = container.querySelector('textarea');
+    await type(area, 'Dirty before refresh.');
+    getWritersRoomWork.mockResolvedValueOnce({ ...work, activeDraftBody: 'Polished body.' });
+    await refresh();
+    expect(area.value).toBe('Dirty before refresh.');
+    expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled();
+  });
+
+  it('adopts the polished body on a clean editor', async () => {
+    const { container } = await renderStateful();
+    getWritersRoomWork.mockResolvedValueOnce({ ...work, activeDraftBody: 'Polished body.' });
+    await refresh();
+    expect(container.querySelector('textarea').value).toBe('Polished body.');
+    expect(screen.getByRole('button', { name: 'Saved' })).toBeDisabled();
+  });
+});

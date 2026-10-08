@@ -1,0 +1,132 @@
+/**
+ * Memory Store
+ *
+ * Persistence + cache layer for the file-based memory service. Owns the
+ * on-disk layout (index.json, embeddings.json, memories/<id>/memory.json),
+ * the in-memory caches, the per-process write mutex, and directory setup.
+ * Extracted from memory.js so the orchestration layer (memory.js) only wires
+ * CRUD/search logic and events on top of these primitives.
+ */
+
+import { existsSync } from 'fs';
+import { join, resolve, relative, isAbsolute } from 'path';
+import { ensureDir, ensureDirs, readJSONFile, atomicWrite, rmGuarded, PATHS } from '../lib/fileUtils.js';
+import { createMutex } from '../lib/asyncMutex.js';
+
+const MEMORY_DIR = PATHS.memory;
+const INDEX_FILE = join(MEMORY_DIR, 'index.json');
+const EMBEDDINGS_FILE = join(MEMORY_DIR, 'embeddings.json');
+const MEMORIES_DIR = join(MEMORY_DIR, 'memories');
+const MEMORY_ID_PATTERN = /^[A-Za-z0-9._-]+$/;
+
+// In-memory caches
+let indexCache = null;
+let embeddingsCache = null;
+
+// Mutex lock for state operations
+export const withMemoryLock = createMutex();
+
+/**
+ * Ensure memory directories exist
+ */
+export async function ensureDirectories() {
+  await ensureDirs([MEMORY_DIR, MEMORIES_DIR]);
+}
+
+/**
+ * Load memory index
+ */
+export async function loadIndex() {
+  if (indexCache) return indexCache;
+
+  await ensureDirectories();
+
+  const defaultIndex = { version: 1, lastUpdated: new Date().toISOString(), count: 0, memories: [] };
+  // STRICT (#4115): `index.count` and the byStatus tally ARE the Memory page's
+  // stat card (GET /api/memory/stats). Worse, the value is cached for the life of
+  // the process AND written back by `saveIndex` — one swallowed unreadable read
+  // would report 0 memories and then overwrite index.json with the empty default.
+  indexCache = await readJSONFile(INDEX_FILE, defaultIndex, { strict: true });
+  return indexCache;
+}
+
+/**
+ * Save memory index
+ */
+export async function saveIndex(index) {
+  await ensureDirectories();
+  index.lastUpdated = new Date().toISOString();
+  indexCache = index;
+  await atomicWrite(INDEX_FILE, index);
+}
+
+/**
+ * Load embeddings
+ */
+export async function loadEmbeddings() {
+  if (embeddingsCache) return embeddingsCache;
+
+  await ensureDirectories();
+
+  const defaultEmbeddings = { model: null, dimension: 0, vectors: {} };
+  // Same contract as `loadIndex` — `Object.keys(vectors).length` is the stats
+  // card's `withEmbeddings`, and `saveEmbeddings` writes this value back.
+  embeddingsCache = await readJSONFile(EMBEDDINGS_FILE, defaultEmbeddings, { strict: true });
+  return embeddingsCache;
+}
+
+/**
+ * Save embeddings
+ */
+export async function saveEmbeddings(embeddings) {
+  await ensureDirectories();
+  embeddingsCache = embeddings;
+  // Pre-stringify compactly: atomicWrite pretty-prints plain objects, which
+  // would inflate the largest file in the memory store on every save.
+  await atomicWrite(EMBEDDINGS_FILE, JSON.stringify(embeddings));
+}
+
+/**
+ * Load full memory by ID
+ */
+export async function loadMemory(id) {
+  const memoryFile = join(MEMORIES_DIR, id, 'memory.json');
+  return readJSONFile(memoryFile, null);
+}
+
+/**
+ * Save full memory
+ */
+export async function saveMemory(memory) {
+  const memoryDir = join(MEMORIES_DIR, memory.id);
+  await ensureDir(memoryDir);
+  await atomicWrite(join(memoryDir, 'memory.json'), memory);
+}
+
+/**
+ * Delete memory files
+ */
+export async function deleteMemoryFiles(id) {
+  if (typeof id !== 'string' || !MEMORY_ID_PATTERN.test(id)) {
+    throw new Error('Invalid memory id');
+  }
+
+  const memoriesRoot = resolve(MEMORIES_DIR);
+  const memoryDir = resolve(memoriesRoot, id);
+  const relativePath = relative(memoriesRoot, memoryDir);
+  if (!relativePath || relativePath.startsWith('..') || isAbsolute(relativePath)) {
+    throw new Error('Invalid memory path');
+  }
+
+  if (existsSync(memoryDir)) {
+    await rmGuarded(memoryDir, { recursive: true });
+  }
+}
+
+/**
+ * Invalidate caches (call after external changes)
+ */
+export function invalidateCaches() {
+  indexCache = null;
+  embeddingsCache = null;
+}

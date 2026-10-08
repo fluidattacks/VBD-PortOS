@@ -1,0 +1,140 @@
+/**
+ * API-based message sync for Outlook and Teams.
+ * Uses bearer tokens extracted from the browser session to call REST APIs directly.
+ * Falls back to Playwright scraping if token extraction fails.
+ */
+
+import { v4 as uuidv4 } from '../lib/uuid.js';
+import crypto from 'crypto';
+import { fetchWithTimeout } from '../lib/fetchWithTimeout.js';
+import { readResponseJson } from '../lib/readResponseJson.js';
+import { getToken, clearTokenCache } from './messageTokenExtractor.js';
+
+const GRAPH_API_TIMEOUT_MS = 30000;
+
+function makeExternalId(prefix, id) {
+  // For API sync, use a stable ID from the API response
+  const hash = crypto.createHash('md5').update(id).digest('hex').slice(0, 12);
+  return `api-${prefix}-${hash}`;
+}
+
+/**
+ * Fetch Outlook inbox messages via the REST API.
+ * @param {object} account - Account config
+ * @param {object} cache - Existing cache
+ * @param {object} io - Socket.IO instance
+ * @param {object} options - { mode: 'unread' | 'full' }
+ * @returns {{ messages, status, syncMethod }} or null if token unavailable
+ */
+export async function syncOutlookApi(account, cache, io, options = {}) {
+  const mode = options.mode || 'unread';
+  const tokenResult = await getToken('outlook');
+
+  if (tokenResult.error) {
+    console.log(`📧 API sync unavailable for account ${account.id}: TOKEN_UNAVAILABLE`);
+    return null; // Signal to fall back to Playwright
+  }
+
+  const token = tokenResult.token;
+  const maxMessages = mode === 'full' ? 200 : 100;
+  console.log(`📧 API sync (${mode}) for account ${account.id}`);
+
+  // Build query — unread mode filters to unread only
+  let filter = '';
+  if (mode === 'unread') {
+    filter = '&$filter=IsRead eq false';
+  }
+
+  const select = '$select=Subject,From,ToRecipients,CcRecipients,ReceivedDateTime,IsRead,BodyPreview,Body,Flag,Categories,ConversationId,Importance,IsDeliveryReceiptRequested';
+  const orderBy = '$orderby=ReceivedDateTime desc';
+  const baseUrl = `https://outlook.office.com/api/v2.0/me/mailfolders/inbox/messages?${select}&${orderBy}&$top=${maxMessages}${filter}`;
+
+  const messages = [];
+  let url = baseUrl;
+  let page = 0;
+  let validMembership = true;
+
+  while (url && messages.length < maxMessages) {
+    page++;
+    io?.emit('messages:sync:progress', { accountId: account.id, current: messages.length, total: maxMessages, page });
+
+    const response = await fetchWithTimeout(url, {
+      headers: { Authorization: `Bearer ${token}`, Prefer: 'outlook.body-content-type="Text"' }
+    }, GRAPH_API_TIMEOUT_MS);
+
+    if (!response.ok) {
+      await response.text().catch(() => ''); // Drain the body without logging provider content.
+      console.warn(`📧 API sync failed for account ${account.id}: HTTP ${response.status}`);
+      if (response.status === 401) {
+        // Token expired — clear cache so next sync re-extracts
+        clearTokenCache('outlook');
+        return null; // Fall back to Playwright
+      }
+      return { messages: [], status: 'api-error' };
+    }
+
+    // Sentinel fallback: a non-JSON/blank 200 body must NOT masquerade as a
+    // successful empty sync. A truthy `{ messages, status: 'success' }` result
+    // suppresses the Playwright fallback in messageSync.js (and mid-pagination
+    // a partial result would prune still-valid cached messages), so a malformed
+    // body returns null to preserve the pre-helper throw→fallback behavior.
+    const data = await readResponseJson(response, { fallback: null, emptyValue: null });
+    if (!data || !Array.isArray(data.value)) {
+      console.log(`📧 API sync: non-JSON or malformed body on page ${page} — falling back to Playwright`);
+      return null;
+    }
+    const items = data.value;
+
+    for (const m of items) {
+      if (!m || typeof m.Id !== 'string' || !m.Id) {
+        validMembership = false;
+        continue;
+      }
+      const extId = makeExternalId('ol', m.Id);
+      const msg = {
+        id: uuidv4(),
+        externalId: extId,
+        apiId: m.Id,
+        conversationId: m.ConversationId || null,
+        threadId: m.ConversationId ? `conv-${crypto.createHash('md5').update(m.ConversationId).digest('hex').slice(0, 12)}` : null,
+        from: {
+          name: m.From?.EmailAddress?.Name || '',
+          email: m.From?.EmailAddress?.Address || ''
+        },
+        to: (m.ToRecipients || []).map(r => r.EmailAddress?.Address || r.EmailAddress?.Name || ''),
+        cc: (m.CcRecipients || []).map(r => r.EmailAddress?.Address || r.EmailAddress?.Name || ''),
+        subject: m.Subject || '',
+        bodyText: m.Body?.Content || m.BodyPreview || '',
+        bodyFull: !!(m.Body?.Content),
+        date: m.ReceivedDateTime || new Date().toISOString(),
+        isRead: m.IsRead ?? true,
+        isUnread: !(m.IsRead ?? true),
+        isPinned: false,
+        isFlagged: m.Flag?.FlagStatus === 'Flagged',
+        isReplied: false, // Not directly available in this endpoint
+        hasMeetingInvite: (m.Subject || '').toLowerCase().includes('meeting') || false,
+        importance: m.Importance || 'Normal',
+        categories: m.Categories || [],
+        labels: m.Categories || [],
+        source: 'outlook',
+        syncMethod: 'api',
+        syncedAt: new Date().toISOString()
+      };
+      messages.push(msg);
+    }
+
+    // Follow @odata.nextLink for pagination
+    const nextLink = data['@odata.nextLink'];
+    if (nextLink != null && (typeof nextLink !== 'string' || !nextLink)) validMembership = false;
+    url = typeof nextLink === 'string' ? nextLink : null;
+    if (messages.length >= maxMessages) break;
+  }
+
+  // Emit messages in real-time
+  if (io && messages.length > 0) {
+    io.emit('messages:sync:message', { accountId: account.id, messages });
+  }
+
+  console.log(`📧 API sync complete: ${messages.length} messages fetched in ${page} page(s)`);
+  return { messages, inboxComplete: mode === 'full' && !url && validMembership, status: 'success', syncMethod: 'api' };
+}

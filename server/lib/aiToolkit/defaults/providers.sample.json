@@ -1,0 +1,1314 @@
+{
+  "activeProvider": "claude-code-tui",
+  "providers": {
+    "kilo-cli": {
+      "id": "kilo-cli",
+      "name": "Kilo Code CLI",
+      "type": "cli",
+      "command": "kilo",
+      "args": [
+        "run",
+        "--auto"
+      ],
+      "models": [],
+      "defaultModel": null,
+      "timeout": 600000,
+      "enabled": false,
+      "envVars": {},
+      "secretEnvVars": []
+    },
+    "kilo-tui": {
+      "id": "kilo-tui",
+      "name": "Kilo Code TUI",
+      "type": "tui",
+      "command": "kilo",
+      "args": [
+        "--auto"
+      ],
+      "models": [],
+      "defaultModel": null,
+      "timeout": 600000,
+      "enabled": false,
+      "envVars": {},
+      "secretEnvVars": [],
+      "tuiPromptDelayMs": 2500
+    },
+    "openchamber-cli": {
+      "id": "openchamber-cli",
+      "name": "OpenChamber",
+      "type": "cli",
+      "command": "openchamber",
+      "args": [
+        "session",
+        "create",
+        "--wait",
+        "--last-assistant",
+        "--quiet"
+      ],
+      "models": [],
+      "defaultModel": null,
+      "timeout": 600000,
+      "enabled": false,
+      "envVars": {},
+      "secretEnvVars": []
+    },
+    "pi-cli": {
+      "id": "pi-cli",
+      "name": "Pi Coding Agent CLI",
+      "type": "cli",
+      "command": "pi",
+      "args": [
+        "--print",
+        "--approve"
+      ],
+      "models": [],
+      "defaultModel": null,
+      "timeout": 600000,
+      "enabled": false,
+      "envVars": {},
+      "secretEnvVars": []
+    },
+    "pi-tui": {
+      "id": "pi-tui",
+      "name": "Pi Coding Agent TUI",
+      "type": "tui",
+      "command": "pi",
+      "args": [
+        "--approve"
+      ],
+      "models": [],
+      "defaultModel": null,
+      "timeout": 600000,
+      "enabled": false,
+      "envVars": {},
+      "secretEnvVars": []
+    },
+    "claude-code": {
+      "id": "claude-code",
+      "name": "Claude Code CLI",
+      "type": "cli",
+      "command": "claude",
+      "args": [
+        "--print"
+      ],
+      "models": [
+        "claude-opus-5-5",
+        "claude-fable-5-1",
+        "claude-sonnet-5-5",
+        "claude-haiku-5-5",
+        "claude-haiku-4-5-20251001",
+        "claude-sonnet-5",
+        "claude-opus-5",
+        "claude-fable-5",
+        "claude-opus-4-8",
+        "claude-opus-4-7",
+        "claude-opus-4-6",
+        "claude-sonnet-4-6"
+      ],
+      "defaultModel": "claude-opus-5-5",
+      "lightModel": "claude-haiku-5-5",
+      "mediumModel": "claude-sonnet-5",
+      "heavyModel": "claude-opus-5-5",
+      "ultraModel": "claude-fable-5-1",
+      "timeout": 900000,
+      "enabled": true,
+      "envVars": {},
+      "secretEnvVars": [],
+      "headlessArgs": [
+        "--no-session-persistence",
+        "--disable-slash-commands",
+        "--tools",
+        ""
+      ]
+    },
+    "claude-code-bedrock": {
+      "id": "claude-code-bedrock",
+      "name": "Claude Code CLI: Bedrock",
+      "type": "cli",
+      "command": "claude",
+      "args": [
+        "--print"
+      ],
+      "models": [
+        "us.anthropic.claude-haiku-4-5",
+        "us.anthropic.claude-sonnet-5",
+        "global.anthropic.claude-opus-5",
+        "global.anthropic.claude-opus-5[1m]"
+      ],
+      "defaultModel": "global.anthropic.claude-opus-5[1m]",
+      "lightModel": "us.anthropic.claude-haiku-4-5",
+      "mediumModel": "us.anthropic.claude-sonnet-5",
+      "heavyModel": "global.anthropic.claude-opus-5[1m]",
+      "timeout": 900000,
+      "enabled": false,
+      "envVars": {
+        "AWS_BEARER_TOKEN_BEDROCK": "",
+        "CLAUDE_CODE_USE_BEDROCK": "1"
+      },
+      "secretEnvVars": [
+        "AWS_BEARER_TOKEN_BEDROCK"
+      ],
+      "headlessArgs": [
+        "--no-session-persistence",
+        "--disable-slash-commands",
+        "--tools",
+        ""
+      ]
+    },
+    "claude-ollama": {
+      "id": "claude-ollama",
+      "name": "Claude Ollama (local model)",
+      "type": "cli",
+      "command": "claude",
+      "args": [
+        "--print"
+      ],
+      "ollamaBacked": true,
+      "models": [],
+      "defaultModel": null,
+      "numCtx": 131072,
+      "temperature": 0.6,
+      "thinking": true,
+      "timeout": 600000,
+      "enabled": false,
+      "envVars": {
+        "ANTHROPIC_BASE_URL": "http://localhost:11434",
+        "ANTHROPIC_AUTH_TOKEN": "ollama",
+        "ANTHROPIC_SMALL_FAST_MODEL": "qwen2.5:7b"
+      },
+      "secretEnvVars": [
+        "ANTHROPIC_AUTH_TOKEN"
+      ],
+      "headlessArgs": [
+        "--no-session-persistence",
+        "--disable-slash-commands",
+        "--tools",
+        ""
+      ]
+    },
+    "claude-ollama-tui": {
+      "id": "claude-ollama-tui",
+      "name": "Claude Ollama TUI (local model)",
+      "type": "tui",
+      "command": "claude",
+      "args": [
+        "--dangerously-skip-permissions"
+      ],
+      "ollamaBacked": true,
+      "models": [],
+      "defaultModel": null,
+      "numCtx": 131072,
+      "temperature": 0.6,
+      "thinking": true,
+      "timeout": 600000,
+      "enabled": false,
+      "envVars": {
+        "ANTHROPIC_BASE_URL": "http://localhost:11434",
+        "ANTHROPIC_AUTH_TOKEN": "ollama",
+        "ANTHROPIC_SMALL_FAST_MODEL": "qwen2.5:7b"
+      },
+      "secretEnvVars": [
+        "ANTHROPIC_AUTH_TOKEN"
+      ],
+      "tuiPromptDelayMs": 2500
+    },
+    "opencode-ollama": {
+      "id": "opencode-ollama",
+      "name": "OpenCode Ollama (local model)",
+      "type": "cli",
+      "command": "opencode",
+      "args": [
+        "run"
+      ],
+      "endpoint": "http://localhost:11434/v1",
+      "ollamaBacked": true,
+      "models": [],
+      "defaultModel": null,
+      "temperature": 0.6,
+      "thinking": true,
+      "timeout": 600000,
+      "enabled": false,
+      "envVars": {
+        "OPENCODE_CONFIG_CONTENT": "{\"permission\":\"allow\",\"provider\":{\"ollama\":{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"Ollama (local)\",\"options\":{\"baseURL\":\"http://localhost:11434/v1\"}}}}"
+      },
+      "secretEnvVars": [],
+      "headlessArgs": []
+    },
+    "opencode-ollama-tui": {
+      "id": "opencode-ollama-tui",
+      "name": "OpenCode Ollama TUI (local model)",
+      "type": "tui",
+      "command": "opencode",
+      "args": [],
+      "endpoint": "http://localhost:11434/v1",
+      "ollamaBacked": true,
+      "models": [],
+      "defaultModel": null,
+      "temperature": 0.6,
+      "thinking": true,
+      "timeout": 600000,
+      "enabled": false,
+      "envVars": {
+        "OPENCODE_CONFIG_CONTENT": "{\"permission\":\"allow\",\"provider\":{\"ollama\":{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"Ollama (local)\",\"options\":{\"baseURL\":\"http://localhost:11434/v1\"}}}}"
+      },
+      "secretEnvVars": [],
+      "tuiPromptDelayMs": 2500
+    },
+    "opencode-lmstudio": {
+      "id": "opencode-lmstudio",
+      "name": "OpenCode LM Studio (local model)",
+      "type": "cli",
+      "command": "opencode",
+      "args": [
+        "run"
+      ],
+      "endpoint": "http://localhost:1234/v1",
+      "lmstudioBacked": true,
+      "models": [],
+      "defaultModel": null,
+      "numCtx": 32768,
+      "timeout": 600000,
+      "enabled": false,
+      "envVars": {
+        "OPENCODE_CONFIG_CONTENT": "{\"permission\":\"allow\",\"provider\":{\"lmstudio\":{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"LM Studio (local)\",\"options\":{\"baseURL\":\"http://localhost:1234/v1\"}}}}"
+      },
+      "secretEnvVars": [],
+      "headlessArgs": []
+    },
+    "opencode-lmstudio-tui": {
+      "id": "opencode-lmstudio-tui",
+      "name": "OpenCode LM Studio TUI (local model)",
+      "type": "tui",
+      "command": "opencode",
+      "args": [],
+      "endpoint": "http://localhost:1234/v1",
+      "lmstudioBacked": true,
+      "models": [],
+      "defaultModel": null,
+      "numCtx": 32768,
+      "timeout": 600000,
+      "enabled": false,
+      "envVars": {
+        "OPENCODE_CONFIG_CONTENT": "{\"permission\":\"allow\",\"provider\":{\"lmstudio\":{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"LM Studio (local)\",\"options\":{\"baseURL\":\"http://localhost:1234/v1\"}}}}"
+      },
+      "secretEnvVars": [],
+      "tuiPromptDelayMs": 2500
+    },
+    "opencode-mtplx": {
+      "id": "opencode-mtplx",
+      "name": "OpenCode MTPLX (local MTP)",
+      "type": "cli",
+      "command": "opencode",
+      "args": [
+        "run"
+      ],
+      "endpoint": "http://127.0.0.1:8000/v1",
+      "mtplxBacked": true,
+      "models": [
+        "mtplx-qwen38-27b-optimized-speed"
+      ],
+      "defaultModel": "mtplx-qwen38-27b-optimized-speed",
+      "timeout": 600000,
+      "enabled": false,
+      "envVars": {
+        "OPENCODE_CONFIG_CONTENT": "{\"permission\":\"allow\",\"provider\":{\"mtplx\":{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"MTPLX (local MTP)\",\"options\":{\"baseURL\":\"http://127.0.0.1:8000/v1\"}}}}"
+      },
+      "secretEnvVars": [],
+      "headlessArgs": []
+    },
+    "opencode-mtplx-tui": {
+      "id": "opencode-mtplx-tui",
+      "name": "OpenCode MTPLX TUI (local MTP)",
+      "type": "tui",
+      "command": "opencode",
+      "args": [],
+      "endpoint": "http://127.0.0.1:8000/v1",
+      "mtplxBacked": true,
+      "models": [
+        "mtplx-qwen38-27b-optimized-speed"
+      ],
+      "defaultModel": "mtplx-qwen38-27b-optimized-speed",
+      "timeout": 600000,
+      "enabled": false,
+      "envVars": {
+        "OPENCODE_CONFIG_CONTENT": "{\"permission\":\"allow\",\"provider\":{\"mtplx\":{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"MTPLX (local MTP)\",\"options\":{\"baseURL\":\"http://127.0.0.1:8000/v1\"}}}}"
+      },
+      "secretEnvVars": [],
+      "tuiPromptDelayMs": 2500
+    },
+    "opencode-llama-tui": {
+      "id": "opencode-llama-tui",
+      "name": "OpenCode llama TUI",
+      "type": "tui",
+      "command": "opencode",
+      "args": [],
+      "endpoint": "http://127.0.0.1:5568/v1",
+      "llamaBacked": true,
+      "models": [
+        "dflash",
+        "qwen3.8-27b-dflash2",
+        "Muse-Glimmer-30B-DFlash2"
+      ],
+      "defaultModel": "dflash",
+      "timeout": 600000,
+      "enabled": true,
+      "envVars": {
+        "OPENCODE_CONFIG_CONTENT": "{\"permission\":\"allow\",\"provider\":{\"llama\":{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"llama.cpp (local)\",\"options\":{\"baseURL\":\"http://127.0.0.1:5568/v1\"}}}}"
+      },
+      "secretEnvVars": [],
+      "tuiPromptDelayMs": 2500,
+      "tuiIdleTimeoutMs": 180000
+    },
+    "opencode-vllm": {
+      "id": "opencode-vllm",
+      "name": "OpenCode vLLM (Qwen3.8-27B)",
+      "type": "cli",
+      "command": "opencode",
+      "args": [
+        "run"
+      ],
+      "endpoint": "http://127.0.0.1:18020/v1",
+      "apiKey": "",
+      "vllmBacked": true,
+      "models": [
+        "qwen3.8-27b"
+      ],
+      "defaultModel": "qwen3.8-27b",
+      "thinking": false,
+      "timeout": 600000,
+      "enabled": false,
+      "envVars": {
+        "OPENCODE_CONFIG_CONTENT": "{\"permission\":\"allow\",\"provider\":{\"vllm\":{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"vLLM Qwen3.8-27B (local)\",\"options\":{\"baseURL\":\"http://127.0.0.1:18020/v1\"}}}}"
+      },
+      "secretEnvVars": [],
+      "headlessArgs": []
+    },
+    "opencode-vllm-tui": {
+      "id": "opencode-vllm-tui",
+      "name": "OpenCode vLLM TUI (Qwen3.8-27B)",
+      "type": "tui",
+      "command": "opencode",
+      "args": [],
+      "endpoint": "http://127.0.0.1:18020/v1",
+      "apiKey": "",
+      "vllmBacked": true,
+      "models": [
+        "qwen3.8-27b"
+      ],
+      "defaultModel": "qwen3.8-27b",
+      "thinking": false,
+      "timeout": 600000,
+      "enabled": false,
+      "envVars": {
+        "OPENCODE_CONFIG_CONTENT": "{\"permission\":\"allow\",\"provider\":{\"vllm\":{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"vLLM Qwen3.8-27B (local)\",\"options\":{\"baseURL\":\"http://127.0.0.1:18020/v1\"}}}}"
+      },
+      "secretEnvVars": [],
+      "tuiPromptDelayMs": 2500,
+      "tuiIdleTimeoutMs": 180000
+    },
+    "opencode-sglang": {
+      "id": "opencode-sglang",
+      "name": "OpenCode SGLang (Qwen3.8-27B)",
+      "type": "cli",
+      "command": "opencode",
+      "args": [
+        "run"
+      ],
+      "endpoint": "http://127.0.0.1:18021/v1",
+      "apiKey": "",
+      "sglangBacked": true,
+      "models": [
+        "qwen3.8-27b"
+      ],
+      "defaultModel": "qwen3.8-27b",
+      "timeout": 600000,
+      "enabled": false,
+      "envVars": {
+        "OPENCODE_CONFIG_CONTENT": "{\"permission\":\"allow\",\"provider\":{\"sglang\":{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"SGLang Qwen3.8-27B (local)\",\"options\":{\"baseURL\":\"http://127.0.0.1:18021/v1\"}}}}"
+      },
+      "secretEnvVars": [],
+      "headlessArgs": []
+    },
+    "opencode-sglang-tui": {
+      "id": "opencode-sglang-tui",
+      "name": "OpenCode SGLang TUI (Qwen3.8-27B)",
+      "type": "tui",
+      "command": "opencode",
+      "args": [],
+      "endpoint": "http://127.0.0.1:18021/v1",
+      "apiKey": "",
+      "sglangBacked": true,
+      "models": [
+        "qwen3.8-27b"
+      ],
+      "defaultModel": "qwen3.8-27b",
+      "timeout": 600000,
+      "enabled": false,
+      "envVars": {
+        "OPENCODE_CONFIG_CONTENT": "{\"permission\":\"allow\",\"provider\":{\"sglang\":{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"SGLang Qwen3.8-27B (local)\",\"options\":{\"baseURL\":\"http://127.0.0.1:18021/v1\"}}}}"
+      },
+      "secretEnvVars": [],
+      "tuiPromptDelayMs": 2500,
+      "tuiIdleTimeoutMs": 180000
+    },
+    "claude-sglang": {
+      "id": "claude-sglang",
+      "name": "Claude SGLang (Qwen3.8-27B)",
+      "type": "cli",
+      "command": "claude",
+      "args": [
+        "--print"
+      ],
+      "endpoint": "http://127.0.0.1:18021/v1",
+      "apiKey": "",
+      "sglangBacked": true,
+      "models": [
+        "qwen3.8-27b"
+      ],
+      "defaultModel": "qwen3.8-27b",
+      "timeout": 600000,
+      "enabled": false,
+      "envVars": {
+        "ANTHROPIC_BASE_URL": "http://127.0.0.1:18021",
+        "ANTHROPIC_AUTH_TOKEN": "sglang",
+        "API_TIMEOUT_MS": "3000000",
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+        "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": "qwen3.8-27b",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": "qwen3.8-27b",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": "qwen3.8-27b",
+        "ANTHROPIC_SMALL_FAST_MODEL": "qwen3.8-27b"
+      },
+      "secretEnvVars": [
+        "ANTHROPIC_AUTH_TOKEN"
+      ],
+      "headlessArgs": [
+        "--no-session-persistence",
+        "--disable-slash-commands",
+        "--tools",
+        ""
+      ]
+    },
+    "claude-sglang-tui": {
+      "id": "claude-sglang-tui",
+      "name": "Claude SGLang TUI (Qwen3.8-27B)",
+      "type": "tui",
+      "command": "claude",
+      "args": [
+        "--dangerously-skip-permissions"
+      ],
+      "endpoint": "http://127.0.0.1:18021/v1",
+      "apiKey": "",
+      "sglangBacked": true,
+      "models": [
+        "qwen3.8-27b"
+      ],
+      "defaultModel": "qwen3.8-27b",
+      "timeout": 600000,
+      "enabled": false,
+      "envVars": {
+        "ANTHROPIC_BASE_URL": "http://127.0.0.1:18021",
+        "ANTHROPIC_AUTH_TOKEN": "sglang",
+        "API_TIMEOUT_MS": "3000000",
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+        "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": "qwen3.8-27b",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": "qwen3.8-27b",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": "qwen3.8-27b",
+        "ANTHROPIC_SMALL_FAST_MODEL": "qwen3.8-27b"
+      },
+      "secretEnvVars": [
+        "ANTHROPIC_AUTH_TOKEN"
+      ],
+      "tuiPromptDelayMs": 2500,
+      "tuiIdleTimeoutMs": 180000
+    },
+    "orcarouter": {
+      "id": "orcarouter",
+      "name": "OrcaRouter",
+      "type": "api",
+      "endpoint": "https://api.orcarouter.ai/v1",
+      "apiKey": "",
+      "models": [
+        "orcarouter/auto"
+      ],
+      "defaultModel": "orcarouter/auto",
+      "lightModel": "orcarouter/auto",
+      "mediumModel": "orcarouter/auto",
+      "heavyModel": "orcarouter/auto",
+      "timeout": 300000,
+      "enabled": false,
+      "envVars": {},
+      "secretEnvVars": []
+    },
+    "opencode-orcarouter": {
+      "id": "opencode-orcarouter",
+      "name": "OpenCode OrcaRouter",
+      "type": "cli",
+      "command": "opencode",
+      "args": [
+        "run"
+      ],
+      "endpoint": "https://api.orcarouter.ai/v1",
+      "orcarouterBacked": true,
+      "models": [
+        "orcarouter/auto"
+      ],
+      "defaultModel": "orcarouter/auto",
+      "timeout": 600000,
+      "enabled": false,
+      "envVars": {
+        "OPENCODE_CONFIG_CONTENT": "{\"permission\":\"allow\",\"provider\":{\"orcarouter\":{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"OrcaRouter\",\"options\":{\"baseURL\":\"https://api.orcarouter.ai/v1\"}}}}"
+      },
+      "secretEnvVars": [],
+      "headlessArgs": []
+    },
+    "openrouter": {
+      "id": "openrouter",
+      "name": "OpenRouter",
+      "type": "api",
+      "endpoint": "https://openrouter.ai/api/v1",
+      "apiKey": "",
+      "models": [
+        "openrouter/auto",
+        "stealth/ox-alpha"
+      ],
+      "defaultModel": "stealth/ox-alpha",
+      "lightModel": "openrouter/auto",
+      "mediumModel": "stealth/ox-alpha",
+      "heavyModel": "stealth/ox-alpha",
+      "timeout": 300000,
+      "enabled": false,
+      "envVars": {},
+      "secretEnvVars": []
+    },
+    "opencode-openrouter": {
+      "id": "opencode-openrouter",
+      "name": "OpenCode OpenRouter",
+      "type": "cli",
+      "command": "opencode",
+      "args": [
+        "run"
+      ],
+      "endpoint": "https://openrouter.ai/api/v1",
+      "gatewayBacked": "openrouter",
+      "models": [
+        "openrouter/auto",
+        "stealth/ox-alpha"
+      ],
+      "defaultModel": "stealth/ox-alpha",
+      "timeout": 600000,
+      "enabled": false,
+      "envVars": {
+        "OPENCODE_CONFIG_CONTENT": "{\"permission\":\"allow\",\"provider\":{\"openrouter\":{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"OpenRouter\",\"options\":{\"baseURL\":\"https://openrouter.ai/api/v1\"}}}}"
+      },
+      "secretEnvVars": [],
+      "headlessArgs": []
+    },
+    "opencode-openrouter-tui": {
+      "id": "opencode-openrouter-tui",
+      "name": "OpenCode OpenRouter TUI",
+      "type": "tui",
+      "command": "opencode",
+      "args": [],
+      "endpoint": "https://openrouter.ai/api/v1",
+      "gatewayBacked": "openrouter",
+      "models": [
+        "openrouter/auto",
+        "stealth/ox-alpha"
+      ],
+      "defaultModel": "stealth/ox-alpha",
+      "timeout": 600000,
+      "enabled": false,
+      "envVars": {
+        "OPENCODE_CONFIG_CONTENT": "{\"permission\":\"allow\",\"provider\":{\"openrouter\":{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"OpenRouter\",\"options\":{\"baseURL\":\"https://openrouter.ai/api/v1\"}}}}"
+      },
+      "secretEnvVars": [],
+      "tuiPromptDelayMs": 2500,
+      "tuiIdleTimeoutMs": 180000
+    },
+    "nvidia-nim": {
+      "id": "nvidia-nim",
+      "name": "NVIDIA NIM",
+      "type": "api",
+      "endpoint": "https://integrate.api.nvidia.com/v1",
+      "apiKey": "",
+      "models": [
+        "google/gemma-4-31b-it",
+        "poolside/laguna-xs-2.1"
+      ],
+      "defaultModel": "poolside/laguna-xs-2.1",
+      "lightModel": "google/gemma-4-31b-it",
+      "mediumModel": "poolside/laguna-xs-2.1",
+      "heavyModel": "poolside/laguna-xs-2.1",
+      "timeout": 300000,
+      "enabled": false,
+      "envVars": {},
+      "secretEnvVars": []
+    },
+    "opencode-nvidia-nim": {
+      "id": "opencode-nvidia-nim",
+      "name": "OpenCode NVIDIA NIM",
+      "type": "cli",
+      "command": "opencode",
+      "args": [
+        "run"
+      ],
+      "endpoint": "https://integrate.api.nvidia.com/v1",
+      "gatewayBacked": "nvidia-nim",
+      "models": [
+        "google/gemma-4-31b-it",
+        "poolside/laguna-xs-2.1"
+      ],
+      "defaultModel": "poolside/laguna-xs-2.1",
+      "timeout": 600000,
+      "enabled": false,
+      "envVars": {
+        "OPENCODE_CONFIG_CONTENT": "{\"permission\":\"allow\",\"provider\":{\"nvidia-nim\":{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"NVIDIA NIM\",\"options\":{\"baseURL\":\"https://integrate.api.nvidia.com/v1\"}}}}"
+      },
+      "secretEnvVars": [],
+      "headlessArgs": []
+    },
+    "opencode-nvidia-nim-tui": {
+      "id": "opencode-nvidia-nim-tui",
+      "name": "OpenCode NVIDIA NIM TUI",
+      "type": "tui",
+      "command": "opencode",
+      "args": [],
+      "endpoint": "https://integrate.api.nvidia.com/v1",
+      "gatewayBacked": "nvidia-nim",
+      "models": [
+        "google/gemma-4-31b-it",
+        "poolside/laguna-xs-2.1"
+      ],
+      "defaultModel": "poolside/laguna-xs-2.1",
+      "timeout": 600000,
+      "enabled": false,
+      "envVars": {
+        "OPENCODE_CONFIG_CONTENT": "{\"permission\":\"allow\",\"provider\":{\"nvidia-nim\":{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"NVIDIA NIM\",\"options\":{\"baseURL\":\"https://integrate.api.nvidia.com/v1\"}}}}"
+      },
+      "secretEnvVars": [],
+      "tuiPromptDelayMs": 2500,
+      "tuiIdleTimeoutMs": 180000
+    },
+    "opencode-orcarouter-tui": {
+      "id": "opencode-orcarouter-tui",
+      "name": "OpenCode OrcaRouter TUI",
+      "type": "tui",
+      "command": "opencode",
+      "args": [],
+      "endpoint": "https://api.orcarouter.ai/v1",
+      "orcarouterBacked": true,
+      "models": [
+        "orcarouter/auto"
+      ],
+      "defaultModel": "orcarouter/auto",
+      "timeout": 600000,
+      "enabled": false,
+      "envVars": {
+        "OPENCODE_CONFIG_CONTENT": "{\"permission\":\"allow\",\"provider\":{\"orcarouter\":{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"OrcaRouter\",\"options\":{\"baseURL\":\"https://api.orcarouter.ai/v1\"}}}}"
+      },
+      "secretEnvVars": [],
+      "tuiPromptDelayMs": 2500,
+      "tuiIdleTimeoutMs": 180000
+    },
+    "opencode-zen": {
+      "id": "opencode-zen",
+      "name": "OpenCode Zen",
+      "type": "api",
+      "endpoint": "https://opencode.ai/zen/v1",
+      "apiKey": "",
+      "models": [
+        "claude-opus-5",
+        "claude-sonnet-5",
+        "claude-haiku-4-5",
+        "gpt-5.6-sol",
+        "gpt-5.5",
+        "grok-4.6",
+        "kimi-k3",
+        "qwen3.6-plus",
+        "big-pickle",
+        "deepseek-v4-flash-free"
+      ],
+      "defaultModel": "claude-sonnet-5",
+      "lightModel": "claude-haiku-4-5",
+      "mediumModel": "claude-sonnet-5",
+      "heavyModel": "claude-opus-5",
+      "timeout": 300000,
+      "enabled": false,
+      "envVars": {},
+      "secretEnvVars": []
+    },
+    "opencode-zen-cli": {
+      "id": "opencode-zen-cli",
+      "name": "OpenCode Zen CLI",
+      "type": "cli",
+      "command": "opencode",
+      "args": [
+        "run"
+      ],
+      "endpoint": "https://opencode.ai/zen/v1",
+      "models": [
+        "opencode/big-pickle",
+        "opencode/ling-3.0-flash-fin-free",
+        "opencode/mimo-v2.5-free",
+        "opencode/muse-spark-1.2-contributor-free",
+        "opencode/muse-spark-1.3-contributor-free",
+        "opencode/nemotron-3-ultra-free",
+        "opencode/nemotron-3.5-lightning-free"
+      ],
+      "defaultModel": "opencode/big-pickle",
+      "timeout": 600000,
+      "enabled": false,
+      "envVars": {
+        "OPENCODE_CONFIG_CONTENT": "{\"permission\":\"allow\"}"
+      },
+      "secretEnvVars": [
+        "OPENCODE_API_KEY"
+      ],
+      "headlessArgs": []
+    },
+    "opencode-zen-tui": {
+      "id": "opencode-zen-tui",
+      "name": "OpenCode Zen TUI",
+      "type": "tui",
+      "command": "opencode",
+      "args": [],
+      "endpoint": "https://opencode.ai/zen/v1",
+      "models": [
+        "opencode/big-pickle",
+        "opencode/ling-3.0-flash-fin-free",
+        "opencode/mimo-v2.5-free",
+        "opencode/muse-spark-1.2-contributor-free",
+        "opencode/muse-spark-1.3-contributor-free",
+        "opencode/nemotron-3-ultra-free",
+        "opencode/nemotron-3.5-lightning-free"
+      ],
+      "defaultModel": "opencode/big-pickle",
+      "timeout": 600000,
+      "enabled": false,
+      "envVars": {
+        "OPENCODE_CONFIG_CONTENT": "{\"permission\":\"allow\"}"
+      },
+      "secretEnvVars": [
+        "OPENCODE_API_KEY"
+      ],
+      "tuiPromptDelayMs": 2500,
+      "tuiIdleTimeoutMs": 180000
+    },
+    "codex": {
+      "id": "codex",
+      "name": "Codex CLI",
+      "type": "cli",
+      "command": "codex",
+      "args": [],
+      "models": [
+        "gpt-6-astra",
+        "gpt-6.1-sol",
+        "gpt-6-sol",
+        "gpt-6-luna",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.4-mini"
+      ],
+      "defaultModel": "gpt-5.6-terra",
+      "lightModel": "gpt-5.6-luna",
+      "mediumModel": "gpt-5.6-terra",
+      "heavyModel": "gpt-5.6-sol",
+      "ultraModel": "gpt-6-astra",
+      "contextWindow": 1000000,
+      "textTransport": "codex-app-server",
+      "ignoreUserConfig": false,
+      "timeout": 300000,
+      "enabled": true,
+      "envVars": {},
+      "secretEnvVars": []
+    },
+    "codex-tui": {
+      "id": "codex-tui",
+      "name": "Codex TUI",
+      "type": "tui",
+      "command": "codex",
+      "args": [
+        "--dangerously-bypass-approvals-and-sandbox"
+      ],
+      "models": [
+        "gpt-6-astra",
+        "gpt-6.1-sol",
+        "gpt-6-sol",
+        "gpt-6-luna",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.4-mini"
+      ],
+      "defaultModel": "gpt-5.6-terra",
+      "lightModel": "gpt-5.6-luna",
+      "mediumModel": "gpt-5.6-terra",
+      "heavyModel": "gpt-5.6-sol",
+      "ultraModel": "gpt-6-astra",
+      "contextWindow": 1000000,
+      "textTransport": "codex-app-server",
+      "ignoreUserConfig": false,
+      "timeout": 600000,
+      "enabled": false,
+      "envVars": {},
+      "secretEnvVars": [],
+      "tuiPromptDelayMs": 2500
+    },
+    "codex-ollama": {
+      "id": "codex-ollama",
+      "name": "Codex Ollama (local model)",
+      "type": "cli",
+      "command": "codex",
+      "args": [],
+      "endpoint": "http://localhost:11434",
+      "ollamaBacked": true,
+      "models": [],
+      "defaultModel": null,
+      "numCtx": 131072,
+      "timeout": 600000,
+      "enabled": false,
+      "envVars": {},
+      "secretEnvVars": [],
+      "headlessArgs": []
+    },
+    "codex-lmstudio": {
+      "id": "codex-lmstudio",
+      "name": "Codex LM Studio (local model)",
+      "type": "cli",
+      "command": "codex",
+      "args": [],
+      "endpoint": "http://localhost:1234/v1",
+      "lmstudioBacked": true,
+      "models": [],
+      "defaultModel": null,
+      "numCtx": 32768,
+      "timeout": 600000,
+      "enabled": false,
+      "envVars": {},
+      "secretEnvVars": [],
+      "headlessArgs": []
+    },
+    "claude-code-tui": {
+      "id": "claude-code-tui",
+      "name": "Claude Code TUI",
+      "type": "tui",
+      "command": "claude",
+      "args": [
+        "--dangerously-skip-permissions"
+      ],
+      "models": [
+        "claude-opus-5-5",
+        "claude-fable-5-1",
+        "claude-sonnet-5-5",
+        "claude-haiku-5-5",
+        "claude-haiku-4-5-20251001",
+        "claude-sonnet-5",
+        "claude-opus-5",
+        "claude-fable-5",
+        "claude-opus-4-8",
+        "claude-opus-4-7",
+        "claude-opus-4-6",
+        "claude-sonnet-4-6"
+      ],
+      "defaultModel": "claude-opus-5-5",
+      "lightModel": "claude-haiku-5-5",
+      "mediumModel": "claude-sonnet-5",
+      "heavyModel": "claude-opus-5-5",
+      "ultraModel": "claude-fable-5-1",
+      "timeout": 900000,
+      "enabled": true,
+      "envVars": {},
+      "secretEnvVars": [],
+      "tuiPromptDelayMs": 2500
+    },
+    "claude-code-tui-bedrock": {
+      "id": "claude-code-tui-bedrock",
+      "name": "Claude Code TUI: Bedrock",
+      "type": "tui",
+      "command": "claude",
+      "args": [
+        "--dangerously-skip-permissions"
+      ],
+      "models": [
+        "us.anthropic.claude-haiku-4-5",
+        "us.anthropic.claude-sonnet-5",
+        "global.anthropic.claude-opus-5",
+        "global.anthropic.claude-opus-5[1m]"
+      ],
+      "defaultModel": "global.anthropic.claude-opus-5[1m]",
+      "lightModel": "us.anthropic.claude-haiku-4-5",
+      "mediumModel": "us.anthropic.claude-sonnet-5",
+      "heavyModel": "global.anthropic.claude-opus-5[1m]",
+      "timeout": 900000,
+      "enabled": false,
+      "envVars": {
+        "AWS_BEARER_TOKEN_BEDROCK": "",
+        "CLAUDE_CODE_USE_BEDROCK": "1"
+      },
+      "secretEnvVars": [
+        "AWS_BEARER_TOKEN_BEDROCK"
+      ],
+      "tuiPromptDelayMs": 2500
+    },
+    "antigravity-tui": {
+      "id": "antigravity-tui",
+      "name": "Antigravity TUI",
+      "type": "tui",
+      "command": "agy",
+      "args": [
+        "--dangerously-skip-permissions"
+      ],
+      "models": [
+        "antigravity-configured-default",
+        "gemini-3.8-flash-high",
+        "gemini-3.8-flash-medium",
+        "gemini-3.8-flash-low",
+        "gemini-3.7-flash-high",
+        "gemini-3.7-flash-medium",
+        "gemini-3.7-flash-low",
+        "gemini-3.6-flash-high",
+        "gemini-3.6-flash-medium",
+        "gemini-3.6-flash-low",
+        "gemini-3.1-pro-high",
+        "gemini-3.1-pro-low",
+        "claude-sonnet-4-6",
+        "claude-opus-4-6-thinking",
+        "gpt-oss-120b-medium"
+      ],
+      "defaultModel": "antigravity-configured-default",
+      "lightModel": "antigravity-configured-default",
+      "mediumModel": "antigravity-configured-default",
+      "heavyModel": "antigravity-configured-default",
+      "contextWindow": 1048576,
+      "timeout": 600000,
+      "enabled": false,
+      "envVars": {},
+      "secretEnvVars": [],
+      "tuiPromptDelayMs": 2500
+    },
+    "antigravity-cli": {
+      "id": "antigravity-cli",
+      "name": "Antigravity CLI",
+      "type": "cli",
+      "command": "agy",
+      "args": [
+        "--print",
+        "--dangerously-skip-permissions"
+      ],
+      "models": [
+        "antigravity-configured-default",
+        "gemini-3.8-flash-high",
+        "gemini-3.8-flash-medium",
+        "gemini-3.8-flash-low",
+        "gemini-3.7-flash-high",
+        "gemini-3.7-flash-medium",
+        "gemini-3.7-flash-low",
+        "gemini-3.6-flash-high",
+        "gemini-3.6-flash-medium",
+        "gemini-3.6-flash-low",
+        "gemini-3.1-pro-high",
+        "gemini-3.1-pro-low",
+        "claude-sonnet-4-6",
+        "claude-opus-4-6-thinking",
+        "gpt-oss-120b-medium"
+      ],
+      "defaultModel": "antigravity-configured-default",
+      "lightModel": "antigravity-configured-default",
+      "mediumModel": "antigravity-configured-default",
+      "heavyModel": "antigravity-configured-default",
+      "contextWindow": 1048576,
+      "timeout": 300000,
+      "enabled": true,
+      "envVars": {},
+      "secretEnvVars": []
+    },
+    "cerebras": {
+      "id": "cerebras",
+      "name": "Cerebras",
+      "type": "api",
+      "endpoint": "https://api.cerebras.ai/v1",
+      "apiKey": "",
+      "models": [
+        "gpt-oss-120b"
+      ],
+      "defaultModel": "gpt-oss-120b",
+      "lightModel": "gpt-oss-120b",
+      "mediumModel": "gpt-oss-120b",
+      "heavyModel": "gpt-oss-120b",
+      "fallbackProvider": null,
+      "timeout": 300000,
+      "enabled": false,
+      "envVars": {},
+      "secretEnvVars": []
+    },
+    "lmstudio": {
+      "id": "lmstudio",
+      "name": "LM Studio",
+      "type": "api",
+      "endpoint": "http://localhost:1234/v1",
+      "apiKey": "lm-studio",
+      "models": [],
+      "defaultModel": null,
+      "timeout": 300000,
+      "enabled": false,
+      "envVars": {},
+      "secretEnvVars": []
+    },
+    "ollama": {
+      "id": "ollama",
+      "name": "Ollama",
+      "type": "api",
+      "endpoint": "http://localhost:11434/v1",
+      "apiKey": "",
+      "models": [],
+      "defaultModel": null,
+      "temperature": 0.6,
+      "thinking": true,
+      "timeout": 300000,
+      "enabled": false,
+      "envVars": {},
+      "secretEnvVars": []
+    },
+    "mtplx": {
+      "id": "mtplx",
+      "name": "MTPLX (local MTP)",
+      "type": "api",
+      "endpoint": "http://127.0.0.1:8000/v1",
+      "apiKey": "",
+      "models": [
+        "mtplx-qwen38-27b-optimized-speed"
+      ],
+      "defaultModel": "mtplx-qwen38-27b-optimized-speed",
+      "timeout": 300000,
+      "enabled": false,
+      "envVars": {},
+      "secretEnvVars": []
+    },
+    "slotstream": {
+      "id": "slotstream",
+      "name": "Slotstream (SSD-streaming MoE)",
+      "type": "api",
+      "endpoint": "http://127.0.0.1:5564/v1",
+      "apiKey": "",
+      "models": [
+        "qwen3-235b-a22b-4bit",
+        "gpt-oss-120b-mxfp4",
+        "qwen3-30b-a3b-4bit"
+      ],
+      "defaultModel": "qwen3-235b-a22b-4bit",
+      "timeout": 300000,
+      "enabled": false,
+      "envVars": {},
+      "secretEnvVars": []
+    },
+    "grok": {
+      "id": "grok",
+      "name": "xAI Grok",
+      "type": "api",
+      "endpoint": "https://api.x.ai/v1",
+      "apiKey": "",
+      "models": [
+        "grok-4.7",
+        "grok-4",
+        "grok-3",
+        "grok-3-mini",
+        "grok-code-fast-1"
+      ],
+      "defaultModel": "grok-4.7",
+      "lightModel": "grok-3-mini",
+      "mediumModel": "grok-3",
+      "heavyModel": "grok-4.7",
+      "fallbackProvider": null,
+      "contextWindow": 500000,
+      "timeout": 300000,
+      "enabled": false,
+      "envVars": {},
+      "secretEnvVars": []
+    },
+    "grok-cli": {
+      "id": "grok-cli",
+      "name": "Grok Build CLI",
+      "type": "cli",
+      "command": "grok",
+      "args": [],
+      "models": [
+        "grok-4.7",
+        "grok-4.6",
+        "grok-4.5"
+      ],
+      "defaultModel": "grok-4.7",
+      "lightModel": "grok-4.7",
+      "mediumModel": "grok-4.7",
+      "heavyModel": "grok-4.7",
+      "contextWindow": 256000,
+      "timeout": 300000,
+      "enabled": false,
+      "envVars": {},
+      "secretEnvVars": []
+    },
+    "grok-tui": {
+      "id": "grok-tui",
+      "name": "Grok Build TUI",
+      "type": "tui",
+      "command": "grok",
+      "args": [],
+      "models": [
+        "grok-4.7",
+        "grok-4.6",
+        "grok-4.5"
+      ],
+      "defaultModel": "grok-4.7",
+      "lightModel": "grok-4.7",
+      "mediumModel": "grok-4.7",
+      "heavyModel": "grok-4.7",
+      "contextWindow": 256000,
+      "timeout": 600000,
+      "enabled": false,
+      "envVars": {},
+      "secretEnvVars": [],
+      "tuiPromptDelayMs": 2500
+    },
+    "kimi-cli": {
+      "id": "kimi-cli",
+      "name": "Kimi Code CLI",
+      "type": "cli",
+      "command": "kimi",
+      "args": [],
+      "models": [
+        "kimi-configured-default"
+      ],
+      "defaultModel": "kimi-configured-default",
+      "lightModel": "kimi-configured-default",
+      "mediumModel": "kimi-configured-default",
+      "heavyModel": "kimi-configured-default",
+      "contextWindow": 256000,
+      "timeout": 300000,
+      "enabled": false,
+      "envVars": {},
+      "secretEnvVars": []
+    },
+    "kimi-tui": {
+      "id": "kimi-tui",
+      "name": "Kimi Code TUI",
+      "type": "tui",
+      "command": "kimi",
+      "args": [
+        "--yolo"
+      ],
+      "models": [
+        "kimi-configured-default"
+      ],
+      "defaultModel": "kimi-configured-default",
+      "lightModel": "kimi-configured-default",
+      "mediumModel": "kimi-configured-default",
+      "heavyModel": "kimi-configured-default",
+      "contextWindow": 256000,
+      "timeout": 600000,
+      "enabled": false,
+      "envVars": {},
+      "secretEnvVars": [],
+      "tuiPromptDelayMs": 2500
+    },
+    "cursor-cli": {
+      "id": "cursor-cli",
+      "name": "Cursor Agent CLI",
+      "type": "cli",
+      "command": "cursor-agent",
+      "args": [
+        "--print",
+        "--force"
+      ],
+      "models": [
+        "auto",
+        "composer-2.5",
+        "claude-opus-5-high",
+        "claude-opus-5-thinking-high",
+        "claude-opus-5-thinking-xhigh",
+        "claude-opus-5-thinking-max",
+        "claude-sonnet-5-high",
+        "claude-sonnet-5-thinking-high",
+        "claude-sonnet-5-thinking-xhigh",
+        "claude-fable-5-high",
+        "claude-fable-5-thinking-high",
+        "claude-opus-4-8-high",
+        "claude-opus-4-8-thinking-high",
+        "claude-4.6-sonnet-medium",
+        "gpt-5.6-sol-high",
+        "gpt-5.6-sol-xhigh",
+        "gpt-5.6-luna-high",
+        "gpt-5.6-terra-high",
+        "gpt-5.5-high",
+        "gpt-5.4-high",
+        "gpt-5.4-mini-high",
+        "gpt-5.3-codex",
+        "gpt-5.3-codex-high",
+        "gpt-5.3-codex-xhigh",
+        "gpt-5.2-high",
+        "gemini-3.1-pro",
+        "gemini-3.5-flash"
+      ],
+      "defaultModel": "auto",
+      "lightModel": "composer-2.5",
+      "mediumModel": "claude-sonnet-5-thinking-high",
+      "heavyModel": "claude-opus-5-thinking-high",
+      "timeout": 300000,
+      "enabled": false,
+      "envVars": {},
+      "secretEnvVars": []
+    },
+    "cursor-tui": {
+      "id": "cursor-tui",
+      "name": "Cursor Agent TUI",
+      "type": "tui",
+      "command": "cursor-agent",
+      "args": [
+        "--force"
+      ],
+      "models": [
+        "auto",
+        "composer-2.5",
+        "claude-opus-5-high",
+        "claude-opus-5-thinking-high",
+        "claude-opus-5-thinking-xhigh",
+        "claude-opus-5-thinking-max",
+        "claude-sonnet-5-high",
+        "claude-sonnet-5-thinking-high",
+        "claude-sonnet-5-thinking-xhigh",
+        "claude-fable-5-high",
+        "claude-fable-5-thinking-high",
+        "claude-opus-4-8-high",
+        "claude-opus-4-8-thinking-high",
+        "claude-4.6-sonnet-medium",
+        "gpt-5.6-sol-high",
+        "gpt-5.6-sol-xhigh",
+        "gpt-5.6-luna-high",
+        "gpt-5.6-terra-high",
+        "gpt-5.5-high",
+        "gpt-5.4-high",
+        "gpt-5.4-mini-high",
+        "gpt-5.3-codex",
+        "gpt-5.3-codex-high",
+        "gpt-5.3-codex-xhigh",
+        "gpt-5.2-high",
+        "gemini-3.1-pro",
+        "gemini-3.5-flash"
+      ],
+      "defaultModel": "auto",
+      "lightModel": "composer-2.5",
+      "mediumModel": "claude-sonnet-5-thinking-high",
+      "heavyModel": "claude-opus-5-thinking-high",
+      "timeout": 600000,
+      "enabled": false,
+      "envVars": {},
+      "secretEnvVars": [],
+      "tuiPromptDelayMs": 2500
+    }
+  }
+}

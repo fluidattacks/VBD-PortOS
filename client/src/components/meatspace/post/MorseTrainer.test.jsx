@@ -1,0 +1,800 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
+import { MemoryRouter, Routes, Route, useLocation } from 'react-router';
+import { awaitEnabled } from '../../../test/enabledBarrier.js';
+
+// Stub the training-log API so mount-time fetches (refreshTrainingStats) and
+// round-completion writes (logTraining) never hit the network — mirrors the
+// mocking convention used by PostDrillConfig.test.jsx / PostHistory.test.jsx.
+vi.mock('../../../services/api', () => ({
+  submitTrainingEntry: vi.fn(() => Promise.resolve({})),
+  getTrainingStats: vi.fn(() => Promise.resolve({
+    currentStreak: 3,
+    byDrill: { 'morse:morse-copy': { practiceCount: 4, accuracy: 80, totalMs: 1000, daysActive: 2 } },
+  })),
+  // Morse server-progress API: a fresh install (kochLevelSet:false, no rounds)
+  // by default so the trainer mounts without adopting or rendering populated
+  // panel content (avoids text collisions with the mode-grid assertions).
+  submitMorseRound: vi.fn(() => Promise.resolve({})),
+  getMorseProgress: vi.fn(() => Promise.resolve({
+    days: 30, kochLevel: 2, kochLevelSet: false, settings: null, totalRounds: 0,
+    series: { copy: [], 'head-copy': [], send: [] }, confusionMatrix: {}, confusionPairs: [], charAccuracy: [],
+  })),
+  updateMorseLevel: vi.fn(() => Promise.resolve({ kochLevel: 2, kochLevelSet: true, adopted: false, settings: null })),
+}));
+
+import MorseTrainer, { MODES, MORSE_MODE_IDS, MORSE_TABLE, KeyPad, isNodeOnPath, resultsToItems } from './MorseTrainer';
+import { submitTrainingEntry, getTrainingStats, submitMorseRound, getMorseProgress, updateMorseLevel } from '../../../services/api';
+
+// Minimal Web Audio mock so CopyDrill's round flow (which calls ensureCtx →
+// playMorse) can run in jsdom without a real AudioContext. No existing shared
+// mock exists for this in the repo (each audio-consuming test file rolls its
+// own) — mirrors that convention. `stop()` resolves playMorse's promise on
+// the next tick, matching the real oscillator's `onended` callback shape.
+class MockOscillator {
+  // `context` mirrors the real AudioNode.context — stopTone reads currentTime
+  // off it instead of re-resolving the AudioContext.
+  constructor(context = { currentTime: 0 }) { this.onended = null; this.frequency = { value: 0 }; this.context = context; }
+  connect() { return this; }
+  start() {}
+  // Scheduled unconditionally, then null-checked when it fires: playMorse calls
+  // stop() BEFORE it assigns onended (the handler lives in the Promise executor
+  // it returns), so an `if (this.onended)` gate here never fires and its promise
+  // never resolves — which silently hid every post-playback assertion.
+  stop() { setTimeout(() => this.onended?.(), 0); }
+  disconnect() {}
+}
+class MockGainNode {
+  constructor() {
+    this.gain = { value: 0, setValueAtTime() {}, linearRampToValueAtTime() {}, cancelScheduledValues() {} };
+  }
+  connect() { return this; }
+  disconnect() {}
+}
+class MockAudioContext {
+  constructor() { this.currentTime = 0; this.destination = {}; this.state = 'running'; }
+  createOscillator() { return new MockOscillator(); }
+  createGain() { return new MockGainNode(); }
+  resume() {}
+  close() {}
+}
+
+// Surfaces the live URL (path + search) so tests can assert the reference tab
+// is encoded in the query string — the "URL is the source of truth" contract.
+function LocationProbe() {
+  const loc = useLocation();
+  return <div data-testid="loc">{loc.pathname}{loc.search}</div>;
+}
+
+async function renderMorse(props = {}, { route = '/post/morse' } = {}) {
+  const result = render(
+    <MemoryRouter initialEntries={[route]}>
+      <Routes>
+        <Route
+          path="/post/morse"
+          element={<><MorseTrainer {...props} /><LocationProbe /></>}
+        />
+      </Routes>
+    </MemoryRouter>,
+  );
+  // Settle the mount-effect fetches (training stats + morse progress) inside
+  // act — the mocks are pre-resolved promises, so one microtask flush drains
+  // every pending .then before the test's own interactions begin.
+  await act(async () => {});
+  return result;
+}
+
+beforeEach(() => {
+  submitTrainingEntry.mockResolvedValue({});
+  submitMorseRound.mockResolvedValue({});
+});
+
+describe('MorseTrainer deep-linking', () => {
+  beforeEach(() => {
+    submitTrainingEntry.mockClear();
+    getTrainingStats.mockClear();
+  });
+
+  it('exports the routed mode ids', () => {
+    expect(MORSE_MODE_IDS).toEqual(['copy', 'head-copy', 'send']);
+    expect(MODES.map((m) => m.id)).toEqual(MORSE_MODE_IDS);
+  });
+
+  it('lets users choose transfer material or opt out of adaptive selection', async () => {
+    await renderMorse();
+    expect(screen.getByLabelText('Adaptive practice')).toBeChecked();
+    fireEvent.click(screen.getByLabelText('Adaptive practice'));
+    expect(screen.getByLabelText('Adaptive practice')).not.toBeChecked();
+    fireEvent.change(screen.getByLabelText('Material'), { target: { value: 'qso' } });
+    expect(screen.getByLabelText('Material')).toHaveValue('qso');
+  });
+
+  it('shows the mode grid and routes on pick (mode=null)', async () => {
+    const onSelectMode = vi.fn();
+    await renderMorse({ mode: null, onSelectMode });
+    // All three mode cards render as pickable entries.
+    fireEvent.click(screen.getByText('Copy'));
+    expect(onSelectMode).toHaveBeenCalledWith('copy');
+    fireEvent.click(screen.getByText('Head Copy'));
+    expect(onSelectMode).toHaveBeenCalledWith('head-copy');
+    fireEvent.click(screen.getByText('Send'));
+    expect(onSelectMode).toHaveBeenCalledWith('send');
+  });
+
+  it('defaults the reference tab to tree with no ?ref param', async () => {
+    await renderMorse({ mode: null, onSelectMode: vi.fn() });
+    // Tree view legend is unique to the tree reference.
+    expect(screen.getByText('start')).toBeInTheDocument();
+  });
+
+  it('reads the reference tab from the ?ref search param', async () => {
+    await renderMorse({ mode: null, onSelectMode: vi.fn() }, { route: '/post/morse?ref=length' });
+    // Length view groups by symbol count.
+    expect(screen.getByText('1 symbol')).toBeInTheDocument();
+  });
+
+  it('encodes the selected reference tab in the URL', async () => {
+    await renderMorse({ mode: null, onSelectMode: vi.fn() });
+    // Exact name — a loose /List/ also matches the "Listen to Morse" mode card.
+    fireEvent.click(screen.getByRole('button', { name: 'List' }));
+    expect(screen.getByTestId('loc').textContent).toBe('/post/morse?ref=list');
+  });
+
+  it('drops the ?ref param when returning to the default tree tab', async () => {
+    await renderMorse({ mode: null, onSelectMode: vi.fn() }, { route: '/post/morse?ref=list' });
+    fireEvent.click(screen.getByRole('button', { name: 'Tree' }));
+    expect(screen.getByTestId('loc').textContent).toBe('/post/morse');
+  });
+});
+
+describe('MorseTrainer head-copy mode', () => {
+  beforeEach(() => {
+    submitTrainingEntry.mockClear();
+    getTrainingStats.mockClear();
+  });
+
+  it('hides the reference cheat sheet and explains the audio-only rules', async () => {
+    await renderMorse({ mode: 'head-copy', onSelectMode: vi.fn(), onExitMode: vi.fn() });
+    // The Tree/Length/List reference tabs only render via ReferenceWidget,
+    // which head-copy mode suppresses entirely.
+    expect(screen.queryByRole('button', { name: 'Tree' })).not.toBeInTheDocument();
+    expect(screen.getByText(/No code hints on the results screen/)).toBeInTheDocument();
+  });
+
+  it('keeps the reference widget visible in plain copy mode (unchanged behavior)', async () => {
+    await renderMorse({ mode: 'copy', onSelectMode: vi.fn(), onExitMode: vi.fn() });
+    expect(screen.getByRole('button', { name: 'Tree' })).toBeInTheDocument();
+  });
+});
+
+describe('MorseTrainer training log integration', () => {
+  beforeEach(() => {
+    submitTrainingEntry.mockClear();
+    getTrainingStats.mockClear();
+  });
+
+  it('fetches 30-day training stats on mount and renders the streak summary', async () => {
+    const { container } = await renderMorse({ mode: null, onSelectMode: vi.fn() });
+    expect(getTrainingStats).toHaveBeenCalledWith(30);
+    await waitFor(() => {
+      expect(container.textContent).toContain('Training streak: 3d');
+    });
+    expect(container.textContent).toContain('Morse logged: 4');
+    expect(container.textContent).toContain('80% avg');
+  });
+
+  it('waits for a Send result to save before continuing the daily routine', async () => {
+    let resolveTraining;
+    let resolveRound;
+    submitTrainingEntry.mockImplementationOnce(() => new Promise(resolve => { resolveTraining = resolve; }));
+    submitMorseRound.mockImplementationOnce(() => new Promise(resolve => { resolveRound = resolve; }));
+    const onContinue = vi.fn();
+    await renderMorse({ mode: 'send', onContinue, onExitMode: vi.fn(), onBack: vi.fn() });
+
+    fireEvent.click(screen.getByText('Check'));
+    fireEvent.click(screen.getByText("Continue Today's Routine"));
+
+    await waitFor(() => expect(submitTrainingEntry).toHaveBeenCalled());
+    await waitFor(() => expect(submitMorseRound).toHaveBeenCalled());
+    expect(onContinue).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolveTraining({});
+      resolveRound({});
+    });
+    await waitFor(() => expect(onContinue).toHaveBeenCalledTimes(1));
+  });
+
+  it('stays on the Send result when a retry still cannot save', async () => {
+    submitTrainingEntry.mockRejectedValue(new Error('offline'));
+    submitMorseRound.mockResolvedValue({});
+    const onContinue = vi.fn();
+    await renderMorse({ mode: 'send', onContinue, onExitMode: vi.fn(), onBack: vi.fn() });
+
+    fireEvent.click(screen.getByText('Check'));
+    await waitFor(() => expect(submitTrainingEntry).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByText("Continue Today's Routine"));
+
+    await waitFor(() => expect(submitTrainingEntry).toHaveBeenCalledTimes(2));
+    expect(onContinue).not.toHaveBeenCalled();
+    await awaitEnabled(() => screen.getByText("Continue Today's Routine"));
+  });
+
+  describe('round completion', () => {
+    // Scoped to just this test — install/teardown live in beforeEach/afterEach
+    // (not inline in the test body) so a failed assertion above the cleanup
+    // line can't leak the mock AudioContext onto `window` for later tests.
+    beforeEach(() => {
+      window.AudioContext = MockAudioContext;
+    });
+    afterEach(() => {
+      delete window.AudioContext;
+    });
+
+    it('logs a completed Head Copy round to the training log with the right payload shape', async () => {
+      await renderMorse({ mode: 'head-copy', onSelectMode: vi.fn(), onExitMode: vi.fn() });
+
+      fireEvent.click(await screen.findByRole('button', { name: /Start Round/i }));
+
+      // 10-question round (ROUND_SIZE): submit a deliberately wrong guess each
+      // time so correctCount is deterministic (0), then advance past feedback.
+      for (let i = 0; i < 10; i++) {
+        const input = await screen.findByPlaceholderText('????');
+        fireEvent.change(input, { target: { value: 'ZZZZZ' } });
+        fireEvent.keyDown(input, { key: 'Enter' });
+        if (i < 9) {
+          const nextButton = await screen.findByRole('button', { name: /Next/i });
+          fireEvent.click(nextButton);
+        }
+      }
+
+      await waitFor(() => {
+        expect(submitTrainingEntry).toHaveBeenCalledWith(expect.objectContaining({
+          module: 'morse',
+          drillType: 'morse-head-copy',
+          questionCount: 10,
+          correctCount: 0,
+        }));
+      });
+    });
+
+    it('submits the completed round to the server with per-character items', async () => {
+      submitMorseRound.mockClear();
+      await renderMorse({ mode: 'head-copy', onSelectMode: vi.fn(), onExitMode: vi.fn() });
+
+      fireEvent.click(await screen.findByRole('button', { name: /Start Round/i }));
+      for (let i = 0; i < 10; i++) {
+        const input = await screen.findByPlaceholderText('????');
+        fireEvent.change(input, { target: { value: 'ZZZZZ' } });
+        fireEvent.keyDown(input, { key: 'Enter' });
+        if (i < 9) {
+          fireEvent.click(await screen.findByRole('button', { name: /Next/i }));
+        }
+      }
+
+      await waitFor(() => {
+        expect(submitMorseRound).toHaveBeenCalledWith(
+          expect.objectContaining({
+            mode: 'head-copy',
+            items: expect.arrayContaining([
+              expect.objectContaining({ sent: expect.any(String), guessed: expect.any(String), correct: expect.any(Boolean) }),
+            ]),
+          }),
+        );
+      });
+      // Every item carries the sent/guessed/correct shape the confusion matrix needs.
+      const round = submitMorseRound.mock.calls[0][0];
+      expect(round.items.length).toBeGreaterThan(0);
+      expect(round.kochLevel).toBeTypeOf('number');
+    });
+  });
+});
+
+// The whole point of the copy drill is learning what you just got wrong. At
+// Koch level 2 the pool is K/M, so a user who never sees the verdict is
+// guessing a coin flip forever — these pin the verdict on screen and keep the
+// answer readable after it is dismissed.
+describe('MorseTrainer per-question feedback', () => {
+  beforeEach(() => {
+    window.AudioContext = MockAudioContext;
+  });
+  afterEach(() => {
+    delete window.AudioContext;
+  });
+
+  // Level 2's pool is K/M and the group length is 1, so the sent character is
+  // one of exactly two known patterns — enough to assert the verdict's shape
+  // without pinning the sampler's seeded choice.
+  const SENT_VERDICT = /^(K-\.-|M--)/;
+
+  async function startCopyRound(mode = 'copy') {
+    await renderMorse({ mode, onSelectMode: vi.fn(), onExitMode: vi.fn() });
+    fireEvent.click(await screen.findByRole('button', { name: /Start Round/i }));
+    const input = await screen.findByLabelText('Decoded characters');
+    input.focus();
+    return input;
+  }
+
+  // The submit gesture is the subject of half these tests, so it lives in one
+  // place — Z is never in the Koch pool, so every answer is a deliberate miss.
+  function answer(input, value = 'Z') {
+    fireEvent.change(input, { target: { value } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+  }
+
+  it.each(['copy', 'head-copy'])('hides answer-bearing selection details until submission in %s', async (mode) => {
+    getMorseProgress.mockResolvedValueOnce({
+      days: 30, kochLevel: 2, kochLevelSet: false, settings: null, totalRounds: 1,
+      series: { copy: [], 'head-copy': [], send: [] }, confusionMatrix: {}, confusionPairs: [],
+      charAccuracy: [
+        { char: 'K', attempts: 10, accuracy: 0 },
+        { char: 'M', attempts: 10, accuracy: 0 },
+      ],
+    });
+    const input = await startCopyRound(mode);
+    expect(screen.queryByText(/Targeting .*rotation\./)).toBeNull();
+
+    answer(input);
+    await screen.findByTestId('morse-verdict');
+    expect(screen.getByText(/Targeting .*rotation\./)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /^Next$/ }));
+    await waitFor(() => expect(screen.queryByTestId('morse-verdict')).toBeNull());
+    expect(screen.queryByText(/Targeting .*rotation\./)).toBeNull();
+  });
+
+  it('shows what was sent, its Morse, and the pattern the user typed instead', async () => {
+    const input = await startCopyRound();
+    answer(input);
+
+    const verdict = await screen.findByTestId('morse-verdict');
+    expect(verdict.textContent).toMatch(SENT_VERDICT);
+    // The guess's own pattern is what makes the miss teachable.
+    expect(verdict.textContent).toContain('You typed Z (--..)');
+  });
+
+  it('keeps focus in the answer box so the submitting keystroke cannot dismiss the verdict', async () => {
+    const input = await startCopyRound();
+    answer(input);
+
+    await screen.findByTestId('morse-verdict');
+    // See the <input> comment in CopyDrill — an autofocused Next button is
+    // activated natively by the same Enter that submitted.
+    const next = screen.getByRole('button', { name: /^Next$/ });
+    expect(document.activeElement).toBe(input);
+    expect(document.activeElement).not.toBe(next);
+  });
+
+  it('ignores an auto-repeat Enter so one held keypress cannot answer and advance', async () => {
+    const input = await startCopyRound();
+    fireEvent.change(input, { target: { value: 'Z' } });
+    fireEvent.keyDown(input, { key: 'Enter', repeat: true });
+    expect(screen.queryByTestId('morse-verdict')).toBeNull();
+
+    fireEvent.keyDown(input, { key: 'Enter' });
+    const verdict = await screen.findByTestId('morse-verdict');
+    fireEvent.keyDown(input, { key: 'Enter', repeat: true });
+    expect(screen.getByTestId('morse-verdict')).toBe(verdict);
+  });
+
+  it('keeps the previous answer on screen through the next question', async () => {
+    const input = await startCopyRound();
+    answer(input);
+    await screen.findByTestId('morse-verdict');
+
+    fireEvent.click(screen.getByRole('button', { name: /^Next$/ }));
+
+    const previous = await screen.findByTestId('morse-previous-answer');
+    expect(previous.textContent).toMatch(/^Previous: (K -\.-|M --) → you typed Z ✗$/);
+  });
+
+  it('withholds the Morse hint from the head-copy recap (pure recall)', async () => {
+    const input = await startCopyRound('head-copy');
+    answer(input);
+    await screen.findByTestId('morse-verdict');
+
+    fireEvent.click(screen.getByRole('button', { name: /^Next$/ }));
+
+    const previous = await screen.findByTestId('morse-previous-answer');
+    expect(previous.textContent).toMatch(/^Previous: (K|M) → you typed Z ✗$/);
+  });
+});
+
+describe('resultsToItems (per-character flatten for the confusion matrix)', () => {
+  it('aligns each prompt character with its guess positionally', () => {
+    const items = resultsToItems([{ prompt: 'KM', guess: 'KR', correct: false, responseMs: 500 }]);
+    expect(items).toEqual([
+      { sent: 'K', guessed: 'K', correct: true, responseMs: 500 },
+      { sent: 'M', guessed: 'R', correct: false, responseMs: 500 },
+    ]);
+  });
+
+  it('scores a missing/short guess as an empty-guess miss', () => {
+    const items = resultsToItems([{ prompt: 'SOS', guess: 'SO', correct: false, responseMs: 0 }]);
+    expect(items[2]).toEqual({ sent: 'S', guessed: '', correct: false, responseMs: 0 });
+  });
+
+  it('records an extra typed character as an empty-sent insertion error', () => {
+    // K→KM: K is a correct copy, but the extra M must not vanish (which would
+    // read as a perfect round) — it becomes an empty-sent error item.
+    const items = resultsToItems([{ prompt: 'K', guess: 'KM', correct: false, responseMs: 100 }]);
+    expect(items).toEqual([
+      { sent: 'K', guessed: 'K', correct: true, responseMs: 100 },
+      { sent: '', guessed: 'M', correct: false, responseMs: 100 },
+    ]);
+  });
+
+  it('flattens a multi-question round into per-character items', () => {
+    const items = resultsToItems([
+      { prompt: 'K', guess: 'K', correct: true, responseMs: 100 },
+      { prompt: 'MU', guess: 'MU', correct: true, responseMs: 200 },
+    ]);
+    expect(items).toHaveLength(3);
+    expect(items.every((i) => i.correct)).toBe(true);
+  });
+});
+
+describe('MorseTrainer server Koch-level hydration', () => {
+  beforeEach(() => {
+    getMorseProgress.mockClear();
+    updateMorseLevel.mockClear();
+    window.localStorage.clear();
+  });
+
+  it('fetches server progress on mount', async () => {
+    await renderMorse({ mode: null, onSelectMode: vi.fn() });
+    await waitFor(() => expect(getMorseProgress).toHaveBeenCalled());
+  });
+
+  it('adopts a cached localStorage level once when the server has none', async () => {
+    // Cache a level beyond the base (2) and a server with kochLevelSet:false.
+    window.localStorage.setItem('portos-post-morse-prefs', JSON.stringify({ kochLevel: 9 }));
+    updateMorseLevel.mockResolvedValueOnce({ kochLevel: 9, kochLevelSet: true, adopted: true, settings: null });
+    await renderMorse({ mode: null, onSelectMode: vi.fn() });
+    await waitFor(() => {
+      expect(updateMorseLevel).toHaveBeenCalledWith(
+        expect.objectContaining({ kochLevel: 9, adopt: true }),
+        expect.objectContaining({ silent: true }),
+      );
+    });
+  });
+
+  it('does not adopt when the cached level is only the base default', async () => {
+    window.localStorage.setItem('portos-post-morse-prefs', JSON.stringify({ kochLevel: 2 }));
+    await renderMorse({ mode: null, onSelectMode: vi.fn() });
+    await waitFor(() => expect(getMorseProgress).toHaveBeenCalled());
+    expect(updateMorseLevel).not.toHaveBeenCalled();
+  });
+});
+
+describe('MorseTrainer iOS audio unlock', () => {
+  // Regression for "audio doesn't work on mobile Safari": iOS starts the
+  // AudioContext suspended and resume() is async. If a tone is scheduled before
+  // resume() settles, it's laid down against a still-suspended clock and never
+  // sounds. The trainer must await resume() (like metronome.js / scorePlayback.js)
+  // so no oscillator is ever created while the context is still 'suspended'.
+  let createdWhileSuspended;
+  let oscCount;
+  class SuspendedAudioContext {
+    constructor() { this.currentTime = 0; this.destination = {}; this.state = 'suspended'; }
+    // Resolve on a macrotask (setTimeout), NOT a microtask. iOS resume latency
+    // is real time, and the component must AWAIT it before touching
+    // createOscillator. A microtask-resolving mock would let the unawaited
+    // (buggy) path pass too — playPrompt's own `await ensureCtx()` yields a
+    // microtask, so a microtask state-flip always beats createOscillator
+    // regardless of the await. The macrotask makes the missing-await path
+    // schedule the oscillator while still 'suspended', so the test fails if the
+    // fix regresses.
+    resume() { return new Promise((resolve) => { setTimeout(() => { this.state = 'running'; resolve(); }, 0); }); }
+    createOscillator() {
+      if (this.state === 'suspended') createdWhileSuspended = true;
+      oscCount += 1;
+      return new MockOscillator();
+    }
+    createGain() { return new MockGainNode(); }
+    close() {}
+  }
+
+  beforeEach(() => {
+    createdWhileSuspended = false;
+    oscCount = 0;
+    submitTrainingEntry.mockClear();
+    getTrainingStats.mockClear();
+    window.AudioContext = SuspendedAudioContext;
+  });
+  afterEach(() => { delete window.AudioContext; });
+
+  it('awaits resume() before scheduling any tone (no oscillator while suspended)', async () => {
+    await renderMorse({ mode: 'copy', onSelectMode: vi.fn(), onExitMode: vi.fn() });
+    fireEvent.click(await screen.findByRole('button', { name: /Start Round/i }));
+    // The round input only renders once playMorse has finished, so by here the
+    // first tone has been scheduled and played.
+    await screen.findByPlaceholderText('????');
+    expect(createdWhileSuspended).toBe(false);
+  });
+
+  it('ignores a second Start-Round tap during the audio-unlock window (no overlapping prompt)', async () => {
+    // While the first play awaits resume() (the iOS unlock window), prompt/playing
+    // aren't set yet, so the Start Round button is still live. A second tap in that
+    // window must be ignored — otherwise two playPrompt runs schedule two Morse
+    // prompts over each other. playMorse uses exactly one oscillator per prompt, so
+    // two overlapping prompts would create two oscillators for one round start.
+    await renderMorse({ mode: 'copy', onSelectMode: vi.fn(), onExitMode: vi.fn() });
+    const startBtn = await screen.findByRole('button', { name: /Start Round/i });
+    // Two synchronous taps land inside the unlock window (resume() resolves on a
+    // later macrotask, so neither startRound has reached createOscillator yet).
+    fireEvent.click(startBtn);
+    fireEvent.click(startBtn);
+    await screen.findByPlaceholderText('????');
+    expect(oscCount).toBe(1);
+  });
+});
+
+describe('MorseTrainer Tree reference view', () => {
+  it('renders a labeled, reachable node for all 41 characters', async () => {
+    const { container } = await renderMorse({ mode: null, onSelectMode: vi.fn() });
+    // Every node (including the root) carries its own morse code (or 'start'
+    // for the root) as its `title` — the most reliable way to pick each tree
+    // node out individually, since letter text alone can collide with other
+    // on-screen content (e.g. mode-card labels).
+    const chars = Object.keys(MORSE_TABLE);
+    for (const ch of chars) {
+      const code = MORSE_TABLE[ch];
+      const node = container.querySelector(`[title="${code}"]`);
+      expect(node, `expected a tree node for "${ch}" (${code})`).toBeTruthy();
+      expect(node.textContent).toBe(ch);
+    }
+  });
+
+  it('centers the start node roughly under "start", not pinned to one edge', async () => {
+    const { container } = await renderMorse({ mode: null, onSelectMode: vi.fn() });
+    const root = container.querySelector('[title="start"]');
+    expect(root).toBeTruthy();
+    expect(root.textContent).toBe('·');
+    // Regression guard for the reported bug: the root previously rendered
+    // displaced toward the DIT side. Its computed x-slot should sit near the
+    // horizontal middle of the tree's total width, not near either edge.
+    const svg = root.closest('svg');
+    const totalWidth = parseFloat(svg.getAttribute('viewBox').split(' ')[2]);
+    const rootLeft = parseFloat(root.querySelector('text').getAttribute('x'));
+    expect(rootLeft).toBeGreaterThan(totalWidth * 0.3);
+    expect(rootLeft).toBeLessThan(totalWidth * 0.7);
+  });
+
+  // Regression guard: the tree used to be a fixed-pixel-width block inside an
+  // `overflow-x-auto` side column, so most of the 41 characters were off-screen
+  // behind a scrollbar on desktop. It must now scale to whatever width it gets.
+  it('renders the whole tree as a scalable viewBox with no horizontal scroller', async () => {
+    const { container } = await renderMorse({ mode: null, onSelectMode: vi.fn() });
+    const svg = container.querySelector('[title="start"]').closest('svg');
+    expect(svg.getAttribute('viewBox')).toMatch(/^0 0 \d+ \d+$/);
+    expect(svg.getAttribute('class')).toContain('w-full');
+    for (let el = svg.parentElement; el && el !== container; el = el.parentElement) {
+      expect(el.className).not.toMatch(/overflow-x-auto/);
+    }
+  });
+
+  // The tree gets the full page width; the compact Length/List views keep the
+  // narrow sticky side column beside the drill.
+  it('stacks the tree full-width but keeps the other reference views in a side column', async () => {
+    const treeRender = await renderMorse({ mode: null, onSelectMode: vi.fn() }, { route: '/post/morse?ref=tree' });
+    expect(treeRender.container.querySelector('.xl\\:grid-cols-\\[minmax\\(0\\,1fr\\)_24rem\\]')).toBeNull();
+    treeRender.unmount();
+
+    const listRender = await renderMorse({ mode: null, onSelectMode: vi.fn() }, { route: '/post/morse?ref=list' });
+    expect(listRender.container.querySelector('.xl\\:grid-cols-\\[minmax\\(0\\,1fr\\)_24rem\\]')).toBeTruthy();
+  });
+});
+
+describe('isNodeOnPath (live keying highlight gate)', () => {
+  // Root's placeholder char is '·' (truthy) and its code is '' — an idle/empty
+  // currentPath must not make it read as "matched", or the reference tree lights
+  // up the root before the user has keyed anything.
+  const root = { char: '·', code: '' };
+  const e = { char: 'E', code: '.' };
+  const i = { char: 'I', code: '..' };
+  const t = { char: 'T', code: '-' };
+
+  it('does not match or highlight the root when currentPath is empty', () => {
+    expect(isNodeOnPath(root, '')).toEqual({ matched: false, onPath: false });
+  });
+
+  it('matches a node whose code equals the current keyed path', () => {
+    expect(isNodeOnPath(i, '..')).toEqual({ matched: true, onPath: false });
+  });
+
+  it('marks an ancestor of the current path as onPath but not matched', () => {
+    // 'e' ('.') is a prefix of the in-progress path '..' but is not the
+    // fully-keyed node itself.
+    expect(isNodeOnPath(e, '..')).toEqual({ matched: false, onPath: true });
+  });
+
+  it('does not flag a node unrelated to the current path', () => {
+    expect(isNodeOnPath(t, '..')).toEqual({ matched: false, onPath: false });
+  });
+});
+
+// The trainer sounds through its OWN per-mount AudioContext (it close()s it on
+// unmount), so it can't inherit the shared lookahead transport's `audioSession`
+// option — it claims the iOS `playback` session by hand. Without the claim the
+// iPhone's ring/silent switch mutes a pure-synth drill that still says
+// "playing..." on screen. jsdom has no `navigator.audioSession`, so these stub
+// the shape Safari 16.4+ exposes and read the declared type back off it (#4131).
+describe('MorseTrainer iOS audio session', () => {
+  beforeEach(() => {
+    window.AudioContext = MockAudioContext;
+    navigator.audioSession = { type: 'auto' };
+  });
+  afterEach(() => {
+    delete window.AudioContext;
+    delete navigator.audioSession;
+  });
+
+  it('claims playback while a copy prompt sounds and hands it back after', async () => {
+    await renderMorse({ mode: 'copy', onSelectMode: vi.fn(), onExitMode: vi.fn() });
+    fireEvent.click(await screen.findByRole('button', { name: /Start Round/i }));
+    // The claim is taken synchronously, before the resume await, so the context
+    // comes up on the right session.
+    expect(navigator.audioSession.type).toBe('playback');
+
+    // playMorse resolves off the oscillator's `onended`, so the release lands a
+    // tick after the prompt stops sounding.
+    await waitFor(() => expect(navigator.audioSession.type).toBe('auto'));
+  });
+
+  it('recovers the copy drill after an audio resume rejection', async () => {
+    let resumes = 0;
+    class FlakyAudioContext extends MockAudioContext {
+      constructor() { super(); this.state = 'suspended'; }
+      resume() {
+        resumes += 1;
+        if (resumes === 1) return Promise.reject(new Error('permission denied'));
+        this.state = 'running';
+        return Promise.resolve();
+      }
+    }
+    window.AudioContext = FlakyAudioContext;
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    await renderMorse({ mode: 'copy', onSelectMode: vi.fn(), onExitMode: vi.fn() });
+
+    fireEvent.click(await screen.findByRole('button', { name: /Start Round/i }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Audio playback could not start');
+    expect(navigator.audioSession.type).toBe('auto');
+
+    fireEvent.click(screen.getByRole('button', { name: /Start Round/i }));
+    await screen.findByPlaceholderText('????');
+    expect(resumes).toBe(2);
+    errorSpy.mockRestore();
+  });
+
+  it('claims playback while the send sidetone is keyed and hands it back on release', async () => {
+    await renderMorse({ mode: 'send', onSelectMode: vi.fn(), onExitMode: vi.fn() });
+    await act(async () => { fireEvent.keyDown(window, { code: 'Space' }); });
+    expect(navigator.audioSession.type).toBe('playback');
+
+    await act(async () => { fireEvent.keyUp(window, { code: 'Space' }); });
+    expect(navigator.audioSession.type).toBe('auto');
+  });
+
+  // A tap short enough to end before the resume await settles has a claim but no
+  // oscillator yet — stopTone releases before its no-oscillator early return, or
+  // the document stays pinned output-only with no release left to call.
+  it('releases a claim taken by a press that ended before the audio unlocked', async () => {
+    // Resume parks until flushed, reproducing the iOS unlock window.
+    let unlock;
+    class SlowAudioContext extends MockAudioContext {
+      constructor() { super(); this.state = 'suspended'; }
+      resume() { return new Promise((r) => { unlock = () => { this.state = 'running'; r(); }; }); }
+    }
+    window.AudioContext = SlowAudioContext;
+    await renderMorse({ mode: 'send', onSelectMode: vi.fn(), onExitMode: vi.fn() });
+
+    fireEvent.keyDown(window, { code: 'Space' });
+    expect(navigator.audioSession.type).toBe('playback');
+    fireEvent.keyUp(window, { code: 'Space' });
+    expect(navigator.audioSession.type).toBe('auto');
+
+    await act(async () => { unlock(); });
+    // The superseded startTone must not re-declare on its way out.
+    expect(navigator.audioSession.type).toBe('auto');
+  });
+
+  it('keeps a newer sidetone claim when an older resume fails', async () => {
+    const resumes = [];
+    class DeferredAudioContext extends MockAudioContext {
+      constructor() { super(); this.state = 'suspended'; }
+      resume() {
+        return new Promise((resolve, reject) => resumes.push({ resolve, reject }));
+      }
+    }
+    window.AudioContext = DeferredAudioContext;
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    await renderMorse({ mode: 'send', onSelectMode: vi.fn(), onExitMode: vi.fn() });
+
+    fireEvent.keyDown(window, { code: 'Space' });
+    fireEvent.keyUp(window, { code: 'Space' });
+    fireEvent.keyDown(window, { code: 'Space' });
+    expect(navigator.audioSession.type).toBe('playback');
+
+    await act(async () => { resumes[0].reject(new Error('first resume failed')); });
+    expect(navigator.audioSession.type).toBe('playback');
+
+    await act(async () => { resumes[1].resolve(); });
+    fireEvent.keyUp(window, { code: 'Space' });
+    expect(navigator.audioSession.type).toBe('auto');
+    errorSpy.mockRestore();
+  });
+
+  // Unmounting inside the unlock window close()s and nulls the per-mount
+  // context, so the parked playPrompt resumes with nothing to sound into. It
+  // must bail rather than throw into playMorse, and the claim must be gone.
+  it('releases and bails when the trainer unmounts inside the unlock window', async () => {
+    let unlock;
+    class SlowAudioContext extends MockAudioContext {
+      constructor() { super(); this.state = 'suspended'; }
+      resume() { return new Promise((r) => { unlock = () => { this.state = 'running'; r(); }; }); }
+    }
+    window.AudioContext = SlowAudioContext;
+    const { unmount } = await renderMorse({ mode: 'copy', onSelectMode: vi.fn(), onExitMode: vi.fn() });
+
+    fireEvent.click(await screen.findByRole('button', { name: /Start Round/i }));
+    expect(navigator.audioSession.type).toBe('playback');
+
+    unmount();
+    expect(navigator.audioSession.type).toBe('auto');
+    await act(async () => { unlock(); });
+    expect(navigator.audioSession.type).toBe('auto');
+  });
+});
+
+// The practice key is the on-screen twin of the spacebar, and both must work
+// after the other has been used. Space on a focused button belongs to the
+// browser (useKeyCapture stands down for it, #4748), so once a mouse tap parks
+// focus on this pad the global claim no longer fires — the pad has to key on
+// its own key events or the spacebar goes dead on the control labelled
+// "TAP / HOLD SPACE".
+describe('MorseTrainer practice key — keyboard parity with the spacebar', () => {
+  const makeKeying = () => ({
+    beginPress: vi.fn(), endPress: vi.fn(), clear: vi.fn(), pressing: false,
+  });
+  const pad = () => screen.getByRole('button', { name: /TAP \/ HOLD SPACE/i });
+
+  it('keys on Space while focused, and does not double-fire via the native click', () => {
+    const keying = makeKeying();
+    render(<KeyPad keying={keying} />);
+    const button = pad();
+    button.focus();
+    expect(document.activeElement).toBe(button);
+
+    fireEvent.keyDown(button, { key: ' ', code: 'Space' });
+    expect(keying.beginPress).toHaveBeenCalledTimes(1);
+    expect(keying.endPress).not.toHaveBeenCalled();
+
+    fireEvent.keyUp(button, { key: ' ', code: 'Space' });
+    expect(keying.endPress).toHaveBeenCalledTimes(1);
+    // The keydown preventDefaults, so the browser never synthesizes the click
+    // that would key a second time.
+    expect(keying.beginPress).toHaveBeenCalledTimes(1);
+  });
+
+  it('treats an auto-repeat keydown as one continuous press, not a re-key', () => {
+    const keying = makeKeying();
+    render(<KeyPad keying={keying} />);
+    const button = pad();
+
+    fireEvent.keyDown(button, { key: ' ', code: 'Space' });
+    fireEvent.keyDown(button, { key: ' ', code: 'Space', repeat: true });
+    fireEvent.keyDown(button, { key: ' ', code: 'Space', repeat: true });
+
+    expect(keying.beginPress).toHaveBeenCalledTimes(1);
+  });
+
+  it('ignores keys that are not a press', () => {
+    const keying = makeKeying();
+    render(<KeyPad keying={keying} />);
+
+    fireEvent.keyDown(pad(), { key: 'a', code: 'KeyA' });
+
+    expect(keying.beginPress).not.toHaveBeenCalled();
+  });
+});

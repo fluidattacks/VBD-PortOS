@@ -1,0 +1,274 @@
+/**
+ * Three-state thumbnail slot for universe canon entries and category variations.
+ *
+ * Mirrors the comic-page render thumb pattern from
+ * `client/src/components/pipeline/MediaJobThumb.jsx`:
+ *
+ *   1. Pending — `inFlightJobId` set → render `MediaJobThumb` so the user
+ *      sees the diffusion spinner / step counter / preview latent.
+ *   2. Completed — `imageRefs[]` non-empty → walk-back thumbnail (the existing
+ *      `EntryCardThumbnail` behavior, extracted here to keep both paths in
+ *      lock-step).
+ *   3. Empty — no jobId, no images → 48x48 placeholder box with a centered
+ *      `emptyIcon` button (Sparkles by default) that fires `onRender()`. Keeps
+ *      row heights consistent across freshly-extracted entries (no images yet)
+ *      and rendered ones, and surfaces a one-click render affordance without
+ *      scrolling to the row's action column.
+ *
+ * All three states are laid out in the same `THUMB_DIMENSIONS` box, so a row
+ * never jitters as a render starts and finishes. Disabled when `canRender` is
+ * false (no backend selected, save pending, etc.) so the button shape is still
+ * visible but inert — `disabledHint` is what says why, and every host has a
+ * different reason, so it has no useful default beyond a neutral one.
+ */
+import { useCallback, useState, useEffect } from 'react';
+import { Sparkles, Star } from 'lucide-react';
+import MediaJobThumb from '../pipeline/MediaJobThumb';
+
+const THUMB_DIMENSIONS = {
+  sm: 'w-12 h-20',
+  lg: 'w-16 h-24',
+  xl: 'w-40 h-60',
+  sheet: 'w-20 h-30 xl:w-40 xl:h-60',
+};
+
+// Width-only tokens used when the host supplies a canvas (`aspectRatio`) so
+// height comes from that ratio instead of the 2:3 `h-*` above. Playing cards
+// are 5:7 and tarot 11:19; a 2:3 `object-cover` box crops their edges.
+const THUMB_WIDTH = {
+  sm: 'w-12',
+  lg: 'w-16',
+  xl: 'w-40',
+  sheet: 'w-20 xl:w-40',
+};
+
+const isPositiveEdge = (value) => Number.isFinite(value) && value > 0;
+
+function thumbFrameProps(size, aspectRatio, { fluid = false } = {}) {
+  const valid = isPositiveEdge(aspectRatio?.width) && isPositiveEdge(aspectRatio?.height);
+  if (!valid) {
+    return {
+      className: `${THUMB_DIMENSIONS[size] || THUMB_DIMENSIONS.sm} shrink-0`,
+      style: undefined,
+    };
+  }
+  const widthClass = fluid ? 'w-full' : (THUMB_WIDTH[size] || THUMB_WIDTH.sm);
+  return {
+    className: `${widthClass} shrink-0`,
+    style: { aspectRatio: `${aspectRatio.width} / ${aspectRatio.height}` },
+  };
+}
+
+export default function EntryThumbSlot({
+  inFlightJobId = null,
+  imageRefs = null,
+  primaryImageRef = null,
+  displayedImageRef = null,
+  onRender = null,
+  onPreview = null,
+  // Fired with the rendered filename when an in-flight job completes (forwarded
+  // to MediaJobThumb's onFilename) so callers can persist the new ref + clear
+  // the in-flight job without their own job subscription. Called with `null` on
+  // a terminal failure, which yields no filename.
+  //
+  // ONE argument, always. Do not overload the second positional slot with a
+  // status: `useSingleImageRender`'s `handleComplete(filename, key)` is wired
+  // straight into this prop (StyleProbeImage), and a status arriving where it
+  // expects a key re-keys its job map so the in-flight job is never cleared and
+  // the slot spins forever. Terminal status goes to `onTerminalStatus` instead.
+  onComplete = null,
+  // `(status, error)` — `'failed' | 'canceled'` plus the failure reason when
+  // the job terminates without a filename, for callers that report a failed
+  // render. Separate from `onComplete` per the arity note above; fires after
+  // it, so the clear happens first either way.
+  onTerminalStatus = null,
+  canRender = true,
+  // The empty slot's affordance. Glyph and label travel together because a host
+  // whose empty state is not "render this" needs to change both: a deck card
+  // with no prompt yet points at its editor instead.
+  emptyIcon: EmptyIcon = Sparkles,
+  emptyHint = 'Render image for this item',
+  // Why the affordance is inert, in the host's own words — shown on hover and
+  // announced as the button's name. There is no shared right answer (an empty
+  // description, an unsaved world, a locked story, no configured backend), so a
+  // host that can disable the slot should always pass this.
+  disabledHint = 'Render unavailable',
+  alt = 'Render',
+  // `'lg'` renders the empty-state box at 64x96 with a bigger Sparkles
+  // affordance (reserved for slots that ride a wider card). `'xl'` is the
+  // 160x240 hero footprint used by the base-style probe on the universe page.
+  // 'sheet' keeps a compact portrait on phones and the hero size on desktop.
+  // Defaults to the compact 48x80 (w-12 h-20) portrait footprint shared with
+  // variation + canon avatar rows — matched to the 2:3 aspect of typical
+  // 1024x1536 universe renders so the slot doesn't crop the subject.
+  size = 'sm',
+  rounded = true,
+  // Optional canvas `{ width, height }`. When set, the slot's box uses that
+  // ratio (instead of the size token's 2:3 height) and the image `object-contain`s
+  // so a playing-card or tarot trim is not cropped by the default portrait box.
+  aspectRatio = null,
+  // Stretch to the host's width. Only applies together with `aspectRatio` —
+  // without a ratio, a `w-full` box has no height. Used by the deck grid so
+  // each card fills its tile at the deck's own trim.
+  fluid = false,
+}) {
+  // MediaJobThumb fires this from an effect keyed on `[effectiveStatus, onStatus]`,
+  // so it must not be a fresh arrow per render or it re-fires on every parent
+  // render instead of once when the job settles. (`onComplete` goes to
+  // `onFilename` unwrapped, so its identity — and arity — stay the caller's.)
+  const onStatus = useCallback(
+    (s, error) => {
+      if (s !== 'failed' && s !== 'canceled') return;
+      onComplete?.(null);
+      onTerminalStatus?.(s, error || null);
+    },
+    [onComplete, onTerminalStatus],
+  );
+  if (inFlightJobId) {
+    // `xs` (48x80) matches the empty + completed states below. `'lg'` upgrades
+    // the pending box to `sm` (64x64); `'xl'` uses `lg` (128x128).
+    // `MediaJobThumb` has no portrait variant past `xs`, so the larger pending
+    // states are square — centered inside the slot's own portrait box, or every
+    // host would have to reserve the height itself to stop the row jumping when
+    // a render starts and again when it finishes.
+    const pendingSize = size === 'xl' ? 'lg' : size === 'lg' ? 'sm' : 'xs';
+    const pendingBox = thumbFrameProps(size, aspectRatio, { fluid });
+    return (
+      <div className={`${pendingBox.className} flex items-center justify-center`} style={pendingBox.style}>
+        <MediaJobThumb
+          jobId={inFlightJobId}
+          label={alt}
+          size={pendingSize}
+          onPreview={onPreview}
+          onFilename={onComplete}
+          // A terminal failure/cancel never yields a filename, so `onComplete`
+          // (which clears the in-flight job) would otherwise never fire and the
+          // job stays pinned. Callers that scope render state per entity keep
+          // that state across switches (no remount to reset it), so a failed job
+          // would leave the slot stuck — clear it via the no-filename path so the
+          // slot returns to an actionable state and the entity can be re-rendered.
+          onStatus={onStatus}
+          rounded={rounded}
+        />
+      </div>
+    );
+  }
+  const refs = Array.isArray(imageRefs) ? imageRefs : [];
+  const hasImage = refs.length > 0 || !!primaryImageRef;
+  if (hasImage) {
+    const defaultChosen = (primaryImageRef && refs.includes(primaryImageRef))
+      ? primaryImageRef
+      : refs[refs.length - 1];
+    const chosen = (displayedImageRef && refs.includes(displayedImageRef))
+      ? displayedImageRef
+      : defaultChosen;
+    return (
+      <WalkBackThumb
+        filename={chosen}
+        alt={alt}
+        fallbackRefs={refs}
+        isPrimary={!!primaryImageRef && primaryImageRef === chosen}
+        onClick={onPreview}
+        size={size}
+        rounded={rounded}
+        aspectRatio={aspectRatio}
+        fluid={fluid}
+      />
+    );
+  }
+  // Empty state — placeholder box with render button. Portrait footprint
+  // (48x80 / 64x96 / 160x240) matches the 2:3 aspect of typical universe
+  // renders so the row reserves the same vertical space as WalkBackThumb's
+  // completed image, eliminating row jitter across the three states.
+  const emptyBox = thumbFrameProps(size, aspectRatio, { fluid });
+  const iconSize = size === 'xl' ? 32 : size === 'lg' ? 18 : 14;
+  const hint = canRender && onRender ? emptyHint : disabledHint;
+  return (
+    <button
+      type="button"
+      onClick={() => onRender?.()}
+      disabled={!onRender || !canRender}
+      title={hint} aria-label={hint}
+      style={emptyBox.style}
+      className={`${emptyBox.className} flex items-center justify-center ${rounded ? 'rounded' : ''} border border-dashed border-port-border bg-port-bg/40 text-gray-500 hover:border-port-accent/50 hover:text-port-accent hover:bg-port-accent/5 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:border-port-border disabled:hover:text-gray-500 disabled:hover:bg-port-bg/40 transition-colors`}
+    >
+      <EmptyIcon size={iconSize} />
+    </button>
+  );
+}
+
+// Walk-back thumbnail extracted from EntryCard's internal renderer so the
+// has-image branch of EntryThumbSlot reuses the same on-error fallback chain
+// (stale gallery file → walk back through prior renders → collapse). Mirrors
+// `EntryCardThumbnail` in `EntryCard.jsx`; intentionally kept in sync — visual
+// drift would defeat the point of a shared slot.
+function WalkBackThumb({
+  filename, alt, onClick, isPrimary = false, fallbackRefs = null, size = 'sm', rounded = true,
+  aspectRatio = null, fluid = false,
+}) {
+  const candidates = [];
+  if (filename) candidates.push(filename);
+  if (Array.isArray(fallbackRefs)) {
+    for (let i = fallbackRefs.length - 1; i >= 0; i -= 1) {
+      const f = fallbackRefs[i];
+      if (typeof f === 'string' && f && f !== filename && !candidates.includes(f)) {
+        candidates.push(f);
+      }
+    }
+  }
+  const candidateKey = candidates.join('|');
+  const [idx, setIdx] = useState(0);
+  useEffect(() => { setIdx(0); }, [candidateKey]);
+  const box = thumbFrameProps(size, aspectRatio, { fluid });
+  if (!candidates.length || idx >= candidates.length) {
+    // All candidates failed to load — collapse to empty (no render button
+    // here; the user can re-render from the action column).
+    return (
+      <div
+        className={`${box.className} ${rounded ? 'rounded' : ''} border border-port-border bg-port-bg/40`}
+        style={box.style}
+      />
+    );
+  }
+  const currentFilename = candidates[idx];
+  const contain = isPositiveEdge(aspectRatio?.width) && isPositiveEdge(aspectRatio?.height);
+  const img = (
+    <img
+      src={`/data/images/${currentFilename}`}
+      alt={alt || currentFilename}
+      className={`w-full h-full ${contain ? 'object-contain' : 'object-cover'}`}
+      loading="lazy"
+      onError={() => setIdx((n) => n + 1)}
+    />
+  );
+  const frame = (
+    <div
+      className={`relative ${box.className} ${rounded ? 'rounded' : ''} overflow-hidden border bg-port-bg ${
+        isPrimary ? 'border-port-accent' : 'border-port-border'
+      }`}
+      style={box.style}
+    >
+      {img}
+      {isPrimary ? (
+        <span
+          title="Primary reference image"
+          className={`absolute top-0.5 right-0.5 p-0.5 ${rounded ? 'rounded' : ''} bg-port-accent text-white`}
+        >
+          <Star size={8} fill="currentColor" />
+        </span>
+      ) : null}
+    </div>
+  );
+  if (!onClick) return frame;
+  return (
+    <button
+      type="button"
+      onClick={() => onClick(currentFilename)}
+      title={`Preview ${alt || currentFilename}`}
+      aria-label={`Preview ${alt || currentFilename}`}
+      className={`p-0 bg-transparent border-0 cursor-zoom-in ${fluid ? 'w-full' : ''}`}
+    >
+      {frame}
+    </button>
+  );
+}

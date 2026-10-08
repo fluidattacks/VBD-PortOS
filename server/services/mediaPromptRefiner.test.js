@@ -1,0 +1,455 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('./providers.js', () => ({
+  getProviderById: vi.fn(),
+}));
+
+// Partial mock: stub the side-effectful run-execution surface (createRun /
+// executeApiRun / executeCliRun) but defer to the REAL helper exports for
+// hasModelFlag / extractBakedModel so the tests always exercise the
+// canonical parsing logic. If those helpers ever change semantics
+// (e.g. start rejecting --model with no value), the refiner tests pick
+// up the new behavior automatically.
+vi.mock('./runner.js', async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    createRun: vi.fn().mockResolvedValue({ runId: 'test-run' }),
+    executeApiRun: vi.fn(),
+    executeCliRun: vi.fn(),
+  };
+});
+
+const providers = await import('./providers.js');
+const runner = await import('./runner.js');
+const { buildMediaPromptRefinePrompt, refineMediaPrompt } = await import('./mediaPromptRefiner.js');
+const { REACTOR_MAX_PROMPT_LENGTH } = await import('../lib/reactorVideoClip.js');
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  runner.createRun.mockResolvedValue({ runId: 'test-run' });
+});
+
+// executeCliRun and executeApiRun both take a single options object with
+// onData/onComplete callbacks — drive them from the options.
+function mockRunnerSuccess(target, payload) {
+  target.mockImplementation(({ onData, onComplete }) => {
+    onData(payload);
+    onComplete({ success: true });
+    return Promise.resolve();
+  });
+}
+
+describe('mediaPromptRefiner', () => {
+  it('builds a prompt with the original prompt config and user feedback', () => {
+    const prompt = buildMediaPromptRefinePrompt({
+      kind: 'image',
+      prompt: 'a painted wizard',
+      negativePrompt: 'blurry',
+      feedback: 'less painted',
+      renderConfig: { width: 1024, height: 1024 },
+    });
+
+    expect(prompt).toContain('a painted wizard');
+    expect(prompt).toContain('blurry');
+    expect(prompt).toContain('less painted');
+    expect(prompt).toContain('"width": 1024');
+  });
+
+  it('returns sanitized prompt refinement JSON from an API provider', async () => {
+    providers.getProviderById.mockResolvedValue({
+      id: 'openai',
+      name: 'OpenAI',
+      type: 'api',
+      enabled: true,
+      defaultModel: 'gpt-test',
+    });
+    mockRunnerSuccess(runner.executeApiRun, JSON.stringify({
+      prompt: 'modern animated series still',
+      negativePrompt: 'painterly, ornate',
+      rationale: 'Adjusted toward clean animated styling.',
+      changes: ['Reduced painterly detail', 'Added clean animation direction'],
+    }));
+
+    const result = await refineMediaPrompt({
+      kind: 'image',
+      prompt: 'ornate painted scene',
+      negativePrompt: '',
+      feedback: 'more modern animated series',
+      providerId: 'openai',
+    });
+
+    expect(runner.executeApiRun).toHaveBeenCalled();
+    expect(runner.executeCliRun).not.toHaveBeenCalled();
+    expect(result).toEqual(expect.objectContaining({
+      prompt: 'modern animated series still',
+      negativePrompt: 'painterly, ornate',
+      providerId: 'openai',
+      model: 'gpt-test',
+    }));
+  });
+
+  it('runs refinement through CLI providers without requiring a model', async () => {
+    providers.getProviderById.mockResolvedValue({
+      id: 'codex',
+      name: 'Codex',
+      type: 'cli',
+      enabled: true,
+    });
+    mockRunnerSuccess(runner.executeCliRun, JSON.stringify({
+      prompt: 'cleaner fox portrait',
+      negativePrompt: '',
+      rationale: '',
+      changes: [],
+    }));
+
+    const result = await refineMediaPrompt({
+      kind: 'image',
+      prompt: 'a fox',
+      feedback: 'cleaner',
+      providerId: 'codex',
+    });
+
+    expect(runner.executeCliRun).toHaveBeenCalled();
+    expect(runner.executeApiRun).not.toHaveBeenCalled();
+    expect(result.providerId).toBe('codex');
+    expect(result.prompt).toBe('cleaner fox portrait');
+  });
+
+  it('skips Codex bracketed metadata (e.g. [workdir, /…]) and finds the JSON object', async () => {
+    providers.getProviderById.mockResolvedValue({
+      id: 'codex', type: 'cli', enabled: true,
+    });
+    const codexOutput = `OpenAI Codex CLI v2.1.0
+[workdir, /Users/antic/github.com/atomantic/PortOS]
+[model, gpt-5]
+[session, abc-123]
+
+${JSON.stringify({ prompt: 'painted owl portrait', negativePrompt: 'blurry', rationale: 'r', changes: ['c1'] })}
+
+[finished]
+`;
+    mockRunnerSuccess(runner.executeCliRun, codexOutput);
+
+    const result = await refineMediaPrompt({
+      kind: 'image',
+      prompt: 'an owl',
+      feedback: 'painted style',
+      providerId: 'codex',
+    });
+
+    expect(result.prompt).toBe('painted owl portrait');
+    expect(result.negativePrompt).toBe('blurry');
+  });
+
+  it('lifts JSON out of CLI banner noise (codex)', async () => {
+    providers.getProviderById.mockResolvedValue({
+      id: 'codex', type: 'cli', enabled: true,
+    });
+    mockRunnerSuccess(runner.executeCliRun, `OpenAI Codex CLI v2.1.0\nsession: abc-123\n${JSON.stringify({ prompt: 'sunny fox portrait', negativePrompt: '', rationale: '', changes: [] })}\n--- done ---\n`);
+
+    const result = await refineMediaPrompt({
+      kind: 'image',
+      prompt: 'a fox',
+      feedback: 'sunnier',
+      providerId: 'codex',
+    });
+
+    expect(result.prompt).toBe('sunny fox portrait');
+  });
+
+  it('requires a model for API providers', async () => {
+    providers.getProviderById.mockResolvedValue({
+      id: 'openai', type: 'api', enabled: true,
+    });
+    await expect(refineMediaPrompt({
+      kind: 'image',
+      prompt: 'x',
+      feedback: 'y',
+      providerId: 'openai',
+    })).rejects.toMatchObject({ code: 'MODEL_REQUIRED', status: 400 });
+  });
+
+  it('rejects disabled providers', async () => {
+    providers.getProviderById.mockResolvedValue({
+      id: 'openai', type: 'api', enabled: false, defaultModel: 'gpt-test',
+    });
+    await expect(refineMediaPrompt({
+      kind: 'image',
+      prompt: 'x',
+      feedback: 'y',
+      providerId: 'openai',
+    })).rejects.toMatchObject({ code: 'PROVIDER_DISABLED', status: 400 });
+  });
+
+  it('honors per-call model override for claude-code / gemini-cli when args do not pin a model', async () => {
+    // runner.js#buildCliArgs now injects --model/-m from provider.defaultModel
+    // for every CLI provider (codex / claude-code / gemini-cli), so cloning
+    // the provider with the user-selected model is safe and the response
+    // accurately reports what'll actually run.
+    providers.getProviderById.mockResolvedValue({
+      id: 'claude-code',
+      type: 'cli',
+      enabled: true,
+      defaultModel: 'claude-baked-in',
+    });
+    mockRunnerSuccess(runner.executeCliRun, JSON.stringify({
+      prompt: 'x', negativePrompt: '', rationale: '', changes: [],
+    }));
+
+    const result = await refineMediaPrompt({
+      kind: 'image',
+      prompt: 'p',
+      feedback: 'f',
+      providerId: 'claude-code',
+      model: 'user-selected-sonnet',
+    });
+
+    expect(result.model).toBe('user-selected-sonnet');
+  });
+
+  it('reports the args-baked model (not defaultModel) when a CLI provider pins a model in args', async () => {
+    // When the user has hard-coded `--model X` (or `-m X`) into provider.args,
+    // buildCliArgs skips injection and the saved arg wins — the per-call
+    // override is silently dropped. To match reality, the response should
+    // report the model extracted from args, NOT defaultModel (which might
+    // diverge from what the CLI will actually run with).
+    providers.getProviderById.mockResolvedValue({
+      id: 'claude-code',
+      type: 'cli',
+      enabled: true,
+      defaultModel: 'claude-stale-default',
+      args: ['--model', 'baked-in-from-args'],
+    });
+    mockRunnerSuccess(runner.executeCliRun, JSON.stringify({
+      prompt: 'x', negativePrompt: '', rationale: '', changes: [],
+    }));
+
+    const result = await refineMediaPrompt({
+      kind: 'image',
+      prompt: 'p',
+      feedback: 'f',
+      providerId: 'claude-code',
+      model: 'user-selection-runner-will-drop',
+    });
+
+    expect(result.model).toBe('baked-in-from-args');
+  });
+
+  it('extracts the args-baked model from joined-form (--model=X) flags too', async () => {
+    providers.getProviderById.mockResolvedValue({
+      id: 'gemini-cli',
+      type: 'cli',
+      enabled: true,
+      defaultModel: 'gemini-stale-default',
+      args: ['-m=gemini-from-joined-arg'],
+    });
+    mockRunnerSuccess(runner.executeCliRun, JSON.stringify({
+      prompt: 'x', negativePrompt: '', rationale: '', changes: [],
+    }));
+
+    const result = await refineMediaPrompt({
+      kind: 'image',
+      prompt: 'p',
+      feedback: 'f',
+      providerId: 'gemini-cli',
+      model: 'user-selection-dropped',
+    });
+
+    expect(result.model).toBe('gemini-from-joined-arg');
+  });
+
+  it('falls back to provider.models[0] when defaultModel is absent (API provider)', async () => {
+    providers.getProviderById.mockResolvedValue({
+      id: 'openai', type: 'api', enabled: true, models: ['gpt-from-list'],
+    });
+    mockRunnerSuccess(runner.executeApiRun, JSON.stringify({
+      prompt: 'x', negativePrompt: '', rationale: '', changes: [],
+    }));
+
+    const result = await refineMediaPrompt({
+      kind: 'image',
+      prompt: 'p',
+      feedback: 'f',
+      providerId: 'openai',
+    });
+
+    expect(result.model).toBe('gpt-from-list');
+  });
+
+  it('throws when the provider is unknown', async () => {
+    providers.getProviderById.mockResolvedValue(null);
+    await expect(refineMediaPrompt({
+      kind: 'image',
+      prompt: 'x',
+      feedback: 'y',
+      providerId: 'missing',
+    })).rejects.toMatchObject({ code: 'PROVIDER_NOT_FOUND', status: 404 });
+  });
+
+  it('skips the echoed schema example and returns the real refinement', async () => {
+    providers.getProviderById.mockResolvedValue({
+      id: 'codex', type: 'cli', enabled: true,
+    });
+    // Codex echoes the prompt to stdout (which contains the schema example
+    // {"prompt": "<full rewritten positive prompt>"}) then emits the real result.
+    const echoedSchema = JSON.stringify({
+      prompt: '<the full rewritten positive prompt, ready to send to the renderer>',
+      negativePrompt: '<the full rewritten negative prompt, or an empty string if none>',
+      rationale: '<one concise sentence explaining the edit>',
+      changes: ['<short bullet of what changed>'],
+    });
+    const realResult = JSON.stringify({
+      prompt: 'a calm watercolor portrait of a fox, soft morning light',
+      negativePrompt: 'harsh shadows, oversaturation',
+      rationale: 'Shifted from oil-painted toward watercolor.',
+      changes: ['Changed medium to watercolor', 'Softened lighting'],
+    });
+    mockRunnerSuccess(runner.executeCliRun, `Codex CLI banner\n${echoedSchema}\n\n${realResult}\n`);
+
+    const result = await refineMediaPrompt({
+      kind: 'image',
+      prompt: 'a fox in oil',
+      feedback: 'watercolor instead',
+      providerId: 'codex',
+    });
+
+    expect(result.prompt).toBe('a calm watercolor portrait of a fox, soft morning light');
+  });
+
+  it('reports a helpful error when the model only returns the schema placeholder', async () => {
+    providers.getProviderById.mockResolvedValue({
+      id: 'codex', type: 'cli', enabled: true,
+    });
+    const onlyPlaceholder = JSON.stringify({
+      prompt: '<the full rewritten positive prompt, ready to send to the renderer>',
+      negativePrompt: '<the full rewritten negative prompt, or an empty string if none>',
+      rationale: 'r',
+      changes: ['c'],
+    });
+    mockRunnerSuccess(runner.executeCliRun, onlyPlaceholder);
+
+    await expect(refineMediaPrompt({
+      kind: 'image',
+      prompt: 'a fox',
+      feedback: 'better',
+      providerId: 'codex',
+    })).rejects.toMatchObject({
+      code: 'PROMPT_REFINE_BAD_JSON',
+      message: expect.stringContaining('schema placeholder'),
+    });
+  });
+
+  it('throws PROMPT_REFINE_FAILED when the runner reports an error', async () => {
+    providers.getProviderById.mockResolvedValue({
+      id: 'openai', type: 'api', enabled: true, defaultModel: 'gpt-test',
+    });
+    runner.executeApiRun.mockImplementation(({ onComplete }) => {
+      onComplete({ error: 'upstream down' });
+      return Promise.resolve();
+    });
+
+    await expect(refineMediaPrompt({
+      kind: 'image',
+      prompt: 'x',
+      feedback: 'y',
+      providerId: 'openai',
+    })).rejects.toMatchObject({ code: 'PROMPT_REFINE_FAILED', status: 502 });
+  });
+
+  it('builds an enhancement prompt when feedback is omitted or empty', () => {
+    const prompt = buildMediaPromptRefinePrompt({
+      kind: 'video',
+      prompt: 'a futuristic city at night',
+      negativePrompt: 'blurry',
+      feedback: '',
+    });
+
+    expect(prompt).toContain('ENHANCED POSITIVE PROMPT');
+    expect(prompt).toContain('a futuristic city at night');
+    expect(prompt).not.toContain('USER FEEDBACK:');
+  });
+
+  it('forwards effort level to provider runner', async () => {
+    providers.getProviderById.mockResolvedValue({
+      id: 'openai', type: 'api', enabled: true, defaultModel: 'gpt-test',
+    });
+    mockRunnerSuccess(runner.executeApiRun, JSON.stringify({
+      prompt: 'enhanced prompt description',
+      negativePrompt: 'low quality',
+      rationale: 'Enhanced details.',
+      changes: ['Added lighting'],
+    }));
+
+    const result = await refineMediaPrompt({
+      kind: 'image',
+      prompt: 'a simple dog',
+      providerId: 'openai',
+      effort: 'high',
+    });
+
+    expect(result.prompt).toBe('enhanced prompt description');
+  });
+
+  it('tells the model the backend prompt cap and clamps an over-length answer', async () => {
+    providers.getProviderById.mockResolvedValue({
+      id: 'openai', type: 'api', enabled: true, defaultModel: 'gpt-test',
+    });
+    // A realistic failure: the model enriches a short reactor prompt into
+    // something well past fast-h3's 800-character cap, which the API rejects
+    // outright rather than trimming.
+    const overLong = `${'A neon-drenched alley in the rain. '.repeat(40)}Final beat.`;
+    expect(overLong.length).toBeGreaterThan(REACTOR_MAX_PROMPT_LENGTH);
+    mockRunnerSuccess(runner.executeApiRun, JSON.stringify({
+      prompt: overLong,
+      negativePrompt: 'blurry',
+      rationale: 'Added lighting.',
+      changes: ['Added lighting'],
+    }));
+
+    const result = await refineMediaPrompt({
+      kind: 'video',
+      prompt: 'a neon alley',
+      providerId: 'openai',
+      maxPromptLength: REACTOR_MAX_PROMPT_LENGTH,
+    });
+
+    expect(result.prompt.length).toBeLessThanOrEqual(REACTOR_MAX_PROMPT_LENGTH);
+    expect(result.truncated).toBe(true);
+
+    const sentToModel = runner.executeApiRun.mock.calls[0][0].prompt;
+    expect(sentToModel).toContain(`AT MOST ${REACTOR_MAX_PROMPT_LENGTH} characters`);
+  });
+
+  it('leaves a within-limit prompt untouched and reports no truncation', async () => {
+    providers.getProviderById.mockResolvedValue({
+      id: 'openai', type: 'api', enabled: true, defaultModel: 'gpt-test',
+    });
+    mockRunnerSuccess(runner.executeApiRun, JSON.stringify({
+      prompt: 'a neon-drenched alley in the rain, handheld camera, sodium streetlights',
+      negativePrompt: '',
+      rationale: 'Added lighting.',
+      changes: [],
+    }));
+
+    const result = await refineMediaPrompt({
+      kind: 'video',
+      prompt: 'a neon alley',
+      providerId: 'openai',
+      maxPromptLength: 800,
+    });
+
+    expect(result.prompt).toBe('a neon-drenched alley in the rain, handheld camera, sodium streetlights');
+    expect(result.truncated).toBe(false);
+  });
+
+  it('omits the length rule when the backend has no prompt cap', () => {
+    const prompt = buildMediaPromptRefinePrompt({
+      kind: 'video',
+      prompt: 'a futuristic city at night',
+      feedback: 'more rain',
+    });
+
+    expect(prompt).not.toContain('HARD LENGTH LIMIT');
+  });
+});

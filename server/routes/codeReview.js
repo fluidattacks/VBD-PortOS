@@ -1,0 +1,133 @@
+import { Router } from 'express'
+import { z } from 'zod'
+import { asyncHandler, ServerError } from '../lib/errorHandler.js'
+import { validateRequest, cliReviewerOutcomeSchema, reportReviewerFailureSchema, isToolFreeReviewer, isProviderReviewer, isReviewerConfigFault, reviewerModelsFromDefaults, normalizeReviewerEffort, reviewerEffortLevels, reviewerEffortsFromDefaults } from '../lib/validation.js'
+import { reviewerAccessFailureCode } from '../lib/reviewerHealth.js'
+import { getSettings } from '../services/settings.js'
+import { runLocalCodeReview, getCodeReviewDefaults, getReviewerCliInstalled, getProviderReviewCapability, withoutResolvedUnsupportedFaults, reportReviewerFailure, reportReviewerSuccess } from '../services/codeReview.js'
+
+const router = Router()
+
+// Body shape for POST /api/code-review/local. `model` and `effort` are optional —
+// when omitted (or empty) we fall back to the model / reasoning effort configured
+// on the Code Review Defaults panel, and with no configured model either, to the
+// model the backend itself reports serving when that is unambiguous (see
+// `resolveServedModel`). Resolved task requests set `inheritDefaults: false` to
+// preserve explicit clears and use the backend's own defaults instead.
+// The diff is sent as-is; agents can pipe
+// `gh pr diff <N>` straight into it without preprocessing.
+// `effort` is checked against the ladder for the REQUESTED backend rather than a
+// flat union of every local level: the two backends are separate identities in
+// `REVIEWER_EFFORT_LEVELS`, so a union would accept a level valid only for the
+// other one, and `runLocalCodeReview`'s inner `normalizeReviewerEffort` would then
+// silently drop it — a 200 with the effort ignored instead of a 400. Same
+// normalizer both places, so they can't disagree.
+const localReviewRequestSchema = z.object({
+  backend: z.string().refine(isToolFreeReviewer),
+  model: z.string().optional(),
+  effort: z.string().optional(),
+  inheritDefaults: z.boolean().optional(),
+  cwd: z.string().min(1).optional(),
+  toolFree: z.boolean().optional(),
+  diff: z.string().min(1, 'diff must be non-empty'),
+  timeoutMs: z.number().int().positive().max(600000).optional(),
+}).strict().superRefine((body, ctx) => {
+  // Blank is "not pinned", not "invalid" — same fallback the sibling `model` field
+  // gets from `body.model || configured` below, and what this route's header
+  // documents ("when omitted or empty we fall back"). Only a NON-empty value that
+  // the backend's ladder rejects is a 400.
+  if (!body.effort) return
+  if (normalizeReviewerEffort(body.effort, body.backend)) return
+  ctx.addIssue({
+    code: z.ZodIssueCode.custom,
+    path: ['effort'],
+    message: `Invalid effort for the ${body.backend} reviewer — expected one of: ${(reviewerEffortLevels(body.backend) || []).join(', ')}`,
+  })
+})
+
+// GET /api/code-review/defaults — resolved global defaults (settings.codeReview
+// + an empty opt-in fallback). The Code Reviewers settings page reads this to render the
+// initial state; TaskAddForm + ScheduleTab read it to seed new reviewer lists.
+// `installed` (per-CLI-reviewer boolean, TTL-probed) rides alongside so a
+// picker can flag a configured reviewer whose binary isn't on this machine
+// (#3606) — warn-only, never filters the `reviewers` list above.
+// `providerReviewUnsupported` is its provider-backed counterpart (#7660): the
+// `provider:<id>` reviewers that have no runnable review transport, so
+// the picker warns at selection time instead of letting the user discover it as
+// a review gate that never clears. Warn-only in exactly the same way.
+router.get('/defaults', asyncHandler(async (_req, res) => {
+  const [defaults, installed, { unsupported, capable }] = await Promise.all([
+    getCodeReviewDefaults(),
+    getReviewerCliInstalled(),
+    getProviderReviewCapability(),
+  ])
+  const reviewerConfigFaults = withoutResolvedUnsupportedFaults(defaults.reviewerConfigFaults || {}, capable)
+  res.json({ ...defaults, reviewerConfigFaults, installed, providerReviewUnsupported: unsupported })
+}))
+
+// POST /api/code-review/local — run a single review pass against the
+// configured local-LLM backend (LM Studio, Ollama, or MTPLX) and return the findings
+// text the agent will act on. Synchronous: keeps the agent's `curl` step
+// simple — one request, one body back.
+router.post('/local', asyncHandler(async (req, res) => {
+  const body = validateRequest(localReviewRequestSchema, req.body)
+  const settings = body.inheritDefaults === false ? {} : await getSettings()
+  // Keyed off the roster's `<reviewer>Model` scalar rather than a per-backend
+  // branch, so a backend added to LOCAL_LLM_REVIEWERS reads its own configured
+  // model instead of silently inheriting another backend's.
+  const configured = isProviderReviewer(body.backend)
+    ? reviewerModelsFromDefaults(settings.codeReview)[body.backend]
+    : settings.codeReview?.[`${body.backend}Model`]
+  const model = body.model || configured
+  // Per-request effort wins over the panel default; absent in both = omit the
+  // field entirely so the model reasons however it normally would. The stored
+  // default is read through the validated accessor rather than off the raw slice,
+  // so this route and `pickCodeReviewDefaults` agree on a hand-edited value
+  // (an open-coded read misses the normalizer's case-folding).
+  const effort = body.effort || reviewerEffortsFromDefaults(settings.codeReview)[body.backend] || null
+  const result = await runLocalCodeReview({
+    backend: body.backend,
+    model,
+    effort,
+    diff: body.diff,
+    cwd: body.cwd,
+    toolFree: body.toolFree,
+    timeoutMs: body.timeoutMs,
+  })
+  if (!result.ok) {
+    await reportReviewerFailure(body.backend, result)
+    // A refusal the caller can fix by changing configuration — no model, a
+    // missing/disabled provider, or one with no command configured —
+    // is a config gap (400). The 502 bucket is for a reviewer that was actually
+    // asked and failed, which is the only kind a caller should retry.
+    throw new ServerError(result.error || 'Code review failed', {
+      status: isReviewerConfigFault(result.code) ? 400 : 502,
+      context: { backend: result.backend, model: result.model,
+        ...(result.code === 'MALFORMED_REVIEW' ? { code: result.code, diagnostics: result.diagnostics } : {}) }
+    })
+  }
+  await reportReviewerSuccess(body.backend)
+  res.json(result)
+}))
+
+// The existing /api auth gate protects this orchestrator-only report. It never
+// invokes a provider, accepts raw CLI output, or changes optional-review policy.
+router.post('/cli-outcome', asyncHandler(async (req, res) => {
+  const body = validateRequest(cliReviewerOutcomeSchema, req.body)
+  if (body.outcome === 'reviewed') {
+    return res.json({ recorded: await reportReviewerSuccess(body.reviewer) })
+  }
+  const code = reviewerAccessFailureCode(body.reviewer, body.failure)
+  const recorded = code ? await reportReviewerFailure(body.reviewer, { code }) : false
+  res.json({ recorded, code })
+}))
+
+// Universal failure reporting for agents/runners. Explicitly tracks quota limits,
+// provider outages, and unavailable reviewers to activate fallback tiers.
+router.post('/report-failure', asyncHandler(async (req, res) => {
+  const body = validateRequest(reportReviewerFailureSchema, req.body)
+  const recorded = await reportReviewerFailure(body.reviewer, { reason: body.reason, error: body.error })
+  res.json({ recorded })
+}))
+
+export default router

@@ -1,0 +1,1923 @@
+/**
+ * Video Generation page (LTX models via mlx_video on macOS, diffusers on
+ * Windows), with local, Grok, and federated render targets.
+ *
+ * Accepts a source image either via direct upload or via the
+ * `?sourceImageFile=` query param so the Image Gen page can pipe a generation
+ * straight into video.
+ *
+ * Modes (UI state, also forwarded to the backend as `mode`):
+ *   - text:   pure text-to-video
+ *   - image:  image-to-video (one source image, current I2V behavior)
+ *   - fflf:   first frame + last frame (two images — backend support is
+ *             experimental; mlx_video only supports a single conditioning
+ *             frame, so when both are provided the last is ignored)
+ *   - extend: pick a previous render → its last frame becomes the source
+ *             image for a new image-to-video generation
+ *   - a2v:    audio-to-video (uploaded WAV/MP3 drives the video's motion +
+ *             audio track) — LTX, or MiniMax H3 Ref2VA with an image
+ *   - ic-*:   IC-LoRA remix modes (issue #3100) — a reference clip drives the
+ *             render through ICLoraPipeline with a per-mode IC-LoRA fused into
+ *             Stage 1. Today: `ic-control` (structure/motion from a depth/pose/
+ *             edge clip) and `ic-colorize` (color restored onto a B&W clip).
+ *             dgrauet/ltx2 runtime only; the mode list comes from
+ *             IC_LORA_MODES in lib/videoGenParams.js.
+ *
+ * Form state, the URL-param prefill paths, the mode/backend transitions, and
+ * `buildGeneratePayload()` live in `useVideoGenForm` (issue #3291) — this page
+ * owns the fetching (status/model-context/history/gallery), the SSE run
+ * pipeline, and the rendering. The durable server queue owns queued work;
+ * each render target drains through its own lane.
+ *
+ * "Add to queue" submits immediately to the durable server queue. That is
+ * important for mixed-target work: a Grok submission can start in its cloud
+ * lane while a local render occupies the GPU lane, and a federated peer owns
+ * the queue for the work it receives.
+ */
+
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { useSearchParams } from 'react-router';
+import { isAudioToVideoRuntime, isMiniMaxH3Runtime } from '../lib/runnerFamilies';
+import { appendTriggerWords } from '../lib/loraTriggers';
+import Drawer from '../components/Drawer';
+import { ImageGenTab } from '../components/settings/ImageGenTab';
+import LocalSetupPanel from '../components/settings/LocalSetupPanel';
+import RuntimeInstallModal from '../components/install/RuntimeInstallModal';
+import FramePanel from '../components/videoGen/FramePanel';
+import KeyframePanel from '../components/videoGen/KeyframePanel';
+import AudioPanel from '../components/videoGen/AudioPanel';
+import ExtendPanel from '../components/videoGen/ExtendPanel';
+import IcLoraPanel from '../components/videoGen/IcLoraPanel';
+import AdvancedParamsPanel from '../components/videoGen/AdvancedParamsPanel';
+import RuntimeFingerprint from '../components/videoGen/RuntimeFingerprint';
+import ModelDisclosure from '../components/videoGen/ModelDisclosure';
+import ModelWorkflowHelp from '../components/videoGen/ModelWorkflowHelp';
+import ModelRepairBanner from '../components/videoGen/ModelRepairBanner';
+import RenderStatusCard from '../components/videoGen/RenderStatusCard';
+import VideoGenGallery from '../components/videoGen/VideoGenGallery';
+import EpisodeComposer from '../components/videoGen/EpisodeComposer';
+import GalleryImagePicker from '../components/imageGen/GalleryImagePicker';
+import MediaPreview from '../components/media/MediaPreview';
+import VideoUpscaleDrawer from '../components/media/VideoUpscaleDrawer';
+import StylePresetPicker from '../components/media/StylePresetPicker';
+import UniverseStylePicker from '../components/media/UniverseStylePicker';
+import PromptEnhancer from '../components/media/PromptEnhancer';
+import { normalizeVideo } from '../components/media/normalize';
+import {
+  Film, Sparkles, Settings as SettingsIcon, RefreshCw, AlertTriangle,
+  X, Type, Image as ImageIcon, GitBranch, ListPlus, Music, SlidersHorizontal, MonitorOff, ChevronDown,
+} from 'lucide-react';
+import toast from '../components/ui/Toast';
+import MediaJobsQueue from '../components/media/MediaJobsQueue';
+import ModelSelect from '../components/ModelSelect';
+import { FormField } from '../components/ui/FormField';
+import AutoSizeTextarea from '../components/ui/AutoSizeTextarea';
+import ModelDownloadBadge, { deriveSizeEstimate } from '../components/media/ModelDownloadBadge';
+import { useDownloadableAssets, useModelDownloadStatus, TEXT_ENCODER_DOWNLOAD_ID, textEncoderDownloadId } from '../hooks/useModelDownloadStatus';
+import TextEncoderPicker from '../components/videoGen/TextEncoderPicker';
+import { useMediaJobSse } from '../hooks/useMediaJobSse';
+import { useMediaCompletionRefresh } from '../hooks/useMediaCompletionRefresh';
+import { useMediaAnnotations } from '../hooks/useMediaAnnotations';
+import usePreviewRoute from '../hooks/usePreviewRoute';
+import useMediaPreviewActions from '../hooks/useMediaPreviewActions';
+import { useVideoGenForm } from '../hooks/useVideoGenForm.js';
+import { useFederatedMediaTarget } from '../hooks/useFederatedMediaTarget';
+import RemoteMediaTargetPicker from '../components/federatedMedia/RemoteMediaTargetPicker';
+import {
+  getVideoGenStatus, getVideoGenModelContext, generateVideo, cancelVideoGen,
+  listVideoHistory, deleteVideoHistoryItem, setVideoHidden,
+  patchSettingsSlice,
+  getActiveVideoJob,
+  getSettings,
+  getVideoGenRuntimeStatus,
+  listLorasFull,
+  getLoom,
+} from '../services/api';
+import { loomEpisodeToDraftScenes } from '../lib/episodeSceneImport.js';
+import LoraPicker from '../components/imageGen/LoraPicker';
+import { VIDEO_RESOLUTIONS, resolutionOptionsForModel } from '../lib/videoGenResolutions';
+import { GROK_VIDEO_DURATIONS } from '../lib/grokVideoClip.js';
+import {
+  FAL_DEFAULT_IMAGE_VIDEO_MODEL, FAL_DEFAULT_TEXT_VIDEO_MODEL, FAL_VIDEO_MODELS, getFalVideoModel, falVideoResolutions, estimateFalVideoCostUsd,
+} from '../lib/falVideoModels.js';
+import { REACTOR_MAX_PROMPT_LENGTH } from '../lib/reactorVideoClip.js';
+import { styledVideoPrompt } from '../lib/videoGenSubmission.js';
+import ReactorPanel from '../components/videoGen/ReactorPanel';
+import { formatCount, formatUsd, timeAgo } from '../utils/formatters';
+import ResolutionField from '../components/media/ResolutionField';
+import { VIDEO_EDGE_BOUNDS, videoEdgeBoundsForModel, IC_LORA_MODES } from '../lib/videoGenParams.js';
+import { finishTargetForRecord, isDeliveryVideoModel } from '../lib/videoFinish.js';
+import { peerModelRequiresInput } from '../lib/federatedMediaReadiness.js';
+const MODES = [
+  { id: 'text',   label: 'Text',   icon: Type,       desc: 'Text-to-video' },
+  { id: 'image',  label: 'Image',  icon: ImageIcon,  desc: 'Image-to-video (start frame)' },
+  { id: 'fflf',   label: 'FFLF',   icon: GitBranch,  desc: 'First frame + last frame' },
+  { id: 'extend', label: 'Extend', icon: Film,       desc: 'Continue from a prior render' },
+  { id: 'a2v',    label: 'Audio',  icon: Music,      desc: 'Audio-to-video (audio drives motion + sync)' },
+  // IC-LoRA remix modes (issue #3100) — derived from the registry so a new
+  // remix mode appears in the mode bar automatically.
+  ...IC_LORA_MODES.map((m) => ({ id: m.mode, label: m.label, icon: SlidersHorizontal, desc: m.description })),
+];
+
+export default function VideoGen() {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const settingsOpen = searchParams.get('settings') === '1';
+  const openSettings = () => setSearchParams(prev => { const n = new URLSearchParams(prev); n.set('settings', '1'); return n; });
+  const closeSettings = () => {
+    setSearchParams(prev => { const n = new URLSearchParams(prev); n.delete('settings'); return n; });
+    // The drawer hosts the Grok enable toggle plus the fal.ai/reactor.inc API
+    // key fields — re-read both so the backend switch appears/disappears
+    // without a reload.
+    refreshGrokEnabled();
+    refreshStatus();
+  };
+
+  // Episode Composer (#6228) — multi-scene continuous-video authoring, opened
+  // either directly or as a FableLoom entry point carrying loomId/episodeId
+  // (LoomSettingsDrawer's "Open Episode Composer" link).
+  const episodeOpen = searchParams.get('episode') === '1';
+  const episodeLoomId = searchParams.get('loomId');
+  const episodeEpisodeId = searchParams.get('episodeId');
+  const openEpisodeComposer = () => setSearchParams(prev => { const n = new URLSearchParams(prev); n.set('episode', '1'); return n; });
+  const closeEpisodeComposer = () => {
+    setSearchParams(prev => {
+      const n = new URLSearchParams(prev);
+      n.delete('episode'); n.delete('loomId'); n.delete('episodeId');
+      return n;
+    });
+    // The composer unmounts on close (conditional render below) — clear the
+    // import so a later open with no loomId/episodeId doesn't inherit it.
+    setEpisodeImportScenes(null);
+  };
+  const [episodeImportScenes, setEpisodeImportScenes] = useState(null);
+  useEffect(() => {
+    if (!episodeOpen || !episodeLoomId || !episodeEpisodeId) return undefined;
+    let active = true;
+    getLoom(episodeLoomId, { silent: true }).then((loom) => {
+      if (!active) return;
+      const episode = loom?.episodes?.find((e) => e.id === episodeEpisodeId);
+      const draftScenes = loomEpisodeToDraftScenes(episode, { format: loom?.format });
+      if (draftScenes.length) setEpisodeImportScenes(draftScenes);
+    }).catch(() => {});
+    return () => { active = false; };
+    // Only re-run when a fresh loom/episode is targeted, not on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [episodeOpen, episodeLoomId, episodeEpisodeId]);
+
+  // `/status` owns connectivity ONLY. It shells out to python on every call
+  // (~1-2s), so nothing the form needs to render may wait on it.
+  const [status, setStatus] = useState(null);
+  const [optionsOpen, setOptionsOpen] = useState(() => (
+    window.matchMedia?.('(min-width: 1024px)').matches ?? true
+  ));
+  // The model list plus the numbers its auto-select reads, off the probe-free
+  // `/model-context`. Fetched alongside /status on mount, it lands first — so
+  // the Model picker paints on a cold load instead of holding a placeholder
+  // through the interpreter probe.
+  const [modelContext, setModelContext] = useState(null);
+  const [statusLoading, setStatusLoading] = useState(true);
+  const [modelContextLoading, setModelContextLoading] = useState(true);
+  // Grok Build CLI video backend (#2859 phase 2) — surfaced only when the
+  // user enabled Grok in Settings → Image Gen (one toggle covers image +
+  // video). 'local' keeps every existing flow untouched.
+  const [grokEnabled, setGrokEnabled] = useState(false);
+  // fal.ai (#6213) / reactor.inc (#6214) usability comes off GET /status
+  // instead of the raw settings object — the server-side `isVideoModeUsable`
+  // it's computed from also honors the FAL_KEY/REACTOR_API_KEY env vars, which
+  // the client can't see, so a key set only via env var (no Settings-form
+  // entry) still surfaces the backend switcher below.
+  const falEnabled = status?.falEnabled === true;
+  const reactorEnabled = status?.reactorEnabled === true;
+  const models = useMemo(() => modelContext?.models || [], [modelContext]);
+  const refreshGrokEnabled = useCallback(() => {
+    getSettings({ silent: true })
+      .then((sv) => setGrokEnabled(sv?.imageGen?.grok?.enabled === true))
+      .catch(() => {});
+  }, []);
+  useEffect(() => { refreshGrokEnabled(); }, [refreshGrokEnabled]);
+
+  useEffect(() => {
+    const desktopOptions = window.matchMedia?.('(min-width: 1024px)');
+    if (!desktopOptions) return undefined;
+    const syncOptionsToViewport = () => setOptionsOpen(desktopOptions.matches);
+    syncOptionsToViewport();
+    desktopOptions.addEventListener('change', syncOptionsToViewport);
+    return () => desktopOptions.removeEventListener('change', syncOptionsToViewport);
+  }, []);
+
+  // Installed LoRA library — the picker filters this to the current model's
+  // video family. Silent: a failure just hides the picker.
+  const [availableLoras, setAvailableLoras] = useState([]);
+  useEffect(() => { listLorasFull().then((l) => setAvailableLoras(Array.isArray(l) ? l : [])).catch(() => {}); }, []);
+
+  // Federated render target (#4348). Picking a peer replaces the local runtime
+  // outright — the clip is rendered there and imported back — so it feeds the
+  // payload builder rather than sitting beside it.
+  const remoteTarget = useFederatedMediaTarget('video');
+  // `null` = no per-render override yet — follow the install default
+  // (settings.videoGen.displaySleep, /status-reported so it can't drift from
+  // the server's own opt-in read). Set once the user touches the checkbox
+  // below. Computed before the form hook call because it feeds
+  // buildGeneratePayload() the same way `remoteSubmissionFields` does.
+  const [displaySleepOverride, setDisplaySleepOverride] = useState(null);
+  const displaySleepEnabled = displaySleepOverride ?? !!status?.displaySleepOnRender;
+  // Every field the form submits, plus the payload builder both submit paths
+  // share. See client/src/hooks/useVideoGenForm.js.
+  const {
+    backend, isGrok, isFal, isReactor, handleBackendChange, grokDuration, setGrokDuration,
+    falDuration, setFalDuration, falModelId, setFalModelId,
+    falResolution, setFalResolution, falGenerateAudio, setFalGenerateAudio,
+    reactorClipId, setReactorClipId, reactorSeconds, setReactorSeconds, reactorSeed, setReactorSeed,
+    reactorAspect, setReactorAspect,
+    mode, handleModeChange,
+    prompt, setPrompt, envelopedPrompt, negativePrompt, setNegativePrompt, stylePreset, setStylePreset,
+    selectedUniverse, setSelectedUniverse, remixModelFallback,
+    modelId, handleModelChange, currentModel, visibleModels,
+    loraFamily, videoLoras, loraUnavailableHint,
+    selectedLoras, setSelectedLoras,
+    width, height, handleResolutionChange,
+    numFrames, setNumFrames, fps, setFps, chunks, setChunks,
+    chunkPrompts, setChunkPromptAt, chainingActive,
+    contextFrames, setContextFrames,
+    steps, setSteps, guidanceScale, setGuidanceScale, imageStrength, setImageStrength,
+    i2vReferenceMode, setI2vReferenceMode, referenceModeSupported, effectiveImageStrength,
+
+    speedProfileId, setSpeedProfileId,
+    draftDecode, setDraftDecode,
+    streamingMode, setStreamingMode,
+    batchSize, setBatchSize,
+    seed, setSeed, handleRandomSeed, tiling, setTiling,
+    textEncoderId, setTextEncoderId, textEncoderOptions,
+    disableAudio, setDisableAudio, noMusic, setNoMusic,
+    sourceImageFile, sourceImageUpload, sourceUploadUrl,
+    pickSourceImage, uploadSourceImage, clearSourceImage,
+    lastImageFile, lastImageUpload, lastUploadUrl,
+    pickLastImage, uploadLastImage, clearLastImage, lastFrameIsAdvisory,
+    keyframesMode, keyframes, keyframesSupported, keyframesActive, keyframesError, keyframesBlocked,
+    toggleKeyframesMode, addKeyframe, updateKeyframe, removeKeyframe,
+    extendFromVideoId, extendingFrame, handleExtendPick, extendModeBlocked,
+    setAudioDurationSec,
+    audioFile, setAudioFile, a2vDurationError, a2vModeBlocked,
+    icSpec, icModeActive, icLoraModeBlocked,
+    icReferenceFile, icReferenceVideoId, icReferenceNames, icReferenceImageFiles,
+    pickIcReferenceFile, pickIcReferenceVideoId,
+    addIcReferenceImage, updateIcReferenceImage, removeIcReferenceImage,
+    icStrength, setIcStrength, icSkipStage2, setIcSkipStage2,
+    applyRemix, applyFinish, applyResumedParams, buildGeneratePayload,
+  } = useVideoGenForm({
+    models, modelContext, availableLoras, grokEnabled, falEnabled, reactorEnabled,
+    remoteSubmissionFields: remoteTarget.isRemote ? remoteTarget.submissionFields : null,
+    displaySleepEnabled,
+  });
+
+  const selectMode = (nextMode) => {
+    handleModeChange(nextMode);
+    // Non-text modes expose required conditioning inputs inside Options. Open
+    // the panel when the mode changes so a touch user never has to infer why
+    // Generate became disabled from a hover-only title.
+    if (nextMode !== 'text') setOptionsOpen(true);
+  };
+
+  // Conditioning the selected peer model cannot take. The server refuses a job
+  // holding any of it (MEDIA_PROVIDER_INPUT_UNSUPPORTED) rather than silently
+  // rendering something else, so the form says so before the user commits.
+  // Nothing is cleared on picking a peer: the inputs stay filled and intact
+  // for a switch back to This instance.
+  //
+  // Start and end FRAMES now cross when the model advertises the role (ADR
+  // docs/decisions/2026-08-22-federated-media-input-assets.md rule 1) — but only
+  // as a GALLERY pick. An UPLOAD is still staged in the multipart temp dir when
+  // the federated branch runs, so it is not a path the uploader can read; the
+  // remedy is to save it to the gallery first, which is what the message says.
+  //
+  // The rest stay refused, each for a recorded reason: LoRA weights are a MODEL
+  // (rule 3), and keyframes / a clip to extend / IC-LoRA references / chained
+  // chunks are multi-step CHAIN STATE this machine sequences (rule 4).
+  const remoteUnsupportedInputs = useMemo(() => {
+    if (!remoteTarget.isRemote) return null;
+    const model = remoteTarget.model;
+    const present = [
+      ['the Grok backend', isGrok],
+      ['the fal.ai backend', isFal],
+      ['the reactor.inc backend', isReactor],
+      // Each remaining pipeline semantic has its own input listed below, but the
+      // mode can be set before that input is filled — so gate the mode too
+      // rather than letting an a2v render reach the peer as plain text-to-video.
+      [`${mode} mode`, ![undefined, 'text', 'image', 'fflf'].includes(mode)],
+      ['a source image', !!sourceImageFile && !remoteTarget.acceptsInput('sourceImage')],
+      ['an end frame', !!lastImageFile && !remoteTarget.acceptsInput('lastImage')],
+      ['an uploaded frame (save it to the gallery first)', !!sourceImageUpload || !!lastImageUpload],
+      ['keyframes', keyframesActive],
+      ['a source clip to extend', !!extendFromVideoId],
+      ['an audio track', !!audioFile],
+      ['IC-LoRA references', !!icReferenceFile || !!icReferenceVideoId || icReferenceImageFiles.length > 0],
+      ['LoRA weights', selectedLoras.length > 0],
+      ['chained chunks', chunks > 1],
+    ].filter(([, set]) => set).map(([label]) => label);
+    if (present.length) {
+      return `The selected peer model cannot take ${present.join(', ')} — clear it to render on this peer.`;
+    }
+    // An end frame alone would render a plain text-to-video clip with the frame
+    // silently discarded — a valid-looking render of a different thing.
+    if (lastImageFile && !sourceImageFile) {
+      return 'A federated first-last-frame render needs both ends — add a start frame, or render on this instance.';
+    }
+    if (peerModelRequiresInput(model) && !sourceImageFile) {
+      return `${model?.modelName || 'The selected peer model'} renders only from a source image — add a start frame, or pick a text-to-video model.`;
+    }
+    return null;
+  }, [remoteTarget.isRemote, remoteTarget.model, remoteTarget.acceptsInput, isGrok, isFal, isReactor, mode, sourceImageFile, sourceImageUpload,
+    lastImageFile, lastImageUpload, keyframesActive, extendFromVideoId, audioFile, icReferenceFile,
+    icReferenceVideoId, icReferenceImageFiles, selectedLoras, chunks]);
+  // One reading for the Generate button, the enqueue guard and the caption.
+  const remoteBlocked = remoteTarget.isRemote
+    ? (remoteTarget.blockedReason || remoteUnsupportedInputs)
+    : null;
+  const localResolutionOptions = resolutionOptionsForModel(currentModel);
+  const localResolutionBounds = videoEdgeBoundsForModel(currentModel);
+
+  // Does an external provider API own this render? Its weights, sampler and
+  // encoder are all on the far side of an HTTP call, so the local STAGE: ladder
+  // (download weights → load model → encode → sample → mux) describes work this
+  // machine never does and no marker ever lands on — which left the status card
+  // pinned on "Loading model" for the whole render. The status card swaps in the
+  // short submit / render / fetch ladder instead. A federated PEER is
+  // deliberately excluded: it really does load the weights and run the sampler,
+  // it just does so out of view.
+  const rendersOffMachine = isGrok || isFal || isReactor;
+  const rendersOnThisMachine = !rendersOffMachine && !remoteTarget.isRemote;
+
+  // Can THIS render put the display to sleep at all? The model says whether
+  // its runtime needs the mitigation (mlx only); the other clauses rule out
+  // backends the mitigation never applies to. UI-only: buildGeneratePayload()
+  // decides independently (from currentModel alone) whether to attach the
+  // choice, since its grok/fal/reactor/remote branches already return first.
+  const canSleepDisplay = !!currentModel?.sleepsDisplayDuringRender
+    && rendersOnThisMachine;
+  const rendersSleepDisplay = canSleepDisplay && displaySleepEnabled;
+
+  // Every gallery-image slot on this page (both frame panels, each multi-keyframe
+  // row, each IC-LoRA reference row) opens the SAME GalleryImagePicker modal the
+  // Image Gen i2i form uses — a searchable thumbnail grid over the whole gallery.
+  // `null` = closed; otherwise `{ kind, index? }` records which slot the pick
+  // lands in, since one modal serves every slot.
+  const [galleryPicker, setGalleryPicker] = useState(null);
+  const handleGalleryPick = (item) => {
+    const filename = item?.filename;
+    if (!filename || !galleryPicker) return;
+    const { kind, index } = galleryPicker;
+    if (kind === 'source') pickSourceImage(filename);
+    else if (kind === 'last') pickLastImage(filename);
+    else if (kind === 'keyframe') updateKeyframe(index, { file: filename });
+    else if (kind === 'icReference') updateIcReferenceImage(index, filename);
+  };
+
+  const [history, setHistory] = useState([]);
+  // `preview` is URL-driven via `usePreviewRoute(previewItems)` — declared
+  // after `previewItems` below so the resolver can match against it.
+  const [showHidden, setShowHidden] = useState(false);
+
+  // 'loading' until the first fetch settles, then 'loaded' or 'error'. A
+  // sentinel rather than `history.length` — the Remix handoff below has to tell
+  // "history is still in flight / failed to load" apart from "history loaded
+  // and has no such record", and an empty array is a legitimate loaded state.
+  //
+  // The mount fetch and the completion refresh share this one sentinel, so the
+  // handoff also needs to know whether ANOTHER fetch is still running before it
+  // trusts an 'error': a transient failure on a background refresh must not
+  // strand a handoff that the in-flight mount fetch is about to satisfy. The
+  // count is a ref because only the effects read it, and they run after commit.
+  const [historyLoad, setHistoryLoad] = useState('loading');
+  const historyInFlightRef = useRef(0);
+  // `silent` — this page owns the failure UI (the Remix banner below, and the
+  // gallery simply staying empty), so the shared toast would double it.
+  const refreshHistory = useCallback(() => {
+    historyInFlightRef.current += 1;
+    return listVideoHistory({ silent: true })
+      .then((items) => {
+        setHistory(Array.isArray(items) ? items : []);
+        setHistoryLoad('loaded');
+      })
+      .catch(() => setHistoryLoad('error'))
+      .finally(() => { historyInFlightRef.current -= 1; });
+  }, []);
+  useMediaCompletionRefresh({ onVideoCompleted: refreshHistory });
+  useEffect(() => { refreshHistory(); }, [refreshHistory]);
+
+  const { visibleHistory, hiddenHistory } = useMemo(() => ({
+    visibleHistory: history.filter((v) => !v.hidden),
+    hiddenHistory: history.filter((v) => v.hidden),
+  }), [history]);
+  const [favoritesOnly, setFavoritesOnly] = useState(false);
+  const { annotations, updateAnnotation, getCardProps } = useMediaAnnotations();
+  // "Continue" is the same action here as on every other media surface (extract
+  // the last frame, open the form on it with the source's prompt), so it comes
+  // from the shared hook rather than a page-local copy. It takes the normalized
+  // shape — gallery callers hand over raw history records, so they normalize.
+  const { handleContinue } = useMediaPreviewActions();
+  // Gallery sections respect the favorites filter; the extend-mode dropdown
+  // (which reads visibleHistory directly) intentionally does not, since
+  // hiding non-favorites from the "pick a previous video" picker would
+  // surprise the user.
+  const { galleryVisible, galleryHidden } = useMemo(() => {
+    if (!favoritesOnly) return { galleryVisible: visibleHistory, galleryHidden: hiddenHistory };
+    // Normalize to derive the canonical item.key rather than hand-building
+    // `video:${v.id}` — the kind/ref convention lives in normalize.js.
+    const isStarred = (v) => !!annotations[normalizeVideo(v).key]?.starred;
+    return { galleryVisible: visibleHistory.filter(isStarred), galleryHidden: hiddenHistory.filter(isStarred) };
+  }, [visibleHistory, hiddenHistory, favoritesOnly, annotations]);
+  const galleryVisibleItems = useMemo(() => galleryVisible.map(normalizeVideo), [galleryVisible]);
+  const galleryHiddenItems = useMemo(() => galleryHidden.map(normalizeVideo), [galleryHidden]);
+  const previewItems = useMemo(() => [
+    ...galleryVisibleItems,
+    ...(showHidden ? galleryHiddenItems : []),
+  ], [galleryVisibleItems, galleryHiddenItems, showHidden]);
+  const [preview, setPreview] = usePreviewRoute(previewItems);
+
+  const handleDeleteHistory = useCallback(async (item) => {
+    const raw = item?.raw || item;
+    const deleted = await deleteVideoHistoryItem(raw.id, { silent: true })
+      .then(() => true)
+      .catch((err) => { toast.error(err.message || 'Delete failed'); return false; });
+    if (!deleted) return;
+    setHistory((h) => h.filter((v) => v.id !== raw.id));
+  }, []);
+  const handlePromptSaved = useCallback((item, prompt) => {
+    const id = item?.id || item?.raw?.id;
+    if (!id) return;
+    setHistory((h) => h.map((v) => v.id === id
+      ? { ...v, prompt: prompt === '(no prompt)' ? '' : prompt }
+      : v));
+  }, []);
+  const handleToggleHistoryHidden = useCallback(async (item) => {
+    const raw = item?.raw || item;
+    const nextHidden = !raw.hidden;
+    setHistory((h) => h.map((v) => (v.id === raw.id ? { ...v, hidden: nextHidden } : v)));
+    const result = await setVideoHidden(raw.id, nextHidden, { silent: true }).catch((err) => {
+      toast.error(err.message || 'Failed to update visibility');
+      setHistory((h) => h.map((v) => (v.id === raw.id ? { ...v, hidden: !nextHidden } : v)));
+      return null;
+    });
+    if (result) toast.success(nextHidden ? 'Video hidden' : 'Video unhidden');
+  }, []);
+  // The button opens a method-picker drawer (#6510) instead of upscaling
+  // directly — the drawer owns the plan fetch, the disclosure, and the actual
+  // submit; this page just supplies which item is open and how to fold the
+  // finished entry into local state.
+  const [upscaleItem, setUpscaleItem] = useState(null);
+  const handleUpscaleHistory = useCallback((item) => {
+    setUpscaleItem(item?.raw || item);
+  }, []);
+  const handleUpscaled = useCallback((video) => {
+    setHistory((h) => [video, ...h]);
+  }, []);
+
+  // Remix a prior render: hand all its params back into the form (the hook
+  // owns the field-by-field restore) and scroll the form back into view.
+  const handleRemixVideo = useCallback((item) => {
+    const raw = item?.raw || item;
+    if (!raw) return;
+    applyRemix(raw);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }, [applyRemix]);
+
+  // Cross-page Remix (#6290). Media History (and every other MediaPreview
+  // surface) hands this page a RECORD ID rather than a render-settings bundle,
+  // so the restore runs through the same `applyRemix` the in-page gallery uses
+  // — one implementation that knows every field the record carries, instead of
+  // a URL enumeration that silently dropped the encoder, speed profile, draft
+  // decode and LoRAs. `history` is the unfiltered load, so a hidden record
+  // resolves too.
+  //
+  // One ref carries the whole "has this handoff been dealt with?" question, and
+  // it holds the handoff ID rather than a boolean, so a SECOND handoff arriving
+  // on the same mount is still honored. It is what makes the restore one-shot —
+  // not the stripped parameter, which lands on an async router update a
+  // completion refresh in the same tick could beat, re-applying the handoff over
+  // edits the user has made since.
+  //
+  // A FAILED fetch settles the handoff too, deliberately: the restore then waits
+  // for the explicit Retry (which clears the ref) instead of riding in on the
+  // next background refresh, since a render completing minutes later would
+  // otherwise replay it over a form the user has been editing the whole time.
+  const remixHandoffId = searchParams.get('remix');
+  const settledRemixHandoffRef = useRef(null);
+  // null while nothing is wrong; otherwise 'error' (the history fetch failed,
+  // retryable) or 'missing' (history loaded and holds no such record).
+  const [remixHandoffProblem, setRemixHandoffProblem] = useState(null);
+  // The restore waits on a history round trip, so unlike the old URL bundle
+  // (applied synchronously on mount) there is a window in which the form still
+  // holds the page defaults and is about to be replaced wholesale. Announce it
+  // and hold Generate: rendering here would spend GPU time on the defaults while
+  // the user believes they are looking at the clip's settings. The window runs
+  // from the parameter appearing until the handoff either restores (which strips
+  // it) or reports a problem — which also covers the wait on a sibling fetch
+  // below, with no second sentinel. Retry re-enters it by clearing the problem.
+  const remixHandoffPending = !!remixHandoffId && !remixHandoffProblem;
+  const consumeRemixHandoff = useCallback(() => {
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.delete('remix');
+      return next;
+    }, { replace: true });
+  }, [setSearchParams]);
+  useEffect(() => {
+    // No handoff in the URL — including right after this one consumed its own.
+    // Clearing the settled id here is what lets the NEXT handoff through, even
+    // when it names the same record.
+    if (!remixHandoffId) { settledRemixHandoffRef.current = null; return; }
+    if (settledRemixHandoffRef.current === remixHandoffId) return;
+    // Still fetching: say nothing. Reporting "no such record" here would be a
+    // lie every time the page is opened faster than the history round trip.
+    // Any banner still up belongs to a previous handoff, so it goes.
+    if (historyLoad === 'loading') { setRemixHandoffProblem(null); return; }
+    // The sentinel is shared with the completion refresh, so an 'error' may
+    // belong to a background fetch that failed alongside the one this handoff is
+    // actually waiting on. Keep waiting while any fetch is still running, or a
+    // transient blip on the sibling would strand a handoff the in-flight request
+    // is about to satisfy.
+    if (historyLoad === 'error' && historyInFlightRef.current > 0) return;
+    settledRemixHandoffRef.current = remixHandoffId;
+    if (historyLoad === 'error') {
+      // Keep the param in the URL — Retry resolves this same handoff.
+      setRemixHandoffProblem('error');
+      return;
+    }
+    const record = history.find((v) => String(v.id) === remixHandoffId);
+    if (record) {
+      applyRemix(record);
+      setRemixHandoffProblem(null);
+    } else {
+      setRemixHandoffProblem('missing');
+    }
+    consumeRemixHandoff();
+  }, [remixHandoffId, historyLoad, history, applyRemix, consumeRemixHandoff]);
+  // Back to 'loading' first, so a retry that fails again still moves the state
+  // ('loading' → 'error') and re-runs the effect above.
+  const retryRemixHandoff = useCallback(() => {
+    settledRemixHandoffRef.current = null;
+    setHistoryLoad('loading');
+    setRemixHandoffProblem(null);
+    refreshHistory();
+  }, [refreshHistory]);
+  const dismissRemixHandoff = useCallback(() => {
+    settledRemixHandoffRef.current = remixHandoffId;
+    setRemixHandoffProblem(null);
+    consumeRemixHandoff();
+  }, [remixHandoffId, consumeRemixHandoff]);
+
+  // Finish a draft (#3696): same restore as Remix, but switched to the delivery
+  // model the draft's registry entry declares. Prefill only — the user presses
+  // Generate themselves.
+  const resolveFinishTarget = useCallback((raw) => finishTargetForRecord(raw, models), [models]);
+  // A model the finish graph names as a DELIVERY target always decodes on its
+  // own decoder — the server declines a draft request there outright (#5423) —
+  // so the decode picker shows Full and says why instead of offering a choice
+  // that would be silently dropped. `applyFinish` already resets the value when
+  // Finish switches models; this keeps the control honest when the user picks
+  // the delivery model by hand.
+  const deliveryModelSelected = isDeliveryVideoModel(currentModel, models);
+  const handleFinishVideo = useCallback((raw, target) => {
+    if (!raw || !target) return;
+    applyFinish(raw, target.id);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }, [applyFinish]);
+  const handleContinueVideo = useCallback((item) => handleContinue(item), [handleContinue]);
+  const handleToggleFavorites = useCallback(() => setFavoritesOnly((value) => !value), []);
+  const handleToggleShowHidden = useCallback(() => setShowHidden((value) => !value), []);
+
+  const [generating, setGenerating] = useState(false);
+  const [progress, setProgress] = useState(null);
+  const [statusMsg, setStatusMsg] = useState('');
+  const [error, setError] = useState(null);
+  // Live render status (#5872). `phase` is the runner's own STAGE: id, mapped
+  // to a named step by the status card — with the queue's own 'queued' as one
+  // more phase id, so waiting in line and running share one piece of state
+  // instead of a boolean every SSE handler has to remember to clear.
+  // `renderStartedAt` drives the elapsed clock, which is what makes a silent
+  // phase (an ~89 GB checkpoint streaming onto the GPU) legible as work rather
+  // than as a hang.
+  const [phase, setPhase] = useState(null);
+  const [renderStartedAt, setRenderStartedAt] = useState(null);
+  // One run owner for the displayed render: its identity (the acquired OR
+  // resumed job), stream, cancellation and unmount detach all live in the hook,
+  // so Cancel is job-scoped on both the start and the reload-resume path.
+  const { start: startRun, cancel: cancelRun } = useMediaJobSse('video', { cancelJob: cancelVideoGen });
+
+  const refreshStatus = useCallback(() => {
+    setStatusLoading(true);
+    getVideoGenStatus()
+      .then(setStatus)
+      .catch(() => setStatus({ connected: false, reason: 'Status check failed' }))
+      .finally(() => setStatusLoading(false));
+  }, []);
+
+  // Kept separate from refreshStatus so the picker never inherits the python
+  // probe's latency. A failure leaves `modelContext` null, which reads exactly
+  // like "no model to offer" — the Model field takes itself away rather than
+  // holding a placeholder forever.
+  const refreshModelContext = useCallback(() => {
+    setModelContextLoading(true);
+    getVideoGenModelContext({ silent: true })
+      .then(setModelContext)
+      .catch(() => {})
+      .finally(() => setModelContextLoading(false));
+  }, []);
+
+  useEffect(() => {
+    refreshStatus();
+    refreshModelContext();
+  }, [refreshStatus, refreshModelContext]);
+
+  // Presentation handlers shared by the in-flight POST path and the mount-time
+  // resume path. `withToast: false` on resume suppresses the success/error
+  // toast — the user already saw it the first time and a page reload
+  // shouldn't replay it.
+  const videoRunHandlers = (withToast) => {
+    return {
+      onQueued: (msg) => {
+        setPhase('queued');
+        setStatusMsg(typeof msg.position === 'number' ? `Queued (position ${msg.position})` : 'Queued');
+      },
+      onStarted: () => {
+        // Out of the queue, but the runner hasn't named a phase yet — clear it
+        // rather than guessing, and let the card default to "Loading model".
+        setPhase(null);
+        // The clock starts HERE, not at submit: time spent waiting in the queue
+        // is not render time, and counting it would make the elapsed figure
+        // jump backwards on a reload (which reads the worker's own startedAt).
+        setRenderStartedAt((at) => at ?? Date.now());
+        setStatusMsg('Starting render…');
+      },
+      // `phase` is presence-guarded on the wire: a frame that carries none must
+      // leave the last known phase alone rather than reset the step list to
+      // "unknown" on every bare status line.
+      onStatus: (msg) => {
+        if (msg.phase) setPhase(msg.phase);
+        setStatusMsg(msg.message);
+      },
+      onProgress: (msg) => {
+        setProgress({ progress: msg.progress });
+        if (msg.phase) setPhase(msg.phase);
+        // A bare tqdm percentage shouldn't blank the STATUS line that just
+        // preceded it; only overwrite when the progress event carries text.
+        if (msg.message) setStatusMsg(msg.message);
+      },
+      onComplete: () => {
+        setGenerating(false);
+        setProgress({ progress: 1 });
+        setPhase(null);
+        setStatusMsg('Complete');
+        if (withToast) toast.success('Video generated');
+        refreshHistory();
+      },
+      onError: (msg) => {
+        setError(msg.error);
+        setGenerating(false);
+        if (withToast) toast.error(msg.error);
+        return new Error(msg.error);
+      },
+      onCanceled: (msg) => {
+        setGenerating(false);
+        setPhase(null);
+        setStatusMsg(msg.reason || 'Canceled');
+        if (withToast) toast(msg.reason || 'Render canceled');
+        return new Error(msg.reason || 'Canceled');
+      },
+      onConnectionError: () => {
+        setError('Lost connection to server');
+        setGenerating(false);
+      },
+    };
+  };
+
+  // Resume an in-flight (or queued) render so a page reload doesn't lose
+  // the progress line next to Generate. Server holds the job's last SSE payload,
+  // so re-attaching replays the most recent status/progress immediately.
+  // Mirrors the ImageGen `getActiveImageJob` mount path.
+  useEffect(() => {
+    // `ifIdle`: bail when the user already started a render in this tab. The
+    // owner also drops this run if one starts while the read is in flight, and
+    // creates no stream (or presentation) if the page unmounts first — the
+    // accepted job stays durable for the next resume.
+    startRun(
+      () => getActiveVideoJob().then((data) => data?.activeJob),
+      {
+        ...videoRunHandlers(false),
+        onAcknowledged: (job) => {
+          applyResumedParams(job.params || {});
+          // The form hook doesn't own this page-level toggle — restore it directly
+          // so a reload mid-render shows the choice that render is actually keeping.
+          if (job.params?.displaySleep !== undefined) setDisplaySleepOverride(!!job.params.displaySleep);
+          setGenerating(true);
+          setPhase(job.status === 'queued' ? 'queued' : null);
+          // The worker's own start time, so a reload keeps a truthful elapsed clock
+          // instead of restarting it and reading as a fresh render. A job still in
+          // the queue has no start time yet and gets no clock — the same rule the
+          // live path follows.
+          setRenderStartedAt(job.startedAt ? new Date(job.startedAt).getTime() : null);
+          // Skip a forced setProgress(0) here — the stream replays the server's
+          // last SSE payload right after open, and a job mid-render would
+          // otherwise visibly flash 0% before jumping back to its real progress.
+          setStatusMsg(job.status === 'queued'
+            ? (typeof job.position === 'number' ? `Queued (position ${job.position})` : 'Queued')
+            : 'Resuming…');
+        },
+      },
+      { ifIdle: true, jobIdOf: (job) => job?.jobId },
+    ).catch(() => {});
+  }, []);
+
+  const handleSavePythonPath = useCallback(async (path) => {
+    await patchSettingsSlice('imageGen.local', { pythonPath: path || undefined }, { silent: true })
+      .then(() => refreshStatus())
+      .catch((err) => toast.error(`Failed to save: ${err.message}`));
+  }, [refreshStatus]);
+
+  // Probe the per-runtime status BEFORE the user hits Generate — without
+  // this they'd see the buildArgs-time "venv not found" 500 with no good way
+  // to recover. The set of "BYOV" runtimes comes from /status server-side so
+  // it can't drift from the server's BYOV_RUNTIME_INFO map.
+  const [byovStatus, setByovStatus] = useState(null);
+  const [installModalOpen, setInstallModalOpen] = useState(false);
+  const byovRuntime = currentModel?.runtime;
+  const needsByovProbe = byovRuntime && (status?.byovRuntimes || []).includes(byovRuntime);
+  const refreshByovStatus = useCallback((signal) => {
+    if (!needsByovProbe) { setByovStatus(null); return Promise.resolve(); }
+    return getVideoGenRuntimeStatus(byovRuntime, { signal })
+      .then((s) => { if (s) setByovStatus(s); })
+      .catch(() => {});
+  }, [byovRuntime, needsByovProbe]);
+  useEffect(() => {
+    if (!needsByovProbe) { setByovStatus(null); return; }
+    const controller = new AbortController();
+    refreshByovStatus(controller.signal);
+    return () => controller.abort();
+  }, [needsByovProbe, refreshByovStatus]);
+  const byovRuntimeMissing = !!byovStatus && byovStatus.installed === false;
+  // While the runtime-status probe is in flight (`needsByovProbe` is true but
+  // we haven't received a response yet), `byovStatus` is null and
+  // `byovRuntimeMissing` reads false — without this guard the user could
+  // submit during that window and hit a venv-missing 500 before the install
+  // banner appears. Gate Generate / Enqueue on the broader "BYOV not yet
+  // confirmed ready" instead. The banner itself still keys on `byovRuntimeMissing`
+  // (we don't want to flash "isn't installed yet" copy before we know).
+  const byovGateBlocked = needsByovProbe && (byovStatus === null || byovStatus.installed === false);
+
+  // Inline cache-status badge for the picked video model + the active text
+  // encoder (a separate ~7-25 GB HF pull). Drives the "Available" / "Download"
+  // affordance under the Model select, so users learn about the multi-GB
+  // pull before hitting Render.
+  const modelDownload = useModelDownloadStatus({ kind: 'video' });
+  const modelStatus = modelId ? modelDownload.getStatus(modelId) : null;
+  const usesSharedTextEncoder = currentModel?.runtime === 'mlx_video' || currentModel?.runtime === 'ltx2';
+  const textEncoderInfo = modelDownload.extra.textEncoder || null;
+  const textEncoderStatus = textEncoderInfo
+    ? (modelDownload.activeModelId === TEXT_ENCODER_DOWNLOAD_ID
+      ? { ...textEncoderInfo, downloading: true, progress: modelDownload.progress }
+      : textEncoderInfo)
+    : null;
+  // Substitutable prompt conditioner (#4081). A built-in option ships inside
+  // the model's own weights, so only a substitute has a download of its own to
+  // track — and only then can it gate Generate.
+  const selectedTextEncoder = textEncoderOptions.find((option) => option.id === textEncoderId) || null;
+  // Non-null exactly when the selection has a download of its own — a built-in
+  // conditioner ships inside the model's weights. Doubles as the "needs
+  // weights" predicate so there's one derivation, not two.
+  const textEncoderOptionDownloadId = selectedTextEncoder && !selectedTextEncoder.builtIn
+    ? textEncoderDownloadId(selectedTextEncoder.id)
+    : null;
+  const textEncoderOptionStatus = textEncoderOptionDownloadId
+    ? modelDownload.getStatus(textEncoderOptionDownloadId)
+    : null;
+  // Choosing a substitute IS the request for its weights: it is unusable until
+  // resident and Generate is gated on it either way, so `startWhenIdle` turns
+  // the pick into the pull (it owns waiting for the cache verdict, skipping an
+  // already-downloaded one, and queueing behind an active download).
+  //
+  // Wired to the PICKER's onChange alone, deliberately — a Remix, a resumed
+  // render, and the snap-to-stock on a model change all reach `setTextEncoderId`
+  // too, and a multi-GB pull must follow a click the user just made rather than
+  // a state restore. Passing null for a built-in option clears any queued pull.
+  const { startWhenIdle: startEncoderWhenIdle } = modelDownload;
+  const handleTextEncoderChange = useCallback((id) => {
+    setTextEncoderId(id);
+    const option = textEncoderOptions.find((entry) => entry.id === id);
+    startEncoderWhenIdle(option && !option.builtIn ? textEncoderDownloadId(id) : null);
+  }, [setTextEncoderId, textEncoderOptions, startEncoderWhenIdle]);
+  const icWeightStatus = icSpec ? modelDownload.getStatus(icSpec.mode) : null;
+  const assets = useDownloadableAssets([
+    {
+      key: 'model', id: modelId, label: 'selected model weights',
+      applies: true, extraBlocked: statusLoading || !modelId || !currentModel,
+      status: modelStatus, keyPrefix: modelId,
+      name: currentModel?.name || modelId, repairLabel: 'Repair model',
+    },
+    {
+      key: 'shared-encoder', id: TEXT_ENCODER_DOWNLOAD_ID, label: 'shared text encoder',
+      applies: usesSharedTextEncoder, status: textEncoderStatus, keyPrefix: 'text-encoder',
+      name: `The shared text encoder${textEncoderStatus?.repo ? ` (${textEncoderStatus.repo})` : ''}`, repairLabel: 'Repair encoder',
+    },
+    {
+      key: 'encoder-option', id: textEncoderOptionDownloadId,
+      label: `${selectedTextEncoder?.label || 'selected'} text encoder`,
+      applies: !!textEncoderOptionDownloadId, status: textEncoderOptionStatus, keyPrefix: textEncoderOptionDownloadId,
+      name: `The ${selectedTextEncoder?.label || 'selected'} text encoder`, repairLabel: 'Repair text encoder',
+    },
+    {
+      key: 'ic-lora', id: icSpec?.mode, label: `${icSpec?.label || 'IC-LoRA'} weight`,
+      applies: icModeActive, status: icWeightStatus, keyPrefix: icSpec?.mode,
+      name: `The ${icSpec?.label || 'IC-LoRA'} weight`, repairLabel: `Repair ${icSpec?.label || 'IC-LoRA'}`,
+    },
+  ], { loading: modelDownload.loading, downloading: modelDownload.downloading, enabled: !rendersOffMachine });
+  const sharedEncoderAsset = assets.find(asset => asset.key === 'shared-encoder');
+  const blockedAsset = assets.find(asset => asset.blocked);
+  const weightsGateBlocked = !!blockedAsset;
+  const activeWeightErrorIds = assets.filter(asset => asset.applies).map(asset => asset.id).filter(Boolean);
+  const activeWeightError = activeWeightErrorIds.includes(modelDownload.lastError?.modelId)
+    ? modelDownload.lastError
+    : null;
+
+  const progressPct = progress?.progress != null ? Math.round(progress.progress * 100) : null;
+
+  // Run a single payload through the SSE pipeline. Returns a promise that
+  // resolves when the job completes (or rejects on error / cancel). The
+  // separate queue-submit path below deliberately does not attach SSE: the
+  // shared MediaJobsQueue is the live view for work submitted in parallel.
+  //
+  // The run owner (useMediaJobSse) holds the abort/identity bookkeeping: Cancel
+  // pressed between the POST and its acknowledgement cancels the eventual job
+  // by id without opening a stream, and an unmount detaches without one.
+  const runGeneration = (payload) => {
+    setGenerating(true);
+    setProgress({ progress: 0 });
+    setStatusMsg('Starting...');
+    setError(null);
+    // Stale-job isolation: the previous run's phase and clock must not be shown
+    // as if they belonged to this one. The clock stays null until `started`
+    // lands, so it measures the render rather than the queue wait.
+    setPhase(null);
+    setRenderStartedAt(null);
+    return startRun(() => generateVideo(payload), videoRunHandlers(true), {
+      onKickoffError: (err) => {
+        setError(err.message || 'Video generation failed');
+        setGenerating(false);
+        toast.error(err.message || 'Video generation failed');
+      },
+    });
+  };
+
+  const handleGenerate = async (e) => {
+    e?.preventDefault?.();
+    if (generating) {
+      if (canEnqueue) await handleEnqueue();
+      return;
+    }
+    if (!canEnqueue) return;
+    // A capacity window expires on the clock, so an enabled button can already
+    // be pointing at a lapsed peer — re-derive at the moment of commit and say
+    // so, rather than letting the peer reject a render already paid for.
+    if (!verifyRemoteTarget()) return;
+    await runGeneration(buildGeneratePayload()).catch(() => {});
+  };
+
+  const verifyRemoteTarget = () => {
+    if (!remoteTarget.isRemote) return true;
+    const fresh = remoteTarget.verify();
+    if (!fresh.ok) { toast.error(fresh.message); return false; }
+    return true;
+  };
+
+  const handleEnqueue = async () => {
+    // Mirror the Generate guard — a BYOV runtime that isn't installed yet
+    // would silently queue a doomed job that fails late in the worker with
+    // VENV_MISSING, hiding the installer banner from the user. Block at
+    // enqueue time so the only path forward is the install banner above.
+    if (!canEnqueue) return;
+    // A capacity window expires on the clock, so re-check the selected peer at
+    // the moment this queued job is committed. The server then owns the job,
+    // including any multipart uploads, and the appropriate lane can start it
+    // without waiting for this tab's active SSE render.
+    if (!verifyRemoteTarget()) return;
+    await generateVideo(buildGeneratePayload())
+      .then((data) => {
+        const position = Number.isInteger(data?.position) ? ` (position ${data.position})` : '';
+        toast.success(`Queued${position}`);
+      })
+      .catch((err) => toast.error(err.message || 'Failed to queue video'));
+  };
+
+  const handleCancel = async () => {
+    // Cancel targets only the run this page owns — started here or resumed
+    // after a reload. With nothing owned there is no job id to name, and an
+    // unscoped cancel could kill an unrelated parallel render.
+    await cancelRun();
+    setGenerating(false);
+    setStatusMsg('Cancelled');
+  };
+
+  // `status.connected` reflects the LEGACY mlx_video pythonPath health. BYOV
+  // runtimes resolve their own venv inside the service
+  // layer, so a missing legacy pythonPath must NOT block them — gate only on
+  // `byovRuntimeMissing` for those models. Without this, a user who installed
+  // ONLY a BYOV runtime via the modal would stay stuck behind a "not
+  // configured" error from the unrelated legacy probe.
+  // The Model field renders as soon as there is anything to say — the list, or
+  // the fact that it is still being fetched. Only a finished fetch that named
+  // no model at all takes the field away. That fetch no longer waits on the
+  // python probe, so on a cold load the list itself is normally what lands.
+  const modelsLoading = models.length === 0;
+  const modelFieldVisible = !modelsLoading || modelContextLoading;
+  const falModel = getFalVideoModel(falModelId);
+  const falResolutions = falVideoResolutions(falModel);
+
+  const notConnected = !!status && status.connected === false && !needsByovProbe;
+
+  // reactor.inc rejects a prompt over 800 characters outright, and the limit
+  // applies to what PortOS SUBMITS — style presets prefix the user's text, so
+  // the counter measures the same string buildVideoGenSubmission builds rather
+  // than the textarea. Gating Generate on it turns a post-click 400 into a
+  // number the user can watch while writing.
+  const submittedPromptLength = useMemo(
+    () => (isReactor
+      ? styledVideoPrompt(prompt, { negativePrompt, stylePreset, selectedUniverse }).length
+      : prompt.length),
+    [isReactor, prompt, negativePrompt, stylePreset, selectedUniverse],
+  );
+  const promptOverLimit = isReactor && submittedPromptLength > REACTOR_MAX_PROMPT_LENGTH;
+
+  // Budget the AI enhancer writes inside. It's the backend cap MINUS the style
+  // preset / universe prefix, because that prefix is part of what PortOS
+  // submits — enhancing to exactly 800 characters would still be rejected once
+  // the preset is prepended. `undefined` for a backend with no cap (and for the
+  // degenerate case where the prefix alone already fills the allowance, which
+  // the counter above is already flagging).
+  const enhancePromptBudget = useMemo(() => {
+    if (!isReactor) return undefined;
+    const overhead = submittedPromptLength - prompt.length;
+    const budget = REACTOR_MAX_PROMPT_LENGTH - Math.max(0, overhead);
+    return budget > 0 ? budget : undefined;
+  }, [isReactor, submittedPromptLength, prompt]);
+
+  // Only grok folds a negative prompt into its request (as an "Avoid:" line);
+  // fal's queue body and reactor's enqueue command have no such field, and a
+  // CFG-distilled local model ignores one. Hide the box rather than showing a
+  // dead field that quietly does nothing. A federated render is the PEER's
+  // model to judge, so the local selection's gate must not take away a field
+  // that lane does submit.
+  const negativePromptSupported = isGrok || remoteTarget.isRemote
+    || (!isFal && !isReactor && currentModel?.supportsNegativePrompt !== false);
+
+  // Every completed reactor render stamps its fast-h3 clip id on the history
+  // record; those ids are the only thing continue_from_clip_id can address, so
+  // the picker is built from them rather than asking the user to know one.
+  const reactorContinuableClips = useMemo(() => visibleHistory
+    .filter((v) => v.clipId && String(v.modelId || '').startsWith('reactor:'))
+    .slice(0, 50)
+    .map((v) => ({
+      clipId: v.clipId,
+      label: `${(v.prompt || v.filename || v.clipId).slice(0, 60)} · ${timeAgo(v.createdAt, 'unknown')}`,
+    })), [visibleHistory]);
+
+  // A selection the picker no longer offers must not survive in state: the
+  // deleted clip's option is gone, so the select falls back to displaying
+  // "Start a fresh shot" while the submission would still carry the stale id.
+  // Image mode clears it for the same reason — a continuation and a starting
+  // frame are exclusive, and the field is disabled there.
+  useEffect(() => {
+    if (!reactorClipId) return;
+    if (mode === 'image' || !reactorContinuableClips.some((clip) => clip.clipId === reactorClipId)) {
+      setReactorClipId('');
+    }
+  }, [reactorClipId, mode, reactorContinuableClips, setReactorClipId]);
+
+  // A federated render answers to the PEER’s readiness, not to this machine’s
+  // runtime gates — none of the local probes below describe the hardware it
+  // will actually run on.
+  const effectiveBatchSize = rendersOnThisMachine
+    && currentModel?.supportsWarmBatch && !chainingActive ? batchSize : 1;
+
+  const a2vBlockReason = a2vModeBlocked ? (a2vDurationError || (!isAudioToVideoRuntime(currentModel?.runtime)
+    ? 'a2v mode requires an audio-to-video model — pick one from the Model dropdown'
+    : !audioFile ? 'Pick an audio file before generating'
+      : 'Pick a reference image before generating with this model')) : null;
+  const generateBlockedReason = remoteBlocked
+    || (byovRuntimeMissing ? `${byovStatus?.label || byovRuntime} runtime is not installed — use the install banner above` : null)
+    || (byovGateBlocked ? `Checking ${byovRuntime} runtime status…` : null)
+    || (blockedAsset ? `Download the ${blockedAsset.label} before generating` : null)
+    || (extendModeBlocked ? 'Pick a prior render and wait for the last frame to extract before generating' : null)
+    || a2vBlockReason
+    || (icLoraModeBlocked ? 'Add the reference media required by this mode before generating' : null)
+    || (keyframesBlocked ? keyframesError : null);
+  const optionsBlockReason = blockedAsset
+    ? `Open Options to download the ${blockedAsset.label}`
+    : extendModeBlocked
+      ? 'Open Options to pick a prior render and wait for its last frame'
+      : a2vBlockReason
+        ? `Open Options: ${a2vBlockReason}`
+        : icLoraModeBlocked
+          ? 'Open Options to add the reference media required by this mode'
+          : keyframesBlocked
+            ? `Open Options: ${keyframesError}`
+            : null;
+
+  const canEnqueue = prompt.trim() && !remixHandoffPending && !promptOverLimit && (remoteTarget.isRemote
+    ? remoteBlocked === null
+    : (rendersOffMachine || (!notConnected && !extendModeBlocked
+      && !a2vModeBlocked && !icLoraModeBlocked && !byovGateBlocked
+      && !weightsGateBlocked && !keyframesBlocked)));
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between gap-2 text-xs">
+        {status ? (
+          <span
+            className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-full border ${
+              status.connected
+                ? 'border-port-success/40 bg-port-success/10 text-port-success'
+                : 'border-port-error/40 bg-port-error/10 text-port-error'
+            }`}
+            title={status.pythonPath || 'Local Python'}
+          >
+            {status.connected ? (
+              <><span className="w-2 h-2 rounded-full bg-port-success shrink-0" /> {status.pythonVersion ? `Python ${status.pythonVersion}` : 'Python'}</>
+            ) : (
+              <>
+                <AlertTriangle className="w-3 h-3 shrink-0" />
+                {status.reason || 'Local Python not configured — set one up below'}
+              </>
+            )}
+          </span>
+        ) : (
+          <span className="text-gray-500">Checking…</span>
+        )}
+        <div className="flex items-center gap-1">
+          <button
+            onClick={refreshStatus}
+            disabled={statusLoading}
+            className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center p-1.5 rounded text-gray-400 hover:text-white hover:bg-port-border/50 disabled:opacity-50"
+            title="Refresh status" aria-label="Refresh status"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${statusLoading ? 'animate-spin' : ''}`} />
+          </button>
+          <button
+            type="button"
+            onClick={openEpisodeComposer}
+            className="flex items-center gap-1.5 px-2 py-1 text-gray-300 hover:text-white border border-port-border rounded hover:bg-port-border/50"
+            title="Compose a multi-scene continuous-video episode"
+          >
+            <Film className="w-3.5 h-3.5" /> Episode
+          </button>
+          <button
+            type="button"
+            onClick={openSettings}
+            className="flex items-center gap-1.5 px-2 py-1 text-gray-300 hover:text-white border border-port-border rounded hover:bg-port-border/50"
+            title="Video Gen settings"
+          >
+            <SettingsIcon className="w-3.5 h-3.5" /> Settings
+          </button>
+        </div>
+      </div>
+
+      <RuntimeFingerprint runtime={status?.runtime} />
+
+      {status && status.connected === false && (() => {
+        const missingCount = status.missingPackages?.length || 0;
+        const hasPath = !!status.pythonPath;
+        return (
+          <div className="bg-port-card border border-port-border rounded-xl p-4">
+            <div className="mb-3">
+              <h3 className="text-sm font-medium text-gray-200">
+                {hasPath ? 'Install missing Python packages' : 'Set up Local Python'}
+              </h3>
+              <p className="text-[11px] text-gray-500 mt-0.5">
+                {hasPath
+                  ? `Your Python is selected (${status.pythonPath}), but ${missingCount} required ${missingCount === 1 ? "package isn't" : "packages aren't"} installed. Click "Install" below — PortOS will pip-install them into this interpreter.`
+                  : 'Pick a Python 3.10+ interpreter — PortOS auto-detects venvs and conda installs and can install missing packages directly.'}
+              </p>
+            </div>
+            <LocalSetupPanel
+              pythonPath={status.pythonPath || ''}
+              onPythonPathChange={handleSavePythonPath}
+              onPackagesChanged={refreshStatus}
+            />
+          </div>
+        );
+      })()}
+
+      {/* Backend switch — shown only when the user enabled Grok in Settings →
+          Image Gen and/or configured a fal.ai or reactor.inc API key. Every
+          cloud backend's image-to-video only supports text (image-first) and
+          image modes, so switching to one snaps an unsupported mode back to
+          the nearest one. */}
+      {(grokEnabled || falEnabled || reactorEnabled) && (
+        <div className="bg-port-card border border-port-border rounded-xl p-1 flex gap-1" role="group" aria-label="Video generation backend">
+          {[
+            { id: 'local', label: 'Local' },
+            ...(grokEnabled ? [{ id: 'grok', label: 'Grok' }] : []),
+            ...(falEnabled ? [{ id: 'fal', label: 'fal.ai' }] : []),
+            ...(reactorEnabled ? [{ id: 'reactor', label: 'Reactor.inc' }] : []),
+          ].map(({ id, label }) => (
+            <button
+              key={id}
+              type="button"
+              aria-pressed={backend === id}
+              onClick={() => handleBackendChange(id)}
+              className={`flex-1 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-colors ${
+                backend === id ? 'bg-port-accent text-white shadow' : 'text-gray-400 hover:text-white hover:bg-port-border/40'
+              }`}
+              title={id === 'grok'
+                ? 'Render via the Grok Build CLI (image_gen → image_to_video). Counts against your Grok plan.'
+                : id === 'fal'
+                  ? 'Render via the fal.ai queue API. Counts against your fal.ai balance.'
+                  : id === 'reactor'
+                    ? 'Render via the reactor.inc fast-h3 API. Counts against your reactor.inc balance.'
+                    : 'Render on this machine with the local runtimes.'}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* Mode switch — segmented control above the form. Sets state that
+          both the form rendering and the submit payload react to.
+          Implemented as plain toggle buttons with `aria-pressed` rather than
+          WAI-ARIA Tabs, since the mode-specific inputs aren't structured as
+          tabpanels and we don't implement roving-tabindex/arrow-key focus. */}
+      <div className="bg-port-card border border-port-border rounded-xl p-1 flex flex-wrap gap-1" role="group" aria-label="Video generation mode">
+        {(rendersOffMachine ? MODES.filter((m) => m.id === 'text' || m.id === 'image') : MODES).map(({ id, label, icon: Icon, desc }) => {
+          const active = mode === id;
+          return (
+            <button
+              key={id}
+              type="button"
+              aria-pressed={active}
+              onClick={() => selectMode(id)}
+              className={`flex-1 min-w-[120px] flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-colors disabled:opacity-50 ${
+                active
+                  ? 'bg-port-accent text-white shadow'
+                  : 'text-gray-400 hover:text-white hover:bg-port-border/40'
+              }`}
+              title={desc}
+            >
+              <Icon className="w-3.5 h-3.5" />
+              <span>{label}</span>
+            </button>
+          );
+        })}
+      </div>
+
+      <form onSubmit={handleGenerate} className="@container/video-form min-w-0">
+        <div className="min-w-0 bg-port-card border border-port-border rounded-xl p-4 space-y-3">
+          {/* A cross-page Remix that could not be restored (#6290). Silence
+              would be the worst outcome here: the user pressed Remix, landed on
+              a form holding whatever it held before, and would start a render
+              with the wrong settings believing they were the clip's. */}
+          {remixHandoffPending && (
+            <p role="status" className="rounded-lg border border-port-border bg-port-bg px-3 py-2 text-xs text-gray-400">
+              Restoring this render's settings — the form below is about to be replaced with them.
+            </p>
+          )}
+          {remixHandoffProblem && (
+            <div
+              role="status"
+              className="rounded-lg border border-port-warning/40 bg-port-warning/10 px-3 py-3 text-xs text-port-warning flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2"
+            >
+              <div>
+                {remixHandoffProblem === 'error'
+                  ? "Couldn't load your render history, so this clip's settings weren't restored."
+                  : 'That render is no longer in your history, so its settings could not be restored.'}
+                {' '}The form still holds its previous values.
+              </div>
+              <div className="flex items-center gap-2 self-start sm:self-auto">
+                {remixHandoffProblem === 'error' && (
+                  <button
+                    type="button"
+                    onClick={retryRemixHandoff}
+                    className="whitespace-nowrap inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-port-accent text-white text-xs font-medium hover:bg-port-accent/80"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    Retry
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={dismissRemixHandoff}
+                  className="text-gray-400 hover:text-gray-200 text-xs"
+                >
+                  Dismiss
+                </button>
+              </div>
+            </div>
+          )}
+          {!rendersOffMachine && byovRuntimeMissing && (
+            <div className="rounded-lg border border-port-warning/40 bg-port-warning/10 px-3 py-3 text-xs text-port-warning flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+              <div>
+                <strong className="font-semibold">{byovStatus.label}</strong> {byovStatus.upgradeAvailable ? 'has an update available.' : "isn't installed yet."}
+                {' '}PortOS can {byovStatus.upgradeAvailable ? 'upgrade' : 'fetch and install'} it from {byovStatus.installSourceLabel || byovStatus.repoUrl?.replace('https://', '')} on demand.
+              </div>
+              <button
+                type="button"
+                onClick={() => setInstallModalOpen(true)}
+                disabled={generating}
+                className="self-start sm:self-auto whitespace-nowrap inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-port-accent text-white text-xs font-medium hover:bg-port-accent/80 disabled:opacity-50"
+              >
+                <Sparkles size={14} />
+                {byovStatus.upgradeAvailable ? 'Upgrade' : 'Install'} {byovStatus.label}
+              </button>
+            </div>
+          )}
+          {assets.filter(asset => asset.showBanner).map(asset => (
+            <ModelRepairBanner
+              key={asset.key}
+              message={<>
+                <strong className="font-semibold">{asset.name}</strong> has {asset.integrityBadCount || 'corrupt'} damaged weight file{asset.integrityBadCount === 1 ? '' : 's'} — renders may come out garbled.
+                Repair deletes the bad file{asset.integrityBadCount === 1 ? '' : 's'} and re-downloads clean copies.
+              </>}
+              repairLabel={asset.repairLabel}
+              onRepair={() => { asset.dismiss(); modelDownload.repair(asset.id); }}
+              onDismiss={asset.dismiss}
+              disabled={modelDownload.repairing || modelDownload.downloading}
+              repairing={modelDownload.repairing}
+            />
+          ))}
+          <FormField label="Prompt" labelClassName="block text-xs font-medium text-gray-400 mb-1">
+            <AutoSizeTextarea
+              value={prompt}
+              onChange={(e) => setPrompt(e.target.value)}
+              rows={3}
+              className="w-full bg-port-bg border border-port-border rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-port-accent disabled:opacity-50 min-h-[80px]"
+              placeholder="Describe the video you want to generate..."
+            />
+            {/* The count is the SUBMITTED length, so a style preset that
+                pushes a short-looking prompt past reactor's cap is visible
+                here instead of surfacing as a 400 after Generate. */}
+            <p className={`mt-1 text-[11px] leading-snug ${promptOverLimit ? 'text-port-error' : 'text-gray-500'}`}>
+              {isReactor
+                ? `${formatCount(submittedPromptLength)} / ${formatCount(REACTOR_MAX_PROMPT_LENGTH)} characters`
+                : `${formatCount(submittedPromptLength)} characters`}
+            </p>
+            {/* Only crossing the cap is worth announcing; the count itself
+                changes on every keystroke and would be pure noise. */}
+            {promptOverLimit && (
+              <p className="mt-1 text-[11px] text-port-error leading-snug" role="status">
+                Reactor will reject this — shorten the prompt. Style presets count toward the limit.
+              </p>
+            )}
+            {!negativePromptSupported && !isFal && !isReactor && (
+              <p className="mt-1 text-[11px] text-gray-500 leading-snug">
+                This model does not use a negative prompt.
+              </p>
+            )}
+          </FormField>
+
+          <div
+            className="sticky top-0 z-10 -mx-4 flex flex-wrap items-center gap-2 border-y border-port-border bg-port-card/95 px-4 py-2 backdrop-blur lg:static lg:mx-0 lg:border-0 lg:bg-transparent lg:p-0 lg:backdrop-blur-none"
+            data-testid="video-primary-actions"
+          >
+            {generating ? (
+              <button
+                type="button"
+                onClick={handleCancel}
+                className="flex min-h-[44px] items-center gap-2 rounded-lg bg-port-error px-4 py-2 text-sm font-medium text-white hover:bg-port-error/80"
+              >
+                <X className="w-4 h-4" /> Cancel
+              </button>
+            ) : (
+              <button
+                type="submit"
+                disabled={!canEnqueue}
+                className="flex min-h-[44px] items-center gap-2 rounded-lg bg-port-accent px-4 py-2 text-sm font-medium text-white hover:bg-port-accent/80 disabled:cursor-not-allowed disabled:opacity-50"
+                title={generateBlockedReason || undefined}
+              >
+                <Sparkles className="w-4 h-4" /> {effectiveBatchSize > 1 ? `Generate ${effectiveBatchSize} videos` : 'Generate'}
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={handleEnqueue}
+              disabled={!canEnqueue}
+              className="flex min-h-[44px] items-center gap-2 rounded-lg border border-port-border px-4 py-2 text-sm font-medium text-gray-200 hover:bg-port-border/40 hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
+              title={canEnqueue ? 'Submit this configuration to its server queue; local, Grok, and remote lanes run independently'
+                : blockedAsset ? `Download the ${blockedAsset.label} before queueing`
+                  : 'Complete the required inputs before queueing'}
+            >
+              <ListPlus className="w-4 h-4" /> {effectiveBatchSize > 1 ? `Add ${effectiveBatchSize} videos to queue` : 'Add to queue'}
+            </button>
+            {optionsBlockReason && (
+              <span className="basis-full text-xs text-port-warning" role="status">{optionsBlockReason}</span>
+            )}
+            {/* Said BEFORE the button is pressed, not after the screen is already
+                dark. A user who first learns about the sleep by watching their
+                display go black reads it as a crash and wakes it — which puts
+                WindowServer back in contention with Metal and risks the GPU
+                watchdog panic the sleep exists to avoid. */}
+            {rendersSleepDisplay && !generating && (
+              <p className="flex items-start gap-1.5 text-[11px] text-port-warning">
+                <MonitorOff className="w-3.5 h-3.5 mt-px shrink-0" />
+                <span>
+                  This render will put your display to sleep. The screen will go dark shortly
+                  after you start — that is expected, and waking it can crash the render. Uncheck
+                  “Sleep display during this render” in Options to keep the screen on.
+                </span>
+              </p>
+            )}
+            {progressPct != null && <span className="text-xs text-port-accent">{progressPct}%</span>}
+            {(generating || error) && (
+              <span role="status" className={`text-xs truncate ${error ? 'text-port-error' : 'text-gray-400'}`}>
+                {error || statusMsg || 'Working...'}
+              </span>
+            )}
+          </div>
+
+          <details
+            open={optionsOpen}
+            onToggle={(event) => setOptionsOpen(event.currentTarget.open)}
+            className="group min-w-0"
+          >
+            <summary className="flex min-h-[44px] cursor-pointer list-none items-center justify-between rounded-lg border border-port-border px-3 py-2 text-sm font-medium text-gray-300 hover:bg-port-border/30 lg:hidden">
+              Options
+              <ChevronDown className="h-4 w-4 transition-transform group-open:rotate-180" aria-hidden="true" />
+            </summary>
+            <div className="mt-3 grid min-w-0 grid-cols-1 gap-4 lg:mt-0 @3xl/video-form:grid-cols-2">
+              <section aria-label="Prompt styling and reference media" className="min-w-0 space-y-3">
+              <div className="grid min-w-0 grid-cols-1 gap-3 @5xl/video-form:grid-cols-2">
+              <UniverseStylePicker
+                value={selectedUniverse?.id || ''}
+                onChange={setSelectedUniverse}
+              />
+              <StylePresetPicker
+                value={stylePreset?.id || ''}
+                onChange={setStylePreset}
+              />
+              </div>
+              {negativePromptSupported && (
+                <FormField label="Negative Prompt" labelClassName="block text-xs font-medium text-gray-400 mb-1">
+                  <AutoSizeTextarea
+                    value={negativePrompt}
+                    onChange={(e) => setNegativePrompt(e.target.value)}
+                    rows={3}
+                    className="w-full bg-port-bg border border-port-border rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-port-accent disabled:opacity-50 min-h-[80px]"
+                    placeholder="What to avoid..."
+                  />
+                </FormField>
+              )}
+
+          {/* Keep Enhance live while a render is in flight so the next clip
+              can be composed and submitted to its server queue. Generate
+              itself becomes Cancel. */}
+          <PromptEnhancer
+            kind="video"
+            prompt={prompt}
+            setPrompt={setPrompt}
+            negativePrompt={negativePromptSupported ? negativePrompt : ''}
+            setNegativePrompt={negativePromptSupported ? setNegativePrompt : undefined}
+            renderConfig={{ stylePreset: stylePreset?.id, mode, model: modelId }}
+            maxPromptLength={enhancePromptBudget}
+          />
+
+          {mode === 'fflf' && keyframesSupported && (
+            <KeyframePanel
+              keyframesMode={keyframesMode}
+              keyframesActive={keyframesActive}
+              keyframes={keyframes}
+              numFrames={numFrames}
+              keyframesError={keyframesError}
+              onToggleMode={toggleKeyframesMode}
+              onAddKeyframe={addKeyframe}
+              onBrowseKeyframe={(index) => setGalleryPicker({ kind: 'keyframe', index })}
+              onUpdateKeyframe={updateKeyframe}
+              onRemoveKeyframe={removeKeyframe}
+            />
+          )}
+
+          {(mode === 'image' || (mode === 'fflf' && !keyframesActive)) && (
+            <div className={`grid gap-2 ${mode === 'fflf' ? 'grid-cols-1 sm:grid-cols-2' : 'grid-cols-1'}`}>
+              <FramePanel
+                label={mode === 'fflf' ? 'First frame' : 'Source image'}
+                file={sourceImageFile}
+                upload={sourceImageUpload}
+                uploadUrl={sourceUploadUrl}
+                onBrowseGallery={() => setGalleryPicker({ kind: 'source' })}
+                onUpload={uploadSourceImage}
+                onClear={clearSourceImage}
+                alt="Source"
+                advisoryNote={mode === 'image' && i2vReferenceMode === 'inspire' ? {
+                  text: 'Inspire — frame one is generated from this, not copied.',
+                  title: 'Inspire conditions the opening frame loosely, so the clip carries this image\u2019s subject and style without reproducing its exact pixels. Switch Reference mode to Anchor under Advanced to make it frame one.',
+                } : null}
+                hint={mode === 'image' && currentModel && !referenceModeSupported ? {
+                  text: 'This model anchors the reference — it becomes frame one exactly.',
+                  title: 'Only LTX-2.5 carries a per-image conditioning strength, which is what a loose (Inspire) reference needs. Every other runtime pins the supplied image as frame one.',
+                } : null}
+              />
+              {mode === 'fflf' && (
+                <FramePanel
+                  label="Last frame"
+                  file={lastImageFile}
+                  upload={lastImageUpload}
+                  uploadUrl={lastUploadUrl}
+                  onBrowseGallery={() => setGalleryPicker({ kind: 'last' })}
+                  onUpload={uploadLastImage}
+                  onClear={clearLastImage}
+                  alt="End frame"
+                  advisoryNote={lastFrameIsAdvisory ? {
+                    text: 'Experimental — last frame is advisory.',
+                    title: `FFLF backend support is experimental — the ${currentModel?.runtime || 'selected'} runtime conditions on the start frame only and treats the last frame as advisory.`,
+                  } : null}
+                  hint={{
+                    text: 'Tip: use keyframes that share scene geometry — same camera, same subject. The model interpolates between them; unrelated images produce a visual cut.',
+                    title: 'FFLF works best when the two frames depict the same scene with continuous geometry. Both runtimes (notapalindrome and dgrauet) benefit from this.',
+                  }}
+                />
+              )}
+            </div>
+          )}
+
+          {mode === 'a2v' && (
+            <div className="grid gap-3 lg:grid-cols-2">
+              <FramePanel
+                label={currentModel?.requiresSourceImageForA2v ? 'Reference image (required)' : 'Reference image (optional)'}
+                file={sourceImageFile}
+                upload={sourceImageUpload}
+                uploadUrl={sourceUploadUrl}
+                onBrowseGallery={() => setGalleryPicker({ kind: 'source' })}
+                onUpload={uploadSourceImage}
+                onClear={clearSourceImage}
+                alt="Audio-to-video reference"
+                hint={{
+                  text: 'This image establishes the subject, composition, and opening geometry.',
+                  title: currentModel?.arbitraryLengthAudio === true
+                    ? 'MiniMax H3 Ref2VA combines the image with each audio window. PortOS carries the prior window\'s last frame forward to keep long renders continuous.'
+                    : 'LTX-2.5 conditions frame one on this image while the uploaded audio drives motion and synchronization.',
+                }}
+              />
+              <AudioPanel
+                audioFile={audioFile}
+                numFrames={numFrames}
+                fps={fps}
+                hasCompatibleModel={visibleModels.length > 0}
+                audioDurationDriven={currentModel?.audioDurationDriven === true}
+                arbitraryLengthAudio={currentModel?.arbitraryLengthAudio === true}
+                maxReferenceAudioSeconds={currentModel?.maxReferenceAudioSeconds}
+                maxDurationSeconds={currentModel?.audioDurationDriven === true
+                  && currentModel?.arbitraryLengthAudio !== true
+                  && Number(currentModel?.maxNumFrames) > 0
+                  ? Number(currentModel.maxNumFrames) / Number(fps)
+                  : null}
+                durationError={a2vDurationError}
+                onDurationChange={setAudioDurationSec}
+                onPick={setAudioFile}
+                onClear={() => setAudioFile(null)}
+              />
+            </div>
+          )}
+
+          {mode === 'extend' && (
+            <ExtendPanel
+              extendFromVideoId={extendFromVideoId}
+              extendingFrame={extendingFrame}
+              sourceImageFile={sourceImageFile}
+              visibleHistory={visibleHistory}
+              onPick={handleExtendPick}
+            />
+          )}
+
+          {icModeActive && (
+            <IcLoraPanel
+              spec={icSpec}
+              referenceFile={icReferenceFile}
+              referenceVideoId={icReferenceVideoId}
+              inFlightReferenceNames={icReferenceNames}
+              visibleHistory={visibleHistory}
+              referenceImageFiles={icReferenceImageFiles}
+              onAddReferenceImage={addIcReferenceImage}
+              onBrowseReferenceImage={(index) => setGalleryPicker({ kind: 'icReference', index })}
+              onRemoveReferenceImage={removeIcReferenceImage}
+              icStrength={icStrength}
+              icSkipStage2={icSkipStage2}
+              width={width}
+              height={height}
+              weightStatus={icWeightStatus}
+              hasCompatibleModel={visibleModels.length > 0}
+              onPickFile={pickIcReferenceFile}
+              onClearFile={() => pickIcReferenceFile(null)}
+              onPickHistory={pickIcReferenceVideoId}
+              onStrengthChange={setIcStrength}
+              onSkipStage2Change={setIcSkipStage2}
+              onDownloadWeight={() => modelDownload.start(icSpec.mode)}
+              onCancelWeightDownload={modelDownload.cancel}
+            />
+          )}
+
+              </section>
+              <section aria-label="Render settings" className="min-w-0 space-y-3">
+          {!rendersOffMachine && (
+            <RemoteMediaTargetPicker
+              target={remoteTarget}
+              kind="video"
+              localBlockedReason={remoteUnsupportedInputs}
+            />
+          )}
+
+          {isGrok ? (
+            <div className="grid grid-cols-2 gap-3">
+              <FormField label="Clip length" labelClassName="block text-xs font-medium text-gray-400 mb-1">
+                <select
+                  value={grokDuration}
+                  onChange={(e) => setGrokDuration(Number(e.target.value))}
+                  className="w-full bg-port-bg border border-port-border rounded-lg px-2 py-2 text-sm text-white focus:outline-none focus:border-port-accent disabled:opacity-50"
+                >
+                  {GROK_VIDEO_DURATIONS.map((d) => <option key={d} value={d}>{d} seconds</option>)}
+                </select>
+              </FormField>
+              <ResolutionField
+                presets={VIDEO_RESOLUTIONS}
+                width={width}
+                height={height}
+                onChange={handleResolutionChange}
+                {...VIDEO_EDGE_BOUNDS}
+                snapOnBlur
+                note="Grok maps the size to its closest supported aspect ratio — exact pixel dimensions are chosen by the model."
+              />
+              <p className="col-span-2 text-[11px] text-gray-500 leading-snug">
+                Grok generates a base image first (or animates your source image in Image mode), then renders motion with its
+                <code className="text-gray-400"> image_to_video </code> tool. Model, frames, and seed are chosen by Grok; renders count against your Grok plan.
+              </p>
+            </div>
+          ) : isFal ? (
+            <div className="grid grid-cols-2 gap-3">
+              <FormField label="fal.ai model" labelClassName="block text-xs font-medium text-gray-400 mb-1">
+                {/* Free text stays: any fal endpoint id renders (on the legacy
+                    body, cost unknown); the list suggests the curated ones
+                    whose request body and price PortOS knows. */}
+                <input
+                  type="text"
+                  list="fal-video-model-suggestions"
+                  value={falModelId}
+                  onChange={(e) => setFalModelId(e.target.value)}
+                  placeholder={mode === 'image' ? FAL_DEFAULT_IMAGE_VIDEO_MODEL : FAL_DEFAULT_TEXT_VIDEO_MODEL}
+                  className="w-full bg-port-bg border border-port-border rounded-lg px-2 py-2 text-sm text-white focus:outline-none focus:border-port-accent"
+                />
+                <datalist id="fal-video-model-suggestions">
+                  {FAL_VIDEO_MODELS.filter((m) => m.kind === (mode === 'image' ? 'i2v' : 't2v')).map((m) => (
+                    <option key={m.id} value={m.id}>{m.label}</option>
+                  ))}
+                </datalist>
+              </FormField>
+              <FormField label="Clip length (sec)" labelClassName="block text-xs font-medium text-gray-400 mb-1">
+                <input
+                  type="number"
+                  min={1}
+                  max={60}
+                  value={falDuration}
+                  onChange={(e) => setFalDuration(e.target.value)}
+                  placeholder="model default"
+                  className="w-full bg-port-bg border border-port-border rounded-lg px-2 py-2 text-sm text-white focus:outline-none focus:border-port-accent"
+                />
+              </FormField>
+              {falModel?.resolution && (
+                <FormField label="Resolution" labelClassName="block text-xs font-medium text-gray-400 mb-1">
+                  <select
+                    value={falResolution}
+                    onChange={(e) => setFalResolution(e.target.value)}
+                    className="w-full bg-port-bg border border-port-border rounded-lg px-2 py-2 text-sm text-white focus:outline-none focus:border-port-accent"
+                  >
+                    <option value="">Model default</option>
+                    {falResolutions.map((resolution) => (
+                      <option key={resolution} value={resolution}>{resolution}</option>
+                    ))}
+                  </select>
+                </FormField>
+              )}
+              {falModel?.audio && (
+                <label htmlFor="fal-provider-audio" className="flex items-center gap-2 text-sm text-gray-400">
+                  <input
+                    id="fal-provider-audio"
+                    type="checkbox"
+                    checked={falGenerateAudio}
+                    onChange={(e) => setFalGenerateAudio(e.target.checked)}
+                    className="accent-port-accent"
+                  />
+                  Provider audio
+                </label>
+              )}
+              <p className="col-span-2 text-[11px] text-gray-500 leading-snug">
+                Renders on fal.ai's queue API — leave the model blank to use PortOS's default (text-to-video, or image-to-video in Image mode). Counts against your fal.ai balance
+                {(() => {
+                  const estimate = estimateFalVideoCostUsd({
+                    modelId: falModelId?.trim() || (mode === 'image' ? FAL_DEFAULT_IMAGE_VIDEO_MODEL : FAL_DEFAULT_TEXT_VIDEO_MODEL),
+                    seconds: falDuration === '' ? null : Number(falDuration),
+                    width, height, resolution: falResolution, generateAudio: falGenerateAudio,
+                  });
+                  return estimate == null
+                    ? ' — cost unknown for this model.'
+                    : ` — about ${formatUsd(estimate)} at list price, at ${falResolution || "the model's default resolution"} with provider audio ${falGenerateAudio ? 'on' : 'off'}.`;
+                })()}
+              </p>
+            </div>
+          ) : isReactor ? (
+            <ReactorPanel
+              clipId={reactorClipId}
+              onClipIdChange={setReactorClipId}
+              continuableClips={reactorContinuableClips}
+              imageModeActive={mode === 'image'}
+              seconds={reactorSeconds}
+              onSecondsChange={setReactorSeconds}
+              seed={reactorSeed}
+              onSeedChange={setReactorSeed}
+              aspect={reactorAspect}
+              onAspectChange={setReactorAspect}
+            />
+          ) : (
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+            {/* The peer advertises its own models; the local list would name
+                none of them, and a stale selection here must not read as the
+                model that rendered the clip. Locally the field holds its place
+                through the probe rather than popping into the form late. */}
+            {modelFieldVisible && !remoteTarget.isRemote && (
+              <FormField className="col-span-2 sm:col-span-3" label="Model" labelClassName="block text-xs font-medium text-gray-400 mb-1">
+                <ModelSelect
+                  models={visibleModels}
+                  value={modelId}
+                  onChange={(e) => handleModelChange(e.target.value)}
+                  loading={modelsLoading}
+                />
+                <ModelWorkflowHelp model={currentModel} mode={mode} models={models} onResolutionChange={handleResolutionChange} />
+                {remixModelFallback && (
+                  <p className="mt-1 text-[11px] text-port-accent leading-snug" role="status">
+                    {remixModelFallback.sourceName} {remixModelFallback.samplerLocked && remixModelFallback.negativePromptUnsupported
+                      ? 'has fixed sampler controls and no negative prompt'
+                      : remixModelFallback.samplerLocked
+                        ? 'has fixed sampler controls'
+                        : 'does not support a negative prompt'}. This remix is using {remixModelFallback.targetName} so its negative prompt, Steps, and CFG Scale remain editable.
+                  </p>
+                )}
+                {modelStatus && (
+                  <ModelDownloadBadge
+                    status={modelStatus}
+                    onDownload={() => modelDownload.start(modelId)}
+                    onCancel={modelDownload.cancel}
+                    estimateLabel={deriveSizeEstimate(currentModel?.name)}
+                  />
+                )}
+                {activeWeightError && (
+                  <div role="status" className="mt-2 rounded-lg border border-port-error/40 bg-port-error/10 px-3 py-2 text-[11px] text-port-error">
+                    <p>{activeWeightError.message}</p>
+                    <div className="mt-1 flex flex-wrap gap-2">
+                      <button type="button" onClick={openSettings} className="underline hover:text-white">
+                        Open Hugging Face settings
+                      </button>
+                      {activeWeightError.repo && (
+                        <a
+                          href={`https://huggingface.co/${activeWeightError.repo}`}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="underline hover:text-white"
+                        >
+                          Open repository access page
+                        </a>
+                      )}
+                    </div>
+                  </div>
+                )}
+                {modelDownload.statusError && (
+                  <div role="status" className="mt-2 rounded-lg border border-port-warning/40 bg-port-warning/10 px-3 py-2 text-[11px] text-port-warning flex flex-wrap items-center justify-between gap-2">
+                    <span>{modelDownload.statusError}</span>
+                    <button type="button" onClick={modelDownload.refresh} className="underline hover:text-white">
+                      Retry cache check
+                    </button>
+                  </div>
+                )}
+                {/* Prompt conditioner. Sits with the Model field rather than in
+                    the collapsed Advanced panel: a substitute is its own
+                    multi-GB pull and gates Generate, so its badge has to be
+                    visible at the moment it's picked. Renders nothing unless
+                    the model offers a real choice. */}
+                <TextEncoderPicker
+                  options={textEncoderOptions}
+                  value={textEncoderId}
+                  onChange={handleTextEncoderChange}
+                  status={textEncoderOptionStatus}
+                  onDownload={() => modelDownload.start(textEncoderOptionDownloadId)}
+                  queued={modelDownload.queuedModelId === textEncoderOptionDownloadId}
+                  onCancel={modelDownload.cancel}
+                  disabled={generating}
+                />
+                {usesSharedTextEncoder && textEncoderStatus && (sharedEncoderAsset.missingWeights || textEncoderStatus.downloading) && (
+                  <div className="mt-1">
+                    <p className="text-[10px] text-gray-500">Text encoder ({textEncoderStatus.repo}) is also required:</p>
+                    <ModelDownloadBadge
+                      status={textEncoderStatus}
+                      onDownload={() => modelDownload.start(TEXT_ENCODER_DOWNLOAD_ID)}
+                      onCancel={modelDownload.cancel}
+                    />
+                  </div>
+                )}
+              </FormField>
+            )}
+
+            {/* Video LoRAs — only on runtimes with a compatible video family
+                (loraFamily non-null) and when at least one matching LoRA is
+                installed (videoLoras is the strict family subset; see hook). */}
+            {loraFamily && videoLoras.length > 0 && (
+              <div className="col-span-2 sm:col-span-3">
+                <LoraPicker
+                  availableLoras={videoLoras}
+                  selected={selectedLoras}
+                  onChange={setSelectedLoras}
+                  currentRunnerFamily={loraFamily}
+                  currentCompatKey={loraFamily}
+                  // Shared with ImageGen: skips a word already present rather than
+                  // re-appending it, and judges presence against the ENVELOPED prompt
+                  // (style preset + no-music suffix) — the exact text the server
+                  // weaves against, so the button and the hint agree with the render.
+                  onAppendTrigger={(triggers) => setPrompt((p) => appendTriggerWords(p, triggers, envelopedPrompt))}
+                  // Grok payloads carry no LoRAs and never reach the local weave, so
+                  // the hint would promise an append that cannot happen. `null`
+                  // (not `''`) is the picker's "host didn't opt in" signal.
+                  prompt={isGrok ? null : envelopedPrompt}
+                  disabled={generating}
+                />
+              </div>
+            )}
+
+            {/* LTX model that can't fuse LoRAs (quantized mlx_video — q4/q8) with
+                compatible LoRAs on disk: explain the absence instead of hiding
+                silently, and point at the models that CAN run them. */}
+            {loraUnavailableHint && (
+              <div className="col-span-2 sm:col-span-3 rounded-lg border border-port-warning/40 bg-port-warning/10 px-3 py-2 text-xs text-port-warning leading-snug">
+                {loraUnavailableHint.kind === 'ltx' ? (
+                  <>You have {loraUnavailableHint.count} LTX video LoRA{loraUnavailableHint.count === 1 ? '' : 's'} installed, but <strong className="font-semibold">{currentModel?.name}</strong> can't fuse LoRAs (its quantized <code>mlx_video</code> runtime isn't supported yet). Switch to the <strong className="font-semibold">LTX-2.3 Unified Beta</strong> (bf16) or an <strong className="font-semibold">LTX-2.3 dgrauet (Q4/Q8)</strong> model to use them.</>
+                ) : (
+                  <>You have {loraUnavailableHint.count} MiniMax H3 LoRA{loraUnavailableHint.count === 1 ? '' : 's'} installed, but this H3 runtime did not pass PortOS's quantization-aware LoRA probe. Repair the <strong className="font-semibold">MiniMax H3</strong> runtime from the model setup panel, then retry.</>
+                )}
+              </div>
+            )}
+
+            {/* Preset dropdown + free-form custom W×H for exact I2V sizing beyond
+                the preset list. Most runners use the shared 64px grid; models
+                such as H3 declare their native 32px grid and trained presets. */}
+            <ResolutionField
+              presets={localResolutionOptions}
+              width={width}
+              height={height}
+              onChange={handleResolutionChange}
+              {...localResolutionBounds}
+              snapOnBlur
+              note={isMiniMaxH3Runtime(currentModel?.runtime)
+                ? 'H3 quality presets follow its trained 768px short-edge, area-capped canvas. Smaller custom sizes are off-distribution but useful for faster wiring tests; each edge snaps to 32px.'
+                : `Each edge 64–2048px; the server rounds each down to the nearest multiple of ${localResolutionBounds.step}px.`}
+            />
+
+          </div>
+          )}
+
+          {/* Provenance / licensing / policy scope for the selected backend +
+              model (#3674). Territory and Community License live here as
+              facts — they do not block download or generate. */}
+          <ModelDisclosure
+            backend={backend}
+            backendDisclosures={status?.backendDisclosures}
+            model={rendersOffMachine ? null : currentModel}
+            systemMemoryGb={modelContext?.systemMemoryGb}
+          />
+
+          {!rendersOffMachine && (
+            <AdvancedParamsPanel
+              mode={mode}
+              currentModel={currentModel}
+              numFrames={numFrames} onNumFramesChange={setNumFrames}
+              chunks={chunks} onChunksChange={setChunks} keyframesActive={keyframesActive}
+              chunkPrompts={chunkPrompts} onChunkPromptChange={setChunkPromptAt} chainingActive={chainingActive}
+              contextFrames={contextFrames} onContextFramesChange={setContextFrames}
+              fps={fps} onFpsChange={setFps}
+              batchSize={batchSize} onBatchSizeChange={setBatchSize}
+              seed={seed} onSeedChange={setSeed} onRandomSeed={handleRandomSeed}
+              steps={steps} onStepsChange={setSteps}
+              guidanceScale={guidanceScale} onGuidanceScaleChange={setGuidanceScale}
+              speedProfileId={speedProfileId} onSpeedProfileChange={setSpeedProfileId}
+              draftDecode={draftDecode} onDraftDecodeChange={setDraftDecode}
+              draftDecodeLocked={deliveryModelSelected}
+              streamingMode={streamingMode} onStreamingModeChange={setStreamingMode}
+              imageStrength={imageStrength} onImageStrengthChange={setImageStrength}
+              i2vReferenceMode={i2vReferenceMode} onI2vReferenceModeChange={setI2vReferenceMode}
+              effectiveImageStrength={effectiveImageStrength}
+              tiling={tiling} onTilingChange={setTiling}
+              disableAudio={disableAudio} onDisableAudioChange={setDisableAudio}
+              noMusic={noMusic} onNoMusicChange={setNoMusic}
+            />
+          )}
+
+          {/* Visible per-render control rather than a settings-only default (off by
+              default — see ImageGenTab's videoGenDisplaySleep) — a GPU-watchdog
+              crash on this model is rare enough that most renders shouldn't pay for
+              the mitigation, but the option needs to be one click away right here. */}
+          {canSleepDisplay && (
+            <label htmlFor="video-gen-display-sleep" className="flex items-start gap-2 text-xs text-gray-400 cursor-pointer">
+              <input
+                id="video-gen-display-sleep"
+                type="checkbox"
+                checked={displaySleepEnabled}
+                onChange={(e) => setDisplaySleepOverride(e.target.checked)}
+                disabled={generating}
+                className="mt-0.5 accent-port-accent"
+              />
+              <span>
+                Sleep display during this render
+                <span className="block text-[11px] text-gray-500">
+                  Reduces WindowServer GPU contention on affected Apple silicon. Change the install-wide
+                  default in Media Gen Settings (gear icon or ⌘K "Media Gen Settings").
+                </span>
+              </span>
+            </label>
+          )}
+
+              </section>
+            </div>
+          </details>
+        </div>
+
+      </form>
+
+      <RenderStatusCard
+        generating={generating}
+        phase={phase}
+        progressPct={progressPct}
+        statusMsg={statusMsg}
+        error={error}
+        startedAt={renderStartedAt}
+        sleepsDisplay={rendersSleepDisplay}
+        remote={rendersOffMachine}
+      />
+
+      <MediaJobsQueue kind="video" />
+
+      <VideoGenGallery
+        galleryVisible={galleryVisibleItems}
+        galleryHidden={galleryHiddenItems}
+        favoritesOnly={favoritesOnly}
+        showHidden={showHidden}
+        onToggleFavorites={handleToggleFavorites}
+        onToggleShowHidden={handleToggleShowHidden}
+        onPreview={setPreview}
+        onRemix={handleRemixVideo}
+        onContinue={handleContinueVideo}
+        onUpscale={handleUpscaleHistory}
+        onDelete={handleDeleteHistory}
+        onToggleHidden={handleToggleHistoryHidden}
+        getCardProps={getCardProps}
+        finishTargetFor={resolveFinishTarget}
+        onFinish={handleFinishVideo}
+      />
+
+      <MediaPreview
+        preview={preview}
+        setPreview={setPreview}
+        items={previewItems}
+        annotations={annotations}
+        updateAnnotation={updateAnnotation}
+        onPromptSaved={handlePromptSaved}
+        onContinue={handleContinue}
+        onRemix={(item) => item?.raw && handleRemixVideo(item.raw)}
+      />
+
+      <GalleryImagePicker
+        open={!!galleryPicker}
+        onClose={() => setGalleryPicker(null)}
+        onSelect={handleGalleryPick}
+      />
+
+      <VideoUpscaleDrawer
+        item={upscaleItem}
+        onClose={() => setUpscaleItem(null)}
+        onUpscaled={handleUpscaled}
+      />
+
+      <Drawer open={settingsOpen} onClose={closeSettings} title="Media Generation Settings" size="lg">
+        <ImageGenTab />
+      </Drawer>
+
+      <Drawer open={episodeOpen} onClose={closeEpisodeComposer} title="Episode Composer" size="xl" closeOnBackdrop={false}>
+        {episodeOpen && <EpisodeComposer initialScenes={episodeImportScenes} onQueued={refreshHistory} />}
+      </Drawer>
+
+      <RuntimeInstallModal
+        open={installModalOpen}
+        runtime={byovRuntime}
+        label={byovStatus?.label}
+        streamMethod="POST"
+        onClose={() => setInstallModalOpen(false)}
+        onComplete={() => {
+          refreshByovStatus();
+          // The capability probe decorates the model list, and the install
+          // also moves python health. Refresh both after install/repair so
+          // H3's LoRA picker and warning react without a manual page reload.
+          refreshStatus();
+          refreshModelContext();
+        }}
+      />
+    </div>
+  );
+}

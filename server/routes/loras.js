@@ -1,0 +1,311 @@
+/**
+ * LoRA management routes.
+ *
+ * REST surface for the `/models/loras` manager UI. The legacy delete
+ * endpoint at `DELETE /api/image-video/models/lora/:filename` is kept for
+ * backward compat (the Models page still calls it); the new manager uses
+ * these endpoints exclusively so it can also surface Civitai metadata.
+ */
+
+import { Router } from 'express';
+import { z } from 'zod';
+import { asyncHandler } from '../lib/errorHandler.js';
+import { deepMerge, isPlainObject } from '../lib/objects.js';
+import { emptyToUndefined, validateRequest, isPaginationRequested, paginateArray, parsePagination } from '../lib/validation.js';
+import {
+  deleteLora,
+  getLora,
+  installFromCivitai,
+  installFromHuggingface,
+  previewCivitaiInstall,
+  previewHuggingfaceInstall,
+  listLoras,
+  patchLoraSidecar,
+} from '../services/loras.js';
+import { probeLoraEffect } from '../services/loraEffectProbe.js';
+import { getSuggestions, searchLorasInFamily } from '../services/civitaiSuggestions.js';
+import { getVideoSuggestions, searchVideoLoras } from '../services/videoLoraSuggestions.js';
+import { findLorasByCharacter } from '../services/characterLoraResolver.js';
+import { getSettings, updateSettingsWith } from '../services/settings.js';
+import { RUNNER_FAMILIES, VIDEO_LORA_FAMILIES } from '../lib/runners.js';
+import { HF_LORA_FAMILIES } from '../lib/huggingfaceLora.js';
+import { openSseStream } from '../lib/sseDownload.js';
+
+const router = Router();
+
+// `?force=1` / `?force=true` busts a server-side cache. Shared by the suggestions
+// refresh and the LoRA effect re-check so the two can't drift on what counts.
+const forceRequested = (req) => req.query.force === '1' || req.query.force === 'true';
+
+// Backward-compatible by default: returns the full LoRA array. When a client
+// passes `limit`/`offset`, the response becomes the bounded
+// `{ items, total, limit, offset }` envelope every paginated PortOS list shares.
+router.get('/', asyncHandler(async (req, res) => {
+  const loras = await listLoras();
+  if (!isPaginationRequested(req.query)) {
+    return res.json(loras);
+  }
+  res.json(paginateArray(loras, req.query, { defaultLimit: 50, maxLimit: 500 }));
+}));
+
+// LoRA suggestions — Civitai image LoRAs per runner family (mflux / flux2 /
+// z-image / ernie …) PLUS a curated list of HuggingFace video LoRAs. Cached
+// server-side for 1h. `?force=1` busts both caches for a manual refresh.
+// Default 4 cards per family — enough to show breadth without overwhelming the
+// panel; users can paste a URL for anything specific.
+router.get('/suggestions', asyncHandler(async (req, res) => {
+  const force = forceRequested(req);
+  const { limit } = parsePagination(req.query, { defaultLimit: 4, maxLimit: 24 });
+  const [civitai, video] = await Promise.all([
+    getSuggestions({ force, limit }),
+    getVideoSuggestions({ force }),
+  ]);
+  res.json({ ...civitai, video });
+}));
+
+// Live keyword search + cursor pagination within one runner family. Backs the
+// per-category search box and "Load more" button on /models/loras. Uncached —
+// results are query/cursor-specific. `query` blank = top ranking for that
+// family (so "Load more" with no keyword just pages the leaderboard).
+const searchQuerySchema = z.object({
+  runner: z.enum(Object.values(RUNNER_FAMILIES)),
+  // emptyToUndefined: a blank box (`query=`) is a valid "top ranking" request,
+  // not a validation error — coerce '' → undefined before the optional check.
+  query: z.preprocess(emptyToUndefined, z.string().max(120).optional()),
+  cursor: z.preprocess(emptyToUndefined, z.string().max(512).optional()),
+  limit: z.coerce.number().int().min(1).max(50).optional(),
+});
+router.get('/search', asyncHandler(async (req, res) => {
+  const { runner, query, cursor, limit } = validateRequest(searchQuerySchema, req.query);
+  res.json(await searchLorasInFamily({
+    runnerFamily: runner,
+    query: query || '',
+    cursor: cursor || null,
+    limit: limit || 12,
+  }));
+}));
+
+// Live keyword/author/repository search across all of HuggingFace for video
+// LoRAs (LTX-Video / MiniMax H3) — backs the video search box + family filter
+// + "Load more" pagination on /models/loras (#6500). Short-cached server-side
+// per (family, query, author, cursor) since each page fans out one metadata
+// fetch per candidate repo. `family` omitted/'all' searches both families.
+// `cursor` is opaque — always the previous page's `nextCursor`, never built
+// by the client.
+const videoSearchQuerySchema = z.object({
+  family: z.enum([...Object.values(VIDEO_LORA_FAMILIES), 'all']).optional(),
+  query: z.preprocess(emptyToUndefined, z.string().max(120).optional()),
+  author: z.preprocess(emptyToUndefined, z.string().max(120).optional()),
+  // HF's opaque Link-header cursor is a base64-ish query blob — longer than a
+  // Civitai cursor, so it gets its own generous-but-bounded cap.
+  cursor: z.preprocess(emptyToUndefined, z.string().max(2048).optional()),
+  limit: z.coerce.number().int().min(1).max(24).optional(),
+});
+router.get('/search/video', asyncHandler(async (req, res) => {
+  const { family, query, author, cursor, limit } = validateRequest(videoSearchQuerySchema, req.query);
+  res.json(await searchVideoLoras({
+    family: family && family !== 'all' ? family : null,
+    query: query || '',
+    author: author || '',
+    cursor: cursor || null,
+    limit: limit || 12,
+  }));
+}));
+
+// Civitai auth status — returns just whether a key is configured (the key
+// itself never leaves the server). The 2-segment path keeps it from
+// colliding with the `/:filename` LoRA endpoints below. `source` lets the
+// UI explain why a key is in effect (env var vs. saved-in-settings) so the
+// user understands whether deleting via the API is meaningful.
+router.get('/auth/civitai', asyncHandler(async (_req, res) => {
+  const settings = await getSettings();
+  const fromSettings = !!(settings?.civitai?.apiKey || '').trim();
+  const fromEnv = !!(process.env.CIVITAI_API_KEY || '').trim();
+  res.json({
+    hasKey: fromSettings || fromEnv,
+    source: fromSettings ? 'settings' : (fromEnv ? 'env' : 'none'),
+  });
+}));
+
+const authPostSchema = z.object({ apiKey: z.string().min(1).max(256) });
+router.post('/auth/civitai', asyncHandler(async (req, res) => {
+  const { apiKey } = validateRequest(authPostSchema, req.body);
+  // Shared deepMerge so future civitai sub-fields don't get clobbered by
+  // updateSettings' shallow-merge contract (see lib/objects.js). Runs inside the
+  // settings write queue so a concurrent save can't clobber it with a stale base.
+  await updateSettingsWith((current) => deepMerge(current, { civitai: { apiKey: apiKey.trim() } }));
+  res.json({ hasKey: true, source: 'settings' });
+}));
+
+router.delete('/auth/civitai', asyncHandler(async (_req, res) => {
+  await updateSettingsWith((current) => {
+    const next = { ...current };
+    // typeof === 'object' is true for arrays — guard explicitly so a
+    // legacy/malformed `civitai: ['x']` value doesn't get spread into
+    // `{ '0': 'x', apiKey: undefined }`.
+    if (isPlainObject(next.civitai)) {
+      const { apiKey: _omit, ...rest } = next.civitai;
+      next.civitai = rest;
+    }
+    return next;
+  });
+  // The env var (if set) still wins after a delete — surface that so the
+  // UI can explain "you cleared the saved key but CIVITAI_API_KEY is still
+  // active in the shell environment."
+  const envActive = !!(process.env.CIVITAI_API_KEY || '').trim();
+  res.json({ hasKey: envActive, source: envActive ? 'env' : 'none' });
+}));
+
+const installSchema = z.object({
+  url: z.string().min(1).max(1024),
+  // Optional one-shot key override — useful if the user wants to test a
+  // restricted LoRA without persisting their key in Settings yet.
+  apiKey: z.string().min(1).max(256).optional(),
+});
+
+router.post('/install', asyncHandler(async (req, res) => {
+  const data = validateRequest(installSchema, req.body);
+  const sidecar = await installFromCivitai(data);
+  res.status(201).json(sidecar);
+}));
+
+// Confirm-step disk preflight for a LoRA install. `source` picks Civitai vs
+// HuggingFace; the URL is the same shape the install endpoints already take.
+// `family`/`file` are the same optional overrides `hfInstallSchema` takes —
+// a caller that already knows them (the curated video quick-install cards)
+// forwards them so the previewed file matches what installFromHuggingface
+// will actually pick, rather than re-guessing from the bare URL.
+const installPreflightSchema = z.object({
+  url: z.string().min(1).max(1024),
+  source: z.enum(['civitai', 'huggingface']).optional().default('civitai'),
+  apiKey: z.string().min(1).max(256).optional(),
+  family: z.enum(HF_LORA_FAMILIES).optional(),
+  file: z.string().min(1).max(512).regex(/\.safetensors$/i).optional(),
+});
+router.post('/install/preflight', asyncHandler(async (req, res) => {
+  const data = validateRequest(installPreflightSchema, req.body);
+  const preview = data.source === 'huggingface'
+    ? await previewHuggingfaceInstall(data)
+    : await previewCivitaiInstall(data);
+  res.json(preview);
+}));
+
+// Install an image or video LoRA from a HuggingFace repo (Flux.2 Klein,
+// fal / Lightricks LTX, MiniMax H3). `family` is an optional override;
+// absence auto-detects from the repo id / tags / filenames.
+const hfInstallSchema = z.object({
+  url: z.string().min(1).max(1024),
+  family: z.enum(HF_LORA_FAMILIES).optional(),
+  file: z.string().min(1).max(512).regex(/\.safetensors$/i).optional(),
+  // One-shot token override; absence falls back to the stored/env/CLI HF token.
+  token: z.string().min(1).max(256).optional(),
+});
+router.post('/install/huggingface', asyncHandler(async (req, res) => {
+  const data = validateRequest(hfInstallSchema, req.body);
+  const sidecar = await installFromHuggingface(data);
+  res.status(201).json(sidecar);
+}));
+
+// Streaming variant of the HF install for the manager UI. Same install, but
+// streams byte-level download `progress` frames (SSE-encoded) so the form can
+// show a percentage instead of a static "Downloading…" (matching the image/video
+// model download badge UX). POST, not GET: this endpoint mutates state (downloads
+// + writes a LoRA), and the client reads the stream body with fetch() (not
+// EventSource), so url/family ride in the JSON body — a state-changing GET would
+// be reachable by a top-level cross-origin navigation carrying a SameSite=Lax
+// session cookie (CSRF), which authGate's Origin check can't see. The HF token
+// always comes from settings/env, never the request. Terminal frames:
+// `{type:'complete', sidecar}` or `{type:'error', message, code}` — the client
+// re-uses `code` (e.g. HF_UNKNOWN_FAMILY) to drive the inline family-confirm
+// retry, exactly as the plain POST path's thrown error does.
+const hfInstallStreamSchema = z.object({
+  url: z.string().min(1).max(1024),
+  family: z.enum(HF_LORA_FAMILIES).optional(),
+  file: z.string().min(1).max(512).regex(/\.safetensors$/i).optional(),
+});
+router.post('/install/huggingface/stream', asyncHandler(async (req, res) => {
+  const data = validateRequest(hfInstallStreamSchema, req.body);
+  const { send, safeEnd } = openSseStream(res);
+  // Headers are already flushed once the stream is open, so an install failure
+  // must NOT bubble to the error middleware (it would try to re-set status on a
+  // committed response). Catch and forward as an SSE `error` frame instead —
+  // the sanctioned SSE-boundary exception to the no-try/catch rule.
+  // On client disconnect (tab close, navigation, dropped connection) actually
+  // ABORT the download via the controller — not just suppress frames — so a
+  // multi-GB LoRA transfer doesn't keep running unwatched and a retry can't race
+  // a still-in-flight install. Listen on RES, not REQ: this is a POST, and the
+  // request stream emits 'close' the instant its body is fully read (Node
+  // auto-destroys the consumed readable) — that is NOT a disconnect and would
+  // wrongly abort every install. `res` 'close' while the response is not yet
+  // finished is the true "client went away" signal; after a normal safeEnd()
+  // it fires with writableEnded already true and is a harmless no-op.
+  const controller = new AbortController();
+  let aborted = false;
+  res.on('close', () => {
+    if (!res.writableEnded) { aborted = true; controller.abort(); }
+  });
+  await installFromHuggingface(data, {
+    signal: controller.signal,
+    onProgress: ({ received, total }) => {
+      if (aborted) return;
+      send({ type: 'progress', received, total, progress: total > 0 ? received / total : null });
+    },
+  })
+    .then((sidecar) => { if (!aborted) send({ type: 'complete', sidecar }); })
+    .catch((err) => {
+      if (!aborted) send({ type: 'error', message: err?.message || 'HuggingFace install failed', code: err?.code || null });
+    });
+  safeEnd();
+}));
+
+// Trained LoRAs linked to a universe character — used by the character card
+// chip in the universe editor + catalog detail page. 2-segment path keeps it
+// off the `/:filename` wildcard below.
+const byCharacterSchema = z.object({
+  entryId: z.preprocess(emptyToUndefined, z.string().max(128).optional()),
+  ingredientId: z.preprocess(emptyToUndefined, z.string().max(128).optional()),
+}).refine((q) => q.entryId || q.ingredientId, { message: 'entryId or ingredientId required' });
+router.get('/by-character', asyncHandler(async (req, res) => {
+  const { entryId, ingredientId } = validateRequest(byCharacterSchema, req.query);
+  res.json(await findLorasByCharacter({ entryId: entryId || null, ingredientId: ingredientId || null }));
+}));
+
+router.get('/:filename', asyncHandler(async (req, res) => {
+  const lora = await getLora(req.params.filename);
+  res.json(lora);
+}));
+
+// Adapter-effect diagnostic (#4872) — the explicit, user-triggered inspection
+// path. Answers "does this LoRA actually change anything" by measuring the
+// rank matrices in the file, so a dead adapter is caught here rather than after
+// a multi-minute video render. Deliberately a POST: it spawns a Python child
+// and writes the measurement back to the sidecar, so it is not a cacheable GET.
+// `?force=1` re-measures instead of returning the stored report. Never 500s on
+// a probe failure — an unmeasurable verdict is a legitimate answer about this
+// machine, and the response carries its reason.
+router.post('/:filename/effect', asyncHandler(async (req, res) => {
+  const force = forceRequested(req);
+  res.json(await probeLoraEffect(req.params.filename, { force }));
+}));
+
+const patchSchema = z.object({
+  // Only user-editable fields. Civitai-derived blocks (`civitai`, `file`,
+  // `runnerFamily`, `triggerWords`) are not patchable through this surface
+  // — the user would have to delete + reinstall to refresh those.
+  name: z.string().min(1).max(200).optional(),
+  description: z.string().max(2000).optional(),
+  recommendedScale: z.number().min(0).max(2).optional(),
+  notes: z.string().max(2000).optional(),
+});
+
+router.patch('/:filename', asyncHandler(async (req, res) => {
+  const patch = validateRequest(patchSchema, req.body);
+  const next = await patchLoraSidecar(req.params.filename, patch);
+  res.json(next);
+}));
+
+router.delete('/:filename', asyncHandler(async (req, res) => {
+  res.json(await deleteLora(req.params.filename));
+}));
+
+export default router;

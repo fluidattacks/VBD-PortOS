@@ -1,0 +1,405 @@
+import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, resolve } from 'node:path';
+import { MODEL_FETCHERS, canRefreshModels, ollamaRefreshGroupKey, resolveModelFetcher, withRefreshCapability, withRefreshCapabilityList } from './modelFetchers.js';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const SHIPPED = JSON.parse(readFileSync(resolve(__dirname, '../../../../data.reference/providers.json'), 'utf8'));
+
+// The shipped ids whose "Refresh Models" button is visible TODAY, transcribed
+// from the pre-table `refreshProviderModels` + `_refreshCLIProviderModels`
+// chains before they collapsed into MODEL_FETCHERS (#3620). This is the
+// regression gate for the refactor: the table may reorganize how a vendor is
+// matched, but it must not change WHICH shipped provider can refresh — the
+// failure mode is silent in both directions (a button that 404s, or a feature
+// that vanishes with no error at all).
+const SHIPPED_REFRESHABLE = [
+  'claude-code-tui',
+  'pi-cli', 'pi-tui',
+  'antigravity-cli', 'antigravity-tui', 'cerebras', 'claude-code',
+  'claude-ollama', 'claude-ollama-tui', 'cursor-cli',
+  'cursor-tui', 'grok', 'lmstudio', 'mtplx', 'nvidia-nim', 'ollama',
+  'slotstream',
+  'opencode-llama-tui',
+  'opencode-mtplx', 'opencode-mtplx-tui', 'opencode-ollama', 'opencode-ollama-tui',
+  'opencode-orcarouter', 'opencode-orcarouter-tui', 'orcarouter',
+  // Every hosted gateway refreshes through the same sibling `/models` probe —
+  // one MODEL_FETCHERS row covers all of them (internal/gateways.js).
+  'opencode-openrouter', 'opencode-openrouter-tui', 'openrouter',
+  'opencode-nvidia-nim', 'opencode-nvidia-nim-tui',
+  'codex', 'codex-tui',
+  // The local-backed Codex wrapper resolves through the OLLAMA row, not codex's:
+  // `ollamaBacked` sits in the first pass, and the tool-capable local catalog is
+  // exactly what its harness needs — the static OpenAI list would be wrong.
+  'codex-ollama',
+  // OpenCode Zen's API record is an ordinary OpenAI-compatible endpoint, so it
+  // refreshes through the same `/models` probe. Its CLI/TUI wrappers do NOT:
+  // they carry no namespace marker at all, which is what makes OpenCode resolve
+  // `opencode/*` through its own built-in provider — nothing here can enumerate
+  // that, and Models → Harnesses ("Refresh models") is where it comes from.
+  'opencode-zen',
+  'opencode-vllm', 'opencode-vllm-tui',
+  // LM Studio publishes its downloaded catalog on the same OpenAI-compatible
+  // `/v1/models` endpoint the bare `lmstudio` API record already refreshes from,
+  // so the `lmstudioBacked` wrappers refresh through it too.
+  'opencode-lmstudio', 'opencode-lmstudio-tui', 'codex-lmstudio',
+  // SGLang publishes its served catalog through the same OpenAI-compatible
+  // `/v1/models` contract as the vLLM pair, so its wrappers refresh too.
+  'opencode-sglang', 'opencode-sglang-tui',
+  // The Claude Code pair points at the SAME container through its Anthropic
+  // `/v1/messages` endpoint, but the catalog still comes from the OpenAI-side
+  // listing — the `sglangBacked` marker selects that fetcher, not the command.
+  'claude-sglang', 'claude-sglang-tui',
+];
+const SHIPPED_NOT_REFRESHABLE = [
+  'claude-code-tui-bedrock',
+  // #8034 moved this one OUT of the refreshable set on purpose. It is
+  // `command: 'claude'` like the subscription record, so it matched the
+  // anthropic row and a refresh overwrote its `global.anthropic.*` /
+  // `us.anthropic.*` catalog with first-party ids its endpoint rejects —
+  // stranding its own `defaultModel` outside its model list. The catalog that
+  // row now reads (Claude Code's own cache) holds only first-party ids, so
+  // there is nothing correct to answer a Bedrock refresh with; the card offers
+  // no button and the stored catalog stands.
+  'claude-code-bedrock',
+  'grok-cli', 'grok-tui', 'kimi-cli', 'kimi-tui',
+  'opencode-zen-cli', 'opencode-zen-tui',
+  // Kilo is an OpenCode fork and follows the same split as the Zen wrappers
+  // above: its catalog comes from the binary's own `kilo models`, which is the
+  // Models → Harnesses "Refresh models" path, not a card-side endpoint probe.
+  'kilo-cli', 'kilo-tui',
+  // OpenChamber's catalog belongs to the runtime the user signed in to, and its
+  // `models` subcommand prints that runtime's SETTINGS, not a catalog — nothing
+  // here or on the Harnesses page can enumerate it.
+  'openchamber-cli',
+];
+
+describe('MODEL_FETCHERS — shipped catalog visibility is unchanged', () => {
+  it('every shipped provider is classified, and the two lists cover the catalog', () => {
+    const ids = Object.keys(SHIPPED.providers).sort();
+    expect(ids.length).toBeGreaterThan(20);
+    expect([...SHIPPED_REFRESHABLE, ...SHIPPED_NOT_REFRESHABLE].sort()).toEqual(ids);
+  });
+
+  it('answers exactly as the pre-table dispatch chains did', () => {
+    for (const provider of Object.values(SHIPPED.providers)) {
+      expect(
+        canRefreshModels(provider),
+        `${provider.id}: model-refresh visibility changed`,
+      ).toBe(SHIPPED_REFRESHABLE.includes(provider.id));
+    }
+  });
+});
+
+describe('ollamaRefreshGroupKey — one probe per daemon, not one per provider', () => {
+  it('collapses every shipped CLI/TUI Ollama provider onto ONE key', () => {
+    // The shipped catalog ships four of them (claude-ollama, claude-ollama-tui,
+    // opencode-ollama, opencode-ollama-tui) all pointed at the same default
+    // daemon — the exact fan-out this key exists to dedup. If a future seed adds
+    // a fifth on the same daemon it must land in this same bucket.
+    const shared = Object.values(SHIPPED.providers)
+      .filter((p) => (p.type === 'cli' || p.type === 'tui') && p.ollamaBacked === true);
+    expect(shared.length).toBeGreaterThanOrEqual(4);
+    const keys = new Set(shared.map((p) => ollamaRefreshGroupKey(p)));
+    expect(keys.size).toBe(1);
+    expect([...keys][0]).toBe('tools:http://localhost:11434');
+  });
+
+  it('keeps the api-type ollama provider OUT of the tool-filtered bucket', () => {
+    // `_refreshAPIProviderModels` persists the unfiltered tag list; the CLI/TUI
+    // probe persists a tool-use-only subset. Same daemon, different answers.
+    const api = SHIPPED.providers.ollama;
+    expect(api.type).toBe('api');
+    expect(ollamaRefreshGroupKey(api)).toBe('api:http://localhost:11434/v1');
+    expect(ollamaRefreshGroupKey(api)).not.toBe(ollamaRefreshGroupKey(SHIPPED.providers['claude-ollama']));
+  });
+
+  it('separates providers on DIFFERENT daemons', () => {
+    const local = { id: 'a', type: 'cli', ollamaBacked: true, envVars: { ANTHROPIC_BASE_URL: 'http://localhost:11434' } };
+    const remote = { id: 'b', type: 'cli', ollamaBacked: true, envVars: { ANTHROPIC_BASE_URL: 'http://192.0.2.10:11434' } };
+    expect(ollamaRefreshGroupKey(local)).not.toBe(ollamaRefreshGroupKey(remote));
+  });
+
+  it('normalizes trailing slashes and an OpenAI-compat /v1 to the same daemon key', () => {
+    // Safe here because `_fetchOllamaToolCapableModels` itself resolves the base
+    // through `ollamaBaseFromProvider` — both spellings issue the SAME request.
+    const bare = { id: 'a', type: 'tui', ollamaBacked: true, envVars: { ANTHROPIC_BASE_URL: 'http://localhost:11434' } };
+    const suffixed = { id: 'b', type: 'tui', ollamaBacked: true, envVars: { ANTHROPIC_BASE_URL: 'http://localhost:11434/v1/' } };
+    expect(ollamaRefreshGroupKey(suffixed)).toBe(ollamaRefreshGroupKey(bare));
+  });
+
+  it('does NOT fold /v1 away for an api provider — that arm probes the endpoint verbatim', () => {
+    // `_refreshAPIProviderModels` requests `${endpoint}/api/tags` then
+    // `${endpoint}/models` with no normalization, so `…:11434` and
+    // `…:11434/v1` are genuinely different probes (only the `/v1` spelling
+    // answers `/models`). Sharing one answer between them would persist a
+    // catalog onto a provider whose own refresh would have failed.
+    const bare = { id: 'a', type: 'api', endpoint: 'http://localhost:11434' };
+    const v1 = { id: 'b', type: 'api', endpoint: 'http://localhost:11434/v1' };
+    expect(ollamaRefreshGroupKey(bare)).not.toBe(ollamaRefreshGroupKey(v1));
+    // A bare trailing slash IS just a spelling of the same URL, so it folds.
+    expect(ollamaRefreshGroupKey({ id: 'c', type: 'api', endpoint: 'http://localhost:11434/v1/' }))
+      .toBe(ollamaRefreshGroupKey(v1));
+  });
+
+  it('returns null — never a shared bucket — for anything that is not an Ollama probe', () => {
+    // A null key means "refresh me individually". Treating it as a group would
+    // persist one vendor's catalog onto every other provider.
+    expect(ollamaRefreshGroupKey(null)).toBeNull();
+    expect(ollamaRefreshGroupKey({ id: 'anthropic', type: 'api', endpoint: 'https://api.anthropic.com' })).toBeNull();
+    expect(ollamaRefreshGroupKey({ id: 'cursor-cli', type: 'cli', command: 'cursor-agent' })).toBeNull();
+    expect(ollamaRefreshGroupKey({ id: 'codex-tui', type: 'tui', command: 'codex' })).toBeNull();
+    // An api provider with no endpoint at all has nothing to key on.
+    expect(ollamaRefreshGroupKey({ id: 'x', type: 'api' })).toBeNull();
+  });
+
+  it('never groups two API providers that would attach DIFFERENT keys to the same probe', () => {
+    // `_refreshAPIProviderModels` falls through from its `/api/tags`
+    // short-circuit to a generic `/models` fetch carrying `provider.apiKey`, so
+    // a keyed provider is ungroupable even on an Ollama-shaped endpoint.
+    const paid = { id: 'x', type: 'api', endpoint: 'https://api.example.com/v1', apiKey: 'k1' };
+    expect(ollamaRefreshGroupKey(paid)).toBeNull();
+    const keyed = { id: 'y', type: 'api', endpoint: 'http://localhost:11434/v1', apiKey: 'k2' };
+    const alsoKeyed = { id: 'z', type: 'api', endpoint: 'http://localhost:11434/v1', apiKey: 'k3' };
+    expect(ollamaRefreshGroupKey(keyed)).toBeNull();
+    expect(ollamaRefreshGroupKey(alsoKeyed)).toBeNull();
+  });
+});
+
+describe('resolveModelFetcher — the ordering the old chains encoded in prose', () => {
+  it('routes an Ollama-backed claude CLI to Ollama, not the static Anthropic list', () => {
+    // The one load-bearing row order: ollama first.
+    const p = { id: 'claude-ollama', type: 'cli', command: 'claude', name: 'Claude Ollama', ollamaBacked: true };
+    expect(resolveModelFetcher(p).fetch).toBe('_fetchOllamaToolCapableModels');
+  });
+
+  it('routes an MTPLX-backed OpenCode CLI to the MTPLX endpoint fetcher', () => {
+    const p = { id: 'opencode-mtplx', type: 'cli', command: 'opencode', mtplxBacked: true };
+    expect(resolveModelFetcher(p).fetch).toBe('_fetchMtplxModels');
+  });
+
+  it('routes a llama-backed OpenCode TUI to the llama endpoint fetcher', () => {
+    const p = { id: 'opencode-llama-tui', type: 'tui', command: 'opencode', llamaBacked: true };
+    expect(resolveModelFetcher(p).fetch).toBe('_fetchLlamaModels');
+  });
+
+  it('lets a command beat a display name — a renamed cursor still reaches cursor-agent', () => {
+    // Renaming a cursor provider "Cursor Claude Opus" must not persist
+    // Anthropic ids that cursor-agent will reject.
+    const p = { id: 'x', type: 'cli', command: 'cursor-agent', name: 'Cursor Claude Opus' };
+    expect(resolveModelFetcher(p).fetch).toBe('_fetchCursorModels');
+  });
+
+  it('lets an agy command beat a claude name — "Antigravity Claude Sonnet" stays on agy', () => {
+    const p = { id: 'x', type: 'cli', command: '/opt/homebrew/bin/agy', name: 'Antigravity Claude Sonnet 4.6' };
+    expect(resolveModelFetcher(p).fetch).toBe('_fetchAntigravityModels');
+  });
+
+  it('lets a claude command beat an antigravity name — the right answer for a claude binary', () => {
+    const p = { id: 'x', type: 'cli', command: 'claude', name: 'Claude via Antigravity' };
+    expect(resolveModelFetcher(p).fetch).toBe('_fetchAnthropicModels');
+  });
+
+  it('falls through to the display name only when no command claims the provider', () => {
+    expect(resolveModelFetcher({ id: 'x', type: 'cli', command: '/usr/bin/weird', name: 'Antigravity Nightly' }).fetch)
+      .toBe('_fetchAntigravityModels');
+    expect(resolveModelFetcher({ id: 'x', type: 'cli', command: '/usr/bin/weird', name: 'Gemini Preview' }).fetch)
+      .toBe('_fetchGeminiModels');
+    expect(resolveModelFetcher({ id: 'x', type: 'cli', command: '/opt/homebrew/bin/claude', name: 'Claude Code CLI' }).fetch)
+      .toBe('_fetchAnthropicModels');
+  });
+
+  it('never lets an ordinary English name claim cursor', () => {
+    // "cursor" is a DB cursor / a text cursor — there is deliberately no
+    // cliNameMatch column on that row.
+    expect(resolveModelFetcher({ id: 'x', type: 'cli', command: 'some-binary', name: 'Cursor Notes' })).toBeNull();
+    // A bare `cursor` is the GUI editor launcher, not the agent binary.
+    expect(resolveModelFetcher({ id: 'x', type: 'cli', command: 'cursor', name: 'Cursor' })).toBeNull();
+  });
+
+  it('serves codex commands and names', () => {
+    expect(resolveModelFetcher({ id: 'codex', type: 'cli', command: 'codex', name: 'Codex CLI' }).fetch)
+      .toBe('_fetchCodexModels');
+    expect(resolveModelFetcher({ id: 'x', type: 'cli', command: '/opt/homebrew/bin/codex', name: 'Custom' }).fetch)
+      .toBe('_fetchCodexModels');
+    expect(resolveModelFetcher({ id: 'x', type: 'cli', command: 'weird', name: 'Codex Custom' }).fetch)
+      .toBe('_fetchCodexModels');
+  });
+
+  it('returns null for a CLI no vendor claims — the caller throws its own 400', () => {
+    for (const command of ['kimi', 'grok']) {
+      expect(resolveModelFetcher({ id: command, type: 'cli', command, name: `${command} CLI` })).toBeNull();
+    }
+  });
+});
+
+describe('resolveModelFetcher — the TUI arm never consults the display name', () => {
+  it('serves the vendors whose --model applies to the interactive session', () => {
+    expect(resolveModelFetcher({ id: 'claude-ollama-tui', type: 'tui', ollamaBacked: true }).fetch)
+      .toBe('_fetchOllamaToolCapableModels');
+    expect(resolveModelFetcher({ id: 'x', type: 'tui', command: '/opt/bin/agy' }).fetch)
+      .toBe('_fetchAntigravityModels');
+    expect(resolveModelFetcher({ id: 'x', type: 'tui', command: 'cursor-agent' }).fetch)
+      .toBe('_fetchCursorModels');
+    expect(resolveModelFetcher({ id: 'x', type: 'tui', command: 'codex' }).fetch)
+      .toBe('_fetchCodexModels');
+  });
+
+  it('serves an MTPLX-backed OpenCode TUI from its local endpoint', () => {
+    expect(resolveModelFetcher({ id: 'opencode-mtplx-tui', type: 'tui', command: 'opencode', mtplxBacked: true }).fetch)
+      .toBe('_fetchMtplxModels');
+  });
+
+  it('admits a shipped TUI id repointed at a wrapper script', () => {
+    // An EXACT shipped-id match, never a name substring: it can only admit the
+    // provider PortOS itself seeds, and probing the user's wrapper is right.
+    expect(resolveModelFetcher({ id: 'cursor-tui', type: 'tui', command: '/opt/bin/cursor-wrap' }).fetch)
+      .toBe('_fetchCursorModels');
+    expect(resolveModelFetcher({ id: 'antigravity-tui', type: 'tui', command: '/opt/bin/agy-wrap' }).fetch)
+      .toBe('_fetchAntigravityModels');
+    expect(resolveModelFetcher({ id: 'codex-tui', type: 'tui', command: '/opt/bin/codex-wrap' }).fetch)
+      .toBe('_fetchCodexModels');
+    expect(resolveModelFetcher({ id: 'custom-tui', type: 'tui', command: '/opt/bin/cursor-wrap' })).toBeNull();
+  });
+
+  it('ignores a vendor name on a TUI — the asymmetry with the CLI arm is deliberate', () => {
+    expect(resolveModelFetcher({ id: 'x', type: 'tui', command: '/usr/bin/weird', name: 'Antigravity Nightly' })).toBeNull();
+    expect(resolveModelFetcher({ id: 'x', type: 'tui', command: 'example-tui', name: 'Claude Code TUI' })).toBeNull();
+  });
+});
+
+describe('canRefreshModels', () => {
+  it('is true for every API provider — they route to the generic fetcher', () => {
+    expect(canRefreshModels({ id: 'cerebras', type: 'api', name: 'Cerebras' })).toBe(true);
+    expect(canRefreshModels({ id: 'lmstudio', type: 'api', endpoint: 'http://localhost:1234/v1' })).toBe(true);
+  });
+
+  it('is false for a nullish provider and for an unknown type', () => {
+    expect(canRefreshModels(null)).toBe(false);
+    expect(canRefreshModels(undefined)).toBe(false);
+    expect(canRefreshModels({ id: 'x', type: 'mystery', command: 'claude', name: 'Claude' })).toBe(false);
+  });
+});
+
+describe('withRefreshCapability', () => {
+  it('returns a copy — the caller\'s (possibly cached, about-to-be-saved) record is untouched', () => {
+    const provider = { id: 'kimi-cli', type: 'cli', command: 'kimi', name: 'Kimi CLI' };
+    const decorated = withRefreshCapability(provider);
+    expect(decorated).not.toBe(provider);
+    expect(decorated.canRefreshModels).toBe(false);
+    expect(provider.canRefreshModels).toBeUndefined();
+  });
+
+  it('passes a nullish provider straight through (GET /active with none set)', () => {
+    expect(withRefreshCapability(null)).toBeNull();
+    expect(withRefreshCapabilityList(undefined)).toBeUndefined();
+  });
+
+  it('decorates every entry of a list', () => {
+    const list = withRefreshCapabilityList([
+      { id: 'a', type: 'api' },
+      { id: 'b', type: 'cli', command: 'kimi', name: 'Kimi CLI' },
+    ]);
+    expect(list.map((p) => p.canRefreshModels)).toEqual([true, false]);
+  });
+});
+
+describe('adding a vendor is exactly ONE table row', () => {
+  // Drives the TABLE, not the chain: the whole point of #3620 is that a new
+  // vendor cannot half-land (server CLI arm but not TUI arm, or server but not
+  // client). Injecting a single row must light up every arm at once.
+  const acmeRow = {
+    key: 'acme',
+    cliMatch: (p) => p?.command === 'acme-agent',
+    cliNameMatch: (p) => String(p?.name || '').toLowerCase().includes('acme'),
+    tuiMatch: (p) => p?.id === 'acme-tui' || p?.command === 'acme-agent',
+    fetch: '_fetchAcmeModels',
+  };
+  const withAcme = [...MODEL_FETCHERS, acmeRow];
+  const acmeCli = { id: 'acme-cli', type: 'cli', command: 'acme-agent', name: 'Acme CLI' };
+  const acmeTui = { id: 'acme-tui', type: 'tui', command: '/opt/bin/acme-wrap', name: 'Acme TUI' };
+
+  it('is invisible to every arm before the row exists', () => {
+    expect(canRefreshModels(acmeCli)).toBe(false);
+    expect(canRefreshModels(acmeTui)).toBe(false);
+    expect(resolveModelFetcher(acmeCli)).toBeNull();
+  });
+
+  it('lights up the CLI arm, the TUI arm, and the payload flag from that one row', () => {
+    expect(resolveModelFetcher(acmeCli, withAcme).fetch).toBe('_fetchAcmeModels');
+    expect(resolveModelFetcher(acmeTui, withAcme).fetch).toBe('_fetchAcmeModels');
+    expect(canRefreshModels(acmeCli, withAcme)).toBe(true);
+    expect(canRefreshModels(acmeTui, withAcme)).toBe(true);
+    // …and its display-name column works without touching any other vendor.
+    expect(resolveModelFetcher({ id: 'x', type: 'cli', command: '/usr/bin/weird', name: 'Acme Nightly' }, withAcme).fetch)
+      .toBe('_fetchAcmeModels');
+  });
+
+  it('leaves every shipped provider\'s answer untouched', () => {
+    for (const provider of Object.values(SHIPPED.providers)) {
+      expect(canRefreshModels(provider, withAcme)).toBe(canRefreshModels(provider));
+    }
+  });
+});
+
+describe('MODEL_FETCHERS shape', () => {
+  it('every row names a fetcher method and carries at least one match column', () => {
+    for (const row of MODEL_FETCHERS) {
+      expect(typeof row.key, 'row is missing a key').toBe('string');
+      expect(typeof row.fetch, `${row.key}: fetch must be a method NAME (string)`).toBe('string');
+      expect(
+        Boolean(row.cliMatch || row.cliNameMatch || row.tuiMatch),
+        `${row.key}: a row that matches nothing is dead weight`,
+      ).toBe(true);
+    }
+  });
+
+  it('has unique keys', () => {
+    const keys = MODEL_FETCHERS.map((f) => f.key);
+    expect(new Set(keys).size).toBe(keys.length);
+  });
+
+  it('every `fetch` names a real method on the provider service', async () => {
+    // The table holds method NAMES so it can stay a pure data module; that
+    // indirection would otherwise fail only at refresh time, as a TypeError
+    // surfaced to the user as a 502.
+    const { createProviderService } = await import('../providers.js');
+    const service = createProviderService({ dataDir: './data' });
+    for (const row of MODEL_FETCHERS) {
+      expect(typeof service[row.fetch], `${row.key}: no such method ${row.fetch}`).toBe('function');
+    }
+  });
+});
+
+describe('claude records pointed at a third-party backend', () => {
+  // #8034: `claude-code-bedrock` is `command: 'claude'` like every other Claude
+  // record, so it matched the anthropic row and a Refresh overwrote its
+  // `global.anthropic.*` / `us.anthropic.*` ids with first-party ones its
+  // endpoint rejects — stranding its own `defaultModel` outside its model list.
+  it.each(['cli', 'tui'])('resolves a third-party %s to NO fetcher', (type) => {
+    const bedrock = {
+      id: 'claude-code-bedrock',
+      type,
+      command: 'claude',
+      name: 'Claude Code CLI: Bedrock',
+      envVars: { CLAUDE_CODE_USE_BEDROCK: '1' },
+    };
+    expect(resolveModelFetcher(bedrock)).toBeNull();
+    expect(canRefreshModels(bedrock)).toBe(false);
+  });
+
+  it('still resolves a first-party claude record to the anthropic fetcher', () => {
+    const subscription = { id: 'claude-code', type: 'cli', command: 'claude', name: 'Claude Code CLI' };
+    expect(resolveModelFetcher(subscription).fetch).toBe('_fetchAnthropicModels');
+  });
+
+  // The ollama row sits ABOVE the claude row and must keep winning: a `claude`
+  // binary pointed at a local daemon carries no CLAUDE_CODE_USE_* marker, so the
+  // new guard never sees it, but pinning the precedence here makes a future
+  // reorder fail loudly.
+  it('leaves an ollama-backed claude wrapper on the ollama fetcher', () => {
+    const wrapper = { id: 'claude-ollama', type: 'cli', command: 'claude', ollamaBacked: true };
+    expect(resolveModelFetcher(wrapper).fetch).toBe('_fetchOllamaToolCapableModels');
+  });
+});

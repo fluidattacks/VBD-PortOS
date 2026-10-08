@@ -1,0 +1,281 @@
+import { useCallback, useMemo, useState } from 'react';
+import { Link } from 'react-router';
+import { CheckCircle2, HelpCircle, Server, XCircle } from 'lucide-react';
+import { getFleetLlmHost, getFleetPeerHosts, revealFleetLlmHostKey, stopFleetLlmHost } from '../../services/apiProviders';
+import FleetHostUsage from './FleetHostUsage';
+import { isFleetHostConfigured } from '../../utils/providers';
+import { copyToClipboard } from '../../lib/clipboard';
+import { useSocketResource } from '../../hooks/useSocketResource';
+import RuntimeInstallModal from '../install/RuntimeInstallModal';
+import Banner from '../ui/Banner';
+import { PORTS } from '../../lib/ports.js';
+import { LOCAL_RUNTIME_MANAGE_URLS } from '../../../../server/lib/modelPinMembership.js';
+
+const HOST_EVENTS = ['fleet-host:changed', 'fleet-host:usage:changed'];
+const PEER_EVENTS = ['instances:peers:updated'];
+const readHost = ({ reconcile, signal }) => getFleetLlmHost({ silent: true, refresh: reconcile, signal });
+const readPeerHosts = () => getFleetPeerHosts({ silent: true });
+
+// A self-host provider (the auto-created Direct API one from `configure()` in
+// server/services/fleetLlmHost.js, and the OpenCode one from `?selfHost=1`)
+// is always wired to the loopback queue address, never `status.endpoint` (the
+// tailnet-facing address published for OTHER machines to connect to) — dedupe
+// against the address these providers actually use, or the "add a provider"
+// nudge below never clears even after the provider exists.
+const SELF_HOST_ENDPOINT = `http://127.0.0.1:${PORTS.FLEET_LLM}/v1`;
+
+export default function FleetHostSetup({ compact = false, providers = [], onConfigured }) {
+  const { data: status, error: statusError, refetch: load, updateData: setStatus } = useSocketResource(
+    readHost, { namespace: 'fleet-host', events: HOST_EVENTS },
+  );
+  const { data: peerResult, error: peerError, refetch: loadPeers } = useSocketResource(
+    readPeerHosts, { namespace: 'instances', events: PEER_EVENTS, enabled: compact },
+  );
+  const peerHosts = peerResult?.hosts || [];
+  const [error, setError] = useState('');
+  const [installing, setInstalling] = useState(false);
+  const [key, setKey] = useState('');
+  const [revealing, setRevealing] = useState(false);
+  // Two-click stop rather than a `confirm()` (which this codebase does not
+  // use): the first click arms, the second acts. Stopping the host cuts off
+  // every federated peer currently pointed at it, so it should not be one
+  // mis-click away — but it must also never be unreachable, which is the state
+  // this whole section is fixing.
+  const [stopArmed, setStopArmed] = useState(false);
+  const [stopping, setStopping] = useState(false);
+  const [stopNote, setStopNote] = useState('');
+  const completed = useCallback((receipt) => {
+    if (receipt?.status) setStatus(receipt.status);
+    else load();
+    onConfigured?.();
+  }, [load, setStatus, onConfigured]);
+
+  const unconfiguredPeerHosts = useMemo(() => {
+    if (!compact) return [];
+    return peerHosts.filter((host) => (host?.serving || host?.enabled) && !isFleetHostConfigured(host, providers));
+  }, [compact, peerHosts, providers]);
+
+  // Host setup only ever creates a Direct API provider on the host itself
+  // (fleetLlmHost.js `configure()`), never an OpenCode TUI one — and the
+  // peer-discovery cards above only ever surface OTHER instances, so a host
+  // machine that wants to also run OpenCode TUI against its own queue had no
+  // discoverable path to it. Reuse the same dedupe the peer cards use, keyed
+  // on the loopback address self-host providers are actually wired to.
+  const selfNeedsProvider = useMemo(
+    () => compact && Boolean(status?.serving || status?.enabled)
+      && !isFleetHostConfigured({ endpoint: SELF_HOST_ENDPOINT }, providers),
+    [compact, status, providers],
+  );
+
+  const reveal = () => {
+    setRevealing(true);
+    revealFleetLlmHostKey({ silent: true }).then(({ apiKey }) => setKey(apiKey))
+      .catch(() => setError('Could not read the host API key. Complete host setup first.'))
+      .finally(() => setRevealing(false));
+  };
+  const stop = () => {
+    setStopping(true);
+    setStopNote('');
+    stopFleetLlmHost({ silent: true })
+      .then((result) => {
+        setStopArmed(false);
+        setStopNote(result?.error
+          ? result.error
+          : result?.containerStopped
+            ? 'Host stopped. The container was removed; its image and weights are still on disk, so starting it again takes minutes, not another download.'
+            : 'Host stopped and disabled.');
+        if (result.status) setStatus(result.status);
+        else load();
+        onConfigured?.();
+      })
+      .catch(() => setStopNote('Could not stop the host. Check that Docker is responding, then try again.'))
+      .finally(() => setStopping(false));
+  };
+  const actionClass = 'inline-flex items-center justify-center min-h-[40px] px-3 py-2 rounded-lg bg-port-accent text-white text-sm disabled:opacity-50';
+  const loadError = statusError ? 'Could not check this machine. Retry to detect hardware and model readiness.'
+    : (peerError || peerResult?.unavailable) ? 'Could not discover peer hosts. Retry when the peer is available.' : '';
+  const title = status?.recommendation.title || 'Recommended model host setup';
+  if (compact) {
+    const warning = loadError && <Banner tone="error">{loadError}<button type="button" onClick={() => { load(); loadPeers(); }} className="ml-2 min-h-[44px] text-port-accent">Retry</button></Banner>;
+    if (selfNeedsProvider || unconfiguredPeerHosts.length > 0) {
+      return (
+        <div className="space-y-3" aria-label="Available model hosts">
+          {warning}
+          {selfNeedsProvider && (
+            <HostCard
+              ariaLabel="This machine's model host"
+              headline="This machine is serving its own model host — add a provider for it?"
+              badge={`${status.serving ? 'Serving' : 'Enabled'} · ${status.model || 'Qwen3.8-27B'}`}
+              description="Host setup already created a Direct API provider. Add OpenCode TUI (or another one) on this same machine to use it for coding agents too."
+              href="/ai/fleet?fleetStep=client&selfHost=1"
+              actionClass={actionClass}
+            />
+          )}
+          {unconfiguredPeerHosts.map((host) => (
+            <HostCard
+              key={host.peerId}
+              ariaLabel={`Available model host ${host.peerName}`}
+              headline={<>Available federated host: <span className="text-port-accent font-semibold">{host.peerName}</span></>}
+              badge={`${host.serving ? 'Serving' : 'Enabled'} · ${host.model || 'Qwen3.8-27B'}`}
+              description={<>Instance <strong className="text-gray-200">{host.peerName}</strong> is running a federated LLM host. Set it up as a provider on this machine?</>}
+              href={`/ai/fleet?fleetStep=client&peerId=${encodeURIComponent(host.peerId)}`}
+              actionClass={actionClass}
+            />
+          ))}
+        </div>
+      );
+    }
+
+    return (
+      <div className="space-y-3">
+      {warning}
+      <section className="rounded-xl border border-port-border bg-port-card p-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between" aria-label="Recommended model host">
+        <div className="min-w-0">
+          <p className="text-sm font-medium text-white flex items-center gap-2"><Server size={16} />{title}</p>
+          <p className="text-xs text-gray-400 mt-1">{status?.serving ? 'Serving · shared request queue enabled' : 'Use one dedicated model host from your other PortOS instances.'}</p>
+        </div>
+        <Link to="/ai/fleet?fleetStep=host" className={actionClass}>Model host setup</Link>
+      </section>
+      </div>
+    );
+  }
+  // The banner above names the page that manages the recommended runtime, so
+  // this button has to open that same page. It pointed at `/models/llms`
+  // because that page WAS the local-server surface; #7414 made it the weights
+  // catalog, which has no start/stop control at all — so on an Apple Silicon
+  // host the banner said "Models → Runtimes" and the button under it went
+  // somewhere with no MTPLX card. vLLM has no PortOS page and an unrecognized
+  // host has no recommendation, and both still belong on the runtimes tab:
+  // it is where every local server PortOS DOES manage lives.
+  const manageHref = LOCAL_RUNTIME_MANAGE_URLS[status?.recommendation?.runtime]
+    ?? LOCAL_RUNTIME_MANAGE_URLS.llama;
+
+  return (
+    <div className="space-y-4">
+      <Banner tone={status?.serving ? 'success' : 'info'} icon={Server} title={title}>
+        <p>{status?.recommendation.reason || 'Detecting this machine…'}</p>
+        {status && <p className="mt-2 text-xs">{status.specs.platform} · {status.specs.totalMemoryGb ?? 'Unknown'} GB RAM{status.specs.cuda?.gpus?.map((gpu) => ` · ${gpu.name} (${gpu.vramGb ?? '?'} GB VRAM)`).join('')}</p>}
+      </Banner>
+      {(error || loadError) && <Banner tone="error">{error || loadError}</Banner>}
+      <div className="flex flex-wrap gap-2">
+        <button type="button" onClick={load} className="min-h-[40px] px-3 rounded-lg bg-port-border text-sm">Refresh host status</button>
+        <Link to={manageHref} className="min-h-[40px] px-3 py-2 text-sm text-port-accent">Manage model servers</Link>
+      </div>
+      {status && (
+        <>
+          <ul className="space-y-2 text-sm">
+            {status.checks.map((check) => {
+              const Icon = check.ok === true ? CheckCircle2 : check.ok === false ? XCircle : HelpCircle;
+              return <li key={check.id} className="flex gap-2"><Icon size={16} className={check.ok === true ? 'text-port-success shrink-0' : 'text-gray-400 shrink-0'} /><span>{check.label}{check.detail && <span className="block text-xs text-gray-400">{check.detail}</span>}</span></li>;
+            })}
+          </ul>
+          {status.recommendation.supported && (
+            <section className="rounded-lg border border-port-border p-3 space-y-3 text-sm">
+              <p>Reserve this GPU for Qwen. Setup reuses prepared weights, fills in missing runtime settings, keeps the container loaded, and creates a Direct API provider on this machine (not an OpenCode TUI one — add that separately below if you want coding agents on this same machine). A new install can download about 30 GB.</p>
+              <p className="text-xs text-gray-400">One active generation across all clients; up to 16 requests wait for at most two minutes. Disconnecting cancels the request. Requests are held in memory and are not replayed after a restart. Other GPU models must be unloaded first. Setup disables competing local providers so they do not reload automatically.</p>
+              <button type="button" disabled={installing || status.setupRunning} onClick={() => setInstalling(true)} className={actionClass}>
+                {status.serving ? 'Reapply recommended host setup' : 'Set up dedicated host · download if needed'}
+              </button>
+              <p className="text-xs text-gray-400">Docker and its GPU drivers must be installed. PortOS can start Docker Desktop, but an engine failure, driver installation or Windows restart may need an action on the host. Setup registers PortOS recovery at Windows login. Keep Docker startup with Windows enabled.</p>
+            </section>
+          )}
+          {status.enabled && (
+            <Banner tone={status.serving ? 'success' : 'warning'}>
+              {status.serving ? 'Ready for client connections.' : 'Configured; model is loading or unavailable. Refresh until all checks pass.'}
+              <p className="mt-1 text-xs">{status.queue.active} generating · {status.queue.queued} queued · limit {status.queue.maxActive} active / {status.queue.maxQueued} waiting</p>
+            </Banner>
+          )}
+          {/* Offered whenever there is anything to turn off — a listening
+              queue, a container answering on the runtime port, or just the
+              enable marker that would start both again at the next boot.
+              Gating this on `serving` would hide it in exactly the state that
+              made the host feel unstoppable: container up, model still loading. */}
+          {status.stoppable && (
+            <section className="rounded-lg border border-port-border p-3 space-y-2 text-sm" aria-label="Stop this machine's model host">
+              <h3 className="font-medium">Stop hosting on this machine</h3>
+              <p className="text-xs text-gray-400">
+                Closes the shared API queue, turns the host off for future restarts, removes the Windows login-recovery task, and stops and removes the vLLM container. The prepared image and weights stay on disk. Any federated instance using this host loses it immediately, and any generation in flight is cancelled.
+              </p>
+              <div className="flex flex-wrap gap-2 items-center">
+                <button
+                  type="button"
+                  disabled={stopping || status.setupRunning}
+                  onClick={() => (stopArmed ? stop() : setStopArmed(true))}
+                  className={`inline-flex items-center justify-center min-h-[40px] px-3 py-2 rounded-lg text-sm disabled:opacity-50 ${stopArmed ? 'bg-port-error text-white' : 'bg-port-border text-white'}`}
+                >
+                  {stopping ? 'Stopping…' : stopArmed ? 'Confirm stop — disconnect peers now' : 'Stop model host'}
+                </button>
+                {stopArmed && !stopping && (
+                  <button type="button" onClick={() => setStopArmed(false)} className="min-h-[40px] px-3 text-sm text-gray-400">Cancel</button>
+                )}
+              </div>
+              {stopNote && <Banner tone="info">{stopNote}</Banner>}
+            </section>
+          )}
+          {(status.enabled || status.listening) && <FleetHostUsage />}
+          {status.hasApiKey && status.endpoint && (
+            <section className="space-y-2 text-sm">
+              <h3 className="font-medium">Use this host from this same machine</h3>
+              <p className="text-xs text-gray-400">
+                The Direct API provider above was created automatically. To also run OpenCode coding agents against this queue on this machine, add that provider explicitly — its endpoint and key are filled in for you.
+              </p>
+              <Link to="/ai/fleet?fleetStep=client&selfHost=1" className={actionClass}>
+                Set up OpenCode TUI on this machine
+              </Link>
+            </section>
+          )}
+          <section className="space-y-3 text-sm">
+            <h3 className="font-medium">Connect another PortOS instance</h3>
+            <ol className="list-decimal pl-5 space-y-2">
+              <li>On the other instance, open <strong>AI Providers → Model host setup → Connect client</strong>.</li>
+              <li>Use the queued API endpoint below and the host key. Choose <strong>Direct API</strong> for text calls or <strong>OpenCode TUI</strong> for coding agents. The coding tools run on that client.</li>
+              <li>Refresh models, then test a small request before assigning agent tasks.</li>
+            </ol>
+            {status.endpoint ? (
+              <div className="rounded-lg bg-port-bg p-3 space-y-2">
+                <p className="break-all font-mono text-xs">{status.endpoint}</p>
+                <p>Model: <code>{status.model}</code></p>
+                <button type="button" onClick={() => copyToClipboard(status.endpoint)} className="text-port-accent min-h-[40px]">Copy API endpoint</button>
+              </div>
+            ) : <Banner tone="warning">Connect Tailscale on this host to obtain its client API address.</Banner>}
+            <p className="text-xs text-gray-400">Restrict this API port to your client machines with Tailscale/network rules. Use this queued endpoint for local and remote providers; direct runtime connections bypass admission control.</p>
+            <button type="button" disabled={!status.hasApiKey || revealing} onClick={key ? () => setKey('') : reveal} className="min-h-[40px] px-3 rounded-lg bg-port-border disabled:opacity-50">{key ? 'Hide API key' : 'Reveal host API key'}</button>
+            {key && <div className="rounded-lg bg-port-bg p-3"><code className="text-xs break-all">{key}</code><button type="button" onClick={() => copyToClipboard(key)} className="block min-h-[40px] text-port-accent">Copy API key</button></div>}
+          </section>
+        </>
+      )}
+      <RuntimeInstallModal open={installing} runtime="vllm" label="Dedicated Qwen host" title="Set up dedicated Qwen host"
+        onClose={() => setInstalling(false)} onComplete={completed} streamMethod="POST"
+        installUrlBase="/api/providers/fleet-host/setup" flushMs={250}
+        description="Prepare missing weights (~30 GB on a fresh install), reserve the GPU and enable the shared API queue."
+        doneText="Host configured. Check readiness while the model loads." />
+    </div>
+  );
+}
+
+// Shared shape for the compact "here's an unconfigured host, add it as a
+// provider?" prompt — used for both this machine's own host and a discovered
+// peer's, which differ only in copy and link target.
+function HostCard({ ariaLabel, headline, badge, description, href, actionClass }) {
+  return (
+    <section
+      className="rounded-xl border border-port-accent/50 bg-port-card p-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between shadow-xs"
+      aria-label={ariaLabel}
+    >
+      <div className="min-w-0">
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="flex h-2 w-2 rounded-full bg-port-success shrink-0" />
+          <p className="text-sm font-medium text-white flex items-center gap-2 truncate">
+            <Server size={16} className="text-port-accent shrink-0" />
+            {headline}
+          </p>
+          <span className="text-[11px] px-1.5 py-0.5 rounded bg-port-success/20 text-port-success font-medium">{badge}</span>
+        </div>
+        <p className="text-xs text-gray-400 mt-1">{description}</p>
+      </div>
+      <div className="flex items-center gap-2 shrink-0">
+        <Link to={href} className={actionClass}>Set up as provider</Link>
+      </div>
+    </section>
+  );
+}

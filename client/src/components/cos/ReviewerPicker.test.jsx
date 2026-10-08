@@ -1,0 +1,981 @@
+import { useState } from 'react';
+import { describe, it, expect, vi } from 'vitest';
+import { render, screen, fireEvent } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import ReviewerPicker from './ReviewerPicker';
+import { typeSettled } from '../../test/settledInput';
+
+describe('ReviewerPicker', () => {
+  it('clears an incompatible provider effort when its model changes and announces why', () => {
+    const provider = { id: 'example-codex', name: 'Example Codex', command: 'codex', enabled: true,
+      defaultModel: 'gpt-5.6-sol', models: ['gpt-5.6-sol', 'gpt-6-astra'] };
+    const token = 'provider:example-codex';
+    const onChange = vi.fn();
+    function Form() {
+      const [config, setConfig] = useState({
+        reviewers: [token], reviewerModels: { [token]: 'gpt-5.6-sol' },
+        reviewerEfforts: { [token]: 'minimal', claude: 'high' },
+      });
+      return <ReviewerPicker {...config} modelOptions={{ providers: [provider], optionsByReviewer: { [token]: provider.models } }}
+        onChange={value => { onChange(value); setConfig(value); }} />;
+    }
+    render(<Form />);
+    fireEvent.change(screen.getByLabelText('Model for Example Codex'), { target: { value: 'gpt-6-astra' } });
+    expect(screen.getByLabelText('Reasoning effort for Example Codex')).toHaveValue('');
+    expect(onChange.mock.lastCall[0].reviewerEfforts).toEqual({ claude: 'high' });
+    expect(screen.getByRole('status')).toHaveTextContent('new model does not support minimal');
+    fireEvent.change(screen.getByLabelText('Reasoning effort for Example Codex'), { target: { value: 'high' } });
+    fireEvent.change(screen.getByLabelText('Model for Example Codex'), { target: { value: 'gpt-5.6-sol' } });
+    expect(onChange.mock.lastCall[0].reviewerEfforts).toEqual({ [token]: 'high', claude: 'high' });
+  });
+
+  it('keeps an incompatible saved provider effort visible and clearable without mutating on mount', () => {
+    const onChange = vi.fn();
+    const token = 'provider:example-codex';
+    render(<ReviewerPicker reviewers={[token]} reviewerModels={{ [token]: 'gpt-6-astra' }}
+      reviewerEfforts={{ [token]: 'minimal' }} onChange={onChange}
+      modelOptions={{ providers: [{ id: 'example-codex', name: 'Example Codex', command: 'codex' }] }} />);
+    const effort = screen.getByLabelText('Reasoning effort for Example Codex');
+    expect(effort).toHaveValue('minimal');
+    expect(screen.getByRole('option', { name: 'minimal (unsupported)' })).toBeInTheDocument();
+    expect(effort).toHaveAttribute('title', expect.stringContaining('does not support minimal'));
+    expect(onChange).not.toHaveBeenCalled();
+    fireEvent.change(effort, { target: { value: '' } });
+    expect(onChange.mock.lastCall[0].reviewerEfforts).toEqual({});
+  });
+
+  it('adds, edits, and clears effort for a configured provider reviewer', () => {
+    const onChange = vi.fn();
+    const providers = [{ id: 'codex-tui', name: 'Codex TUI', command: 'codex', enabled: true, defaultModel: 'gpt-6-astra', models: ['gpt-6-astra'] }];
+    function Form() {
+      const [config, setConfig] = useState({ reviewers: [] });
+      return <ReviewerPicker {...config} modelOptions={{ providers }} onChange={value => { onChange(value); setConfig(value); }} />;
+    }
+    render(<Form />);
+    fireEvent.change(screen.getByLabelText('Provider'), { target: { value: 'codex-tui' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Add provider reviewer' }));
+    fireEvent.change(screen.getByLabelText('Reasoning effort for Codex TUI'), { target: { value: 'ultra' } });
+    const effort = screen.getByLabelText('Reasoning effort for Codex TUI');
+    expect(effort).toHaveValue('ultra');
+    expect([...effort.options].map(option => option.value)).not.toContain('minimal');
+    fireEvent.change(effort, { target: { value: 'high' } });
+    expect(onChange.mock.lastCall[0].reviewerEfforts).toEqual({ 'provider:codex-tui': 'high' });
+    fireEvent.change(effort, { target: { value: '' } });
+    expect(onChange.mock.lastCall[0].reviewerEfforts).toEqual({});
+  });
+
+  it('renders the selected reviewers in order with numbered badges', () => {
+    render(<ReviewerPicker reviewers={['codex', 'antigravity', 'copilot']} onChange={() => {}} />);
+    expect(screen.getByText('1.')).toBeInTheDocument();
+    expect(screen.getByText('2.')).toBeInTheDocument();
+    expect(screen.getByText('3.')).toBeInTheDocument();
+    // The not-yet-selected reviewer (claude) shows in the Add row.
+    fireEvent.click(screen.getByText('Standalone / legacy backend'));
+    expect(screen.getByRole('option', { name: 'Claude' })).toBeInTheDocument();
+  });
+
+  describe('installed badge (#3606)', () => {
+    it('flags a selected reviewer whose CLI probe came back false', () => {
+      render(<ReviewerPicker reviewers={['antigravity']} installed={{ antigravity: false }} onChange={() => {}} />);
+      expect(screen.getByText('not installed')).toBeInTheDocument();
+    });
+
+    it('does not flag a selected reviewer with no probe entry (not a CLI reviewer, or not fetched)', () => {
+      render(<ReviewerPicker reviewers={['copilot']} installed={{ antigravity: false }} onChange={() => {}} />);
+      // copilot has no `installed` entry (it's not a CLI reviewer) — its row
+      // stays unbadged even though the map has an entry for a different reviewer.
+      expect(screen.getByText('Copilot').closest('div')).not.toHaveTextContent('not installed');
+    });
+
+    it('does not flag anything when installed is absent', () => {
+      render(<ReviewerPicker reviewers={['codex', 'antigravity']} onChange={() => {}} />);
+      expect(screen.queryByText('not installed')).not.toBeInTheDocument();
+    });
+
+    it('flags an unselected reviewer once the Add row reveals it', async () => {
+      const user = userEvent.setup();
+      render(<ReviewerPicker reviewers={['copilot']} installed={{ antigravity: false }} onChange={() => {}} />);
+      await user.click(screen.getByText('Standalone / legacy backend'));
+      expect(screen.getByRole('option', { name: /Antigravity/ })).toHaveTextContent('not installed');
+    });
+  });
+
+  // A local backend answers from its own daemon, so the live probe is the only
+  // thing that can say whether it will review — a same-named AI-provider record
+  // being switched off says nothing about it (see the hook's exemption).
+  describe('local-backend reachability badge', () => {
+    it('flags a local backend whose probe reports it down', () => {
+      render(<ReviewerPicker reviewers={['lmstudio']} modelOptions={{ loaded: true, unavailable: { lmstudio: true } }} onChange={() => {}} />);
+      expect(screen.getByText('not running')).toBeInTheDocument();
+    });
+
+    it('leaves a reachable local backend unbadged', () => {
+      render(<ReviewerPicker reviewers={['lmstudio']} modelOptions={{ loaded: true, unavailable: { lmstudio: false } }} onChange={() => {}} />);
+      expect(screen.queryByText('not running')).not.toBeInTheDocument();
+      expect(screen.queryByText('disabled')).not.toBeInTheDocument();
+    });
+
+    it('says nothing before the probe has landed', () => {
+      render(<ReviewerPicker reviewers={['lmstudio']} modelOptions={{ loaded: false }} onChange={() => {}} />);
+      expect(screen.queryByText('not running')).not.toBeInTheDocument();
+    });
+  });
+
+  // #7660: an enabled, present provider that still has no enforceable tool-free
+  // review transport is the one case nothing used to say out loud — the user
+  // found out only when every PR it gated sat unmergeable forever.
+  describe("provider reviewer that can't review (#7660)", () => {
+    const providers = [{ id: 'hosted-harness', name: 'Hosted Harness', command: 'opencode', enabled: true, models: [] }];
+
+    it('flags an enabled provider reported as unable to run any review', () => {
+      render(
+        <ReviewerPicker
+          reviewers={['provider:hosted-harness']}
+          modelOptions={{ loaded: true, providers }}
+          providerReviewUnsupported={{ 'provider:hosted-harness': 'REVIEWER_UNSUPPORTED' }}
+          onChange={() => {}}
+        />
+      );
+      expect(screen.getByText("can't review")).toHaveAttribute('title', expect.stringContaining('Set its command or switch it to API mode'));
+    });
+
+    it('says nothing about a provider absent from the map, or when it was never fetched', () => {
+      const { rerender } = render(
+        <ReviewerPicker
+          reviewers={['provider:hosted-harness']}
+          modelOptions={{ loaded: true, providers }}
+          providerReviewUnsupported={{ 'provider:other': 'REVIEWER_UNSUPPORTED' }}
+          onChange={() => {}}
+        />
+      );
+      expect(screen.queryByText("can't review")).not.toBeInTheDocument();
+      rerender(
+        <ReviewerPicker
+          reviewers={['provider:hosted-harness']}
+          modelOptions={{ loaded: true, providers }}
+          onChange={() => {}}
+        />
+      );
+      expect(screen.queryByText("can't review")).not.toBeInTheDocument();
+    });
+
+    it('keeps the more specific word for a switched-off provider rather than badging it twice', () => {
+      render(
+        <ReviewerPicker
+          reviewers={['provider:hosted-harness']}
+          modelOptions={{ loaded: true, providers: [{ ...providers[0], enabled: false }] }}
+          providerReviewUnsupported={{ 'provider:hosted-harness': 'REVIEWER_UNSUPPORTED' }}
+          onChange={() => {}}
+        />
+      );
+      expect(screen.getByText('disabled')).toBeInTheDocument();
+      expect(screen.queryByText("can't review")).not.toBeInTheDocument();
+    });
+  });
+
+  it('offers CLI and API providers as new reviewers, but not TUI records', () => {
+    render(
+      <ReviewerPicker
+        reviewers={[]}
+        modelOptions={{ loaded: true, providers: [
+          { id: 'example-cli', name: 'Example CLI', type: 'cli', command: 'agy', enabled: true, models: [] },
+          { id: 'example-api', name: 'Example API', type: 'api', enabled: true, models: [] },
+          { id: 'example-tui', name: 'Example TUI', type: 'tui', command: 'agy', enabled: true, models: [] },
+        ] }}
+        onChange={() => {}}
+      />
+    );
+    expect(screen.getByRole('option', { name: /Example CLI/ })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: /Example API/ })).toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: /Example TUI/ })).not.toBeInTheDocument();
+  });
+
+  // The Add row lists what this machine can actually run. Hidden, not dropped:
+  // both signals are local-machine-only and the reviewer list is
+  // federation-wide config, so a peer's reviewer stays configurable from here.
+  describe('unavailable reviewers in the Add row', () => {
+    const modelOptions = { providerDisabled: { kimi: true, cursor: true } };
+
+    it('labels missing and disabled backends in the legacy selector', () => {
+      render(
+        <ReviewerPicker
+          reviewers={['copilot']}
+          installed={{ antigravity: false }}
+          modelOptions={modelOptions}
+          onChange={() => {}}
+        />
+      );
+      fireEvent.click(screen.getByText('Standalone / legacy backend'));
+      expect(screen.getByRole('option', { name: /Antigravity/ })).toHaveTextContent('not installed');
+      expect(screen.getByRole('option', { name: /Kimi/ })).toHaveTextContent('disabled');
+      expect(screen.getByRole('option', { name: /Codex/ })).toHaveTextContent('Codex');
+    });
+
+    it('reveals them, badged with which signal fired, and adds them normally', async () => {
+      const onChange = vi.fn();
+      const user = userEvent.setup();
+      render(
+        <ReviewerPicker
+          reviewers={['copilot']}
+          installed={{ antigravity: false }}
+          modelOptions={modelOptions}
+          onChange={onChange}
+        />
+      );
+      await user.click(screen.getByText('Standalone / legacy backend'));
+      expect(screen.getByRole('option', { name: /Kimi/ })).toHaveTextContent('disabled');
+      expect(screen.getByRole('option', { name: /Antigravity/ })).toHaveTextContent('not installed');
+      await user.selectOptions(screen.getByLabelText('Legacy backend'), 'kimi');
+      await user.click(screen.getByRole('button', { name: 'Add legacy reviewer' }));
+      expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ reviewers: ['copilot', 'kimi'] }));
+    });
+
+    it('keeps an already-selected unavailable reviewer visible, badged', () => {
+      render(
+        <ReviewerPicker reviewers={['kimi']} modelOptions={modelOptions} onChange={() => {}} />
+      );
+      expect(screen.getByText('Kimi').parentElement).toHaveTextContent('disabled');
+    });
+
+    it('offers the whole roster when neither signal was fetched', () => {
+      render(<ReviewerPicker reviewers={['copilot']} onChange={() => {}} />);
+      fireEvent.click(screen.getByText('Standalone / legacy backend'));
+      expect(screen.queryByRole('option', { name: /unavailable/ })).not.toBeInTheDocument();
+      expect(screen.getByRole('option', { name: /Kimi/ })).toBeInTheDocument();
+    });
+  });
+
+  it('shows the empty-state hint when no reviewers are selected', () => {
+    render(<ReviewerPicker reviewers={[]} onChange={() => {}} />);
+    expect(screen.getByText(/none — no AI reviewers in this list/)).toBeInTheDocument();
+  });
+
+  it('keeps the short provider intro unless the page explains tiers itself', () => {
+    const { unmount } = render(<ReviewerPicker reviewers={[]} onChange={() => {}} />);
+    expect(screen.getByText(/Add a configured provider/)).toBeInTheDocument();
+    unmount();
+    render(<ReviewerPicker reviewers={['codex']} onChange={() => {}} showIntro={false} />);
+    expect(screen.queryByText(/Add a configured provider/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Tool-free first/)).not.toBeInTheDocument();
+  });
+
+  it('de-dupes a malformed list with duplicates (order-preserving)', () => {
+    render(<ReviewerPicker reviewers={['codex', 'codex', 'antigravity']} onChange={() => {}} />);
+    // Two distinct pills (badges 1 and 2), not three.
+    expect(screen.getByText('1.')).toBeInTheDocument();
+    expect(screen.getByText('2.')).toBeInTheDocument();
+    expect(screen.queryByText('3.')).not.toBeInTheDocument();
+  });
+
+  it('emits an empty list when the last reviewer is removed (server resolves to copilot)', async () => {
+    const onChange = vi.fn();
+    const user = userEvent.setup();
+    render(<ReviewerPicker reviewers={['copilot']} onChange={onChange} />);
+    await user.click(screen.getByLabelText('Remove Copilot'));
+    expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ reviewers: [] }));
+  });
+
+  it('appends a reviewer in click order on add', async () => {
+    const onChange = vi.fn();
+    const user = userEvent.setup();
+    render(<ReviewerPicker reviewers={['copilot']} onChange={onChange} />);
+    await user.click(screen.getByText('Standalone / legacy backend'));
+    await user.selectOptions(screen.getByLabelText('Legacy backend'), 'codex');
+    await user.click(screen.getByRole('button', { name: 'Add legacy reviewer' }));
+    expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ reviewers: ['copilot', 'codex'] }));
+  });
+
+  it('reorders with the up arrow', async () => {
+    const onChange = vi.fn();
+    const user = userEvent.setup();
+    render(<ReviewerPicker reviewers={['codex', 'antigravity', 'copilot']} onChange={onChange} />);
+    await user.click(screen.getByLabelText('Move Antigravity earlier'));
+    expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ reviewers: ['antigravity', 'codex', 'copilot'] }));
+  });
+
+  it('removes a reviewer', async () => {
+    const onChange = vi.fn();
+    const user = userEvent.setup();
+    render(<ReviewerPicker reviewers={['codex', 'copilot']} onChange={onChange} />);
+    await user.click(screen.getByLabelText('Remove Codex'));
+    expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ reviewers: ['copilot'] }));
+  });
+
+  it('shows the stop-mode select only for 2+ reviewers', () => {
+    const { rerender } = render(<ReviewerPicker reviewers={['codex']} onChange={() => {}} />);
+    expect(screen.queryByText('Stop mode:')).not.toBeInTheDocument();
+    rerender(<ReviewerPicker reviewers={['codex', 'antigravity']} onChange={() => {}} />);
+    expect(screen.getByText('Stop mode:')).toBeInTheDocument();
+  });
+
+  it('normalizes legacy Gemini reviewer values to Antigravity', () => {
+    render(<ReviewerPicker reviewers={['gemini']} onChange={() => {}} />);
+    expect(screen.getByText('Antigravity')).toBeInTheDocument();
+  });
+
+  // slashdo's loop grants the editing pass to codex alone and forces every other
+  // local reviewer back to review-only, reverting whatever it wrote. Offering the
+  // toggle for agy asked the user to grant write access that buys them nothing.
+  it('shows the reviewer-applies toggle only when codex is selected', () => {
+    const { rerender } = render(<ReviewerPicker reviewers={['copilot']} onChange={() => {}} />);
+    expect(screen.queryByText(/Reviewer applies fixes/)).not.toBeInTheDocument();
+    rerender(<ReviewerPicker reviewers={['antigravity', 'grok']} onChange={() => {}} />);
+    expect(screen.queryByText(/Reviewer applies fixes/)).not.toBeInTheDocument();
+    rerender(<ReviewerPicker reviewers={['codex']} onChange={() => {}} />);
+    expect(screen.getByText(/Reviewer applies fixes/)).toBeInTheDocument();
+  });
+
+  it('adds a GitHub/GitLab reviewer username (strips @) via the Add button', async () => {
+    const onChange = vi.fn();
+    const user = userEvent.setup();
+    render(<ReviewerPicker reviewers={['copilot']} onChange={onChange} />);
+    await typeSettled(user, screen.getByLabelText('Add a GitHub/GitLab reviewer username'), '@CodeReviewbot');
+    await user.click(screen.getByRole('button', { name: 'Add reviewer username' }));
+    expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ usernames: ['CodeReviewbot'] }));
+  });
+
+  it('adds a username on Enter', async () => {
+    const onChange = vi.fn();
+    const user = userEvent.setup();
+    render(<ReviewerPicker reviewers={['copilot']} onChange={onChange} />);
+    // Enter is pressed separately so the draft can be pinned first: the keydown
+    // handler adds whatever `usernameInput` state holds at that moment.
+    await typeSettled(user, screen.getByLabelText('Add a GitHub/GitLab reviewer username'), 'reviewer-bot');
+    await user.keyboard('{Enter}');
+    expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ usernames: ['reviewer-bot'] }));
+  });
+
+  it('rejects an invalid username and surfaces an error without emitting', async () => {
+    const onChange = vi.fn();
+    const user = userEvent.setup();
+    render(<ReviewerPicker reviewers={['copilot']} onChange={onChange} />);
+    // Same pin: a partially-typed `bad` is a *valid* username, so an Enter that
+    // beat the last keystrokes would emit and make this assertion lie.
+    await typeSettled(user, screen.getByLabelText('Add a GitHub/GitLab reviewer username'), 'bad token!');
+    await user.keyboard('{Enter}');
+    expect(onChange).not.toHaveBeenCalled();
+    expect(screen.getByRole('alert')).toHaveTextContent('Invalid reviewer names: bad token!');
+  });
+
+  it('renders existing username pills and removes one', async () => {
+    const onChange = vi.fn();
+    const user = userEvent.setup();
+    render(<ReviewerPicker reviewers={['copilot']} usernames={['CodeReviewbot', 'other-bot']} onChange={onChange} />);
+    expect(screen.getByText('CodeReviewbot')).toBeInTheDocument();
+    await user.click(screen.getByLabelText('Remove @CodeReviewbot'));
+    expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ usernames: ['other-bot'] }));
+  });
+
+  it('adds comma/newline forge usernames as one validated, deduplicated batch', () => {
+    const onChange = vi.fn();
+    render(<ReviewerPicker usernames={['Alice']} onChange={onChange} />);
+    const input = screen.getByLabelText('Add a GitHub/GitLab reviewer username');
+    fireEvent.change(input, { target: { value: '@alice, bob.team\ncarol_dev' } });
+    fireEvent.click(screen.getByLabelText('Add reviewer username'));
+    expect(onChange.mock.lastCall[0].usernames).toEqual(['Alice', 'bob.team', 'carol_dev']);
+    onChange.mockClear();
+    fireEvent.change(input, { target: { value: 'valid-user, not valid!' } });
+    fireEvent.click(screen.getByLabelText('Add reviewer username'));
+    expect(screen.getByRole('alert')).toHaveTextContent('Invalid reviewer names: not valid!');
+    expect(input).toHaveValue('valid-user, not valid!');
+    expect(onChange).not.toHaveBeenCalled();
+    fireEvent.change(input, { target: { value: Array.from({ length: 20 }, (_, index) => `reviewer-${index}`).join(',') } });
+    fireEvent.click(screen.getByLabelText('Add reviewer username'));
+    expect(screen.getByRole('alert')).toHaveTextContent('At most 20 reviewer usernames');
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it('toggles a keyed reviewer non-blocking (adds its slug to optionalReviewers)', async () => {
+    const onChange = vi.fn();
+    const user = userEvent.setup();
+    render(<ReviewerPicker reviewers={['codex', 'ollama']} onChange={onChange} />);
+    await user.click(screen.getByLabelText('Make Ollama non-blocking'));
+    expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ optionalReviewers: ['ollama'] }));
+  });
+
+  it('toggles a non-blocking reviewer back to blocking (removes it)', async () => {
+    const onChange = vi.fn();
+    const user = userEvent.setup();
+    render(<ReviewerPicker reviewers={['codex', 'ollama']} optionalReviewers={['ollama']} onChange={onChange} />);
+    await user.click(screen.getByLabelText('Make Ollama blocking'));
+    expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ optionalReviewers: [] }));
+  });
+
+  it('marks a GitHub/GitLab reviewer username non-blocking with the @-form token', async () => {
+    const onChange = vi.fn();
+    const user = userEvent.setup();
+    render(<ReviewerPicker reviewers={['copilot']} usernames={['flaky-bot']} onChange={onChange} />);
+    await user.click(screen.getByLabelText('Make @flaky-bot non-blocking'));
+    expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ optionalReviewers: ['@flaky-bot'] }));
+  });
+
+  it('prunes the optional token when its reviewer is removed', async () => {
+    const onChange = vi.fn();
+    const user = userEvent.setup();
+    render(<ReviewerPicker reviewers={['codex', 'ollama']} optionalReviewers={['ollama']} onChange={onChange} />);
+    await user.click(screen.getByLabelText('Remove Ollama'));
+    expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ reviewers: ['codex'], optionalReviewers: [] }));
+  });
+
+  describe('~max round caps', () => {
+    it('renders a blank cap input per reviewer/username chip when no cap is set', () => {
+      render(<ReviewerPicker reviewers={['codex', 'ollama']} usernames={['flaky-bot']} onChange={() => {}} />);
+      expect(screen.getByLabelText('Max review rounds for Codex')).toHaveValue(null);
+      expect(screen.getByLabelText('Max review rounds for Ollama')).toHaveValue(null);
+      expect(screen.getByLabelText('Max review rounds for @flaky-bot')).toHaveValue(null);
+    });
+
+    it('shows an existing cap, including an explicit 0', () => {
+      render(<ReviewerPicker reviewers={['codex', 'ollama']} reviewerMaxRounds={{ ollama: 0, codex: 2 }} onChange={() => {}} />);
+      // 0 is a real value (loop until clean) and must render as 0, not blank.
+      expect(screen.getByLabelText('Max review rounds for Ollama')).toHaveValue(0);
+      expect(screen.getByLabelText('Max review rounds for Codex')).toHaveValue(2);
+    });
+
+    it('sets a cap for a keyed reviewer', async () => {
+      const onChange = vi.fn();
+      const user = userEvent.setup();
+      render(<ReviewerPicker reviewers={['codex', 'ollama']} onChange={onChange} />);
+      await user.type(screen.getByLabelText('Max review rounds for Ollama'), '1');
+      expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ reviewerMaxRounds: { ollama: 1 } }));
+    });
+
+    it('sets a cap for a @username reviewer keyed by its @-form token', async () => {
+      const onChange = vi.fn();
+      const user = userEvent.setup();
+      render(<ReviewerPicker reviewers={['copilot']} usernames={['flaky-bot']} onChange={onChange} />);
+      await user.type(screen.getByLabelText('Max review rounds for @flaky-bot'), '3');
+      expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ reviewerMaxRounds: { '@flaky-bot': 3 } }));
+    });
+
+    it('clearing the input DELETES the entry rather than writing 0 (absent ≠ 0)', async () => {
+      const onChange = vi.fn();
+      const user = userEvent.setup();
+      render(<ReviewerPicker reviewers={['codex', 'ollama']} reviewerMaxRounds={{ ollama: 2 }} onChange={onChange} />);
+      await user.clear(screen.getByLabelText('Max review rounds for Ollama'));
+      expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ reviewerMaxRounds: {} }));
+    });
+
+    it('clamps a cap above the ceiling instead of sending a value the server would drop', () => {
+      const onChange = vi.fn();
+      render(<ReviewerPicker reviewers={['ollama']} onChange={onChange} />);
+      // fireEvent (not user.type) so the whole out-of-range value lands in one
+      // change event — a controlled input never accumulates keystrokes.
+      fireEvent.change(screen.getByLabelText('Max review rounds for Ollama'), { target: { value: '99' } });
+      expect(onChange).toHaveBeenLastCalledWith(expect.objectContaining({ reviewerMaxRounds: { ollama: 10 } }));
+    });
+
+    it('rejects a negative cap rather than clamping it to 0 (which would mean unlimited)', () => {
+      const onChange = vi.fn();
+      render(<ReviewerPicker reviewers={['ollama']} onChange={onChange} />);
+      fireEvent.change(screen.getByLabelText('Max review rounds for Ollama'), { target: { value: '-2' } });
+      // Clamping to 0 would silently turn a typo into slashdo's "loop until clean".
+      expect(onChange).not.toHaveBeenCalled();
+    });
+
+    it('rejects a fractional cap rather than truncating it', () => {
+      const onChange = vi.fn();
+      render(<ReviewerPicker reviewers={['ollama']} onChange={onChange} />);
+      fireEvent.change(screen.getByLabelText('Max review rounds for Ollama'), { target: { value: '1.5' } });
+      expect(onChange).not.toHaveBeenCalled();
+    });
+
+    it('prunes the cap entry when its reviewer is removed', async () => {
+      const onChange = vi.fn();
+      const user = userEvent.setup();
+      render(<ReviewerPicker reviewers={['codex', 'ollama']} reviewerMaxRounds={{ ollama: 1 }} onChange={onChange} />);
+      await user.click(screen.getByLabelText('Remove Ollama'));
+      expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ reviewers: ['codex'], reviewerMaxRounds: {} }));
+    });
+
+    it('prunes the cap entry when its username reviewer is removed', async () => {
+      const onChange = vi.fn();
+      const user = userEvent.setup();
+      render(<ReviewerPicker reviewers={['copilot']} usernames={['flaky-bot']} reviewerMaxRounds={{ '@flaky-bot': 2 }} onChange={onChange} />);
+      await user.click(screen.getByLabelText('Remove @flaky-bot'));
+      expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ usernames: [], reviewerMaxRounds: {} }));
+    });
+
+    it('keeps the ~opt toggle and the cap independent', async () => {
+      const onChange = vi.fn();
+      const user = userEvent.setup();
+      render(<ReviewerPicker reviewers={['ollama']} reviewerMaxRounds={{ ollama: 1 }} onChange={onChange} />);
+      await user.click(screen.getByLabelText('Make Ollama non-blocking'));
+      expect(onChange).toHaveBeenCalledWith(expect.objectContaining({
+        optionalReviewers: ['ollama'],
+        reviewerMaxRounds: { ollama: 1 }
+      }));
+    });
+  });
+
+  describe('per-reviewer Model column', () => {
+    // Shape mirrors useReviewerModelOptions()' return — the caller owns the fetch.
+    const modelOptions = {
+      optionsByReviewer: {
+        ollama: ['qwen2.5-coder:32b', 'codellama'],
+        lmstudio: ['local-model-a'],
+        codex: ['gpt-tier-a', 'gpt-tier-b'],
+        claude: ['claude-tier-a', 'qwen2.5-coder:32b'],
+      },
+      defaultModels: { codex: 'gpt-tier-a' },
+      freeText: { codex: true, claude: true, lmstudio: false, ollama: false },
+      unavailable: { lmstudio: false, ollama: false },
+      loaded: true,
+    };
+
+    it('renders a Model control for each model-taking reviewer', () => {
+      render(<ReviewerPicker reviewers={['ollama', 'codex', 'copilot']} modelOptions={modelOptions} onChange={() => {}} />);
+      expect(screen.getByLabelText('Model for Ollama')).toBeInTheDocument();
+      expect(screen.getByLabelText('Model for Codex')).toBeInTheDocument();
+      // Copilot has no CLI and takes no model — no control, just the em dash.
+      expect(screen.queryByLabelText('Model for Copilot')).not.toBeInTheDocument();
+    });
+
+    it('shows the provider default when no per-reviewer model pin exists', () => {
+      render(<ReviewerPicker reviewers={['codex']} modelOptions={modelOptions} onChange={() => {}} />);
+      expect(screen.getByLabelText('Model for Codex')).toHaveValue('gpt-tier-a');
+      expect(screen.getByLabelText('Model for Codex')).toHaveAttribute('title', expect.stringContaining('by default'));
+    });
+
+    it('does not render a Model control for a @username reviewer', () => {
+      render(<ReviewerPicker reviewers={['copilot']} usernames={['flaky-bot']} modelOptions={modelOptions} onChange={() => {}} />);
+      expect(screen.queryByLabelText('Model for @flaky-bot')).not.toBeInTheDocument();
+    });
+
+    it('renders a local backend as a closed select of its installed ids', () => {
+      render(<ReviewerPicker reviewers={['ollama']} modelOptions={modelOptions} onChange={() => {}} />);
+      const select = screen.getByLabelText('Model for Ollama');
+      expect(select.tagName).toBe('SELECT');
+      expect(screen.getByRole('option', { name: 'qwen2.5-coder:32b' })).toBeInTheDocument();
+    });
+
+    it('renders a CLI reviewer as a dropdown of its catalog', () => {
+      render(<ReviewerPicker reviewers={['claude']} modelOptions={modelOptions} onChange={() => {}} />);
+      expect(screen.getByLabelText('Model for Claude').tagName).toBe('SELECT');
+      expect(screen.getByRole('option', { name: 'claude-tier-a' })).toBeInTheDocument();
+    });
+
+    it('offers a CLI reviewer a Custom… escape that swaps in a free-text input', () => {
+      const onChange = vi.fn();
+      render(<ReviewerPicker reviewers={['claude']} modelOptions={modelOptions} onChange={onChange} />);
+      fireEvent.change(screen.getByLabelText('Model for Claude'), { target: { value: '[custom]' } });
+      // An Ollama-backed / Bedrock-form claude id can't be enumerated, so the
+      // escape must accept a typed value rather than only a pick.
+      expect(screen.getByLabelText('Model for Claude').tagName).toBe('INPUT');
+      // The sentinel is a UI mode, not an id — it must never be stored as a pin.
+      expect(onChange).not.toHaveBeenCalled();
+    });
+
+    it('does not offer the Custom… escape to a probed local backend', () => {
+      render(<ReviewerPicker reviewers={['ollama']} modelOptions={modelOptions} onChange={() => {}} />);
+      // Ollama's list is the daemon's own answer: an id it doesn't list isn't installed.
+      expect(screen.queryByRole('option', { name: 'Custom…' })).not.toBeInTheDocument();
+    });
+
+    it('leaving an empty Custom… field returns the cell to the dropdown', () => {
+      render(<ReviewerPicker reviewers={['claude']} modelOptions={modelOptions} onChange={() => {}} />);
+      fireEvent.change(screen.getByLabelText('Model for Claude'), { target: { value: '[custom]' } });
+      fireEvent.blur(screen.getByLabelText('Model for Claude'));
+      expect(screen.getByLabelText('Model for Claude').tagName).toBe('SELECT');
+    });
+
+    it('keeps the Custom… input mounted while a typed id is being edited', () => {
+      render(<ReviewerPicker reviewers={['claude']} modelOptions={modelOptions} onChange={() => {}} />);
+      fireEvent.change(screen.getByLabelText('Model for Claude'), { target: { value: '[custom]' } });
+      // Clearing the field to retype must not swap the control out mid-edit.
+      fireEvent.change(screen.getByLabelText('Model for Claude'), { target: { value: 'x' } });
+      fireEvent.change(screen.getByLabelText('Model for Claude'), { target: { value: '' } });
+      expect(screen.getByLabelText('Model for Claude').tagName).toBe('INPUT');
+    });
+
+    it('keeps a pin outside the catalog editable rather than unpickable', () => {
+      render(<ReviewerPicker reviewers={['claude']} reviewerModels={{ claude: 'llama3.1:70b' }} modelOptions={modelOptions} onChange={() => {}} />);
+      const control = screen.getByLabelText('Model for Claude');
+      expect(control.tagName).toBe('INPUT');
+      expect(control).toHaveValue('llama3.1:70b');
+    });
+
+    it('falls back to free-text when no options resolved (a closed empty select would be dead)', () => {
+      render(<ReviewerPicker reviewers={['ollama']} onChange={() => {}} />);
+      expect(screen.getByLabelText('Model for Ollama').tagName).toBe('INPUT');
+    });
+
+    it('shows an existing pin', () => {
+      render(<ReviewerPicker reviewers={['ollama']} reviewerModels={{ ollama: 'codellama' }} modelOptions={modelOptions} onChange={() => {}} />);
+      expect(screen.getByLabelText('Model for Ollama')).toHaveValue('codellama');
+    });
+
+    it('keeps an option for a pin the probe no longer lists', () => {
+      render(<ReviewerPicker reviewers={['ollama']} reviewerModels={{ ollama: 'uninstalled-model' }} modelOptions={modelOptions} onChange={() => {}} />);
+      // Without the synthesized option the select would render blank and read as
+      // "unset" while the value is in fact stored.
+      expect(screen.getByLabelText('Model for Ollama')).toHaveValue('uninstalled-model');
+      expect(screen.getByRole('option', { name: /uninstalled-model \(not installed\)/ })).toBeInTheDocument();
+    });
+
+    it('pins a model for a local reviewer', () => {
+      const onChange = vi.fn();
+      render(<ReviewerPicker reviewers={['ollama']} modelOptions={modelOptions} onChange={onChange} />);
+      fireEvent.change(screen.getByLabelText('Model for Ollama'), { target: { value: 'codellama' } });
+      expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ reviewerModels: { ollama: 'codellama' } }));
+    });
+
+    it('pins a typed model for a CLI reviewer', () => {
+      const onChange = vi.fn();
+      render(<ReviewerPicker reviewers={['codex']} modelOptions={modelOptions} onChange={onChange} />);
+      fireEvent.change(screen.getByLabelText('Model for Codex'), { target: { value: 'gpt-tier-b' } });
+      expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ reviewerModels: { codex: 'gpt-tier-b' } }));
+    });
+
+    it('clearing the field DELETES the pin rather than writing an empty id', () => {
+      const onChange = vi.fn();
+      render(<ReviewerPicker reviewers={['codex']} reviewerModels={{ codex: 'gpt-tier-a' }} modelOptions={modelOptions} onChange={onChange} />);
+      fireEvent.change(screen.getByLabelText('Model for Codex'), { target: { value: '' } });
+      // `''` would emit a `--model ` with no id; absent means "its own default".
+      expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ reviewerModels: {} }));
+    });
+
+    it('treats a whitespace-only entry as a clear, not a pin', () => {
+      const onChange = vi.fn();
+      render(<ReviewerPicker reviewers={['codex']} reviewerModels={{ codex: 'gpt-tier-a' }} modelOptions={modelOptions} onChange={onChange} />);
+      fireEvent.change(screen.getByLabelText('Model for Codex'), { target: { value: '[custom]' } });
+      fireEvent.change(screen.getByLabelText('Model for Codex'), { target: { value: '   ' } });
+      expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ reviewerModels: {} }));
+    });
+
+    it('prunes the pin when its reviewer is removed', async () => {
+      const onChange = vi.fn();
+      const user = userEvent.setup();
+      render(<ReviewerPicker reviewers={['codex', 'ollama']} reviewerModels={{ ollama: 'codellama' }} modelOptions={modelOptions} onChange={onChange} />);
+      await user.click(screen.getByLabelText('Remove Ollama'));
+      expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ reviewers: ['codex'], reviewerModels: {} }));
+    });
+
+    it('keeps the model pin, the ~opt toggle, and the cap independent', async () => {
+      const onChange = vi.fn();
+      const user = userEvent.setup();
+      render(
+        <ReviewerPicker
+          reviewers={['ollama']}
+          reviewerModels={{ ollama: 'codellama' }}
+          reviewerMaxRounds={{ ollama: 1 }}
+          modelOptions={modelOptions}
+          onChange={onChange}
+        />
+      );
+      await user.click(screen.getByLabelText('Make Ollama non-blocking'));
+      expect(onChange).toHaveBeenCalledWith(expect.objectContaining({
+        optionalReviewers: ['ollama'],
+        reviewerMaxRounds: { ollama: 1 },
+        reviewerModels: { ollama: 'codellama' }
+      }));
+    });
+
+    it('preserves an untouched pin when another row changes', () => {
+      const onChange = vi.fn();
+      render(
+        <ReviewerPicker
+          reviewers={['codex', 'ollama']}
+          reviewerModels={{ codex: 'gpt-tier-a' }}
+          modelOptions={modelOptions}
+          onChange={onChange}
+        />
+      );
+      fireEvent.change(screen.getByLabelText('Model for Ollama'), { target: { value: 'codellama' } });
+      expect(onChange).toHaveBeenCalledWith(expect.objectContaining({
+        reviewerModels: { codex: 'gpt-tier-a', ollama: 'codellama' }
+      }));
+    });
+
+    it('reads a pin case-insensitively (legacy/hand-edited key casing)', () => {
+      render(<ReviewerPicker reviewers={['codex']} reviewerModels={{ Codex: 'gpt-tier-a' }} modelOptions={modelOptions} onChange={() => {}} />);
+      expect(screen.getByLabelText('Model for Codex')).toHaveValue('gpt-tier-a');
+    });
+
+    it('strips characters that would corrupt the emitted [model] selector', () => {
+      const onChange = vi.fn();
+      render(<ReviewerPicker reviewers={['codex']} modelOptions={modelOptions} onChange={onChange} />);
+      // `foo]~opt` would close the selector early and leave slashdo reading the
+      // rest as a suffix; the server drops such an id, so accepting it here would
+      // show a pin that never persists.
+      fireEvent.change(screen.getByLabelText('Model for Codex'), { target: { value: '[custom]' } });
+      fireEvent.change(screen.getByLabelText('Model for Codex'), { target: { value: 'foo]~opt' } });
+      expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ reviewerModels: { codex: 'foo~opt' } }));
+    });
+
+    it('keeps a space in a typed id (slashdo selectors are free-form)', () => {
+      const onChange = vi.fn();
+      render(<ReviewerPicker reviewers={['claude']} modelOptions={modelOptions} onChange={onChange} />);
+      fireEvent.change(screen.getByLabelText('Model for Claude'), { target: { value: '[custom]' } });
+      fireEvent.change(screen.getByLabelText('Model for Claude'), { target: { value: 'Some Model (High)' } });
+      expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ reviewerModels: { claude: 'Some Model (High)' } }));
+    });
+  });
+  describe('Effort column', () => {
+      it('offers each reviewer only the tiers its own CLI accepts', () => {
+        render(<ReviewerPicker reviewers={['antigravity']} onChange={() => {}} />);
+        const select = screen.getByLabelText('Reasoning effort for Antigravity');
+        expect(select.tagName).toBe('SELECT');
+        expect(screen.getByRole('option', { name: 'high' })).toBeInTheDocument();
+        // agy rejects `--effort max`, so the picker must not offer it.
+        expect(screen.queryByRole('option', { name: 'max' })).not.toBeInTheDocument();
+      });
+
+      it('offers the wider claude ladder on a claude row', () => {
+        render(<ReviewerPicker reviewers={['claude']} onChange={() => {}} />);
+        expect(screen.getByRole('option', { name: 'xhigh' })).toBeInTheDocument();
+      });
+
+      it('tells a cursor row its tier needs a Model pin to reach the CLI', () => {
+        // cursor-agent has no --effort flag: the level rides inside the model id,
+        // so a tier with no model is dropped when the invocation is built.
+        const { rerender } = render(<ReviewerPicker reviewers={['cursor']} reviewerEfforts={{ cursor: 'max' }} onChange={() => {}} />);
+        expect(screen.getByLabelText('Reasoning effort for Cursor Agent'))
+          .toHaveAttribute('title', expect.stringContaining('pin a Model too'));
+        rerender(<ReviewerPicker reviewers={['cursor']} reviewerEfforts={{ cursor: 'max' }} reviewerModels={{ cursor: 'gpt-5' }} onChange={() => {}} />);
+        expect(screen.getByLabelText('Reasoning effort for Cursor Agent'))
+          .not.toHaveAttribute('title', expect.stringContaining('pin a Model too'));
+      });
+
+      it('renders no Effort control for a reviewer with no effort knob', () => {
+        render(<ReviewerPicker reviewers={['copilot']} usernames={['flaky-bot']} onChange={() => {}} />);
+        expect(screen.queryByLabelText('Reasoning effort for Copilot')).not.toBeInTheDocument();
+        expect(screen.queryByLabelText('Reasoning effort for @flaky-bot')).not.toBeInTheDocument();
+      });
+
+      it('offers grok its own ladder, which stops short of max', () => {
+        render(<ReviewerPicker reviewers={['grok']} onChange={() => {}} />);
+        const select = screen.getByLabelText('Reasoning effort for Grok');
+        expect([...select.options].map((o) => o.value)).toEqual(['', 'low', 'medium', 'high', 'xhigh']);
+      });
+
+      it('shows an existing pin and emits a picked tier', () => {
+        const onChange = vi.fn();
+        render(<ReviewerPicker reviewers={['codex']} reviewerEfforts={{ codex: 'low' }} onChange={onChange} />);
+        const select = screen.getByLabelText('Reasoning effort for Codex');
+        expect(select).toHaveValue('low');
+        fireEvent.change(select, { target: { value: 'high' } });
+        expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ reviewerEfforts: { codex: 'high' } }));
+      });
+
+      it('clearing DELETES the key rather than writing an empty string', () => {
+        const onChange = vi.fn();
+        render(<ReviewerPicker reviewers={['codex']} reviewerEfforts={{ codex: 'high' }} onChange={onChange} />);
+        fireEvent.change(screen.getByLabelText('Reasoning effort for Codex'), { target: { value: '' } });
+        expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ reviewerEfforts: {} }));
+      });
+
+      it('keeps a stored tier the ladder no longer lists visible instead of reading as unset', () => {
+        render(<ReviewerPicker reviewers={['antigravity']} reviewerEfforts={{ antigravity: 'max' }} onChange={() => {}} />);
+        const select = screen.getByLabelText('Reasoning effort for Antigravity');
+        expect(select).toHaveValue('max');
+        expect(screen.getByRole('option', { name: 'max (unsupported)' })).toBeInTheDocument();
+      });
+
+      it('prunes the effort pin when its reviewer is removed', () => {
+        const onChange = vi.fn();
+        render(<ReviewerPicker reviewers={['codex', 'ollama']} reviewerEfforts={{ ollama: 'high' }} onChange={onChange} />);
+        fireEvent.click(screen.getByLabelText('Remove Ollama'));
+        expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ reviewers: ['codex'], reviewerEfforts: {} }));
+      });
+
+      it('reads a pin case-insensitively, like the sibling maps', () => {
+        render(<ReviewerPicker reviewers={['codex']} reviewerEfforts={{ Codex: 'high' }} onChange={() => {}} />);
+        expect(screen.getByLabelText('Reasoning effort for Codex')).toHaveValue('high');
+      });
+
+      // #3733: agy validates the model/effort PAIR, so the ladder narrows by the
+      // row's pinned model. `modelEffortLevels` is the caller's accessor (see
+      // useReviewerModelOptions) — stubbed here the way the real hook behaves.
+      describe('narrowed by the pinned model', () => {
+        const tiersByModel = {
+          'gemini-3.1-pro': ['high'],
+          'gemini-3.6-flash': ['low', 'high'],
+          'claude-sonnet-4-6': [],
+        };
+        const narrowing = {
+          optionsByReviewer: { antigravity: Object.keys(tiersByModel) },
+          freeText: { antigravity: true },
+          unavailable: {},
+          loaded: true,
+          modelEffortLevels: (reviewer, model) => (reviewer === 'antigravity'
+            ? (tiersByModel[model] ?? ['low', 'medium', 'high'])
+            : ['low', 'medium', 'high'])
+        };
+
+        it('offers only the tiers the pinned model actually has', () => {
+          render(<ReviewerPicker reviewers={['antigravity']} reviewerModels={{ antigravity: 'gemini-3.1-pro' }} modelOptions={narrowing} onChange={() => {}} />);
+          expect(screen.getByRole('option', { name: 'high' })).toBeInTheDocument();
+          // The pair agy rejects — the whole point of the narrowing.
+          expect(screen.queryByRole('option', { name: 'medium' })).not.toBeInTheDocument();
+        });
+
+        it('keeps the full ladder when no model is pinned', () => {
+          render(<ReviewerPicker reviewers={['antigravity']} modelOptions={narrowing} onChange={() => {}} />);
+          expect(screen.getByRole('option', { name: 'medium' })).toBeInTheDocument();
+        });
+
+        it('falls back to the static ladder when the caller passes no modelOptions', () => {
+          render(<ReviewerPicker reviewers={['antigravity']} reviewerModels={{ antigravity: 'gemini-3.1-pro' }} onChange={() => {}} />);
+          expect(screen.getByRole('option', { name: 'medium' })).toBeInTheDocument();
+        });
+
+        it('drops the Effort control for a pinned model with no tiers at all', () => {
+          render(<ReviewerPicker reviewers={['antigravity']} reviewerModels={{ antigravity: 'claude-sonnet-4-6' }} modelOptions={narrowing} onChange={() => {}} />);
+          expect(screen.queryByLabelText('Reasoning effort for Antigravity')).not.toBeInTheDocument();
+        });
+
+        it('still renders a STORED pin under a tier-less model so it stays clearable', () => {
+          const onChange = vi.fn();
+          render(<ReviewerPicker reviewers={['antigravity']} reviewerModels={{ antigravity: 'claude-sonnet-4-6' }} reviewerEfforts={{ antigravity: 'high' }} modelOptions={narrowing} onChange={onChange} />);
+          const select = screen.getByLabelText('Reasoning effort for Antigravity');
+          expect(select).toHaveValue('high');
+          fireEvent.change(select, { target: { value: '' } });
+          expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ reviewerEfforts: {} }));
+        });
+
+        it('keeps a stored tier the pinned model dropped visible as unsupported', () => {
+          render(<ReviewerPicker reviewers={['antigravity']} reviewerModels={{ antigravity: 'gemini-3.1-pro' }} reviewerEfforts={{ antigravity: 'medium' }} modelOptions={narrowing} onChange={() => {}} />);
+          expect(screen.getByLabelText('Reasoning effort for Antigravity')).toHaveValue('medium');
+          expect(screen.getByRole('option', { name: 'medium (unsupported)' })).toBeInTheDocument();
+        });
+      });
+    });
+
+  describe('help disclosure', () => {
+    it('keeps the reviewer tip collapsed until opened', async () => {
+      const user = userEvent.setup();
+      render(<ReviewerPicker reviewers={['codex']} onChange={() => {}} />);
+      const summary = screen.getByText('Tip: reviewer controls');
+      const details = summary.closest('details');
+      expect(details).not.toHaveAttribute('open');
+      await user.click(summary);
+      expect(details).toHaveAttribute('open');
+    });
+  });
+
+  describe('defaults-aware emit (#6208)', () => {
+    const DEFAULTS = {
+      reviewers: ['copilot'],
+      usernames: [],
+      optionalReviewers: [],
+      reviewerMaxRounds: {},
+      reviewerModels: {},
+      reviewerEfforts: {},
+      stopMode: 'all',
+      reviewerApplies: false,
+    };
+
+    it('emits the full snapshot when no defaults are provided', async () => {
+      const onChange = vi.fn();
+      const user = userEvent.setup();
+      render(<ReviewerPicker reviewers={['codex', 'antigravity']} onChange={onChange} />);
+      await user.click(screen.getByLabelText('Remove Codex'));
+      expect(onChange).toHaveBeenCalledWith(expect.objectContaining({
+        reviewers: ['antigravity'],
+        usernames: [],
+        optionalReviewers: [],
+        reviewerMaxRounds: {},
+        reviewerModels: {},
+        reviewerEfforts: {},
+      }));
+    });
+
+    it('omits every key that still equals the defaults when only the stop-mode changes', async () => {
+      const onChange = vi.fn();
+      const user = userEvent.setup();
+      render(
+        <ReviewerPicker
+          reviewers={['codex', 'antigravity']}
+          stopMode="all"
+          defaults={{ ...DEFAULTS, reviewers: ['codex', 'antigravity'] }}
+          onChange={onChange}
+        />
+      );
+      await user.selectOptions(screen.getByLabelText('Stop mode:'), 'on-clean');
+      expect(onChange).toHaveBeenCalledTimes(1);
+      expect(onChange).toHaveBeenCalledWith({ stopMode: 'on-clean' });
+    });
+
+    it('emits only reviewers when one is removed from a seeded list', async () => {
+      const onChange = vi.fn();
+      const user = userEvent.setup();
+      render(
+        <ReviewerPicker
+          reviewers={['codex', 'antigravity']}
+          defaults={{ ...DEFAULTS, reviewers: ['codex', 'antigravity'] }}
+          onChange={onChange}
+        />
+      );
+      await user.click(screen.getByLabelText('Remove Codex'));
+      expect(onChange).toHaveBeenCalledTimes(1);
+      expect(onChange).toHaveBeenCalledWith({ reviewers: ['antigravity'] });
+    });
+
+    it('emits an explicitly-emptied map that clears a default pin (absent ≠ empty)', async () => {
+      const onChange = vi.fn();
+      const user = userEvent.setup();
+      render(
+        <ReviewerPicker
+          reviewers={['codex']}
+          optionalReviewers={['codex']}
+          defaults={{ ...DEFAULTS, reviewers: ['codex'], optionalReviewers: ['codex'] }}
+          onChange={onChange}
+        />
+      );
+      await user.click(screen.getByLabelText('Make Codex blocking'));
+      expect(onChange).toHaveBeenCalledTimes(1);
+      expect(onChange).toHaveBeenCalledWith({ optionalReviewers: [] });
+    });
+
+    it('omits a pin map that already matches the defaults when an unrelated control changes', async () => {
+      const onChange = vi.fn();
+      const user = userEvent.setup();
+      render(
+        <ReviewerPicker
+          reviewers={['codex']}
+          reviewerModels={{ codex: 'gpt-5' }}
+          defaults={{ ...DEFAULTS, reviewers: ['codex'], reviewerModels: { codex: 'gpt-5' } }}
+          onChange={onChange}
+        />
+      );
+      await user.click(screen.getByLabelText('Make Codex non-blocking'));
+      expect(onChange).toHaveBeenCalledTimes(1);
+      expect(onChange).toHaveBeenCalledWith({ optionalReviewers: ['codex'] });
+    });
+
+    it('compares membership lists order-insensitively (reviewers stay order-sensitive)', async () => {
+      const onChange = vi.fn();
+      const user = userEvent.setup();
+      render(
+        <ReviewerPicker
+          reviewers={['codex', 'antigravity']}
+          optionalReviewers={['antigravity', 'codex']}
+          defaults={{ ...DEFAULTS, reviewers: ['codex', 'antigravity'], optionalReviewers: ['codex', 'antigravity'] }}
+          onChange={onChange}
+        />
+      );
+      // Reordering the reviewers IS a change (run order); the same-membership
+      // optional set in another order is not — only reviewers is emitted.
+      await user.click(screen.getByLabelText('Move Antigravity earlier'));
+      expect(onChange).toHaveBeenCalledTimes(1);
+      expect(onChange).toHaveBeenCalledWith({ reviewers: ['antigravity', 'codex'] });
+    });
+
+    it('compares pin-map keys case-insensitively', async () => {
+      const onChange = vi.fn();
+      const user = userEvent.setup();
+      render(
+        <ReviewerPicker
+          reviewers={['codex']}
+          reviewerModels={{ Codex: 'gpt-5' }}
+          defaults={{ ...DEFAULTS, reviewers: ['codex'], reviewerModels: { codex: 'gpt-5' } }}
+          onChange={onChange}
+        />
+      );
+      await user.click(screen.getByLabelText('Make Codex non-blocking'));
+      expect(onChange).toHaveBeenCalledTimes(1);
+      expect(onChange).toHaveBeenCalledWith({ optionalReviewers: ['codex'] });
+    });
+  });
+});

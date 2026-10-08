@@ -1,0 +1,327 @@
+import { useState, useEffect, useRef, Fragment } from 'react';
+import { createPortal } from 'react-dom';
+import { Maximize2, X } from 'lucide-react';
+import { applyProcessAction } from '../../../services/api';
+import BrailleSpinner from '../../BrailleSpinner';
+import { FormField } from '../../ui/FormField';
+import ProcessLogLines, { LogStreamBadge } from '../../ui/ProcessLogLines';
+import { useProcessSnapshot } from '../../../hooks/useProcessSnapshot';
+import { useProcessLogs } from '../../../hooks/useProcessLogs';
+import useFocusTrap from '../../../hooks/useFocusTrap';
+import { copyToClipboard } from '../../../lib/clipboard';
+import { formatBytes, formatCount, formatDurationMs, formatTimeOfDaySeconds } from '../../../utils/formatters';
+
+const getStatusClasses = (status) => {
+  switch (status) {
+    case 'online': return { badge: 'bg-port-success/15 text-port-success', dot: 'bg-port-success' };
+    case 'stopped': return { badge: 'bg-gray-500/20 text-gray-400', dot: 'bg-gray-500' };
+    case 'errored': return { badge: 'bg-port-error/15 text-port-error', dot: 'bg-port-error' };
+    default: return { badge: 'bg-port-warning/15 text-port-warning', dot: 'bg-port-warning' };
+  }
+};
+
+export default function ProcessesTab({ appId, pm2ProcessNames, filterFn }) {
+  const [expandedProcess, setExpandedProcess] = useState(null);
+  const [restarting, setRestarting] = useState({});
+  const [tailLines, setTailLines] = useState(500);
+  const [fullscreen, setFullscreen] = useState(false);
+  const logsRef = useRef(null);
+  const fullscreenLogsRef = useRef(null);
+  const fullscreenModalRef = useRef(null);
+  const fullscreenButtonRef = useRef(null);
+
+  // Focus trap for fullscreen modal: trap Tab/Shift+Tab and restore focus on close
+  useFocusTrap(fullscreen, fullscreenModalRef);
+
+  // Socket log lifecycle lives in the shared hook so this tab and the desktop
+  // launch-progress panel can't drift.
+  const { logs, status, statusDetail, retry, clear: clearLogs } = useProcessLogs(expandedProcess, { lines: tailLines, appId });
+
+  const { data, loading, error, refetch, applySnapshot } = useProcessSnapshot(appId);
+  const processes = data ?? [];
+
+  // Pin both log panes to the bottom as lines arrive. Driven off `logs` rather
+  // than the socket frame so it also fires on the initial tail replay.
+  useEffect(() => {
+    for (const ref of [logsRef, fullscreenLogsRef]) {
+      if (ref.current) ref.current.scrollTop = ref.current.scrollHeight;
+    }
+  }, [logs]);
+
+  const pm2Action = async (action, name) => {
+    setRestarting(prev => ({ ...prev, [name]: true }));
+    const result = await applyProcessAction(name, action, appId).catch(() => null);
+    if (result) applySnapshot(result.processes);
+    setRestarting(prev => ({ ...prev, [name]: false }));
+  };
+
+  // No explicit clear here — useProcessLogs resets its buffer whenever
+  // processName changes, so the new process never shows the old one's tail.
+  const toggleExpand = (name) => {
+    setExpandedProcess(prev => prev === name ? null : name);
+  };
+
+  const copyLogs = () => {
+    if (logs.length === 0) return;
+    const text = logs
+      .map(({ line, type, timestamp }) => `[${formatTimeOfDaySeconds(timestamp)}] [${type}] ${line}`)
+      .join('\n');
+    copyToClipboard(text, 'Logs copied');
+  };
+
+  const handleFullscreenEscape = (e) => {
+    if (e.key === 'Escape' && fullscreen) {
+      e.preventDefault();
+      setFullscreen(false);
+    }
+  };
+
+  const filteredProcesses = filterFn
+    ? processes.filter(proc => filterFn(proc.name))
+    : pm2ProcessNames
+      ? processes.filter(proc => pm2ProcessNames.includes(proc.name))
+      : processes;
+
+  if (loading) {
+    return <div className="text-center py-8"><BrailleSpinner text="Loading processes" /></div>;
+  }
+
+  return (
+    <>
+      <div className="space-y-4">
+        {error && <p role="status" className="text-port-warning">Process status unavailable; showing the last known state.</p>}
+        <div className="flex justify-between items-center">
+          <p className="text-gray-500 text-sm">{filteredProcesses.length} process{filteredProcesses.length !== 1 ? 'es' : ''}</p>
+          <button
+            onClick={refetch}
+            className="px-3 py-1.5 bg-port-border hover:bg-port-border/80 text-white rounded-lg transition-colors text-sm"
+          >
+            Refresh
+          </button>
+        </div>
+
+        <div className="bg-port-card border border-port-border rounded-xl overflow-hidden overflow-x-auto">
+          <table className="w-full min-w-[700px]" aria-label="PM2 processes">
+            <thead className="bg-port-border/50">
+              <tr>
+                <th scope="col" className="px-4 py-3 text-left text-sm font-medium text-gray-400 w-8">
+                  <span className="sr-only">Details</span>
+                </th>
+                <th scope="col" className="px-4 py-3 text-left text-sm font-medium text-gray-400">Name</th>
+                <th scope="col" className="px-4 py-3 text-left text-sm font-medium text-gray-400">Status</th>
+                <th scope="col" className="px-4 py-3 text-left text-sm font-medium text-gray-400">PID</th>
+                <th scope="col" className="px-4 py-3 text-left text-sm font-medium text-gray-400">CPU</th>
+                <th scope="col" className="px-4 py-3 text-left text-sm font-medium text-gray-400">Memory</th>
+                <th scope="col" className="px-4 py-3 text-left text-sm font-medium text-gray-400">Uptime</th>
+                <th scope="col" className="px-4 py-3 text-left text-sm font-medium text-gray-400">Restarts</th>
+                <th scope="col" className="px-4 py-3 text-right text-sm font-medium text-gray-400">Actions</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-port-border">
+              {filteredProcesses.map(proc => (
+                <Fragment key={proc.pm_id}>
+                  <tr className="hover:bg-port-border/20">
+                    <td className="px-4 py-3">
+                      <button
+                        onClick={() => toggleExpand(proc.name)}
+                        aria-expanded={expandedProcess === proc.name}
+                        aria-label={`${expandedProcess === proc.name ? 'Collapse' : 'Expand'} details for ${proc.name}`}
+                        className="text-gray-400 hover:text-white transition-transform"
+                      >
+                        <span className={`inline-block transition-transform ${expandedProcess === proc.name ? 'rotate-90' : ''}`}>▶</span>
+                      </button>
+                    </td>
+                    <td className="px-4 py-3">
+                      <span className="font-medium text-white">{proc.name}</span>
+                    </td>
+                    <td className="px-4 py-3">
+                      {(() => { const sc = getStatusClasses(proc.status); return (
+                        <span className={`inline-flex items-center gap-2 px-2 py-1 rounded text-xs ${sc.badge}`}>
+                          <span className={`w-2 h-2 rounded-full ${sc.dot}`} />
+                          {proc.status}
+                        </span>
+                      ); })()}
+                    </td>
+                    <td className="px-4 py-3 text-gray-400 font-mono text-sm">{proc.pid || '-'}</td>
+                    <td className="px-4 py-3 text-gray-400">{proc.cpu ? `${proc.cpu}%` : '-'}</td>
+                    <td className="px-4 py-3 text-gray-400">{formatBytes(proc.memory)}</td>
+                    <td className="px-4 py-3 text-gray-400">{proc.uptime ? formatDurationMs(proc.uptime) : '-'}</td>
+                    <td className="px-4 py-3 text-gray-400">{proc.restarts}</td>
+                    <td className="px-4 py-3 text-right">
+                      <div className="flex justify-end gap-1">
+                        {proc.status === 'online' ? (
+                          <>
+                            <button
+                              onClick={() => pm2Action('restart', proc.name)}
+                              disabled={restarting[proc.name]}
+                              className="px-2 py-1 text-xs bg-port-warning/20 text-port-warning hover:bg-port-warning/30 rounded disabled:opacity-50"
+                            >
+                              {restarting[proc.name] ? '...' : 'Restart'}
+                            </button>
+                            <button
+                              onClick={() => pm2Action('stop', proc.name)}
+                              disabled={restarting[proc.name]}
+                              className="px-2 py-1 text-xs bg-port-error/20 text-port-error hover:bg-port-error/30 rounded disabled:opacity-50"
+                            >
+                              Stop
+                            </button>
+                          </>
+                        ) : (
+                          <button
+                            onClick={() => pm2Action('start', proc.name)}
+                            disabled={restarting[proc.name]}
+                            className="px-2 py-1 text-xs bg-port-success/20 text-port-success hover:bg-port-success/30 rounded disabled:opacity-50"
+                          >
+                            {restarting[proc.name] ? '...' : 'Start'}
+                          </button>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                  {expandedProcess === proc.name && (
+                    <tr>
+                      <td colSpan={9} className="p-0">
+                        <div className="bg-port-bg border-t border-port-border">
+                          <div className="flex items-center justify-between px-4 py-2 border-b border-port-border">
+                            <div className="flex items-center gap-3">
+                              <span className="text-xs text-gray-400">Live logs for {proc.name}</span>
+                              <LogStreamBadge status={status} />
+                            </div>
+                            <div className="flex items-center gap-3">
+                              <FormField className="flex items-center gap-2" label="Tail lines:" labelClassName="text-xs text-gray-500">
+                                <select
+                                  value={tailLines}
+                                  onChange={(e) => setTailLines(Number(e.target.value))}
+                                  className="px-2 py-1 text-xs bg-port-card border border-port-border rounded text-white"
+                                >
+                                  <option value={100}>100</option>
+                                  <option value={250}>250</option>
+                                  <option value={500}>500</option>
+                                  <option value={1000}>1000</option>
+                                  <option value={2000}>2000</option>
+                                </select>
+                              </FormField>
+                              <span className="text-xs text-gray-600">{formatCount(logs.length)} lines</span>
+                              <button
+                                onClick={clearLogs}
+                                className="min-h-[44px] min-w-[44px] px-1 text-xs text-gray-500 hover:text-white"
+                              >
+                                Clear
+                              </button>
+                              <button
+                                onClick={copyLogs}
+                                disabled={logs.length === 0}
+                                className="min-h-[44px] min-w-[44px] px-1 text-xs text-gray-500 hover:text-white disabled:opacity-50 disabled:hover:text-gray-500"
+                              >
+                                Copy logs
+                              </button>
+                              <button
+                                ref={fullscreenButtonRef}
+                                onClick={() => setFullscreen(true)}
+                                className="min-h-[44px] px-1 text-xs text-gray-500 hover:text-white flex items-center gap-1"
+                                title="Fullscreen"
+                              >
+                                <Maximize2 size={12} />
+                                Fullscreen
+                              </button>
+                            </div>
+                          </div>
+                          <div
+                            ref={logsRef}
+                            className="h-[32rem] overflow-auto p-3 font-mono text-xs"
+                          >
+                            <ProcessLogLines logs={logs} status={status} statusDetail={statusDetail} onRetry={retry} showTimestamps />
+                          </div>
+                        </div>
+                      </td>
+                    </tr>
+                  )}
+                </Fragment>
+              ))}
+              {filteredProcesses.length === 0 && (
+                <tr>
+                  <td colSpan={9} className="px-4 py-12 text-center text-gray-500">
+                    No PM2 processes found
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/*
+        Fullscreen Log Modal — portaled to <body>.
+
+        This tab renders inside an app-detail / processes-page card tree, and on
+        "glass" themes (`--port-backdrop-filter` non-none) `index.css` gives every
+        bordered/rounded `.bg-port-card` a backdrop-filter, which makes that card
+        the containing block for `position:fixed` descendants. Rendered inline the
+        overlay would be sized to the card instead of the viewport. Same escape
+        GalleryImagePicker / FolderPicker get via <ui/Modal>'s `usePortal`, and the
+        same fix MediaLightbox took in #4151 — reached through createPortal
+        directly because this overlay isn't a <Modal>.
+      */}
+      {fullscreen && expandedProcess && createPortal(
+        <div
+          ref={fullscreenModalRef}
+          className="fixed inset-0 bg-port-bg z-50 flex flex-col"
+          role="dialog"
+          aria-modal="true"
+          aria-label={`Logs for ${expandedProcess}`}
+          onKeyDown={handleFullscreenEscape}
+        >
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 px-4 sm:px-6 py-3 sm:py-4 border-b border-port-border bg-port-card">
+            <div className="flex flex-wrap items-center gap-2 sm:gap-4">
+              <span className="text-lg font-medium text-white">Logs: {expandedProcess}</span>
+              <LogStreamBadge status={status} className="text-sm" />
+            </div>
+            <div data-testid="fullscreen-log-controls" className="flex flex-wrap items-center gap-2 sm:gap-4">
+              <FormField className="flex items-center gap-2" label="Tail lines:" labelClassName="text-sm text-gray-500">
+                <select
+                  value={tailLines}
+                  onChange={(e) => setTailLines(Number(e.target.value))}
+                  className="px-2 py-1 text-sm bg-port-bg border border-port-border rounded text-white"
+                >
+                  <option value={100}>100</option>
+                  <option value={250}>250</option>
+                  <option value={500}>500</option>
+                  <option value={1000}>1000</option>
+                  <option value={2000}>2000</option>
+                </select>
+              </FormField>
+              <span className="text-sm text-gray-400">{formatCount(logs.length)} lines</span>
+              <button
+                onClick={clearLogs}
+                className="min-h-[44px] min-w-[44px] px-1 text-sm text-gray-500 hover:text-white"
+              >
+                Clear
+              </button>
+              <button
+                onClick={copyLogs}
+                disabled={logs.length === 0}
+                className="min-h-[44px] min-w-[44px] px-1 text-sm text-gray-500 hover:text-white disabled:opacity-50 disabled:hover:text-gray-500"
+              >
+                Copy logs
+              </button>
+              <button
+                onClick={() => setFullscreen(false)}
+                className="min-h-[44px] min-w-[44px] p-2 text-gray-400 hover:text-white flex items-center justify-center"
+                title="Exit fullscreen" aria-label="Exit fullscreen"
+              >
+                <X size={20} />
+              </button>
+            </div>
+          </div>
+          <div
+            ref={fullscreenLogsRef}
+            className="flex-1 overflow-auto p-4 font-mono text-sm"
+          >
+            <ProcessLogLines logs={logs} status={status} statusDetail={statusDetail} onRetry={retry} showTimestamps timestampGap="mr-3" />
+          </div>
+        </div>,
+        document.body
+      )}
+    </>
+  );
+}

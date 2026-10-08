@@ -1,0 +1,93 @@
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('../lib/bufferedSpawn.js', () => ({ killProcessTree: vi.fn() }));
+
+import { armForceKill } from './forceKill.js';
+import { createTuiExitHandler } from './tuiExit.js';
+
+function setup(extra = {}) {
+  const agent = {
+    process: {}, startedAt: Date.now(), outputBuffer: 'Usage limit reached',
+    completedBySentinel: false, exited: false, doneWatcher: vi.fn(), ...extra,
+  };
+  const activeAgents = new Map([['agent-old', agent]]);
+  const state = { agents: { 'agent-old': { status: 'paused' } }, stats: { completed: 0, failed: 0 } };
+  const io = { emit: vi.fn() };
+  const emitToServer = vi.fn();
+  const withState = vi.fn(async fn => fn(state));
+  const persistCompletion = vi.fn().mockResolvedValue();
+  const onExit = createTuiExitHandler({
+    agentId: 'agent-old', taskId: 'task-1', sessionId: 'session-1',
+    agent, activeAgents, io, emitToServer, withState, persistCompletion,
+  });
+  return { agent, activeAgents, state, io, emitToServer, withState, onExit, persistCompletion };
+}
+
+afterEach(() => vi.useRealTimers());
+
+describe('runner TUI exit handoff', () => {
+  it('delivers the exit after force-kill removed the handle, exactly once', async () => {
+    vi.useFakeTimers();
+    const run = setup();
+    armForceKill(run.activeAgents, 'agent-old', run.agent, { graceMs: 5000 });
+    vi.advanceTimersByTime(5000);
+    expect(run.activeAgents.size).toBe(0);
+    // Sending SIGKILL alone must not release the server's worktree hold.
+    expect(run.io.emit).not.toHaveBeenCalled();
+
+    await run.onExit({ exitCode: 0, signal: 9 });
+    await run.onExit({ exitCode: 0, signal: 9 });
+    expect(run.io.emit).toHaveBeenCalledExactlyOnceWith('tui:exit', {
+      agentId: 'agent-old', sessionId: 'session-1', exitCode: 0, signal: 9,
+      outputTail: 'Usage limit reached',
+    });
+    expect(run.emitToServer).toHaveBeenCalledTimes(1);
+    expect(run.state.stats).toEqual({ completed: 1, failed: 1 });
+    expect(run.agent.doneWatcher).toHaveBeenCalledTimes(1);
+  });
+
+  it('releases the transport on paused exit while preserving the resumable record', async () => {
+    const run = setup({ paused: true });
+    await run.onExit({ exitCode: 0, signal: 15 });
+    expect(run.io.emit).toHaveBeenCalledWith('tui:exit', expect.objectContaining({ signal: 15 }));
+    expect(run.activeAgents.size).toBe(0);
+    expect(run.emitToServer).not.toHaveBeenCalled();
+    expect(run.withState).not.toHaveBeenCalled();
+    expect(run.state.agents['agent-old']).toEqual({ status: 'paused' });
+  });
+
+  it('persists the sentinel received during exit instead of the Gemini thinking transcript', async () => {
+    const run = setup({ outputBuffer: 'Thinking: inspect the code and write the completion file.' });
+    const summary = `✅ Agent signaled completion\n## Summary\n${'Detailed results. '.repeat(400)}\nFinal conclusion.\n`;
+    run.agent.sentinelWork = Promise.resolve().then(() => {
+      run.agent.completedBySentinel = true;
+      run.agent.completionOutput = summary;
+    });
+    await run.onExit({ exitCode: 1, signal: 15 });
+    expect(run.persistCompletion).toHaveBeenCalledWith('agent-old', summary, expect.objectContaining({ success: true }));
+    expect(run.emitToServer).toHaveBeenCalledWith('agent:completed', expect.objectContaining({ outputLength: summary.length }));
+    expect(run.io.emit).toHaveBeenCalledWith('tui:exit', expect.objectContaining({ outputTail: run.agent.outputBuffer }));
+  });
+
+  it('retains successful sentinel completion and bounds the exit transcript', async () => {
+    const run = setup({ completedBySentinel: true, outputBuffer: 'x'.repeat(20000) });
+    await run.onExit({ exitCode: 1, signal: 15 });
+    expect(run.io.emit).toHaveBeenCalledWith('tui:exit', expect.objectContaining({
+      exitCode: 0, signal: 0, outputTail: 'x'.repeat(16 * 1024),
+    }));
+    expect(run.state.stats).toEqual({ completed: 1, failed: 0 });
+    expect(run.state.agents).toEqual({});
+  });
+
+  it('never persists the raw terminal repaint stream as the transcript', async () => {
+    const noSummary = setup({ completedBySentinel: true, outputBuffer: '\x1b[1;38;2;1;2;3mrepaint\x1b[m\x1b[K' });
+    await noSummary.onExit({ exitCode: 0, signal: 0 });
+    const [, written] = noSummary.persistCompletion.mock.calls[0];
+    expect(written).not.toContain('\x1b');
+    expect(written).toContain('Agent signaled completion');
+
+    const failed = setup({ outputBuffer: '\x1b[31mUsage limit reached\x1b[m' });
+    await failed.onExit({ exitCode: 1, signal: 0 });
+    expect(failed.persistCompletion.mock.calls[0][1]).toBe('Usage limit reached');
+  });
+});

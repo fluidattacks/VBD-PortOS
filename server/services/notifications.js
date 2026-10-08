@@ -1,0 +1,320 @@
+/**
+ * Notifications Service
+ *
+ * Manages user task notifications for items requiring attention:
+ * - Memory approvals
+ * - CoS task approvals
+ * - Code reviews
+ * - Health issues
+ */
+
+import { join } from 'path';
+import { v4 as uuidv4 } from '../lib/uuid.js';
+import { EventEmitter } from 'events';
+import { ensureDir, PATHS, readJSONFile, atomicWrite } from '../lib/fileUtils.js';
+import { createMutex } from '../lib/asyncMutex.js';
+
+const withLock = createMutex();
+
+const DATA_DIR = PATHS.data;
+const NOTIFICATIONS_FILE = join(DATA_DIR, 'notifications.json');
+
+// Event emitter for notification changes
+export const notificationEvents = new EventEmitter();
+
+// In-memory cache
+let notificationsCache = null;
+
+export { NOTIFICATION_TYPES } from '../lib/notificationTypes.js';
+
+// Priority levels
+export const PRIORITY_LEVELS = {
+  LOW: 'low',
+  MEDIUM: 'medium',
+  HIGH: 'high',
+  CRITICAL: 'critical'
+};
+
+const loadActionAdapter = () => import('./reviewActionAdapters.js');
+
+/**
+ * Ensure data directory exists
+ */
+async function ensureDirectory() {
+  await ensureDir(DATA_DIR);
+}
+
+/**
+ * Load notifications from file
+ */
+async function loadNotifications() {
+  if (notificationsCache) return notificationsCache;
+
+  await ensureDirectory();
+
+  // STRICT (#4115): this feeds `getUnreadCount()`, the bell badge served by
+  // GET /api/notifications/count — a fake 0 there is a lie, not a default. It is
+  // also the base of every read-modify-write (`saveNotifications`), so a
+  // swallowed unreadable read would let the next markAsRead truncate the file.
+  // `ensureDirectory()` above can already reject, so callers tolerate a throw.
+  notificationsCache = await readJSONFile(NOTIFICATIONS_FILE, { version: 1, notifications: [] }, { strict: true });
+  return notificationsCache;
+}
+
+/**
+ * Save notifications to file
+ */
+async function saveNotifications(data) {
+  await ensureDirectory();
+  notificationsCache = data;
+  await atomicWrite(NOTIFICATIONS_FILE, data);
+}
+
+/**
+ * Get all notifications
+ */
+export async function getNotifications(options = {}) {
+  const data = await loadNotifications();
+  let notifications = [...data.notifications];
+  if (!options.includeHidden) notifications = notifications.filter(n => n.historyHidden !== true);
+
+  // Filter by type
+  if (options.type) {
+    notifications = notifications.filter(n => n.type === options.type);
+  }
+
+  // Filter by read status
+  if (options.unreadOnly) {
+    notifications = notifications.filter(n => !n.read);
+  }
+
+  // Sort by timestamp descending (newest first)
+  notifications.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+
+  // Limit
+  if (options.limit) {
+    notifications = notifications.slice(0, options.limit);
+  }
+
+  return notifications;
+}
+
+/**
+ * Get unread notification count
+ */
+export async function getUnreadCount() {
+  const data = await loadNotifications();
+  return data.notifications.filter(n => !n.read && n.historyHidden !== true).length;
+}
+
+/**
+ * Get notification counts by type
+ */
+export async function getCountsByType() {
+  const data = await loadNotifications();
+  const counts = {
+    total: 0,
+    unread: 0,
+    byType: {}
+  };
+
+  for (const n of data.notifications) {
+    if (n.historyHidden === true) continue;
+    counts.total++;
+    if (!n.read) counts.unread++;
+    counts.byType[n.type] = (counts.byType[n.type] || 0) + 1;
+  }
+
+  return counts;
+}
+
+/**
+ * Add a new notification
+ */
+export async function addNotification(notification) {
+  return withLock(async () => {
+    const { adaptNotification } = await loadActionAdapter();
+    const data = await loadNotifications();
+
+    const newNotification = {
+      id: uuidv4(),
+      type: notification.type,
+      title: notification.title,
+      // Some legacy producers call this field `message`. Preserve it at the
+      // store boundary so the action adapter can retain the user's remedy.
+      description: notification.description || notification.message || '',
+      priority: notification.priority || PRIORITY_LEVELS.MEDIUM,
+      timestamp: new Date().toISOString(),
+      link: notification.link || null,
+      read: false,
+      metadata: notification.metadata || {}
+    };
+    const action = adaptNotification(newNotification);
+    if (action) newNotification.metadata = { ...newNotification.metadata, actionId: action.id };
+
+    data.notifications.push(newNotification);
+
+    // Bound event history without dropping an unresolved source obligation.
+    if (data.notifications.length > 500) {
+      const recentIds = new Set(data.notifications.filter(n => !n.historyHidden).slice(-500).map(n => n.id));
+      data.notifications = data.notifications.filter(n => {
+        if (recentIds.has(n.id)) return true;
+        if (!adaptNotification(n)) return false;
+        n.historyHidden = true;
+        return true;
+      });
+    }
+
+    await saveNotifications(data);
+
+    console.log(`🔔 Notification added: ${newNotification.type} - ${newNotification.title}`);
+    notificationEvents.emit('added', newNotification);
+    notificationEvents.emit('count-changed', await getUnreadCount());
+
+    return newNotification;
+  });
+}
+
+/**
+ * Remove a notification by ID
+ */
+export async function removeNotification(id) {
+  return withLock(async () => {
+    const { adaptNotification } = await loadActionAdapter();
+    const data = await loadNotifications();
+    const index = data.notifications.findIndex(n => n.id === id);
+
+    if (index === -1) {
+      return { success: false, error: 'Notification not found' };
+    }
+
+    const removed = data.notifications[index];
+    if (adaptNotification(removed)) removed.historyHidden = true;
+    else data.notifications.splice(index, 1);
+    await saveNotifications(data);
+
+    console.log(`🔔 Notification removed: ${id}`);
+    notificationEvents.emit('removed', { id });
+    notificationEvents.emit('count-changed', await getUnreadCount());
+
+    return { success: true, notification: removed };
+  });
+}
+
+/**
+ * Remove notifications by metadata field
+ * Useful for removing notifications when the underlying item is handled
+ */
+export async function removeByMetadata(field, value) {
+  return withLock(async () => {
+    const data = await loadNotifications();
+    // Capture the ids being removed so live clients can prune their local list.
+    // Emitting only 'count-changed' updates the unread badge but leaves the
+    // removed items rendered in the notification center until a reload — the
+    // socket bridge fans 'removed' (not 'count-changed') to the client list.
+    const removedIds = data.notifications.filter(n => n.metadata?.[field] === value).map(n => n.id);
+
+    data.notifications = data.notifications.filter(n => n.metadata?.[field] !== value);
+
+    if (removedIds.length > 0) {
+      await saveNotifications(data);
+      console.log(`🔔 Removed ${removedIds.length} notifications with ${field}=${value}`);
+      for (const id of removedIds) notificationEvents.emit('removed', { id });
+      notificationEvents.emit('count-changed', await getUnreadCount());
+    }
+
+    return { success: true, removed: removedIds.length };
+  });
+}
+
+/**
+ * Mark a notification as read
+ */
+export async function markAsRead(id) {
+  return withLock(async () => {
+    const data = await loadNotifications();
+    const notification = data.notifications.find(n => n.id === id);
+
+    if (!notification) {
+      return { success: false, error: 'Notification not found' };
+    }
+
+    if (!notification.read) {
+      notification.read = true;
+      await saveNotifications(data);
+
+      notificationEvents.emit('updated', notification);
+      notificationEvents.emit('count-changed', await getUnreadCount());
+    }
+
+    return { success: true, notification };
+  });
+}
+
+/**
+ * Mark all notifications as read
+ */
+export async function markAllAsRead() {
+  return withLock(async () => {
+    const data = await loadNotifications();
+    let updated = 0;
+
+    for (const notification of data.notifications) {
+      if (!notification.read && !notification.historyHidden) {
+        notification.read = true;
+        updated++;
+      }
+    }
+
+    if (updated > 0) {
+      await saveNotifications(data);
+      notificationEvents.emit('count-changed', 0);
+    }
+
+    return { success: true, updated };
+  });
+}
+
+/**
+ * Clear all notifications
+ */
+export async function clearAll() {
+  return withLock(async () => {
+    const { adaptNotification } = await loadActionAdapter();
+    const data = await loadNotifications();
+    const count = data.notifications.filter(n => !n.historyHidden).length;
+
+    data.notifications = data.notifications.filter(n => {
+      if (!adaptNotification(n)) return false;
+      n.historyHidden = true;
+      return true;
+    });
+    await saveNotifications(data);
+
+    notificationEvents.emit('cleared');
+    notificationEvents.emit('count-changed', 0);
+
+    return { success: true, cleared: count };
+  });
+}
+
+/**
+ * Check if a notification already exists (prevent duplicates).
+ * When metadataField/metadataValue are omitted, matches by type alone.
+ */
+export async function exists(type, metadataField, metadataValue) {
+  const data = await loadNotifications();
+  if (!metadataField) {
+    return data.notifications.some(n => n.type === type);
+  }
+  return data.notifications.some(
+    n => n.type === type && n.metadata?.[metadataField] === metadataValue
+  );
+}
+
+/**
+ * Invalidate cache (call after external changes)
+ */
+export function invalidateCache() {
+  notificationsCache = null;
+}

@@ -1,0 +1,662 @@
+import { useState, useEffect, useRef, useCallback, useMemo, useId } from 'react';
+import { createPortal } from 'react-dom';
+import { useLocation, useNavigate } from 'react-router';
+import { Brain, Cpu, Package, History, HeartPulse, Search, Loader2, Navigation, Play, LayoutGrid, BookMarked, Send, Video } from 'lucide-react';
+import { useCmdKSearch } from '../hooks/useCmdKSearch';
+import useFocusTrap from '../hooks/useFocusTrap.js';
+import { useInstanceFeatures } from '../hooks/useInstanceFeatures.js';
+import { useScrollLock } from '../hooks/useScrollLock';
+import { search, getPaletteManifest, runPaletteAction, getDashboardLayouts, setActiveDashboardLayout, listCatalogIngredients } from '../services/api';
+import toast from './ui/Toast';
+import { modKey } from '../utils/platform';
+import { DASHBOARD_LAYOUT_CHANGED } from '../constants/events.js';
+import { recordManualLayoutPick } from '../utils/timeWindow.js';
+import { RECENT_KEY, RECENT_CAP, resolveRecentNavEntries } from '../utils/navWorkingSet.js';
+import { filterNavByFeatures } from '../lib/navFeatures.js';
+import { safeReadJsonStorage } from '../lib/safeStorage.js';
+import { escapeRegExp } from '../lib/textUtils.js';
+import { onActivateKeyDown } from '../lib/a11yKeyboard.js';
+
+const ICON_MAP = { Brain, Cpu, Package, History, HeartPulse, Video };
+
+// Subsequence-based fuzzy scorer. Tiered: exact label > label-prefix > alias
+// exact > label-contains > alias-contains > keyword-contains > section-contains
+// > subsequence. Reads precomputed lowercased fields to keep each comparison
+// allocation-free on the per-keystroke hot path.
+const scoreCommand = (c, q) => {
+  if (!q) return 0;
+  const { _label, _aliases, _keywords, _section } = c;
+  if (_label === q) return 1000;
+  if (_label.startsWith(q)) return 800 - (_label.length - q.length);
+  if (_aliases.includes(q)) return 750;
+  if (_label.includes(q)) return 500;
+  for (const a of _aliases) if (a.includes(q)) return 400;
+  for (const k of _keywords) if (k.includes(q)) return 300;
+  if (_section.includes(q)) return 150;
+  let i = 0;
+  for (const ch of _label) if (ch === q[i]) i += 1;
+  return i === q.length ? 100 + i : 0;
+};
+
+const precompute = (cmd) => ({
+  ...cmd,
+  _label: (cmd.label || '').toLowerCase(),
+  _aliases: (cmd.aliases || []).map((a) => a.toLowerCase()),
+  _keywords: (cmd.keywords || []).map((k) => k.toLowerCase()),
+  _section: (cmd.section || '').toLowerCase(),
+});
+
+function Highlight({ text, query }) {
+  if (!query || !text) return <span>{text}</span>;
+  const escaped = escapeRegExp(query);
+  const parts = text.split(new RegExp(`(${escaped})`, 'gi'));
+  return (
+    <span>
+      {parts.map((part, i) =>
+        part.toLowerCase() === query.toLowerCase()
+          ? <mark key={i} className="bg-port-accent/30 text-white rounded px-0.5 not-italic">{part}</mark>
+          : <span key={i}>{part}</span>
+      )}
+    </span>
+  );
+}
+
+// Curated default shortlist — shown when the palette opens with no query so
+// Enter always does something useful.
+const DEFAULT_NAV_IDS = new Set(['nav.dashboard', 'nav.brain.inbox', 'nav.cos.tasks', 'nav.goals', 'nav.review-hub']);
+const DEFAULT_ACTION_IDS = new Set(['brain_capture', 'time_now', 'goal_list', 'meatspace_summary_today']);
+
+export default function CmdKSearch() {
+  const { open, setOpen } = useCmdKSearch();
+  const navigate = useNavigate();
+  const location = useLocation();
+  const paletteId = useId();
+  const listboxId = `${paletteId}-results`;
+  const optionId = (item) => `${paletteId}-option-${encodeURIComponent(JSON.stringify([item.kind, item.sourceId, item.type, item.id, item.path ?? item.url]))}`;
+  const inputRef = useRef(null);
+  const modalRef = useRef(null);
+
+  const [query, setQuery] = useState('');
+  const [manifest, setManifest] = useState(null);
+  const { isFeatureEnabled } = useInstanceFeatures();
+  const [searchResults, setSearchResults] = useState([]);
+  const [catalogResults, setCatalogResults] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [focusedIndex, setFocusedIndex] = useState(0);
+  const [expandedSources, setExpandedSources] = useState(new Set());
+  const [recentPaths, setRecentPaths] = useState([]);
+  const [captureMode, setCaptureMode] = useState(false);
+  const [captureDraft, setCaptureDraft] = useState('');
+  const [captureSubmitting, setCaptureSubmitting] = useState(false);
+  const captureSubmittingRef = useRef(false);
+  const captureAttemptRef = useRef(0);
+  const resultRefs = useRef([]);
+
+  useFocusTrap(open, modalRef, { initialFocusRef: inputRef });
+  useScrollLock(open);
+
+  // Layout records every route visit in the shared sidebar working set. Refresh
+  // from storage on each open so the palette reflects navigation that happened
+  // since its previous use without owning a second history store.
+  useEffect(() => {
+    if (open) setRecentPaths(safeReadJsonStorage(RECENT_KEY, []));
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) {
+      setQuery('');
+      setCaptureMode(false);
+      setCaptureDraft('');
+      setCaptureSubmitting(false);
+      captureSubmittingRef.current = false;
+      captureAttemptRef.current += 1;
+      setSearchResults([]);
+      setCatalogResults([]);
+      setFocusedIndex(0);
+      setExpandedSources(new Set());
+      resultRefs.current = [];
+    }
+  }, [open]);
+
+  // Two effects so setManifest never retriggers a fetch loop:
+  //   1. nav + actions are static server-side; fetched once per mount (guarded
+  //      by a ref so remounting `open` doesn't re-hit the network).
+  //   2. layouts change when the user creates/renames/deletes; re-fetched on
+  //      every open-transition so the palette picks up changes immediately.
+  // Each updates `manifest` functionally without depending on its value.
+  const navActionsFetchedRef = useRef(false);
+  useEffect(() => {
+    if (!open || navActionsFetchedRef.current) return;
+    let cancelled = false;
+    let fetchOk = true;
+    // request() toasts the failure centrally; on rejection we fall back to
+    // an empty shape so the palette still renders (layouts + search work).
+    // The ref only flips to true after a SUCCESSFUL apply — if the fetch
+    // fails or the user closes the palette before it resolves, the next
+    // open will re-fetch instead of being stuck with empty nav/actions.
+    getPaletteManifest()
+      .catch(() => { fetchOk = false; return { nav: [], actions: [] }; })
+      .then((data) => {
+        if (cancelled) return;
+        if (fetchOk) navActionsFetchedRef.current = true;
+        const nav = (data?.nav || []).map(precompute);
+        const actions = (data?.actions || []).map(precompute);
+        setManifest((prev) => ({
+          nav,
+          actions,
+          layouts: prev?.layouts || [],
+        }));
+      });
+    return () => { cancelled = true; };
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    let fetchOk = true;
+    getDashboardLayouts()
+      .catch(() => { fetchOk = false; return { layouts: [] }; })
+      .then((dashboards) => {
+        if (cancelled) return;
+        // Transient failure: preserve the previously-loaded layouts rather
+        // than wiping "Dashboard: …" commands out of the palette until the
+        // next successful open.
+        if (!fetchOk) return;
+        const layouts = (dashboards?.layouts || []).map((l) => precompute({
+          id: `layout.${l.id}`,
+          layoutId: l.id,
+          layoutName: l.name,
+          label: `Dashboard: ${l.name}`,
+          section: 'Layouts',
+          aliases: ['layout', l.id, ...l.name.toLowerCase().split(/\s+/)],
+          keywords: ['dashboard', 'layout', 'view'],
+        }));
+        setManifest((prev) => ({
+          nav: prev?.nav || [],
+          actions: prev?.actions || [],
+          layouts,
+        }));
+      });
+    return () => { cancelled = true; };
+  }, [open]);
+
+  useEffect(() => {
+    if (query.length < 2) {
+      setSearchResults([]);
+      setLoading(false);
+      return;
+    }
+    setLoading(true);
+    // Mirror the catalog effect's cancelled guard so a slow in-flight
+    // response for an older query can't overwrite results for a newer one
+    // (or flip loading off) after the user has typed on.
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      search(query)
+        .then((data) => { if (!cancelled) setSearchResults(data?.sources ?? []); })
+        .finally(() => { if (!cancelled) setLoading(false); });
+    }, 300);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [query]);
+
+  useEffect(() => {
+    if (query.length < 2) {
+      setCatalogResults([]);
+      return;
+    }
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      listCatalogIngredients({ q: query, limit: 5, silent: true })
+        .then((data) => { if (!cancelled) setCatalogResults(data?.items ?? []); })
+        .catch(() => { if (!cancelled) setCatalogResults([]); });
+    }, 300);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [query]);
+
+  useEffect(() => {
+    setFocusedIndex(0);
+  }, [searchResults, catalogResults, query]);
+
+  // Pages belonging to a feature this install turned off are dropped here rather
+  // than server-side: the manifest is fetched once per session (and HTTP-cached),
+  // so filtering it on the server would leave ⌘K offering hidden pages until a
+  // reload. Applying the gate at render keeps it live with the Features toggle.
+  const gatedNav = useMemo(
+    () => (manifest ? filterNavByFeatures(manifest.nav, isFeatureEnabled) : []),
+    [manifest, isFeatureEnabled],
+  );
+
+  const combined = useMemo(() => {
+    if (!manifest) return { recentNav: [], nav: [], actions: [], layouts: [], commandCount: 0 };
+    const q = query.trim().toLowerCase();
+    if (!q) {
+      const recentNav = resolveRecentNavEntries(recentPaths, gatedNav, {
+        currentPath: location.pathname,
+        limit: RECENT_CAP,
+      }).map((c) => ({ ...c, kind: 'nav' }));
+      const recentIds = new Set(recentNav.map((c) => c.id));
+      const fallbackLimit = Math.max(0, RECENT_CAP - recentNav.length);
+      const nav = gatedNav
+        .filter((c) => DEFAULT_NAV_IDS.has(c.id) && !recentIds.has(c.id) && c.path !== location.pathname)
+        .slice(0, fallbackLimit)
+        .map((c) => ({ ...c, kind: 'nav' }));
+      const actions = manifest.actions.filter((a) => DEFAULT_ACTION_IDS.has(a.id)).map((a) => ({ ...a, kind: 'action' }));
+      return { recentNav, nav, actions, layouts: [], commandCount: recentNav.length + nav.length + actions.length };
+    }
+    const rank = (items, max) => items
+      .map((c) => ({ cmd: c, score: scoreCommand(c, q) }))
+      .filter((x) => x.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, max)
+      .map((x) => x.cmd);
+    const nav = rank(gatedNav, 8).map((c) => ({ ...c, kind: 'nav' }));
+    const actions = rank(manifest.actions, 5).map((a) => ({ ...a, kind: 'action' }));
+    const layouts = rank(manifest.layouts || [], 5).map((l) => ({ ...l, kind: 'layout' }));
+    return { recentNav: [], nav, actions, layouts, commandCount: nav.length + actions.length + layouts.length };
+  }, [manifest, gatedNav, query, recentPaths, location.pathname]);
+
+  const flatSearchResults = useMemo(
+    () => (loading ? [] : searchResults).flatMap((source) => {
+      const visible = expandedSources.has(source.id) ? source.results : source.results.slice(0, 3);
+      return visible.map((r) => ({ ...r, kind: 'search', sourceId: source.id }));
+    }),
+    [searchResults, expandedSources, loading]
+  );
+
+  const catalogHits = useMemo(
+    () => catalogResults.map((ing) => ({
+      kind: 'catalog',
+      id: ing.id,
+      name: ing.name,
+      type: ing.type,
+      path: `/catalog/${encodeURIComponent(ing.type)}/${encodeURIComponent(ing.id)}`,
+    })),
+    [catalogResults]
+  );
+
+  const focusable = useMemo(
+    () => [...combined.recentNav, ...combined.nav, ...combined.actions, ...combined.layouts, ...catalogHits, ...flatSearchResults],
+    [combined, catalogHits, flatSearchResults]
+  );
+
+  const activeIndex = focusable.length ? Math.min(focusedIndex, focusable.length - 1) : -1;
+  const activeResult = focusable[activeIndex];
+
+  useEffect(() => {
+    const el = resultRefs.current[activeIndex];
+    if (el) el.scrollIntoView({ block: 'nearest' });
+  }, [activeIndex, focusable]);
+
+  useEffect(() => {
+    if (open) inputRef.current?.focus();
+  }, [open, captureMode]);
+
+  const resetCapture = useCallback(() => {
+    captureAttemptRef.current += 1;
+    captureSubmittingRef.current = false;
+    setCaptureMode(false);
+    setCaptureDraft('');
+    setCaptureSubmitting(false);
+  }, []);
+
+  const close = useCallback(() => {
+    resetCapture();
+    setOpen(false);
+  }, [resetCapture, setOpen]);
+
+  const enterCaptureMode = useCallback(() => {
+    setCaptureMode(true);
+  }, []);
+
+  const submitCapture = useCallback(async () => {
+    const text = captureDraft.trim();
+    if (!text || captureSubmittingRef.current) return;
+
+    captureSubmittingRef.current = true;
+    inputRef.current?.focus();
+    setCaptureSubmitting(true);
+    const attempt = ++captureAttemptRef.current;
+    const res = await runPaletteAction('brain_capture', { text }).then(
+      (result) => result,
+      () => null,
+    );
+    if (attempt !== captureAttemptRef.current) return;
+
+    captureSubmittingRef.current = false;
+    setCaptureSubmitting(false);
+    if (!res) {
+      inputRef.current?.focus();
+      return;
+    }
+
+    const summary = res?.result?.summary || 'Captured to Brain.';
+    if (res?.ok === false) {
+      toast.error(summary);
+      inputRef.current?.focus();
+      return;
+    }
+
+    toast.success(summary);
+    setCaptureDraft('');
+    close();
+  }, [captureDraft, close]);
+
+  const DISPATCH = useMemo(() => ({
+    nav: (item) => {
+      let targetPath = item.path;
+      const match = location.pathname.match(/^\/music-video\/([^/?#]+)/);
+      if (match && match[1] !== 'new' && item.path.startsWith('/music-video/')) {
+        const stage = item.path.replace(/^\/music-video\//, '').split(/[?#]/)[0];
+        if (stage && !item.path.includes('?new=')) {
+          targetPath = `/music-video/${match[1]}/${stage}`;
+        }
+      }
+      navigate(targetPath);
+      close();
+    },
+    search: (item) => { navigate(item.url); close(); },
+    catalog: (item) => { navigate(item.path); close(); },
+    layout: async (item) => {
+      // request() toasts errors centrally; swallow the rejection here so
+      // clicks from sync event handlers don't bubble as unhandled. On
+      // success, tell any mounted Dashboard to re-fetch because
+      // navigate('/') is a no-op if the user is already there.
+      const ok = await setActiveDashboardLayout(item.layoutId).then(() => true, () => false);
+      if (!ok) { close(); return; }
+      // Lock in for the day so the next dashboard mount doesn't bump us
+      // back to a time-window layout — palette picks are intentional.
+      recordManualLayoutPick(item.layoutId);
+      window.dispatchEvent(new CustomEvent(DASHBOARD_LAYOUT_CHANGED));
+      navigate('/');
+      toast.success(`Switched to "${item.layoutName}"`);
+      close();
+    },
+    action: async (item) => {
+      if (item.id === 'brain_capture') {
+        enterCaptureMode();
+        return;
+      }
+      const required = item.parameters?.required || [];
+      if (required.length > 0) {
+        // Keep palette open so the user can pick another command.
+        toast(`${item.label} needs arguments — use voice or open the related page.`);
+        return;
+      }
+      const res = await runPaletteAction(item.id);
+      const summary = res?.result?.summary || `${item.label} ran.`;
+      if (res?.ok === false) toast.error(summary);
+      else toast.success(summary);
+      close();
+    },
+  }), [navigate, close, enterCaptureMode]);
+
+  const dispatchCommand = useCallback((item) => DISPATCH[item.kind]?.(item), [DISPATCH]);
+
+  const handleKeyDown = (e) => {
+    if (captureMode) {
+      if (e.key === 'Enter') {
+        if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+        e.preventDefault();
+        submitCapture();
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        resetCapture();
+      }
+      return;
+    }
+
+    if (e.target !== inputRef.current && e.key !== 'Escape') return;
+
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      if (focusable.length > 0) setFocusedIndex((i) => Math.min(i + 1, focusable.length - 1));
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (focusable.length > 0) setFocusedIndex(Math.max(activeIndex - 1, 0));
+    } else if (e.key === 'Enter') {
+      const item = activeResult;
+      if (item) dispatchCommand(item);
+    } else if (e.key === 'Escape') {
+      // Consume it so an underlying Drawer's window-level Esc listener doesn't also close.
+      e.preventDefault();
+      e.stopPropagation();
+      close();
+    }
+  };
+
+  if (!open) return null;
+
+  let flatIdx = 0;
+
+  const renderRow = (item, { icon: Icon, title, subtitle, badge }) => {
+    const currentIdx = flatIdx++;
+    const isFocused = activeIndex === currentIdx;
+    return (
+      <div
+        key={optionId(item)}
+        id={optionId(item)}
+        ref={(el) => { resultRefs.current[currentIdx] = el; }}
+        onClick={() => dispatchCommand(item)}
+        className={`flex items-start gap-3 px-3 py-2 min-h-[44px] rounded-lg cursor-pointer transition-colors ${
+          isFocused ? 'bg-port-accent/10' : 'hover:bg-white/5'
+        }`}
+        role="option"
+        aria-selected={isFocused}
+        // Virtually focused via the input's `aria-activedescendant` (WAI-ARIA
+        // combobox pattern) rather than individually tabbable; tabIndex={-1}
+        // still lets it be moved into view and keeps this row keyboard-operable
+        // if it ever receives focus directly.
+        tabIndex={-1}
+        onKeyDown={onActivateKeyDown(() => dispatchCommand(item))}
+      >
+        {Icon && <Icon size={14} className="shrink-0 mt-0.5 text-gray-400" />}
+        <div className="flex-1 min-w-0">
+          <p className="text-sm font-medium text-white truncate">
+            <Highlight text={title} query={query} />
+          </p>
+          {subtitle && (
+            <p className="text-xs text-gray-500 truncate mt-0.5">
+              <Highlight text={subtitle} query={query} />
+            </p>
+          )}
+        </div>
+        {badge && <span className="text-[10px] uppercase tracking-wide text-gray-500 shrink-0 mt-1">{badge}</span>}
+      </div>
+    );
+  };
+
+  const renderGroup = (headerIcon, headerLabel, rows) => rows.length > 0 && (
+    <div role="group" aria-label={headerLabel} className="mb-2">
+      <div className="flex items-center gap-2 px-3 py-2 text-xs text-gray-400 uppercase tracking-wide">
+        {headerIcon}
+        <span>{headerLabel}</span>
+      </div>
+      {rows}
+    </div>
+  );
+
+  const overlay = (
+    <div
+      className="fixed inset-0 z-[9999] flex items-start justify-center pt-[10vh]"
+      onKeyDown={handleKeyDown}
+    >
+      <div
+        className="absolute inset-0 bg-black/60"
+        onClick={close}
+        aria-hidden="true"
+      />
+
+      <div
+        ref={modalRef}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Command palette"
+        className="relative flex flex-col max-h-dvh-cap [--dvh-inset:calc(10vh+1rem)] w-full max-w-3xl mx-4 bg-port-card rounded-xl border border-port-border shadow-2xl overflow-hidden"
+      >
+        <div className="flex shrink-0 items-center gap-3 px-4 py-4 border-b border-port-border">
+          {captureMode ? <Brain size={18} className="text-port-accent shrink-0" /> : <Search size={18} className="text-gray-400 shrink-0" />}
+          <div className="flex-1 min-w-0">
+            {captureMode ? (
+              <>
+                <label htmlFor="command-palette-capture" className="block text-xs font-medium text-port-accent mb-1">
+                  Capture to Brain
+                </label>
+                <input
+                  id="command-palette-capture"
+                  ref={inputRef}
+                  type="text"
+                  value={captureDraft}
+                  onChange={(e) => setCaptureDraft(e.target.value)}
+                  placeholder="Thought or URL…"
+                  className="w-full bg-transparent text-white placeholder-gray-500 outline-hidden text-sm"
+                  readOnly={captureSubmitting}
+                />
+              </>
+            ) : (
+              <input
+                ref={inputRef}
+                type="text"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Go to page, run an action, or search Brain / Memory / Apps…"
+                className="w-full bg-transparent text-white placeholder-gray-500 outline-hidden text-sm"
+                role="combobox"
+                aria-expanded="true"
+                aria-autocomplete="list"
+                aria-controls={listboxId}
+                aria-activedescendant={activeResult ? optionId(activeResult) : undefined}
+                aria-label="Command palette"
+              />
+            )}
+          </div>
+          {captureMode ? (
+            <button
+              type="button"
+              onClick={submitCapture}
+              disabled={!captureDraft.trim() || captureSubmitting}
+              aria-label="Capture thought"
+              className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-port-accent/20 text-port-accent hover:bg-port-accent/30 disabled:opacity-40 disabled:cursor-not-allowed transition-colors text-sm"
+            >
+              {captureSubmitting ? <Loader2 size={14} className="animate-spin" /> : <Send size={14} />}
+              Capture
+            </button>
+          ) : (
+            <span className="text-xs text-gray-500 border border-port-border rounded px-1.5 py-0.5 shrink-0">
+              {`${modKey}+K`}
+            </span>
+          )}
+        </div>
+
+        {!captureMode && <div className="min-h-0 max-h-96 overflow-y-auto p-2">
+          <div id={listboxId} role="listbox" aria-label="Command palette results">
+            {renderGroup(
+              <History size={14} />,
+              'Recent destinations',
+              combined.recentNav.map((c) =>
+                renderRow(c, { icon: History, title: c.label, subtitle: `${c.section} · ${c.path}`, badge: 'RECENT' })
+              )
+            )}
+
+            {renderGroup(
+              <Navigation size={14} />,
+              'Go to',
+              combined.nav.map((c) =>
+                renderRow(c, { icon: Navigation, title: c.label, subtitle: `${c.section} · ${c.path}`, badge: 'GO' })
+              )
+            )}
+
+            {renderGroup(
+              <Play size={14} />,
+              'Run',
+              combined.actions.map((a) =>
+                renderRow(a, { icon: Play, title: a.label, subtitle: (a.description || a.section || '').slice(0, 80), badge: 'RUN' })
+              )
+            )}
+
+            {renderGroup(
+              <LayoutGrid size={14} />,
+              'Dashboard layout',
+              combined.layouts.map((l) =>
+                renderRow(l, { icon: LayoutGrid, title: l.label, subtitle: 'Switch dashboard layout', badge: 'LAYOUT' })
+              )
+            )}
+
+            {renderGroup(
+              <BookMarked size={14} />,
+              'Catalog',
+              catalogHits.map((c) =>
+                renderRow(c, { icon: BookMarked, title: c.name, subtitle: c.type, badge: c.type.toUpperCase() })
+              )
+            )}
+
+            {loading && (
+              <div className="flex items-center justify-center py-4">
+                <Loader2 size={18} className="animate-spin text-gray-400" />
+              </div>
+            )}
+
+            {!loading && query.length >= 2 && searchResults.length === 0 && catalogHits.length === 0 && combined.commandCount === 0 && (
+              <div className="text-center text-sm text-gray-500 py-8">
+                No results for &ldquo;{query}&rdquo;
+              </div>
+            )}
+
+            {!loading && !query && combined.commandCount === 0 && (
+              <div className="text-center text-sm text-gray-600 py-8">
+                Start typing to go to a page, run an action, or search.
+              </div>
+            )}
+
+            {!loading && searchResults.map((source) => {
+              const SourceIcon = ICON_MAP[source.icon] ?? Search;
+              const isExpanded = expandedSources.has(source.id);
+              const visible = isExpanded ? source.results : source.results.slice(0, 3);
+
+              return (
+                <div key={source.id} role="group" aria-label={source.label} className="mb-2">
+                  <div className="flex items-center gap-2 px-3 py-2 text-xs text-gray-400 uppercase tracking-wide">
+                    <SourceIcon size={14} />
+                    <span>{source.label}</span>
+                  </div>
+
+                  {visible.map((result) =>
+                    renderRow(
+                      { ...result, kind: 'search', sourceId: source.id },
+                      { title: result.title, subtitle: result.snippet }
+                    )
+                  )}
+                </div>
+              );
+            })}
+          </div>
+          {!loading && searchResults.filter((source) => source.results.length > 3 && !expandedSources.has(source.id)).map((source) => (
+            <button
+              key={source.id}
+              onClick={() => {
+                inputRef.current?.focus();
+                setExpandedSources((prev) => new Set(prev).add(source.id));
+              }}
+              className="text-xs text-port-accent px-3 py-1 hover:underline"
+            >
+              Show {source.results.length - 3} more from {source.label}
+            </button>
+          ))}
+        </div>}
+
+        {captureMode && (
+          <div className="min-h-0 overflow-y-auto px-4 py-5 text-sm text-gray-400">
+            Capture one unstructured thought or URL without leaving the command palette.
+          </div>
+        )}
+
+        <div className="flex shrink-0 items-center justify-between gap-2 px-4 py-2 border-t border-port-border text-[11px] text-gray-500">
+          <span>{captureMode ? '↵ capture · Esc back' : '↑↓ navigate · ↵ run · Esc close'}</span>
+          <span>Shared backbone with voice agent</span>
+        </div>
+      </div>
+    </div>
+  );
+
+  return createPortal(overlay, document.body);
+}

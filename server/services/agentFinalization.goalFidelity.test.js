@@ -1,0 +1,744 @@
+/**
+ * Tests for the goal-fidelity completion gate (#5994).
+ *
+ * Every other check on the finalize path proves the run PRODUCED something —
+ * commits exist, a change request was opened, the diff is decent code. None of
+ * them can prove it is the change that was ASKED for, because no reviewer ever
+ * sees the request. This gate re-reads the accumulated run-window diff against
+ * the task's own objective and holds a run whose verdict is `rethink`.
+ *
+ * The failure mode being pinned: a clean, reviewed, green run that quietly
+ * shipped something else — and, on the other side, a gate so eager it holds a
+ * run because a local model was down.
+ */
+
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+vi.mock('../lib/execGit.js', () => ({
+  execGit: vi.fn(async () => ({ stdout: '', stderr: '', exitCode: 0 })),
+}));
+vi.mock('./github.js', () => ({
+  execGh: vi.fn(),
+  findPullRequestForBranch: vi.fn(async () => ({ status: 'found', number: 7, url: 'https://example.com/pr/7', body: 'Closes #42' })),
+  ensureForgeReachable: vi.fn(async () => ({ ok: true, status: 'ok' })),
+  getPullRequestState: vi.fn(async () => ({ status: 'known', state: 'MERGED', detail: null })),
+}));
+vi.mock('./gitlab.js', () => ({ findMergeRequestForBranch: vi.fn(), execGlab: vi.fn() }));
+vi.mock('./git.js', () => ({ resolveForgeForRepo: vi.fn(async () => ({ cli: 'gh' })) }));
+vi.mock('../lib/workTracker.js', async (importOriginal) => ({
+  ...(await importOriginal()), resolveRepoForgeTarget: vi.fn(async () => null),
+}));
+vi.mock('./cosEvents.js', () => ({ emitLog: vi.fn(), cosEvents: { emit: vi.fn(), on: vi.fn() } }));
+vi.mock('../lib/primaryCheckoutGuard.js', async (importOriginal) => ({
+  ...(await importOriginal()),
+  detectPrimaryCheckoutDrift: vi.fn(async () => ({ drifted: false })),
+}));
+
+const completeAgentMock = vi.fn();
+vi.mock('./cosAgentLifecycle.js', () => ({
+  getAgent: vi.fn(async () => null),
+  getAgentRecord: vi.fn(async () => null),
+  updateAgent: vi.fn(async () => null),
+  completeAgent: (...args) => completeAgentMock(...args),
+}));
+
+const updateTaskMock = vi.fn(async () => ({}));
+vi.mock('./cos.js', () => ({ updateTask: (...args) => updateTaskMock(...args) }));
+vi.mock('./providers.js', () => ({ getActiveProvider: vi.fn(async () => null) }));
+vi.mock('./providerStatus.js', () => ({
+  markProviderUsageLimit: vi.fn(async () => null),
+  markProviderRateLimited: vi.fn(async () => null),
+  markProviderUnavailable: vi.fn(async () => null),
+}));
+vi.mock('./executionLanes.js', () => ({ release: vi.fn() }));
+vi.mock('./toolStateMachine.js', () => ({ completeExecution: vi.fn(), errorExecution: vi.fn() }));
+vi.mock('./agentErrorAnalysis.js', () => ({
+  resolveFailedTaskUpdate: vi.fn(async (_task, analysis) => ({
+    status: 'pending',
+    metadata: { lastErrorCategory: analysis?.category || null },
+  })),
+  resolveTypeFailureSignal: vi.fn(() => ({ record: 'skip' })),
+}));
+
+const runWindowDiffMock = vi.fn(async () => ({ diff: 'diff --git a/a.js b/a.js', base: 'abc', truncated: false, reason: null }));
+vi.mock('../lib/gitCommitProbe.js', () => ({
+  committedDuringRun: vi.fn(async () => true),
+  runWindowDiff: (...args) => runWindowDiffMock(...args),
+}));
+vi.mock('./agentRunEventLog.js', () => ({ appendRunEvent: vi.fn(async () => null) }));
+vi.mock('./agentRunTracking.js', () => ({ createAgentRun: vi.fn(), completeAgentRun: vi.fn(async () => null) }));
+vi.mock('./taskTypeHooks.js', async (importOriginal) => ({
+  // isClaimFlowDispatch stays REAL: the claim-flow fidelity cases below depend
+  // on it resolving the claim marker/type exactly as production does.
+  ...(await importOriginal()),
+  canRunTaskOutputHookWithoutPayload: vi.fn(() => false),
+  isProgrammaticIoTaskType: vi.fn(() => false),
+  resolveTaskHookType: vi.fn(() => null),
+  declaresNoCommitCriterion: vi.fn(() => false),
+  getTaskOutputHook: vi.fn(async () => null),
+  getTaskOutputPayloadPredicate: vi.fn(async () => null),
+}));
+// The follow-up (file an issue / queue a fix) is dispatched through a LAZY
+// import, so it is doubled here rather than left to load the real filer's
+// apps + forge + JIRA graph into a suite that only cares about the wiring.
+const runGoalFidelityFollowUpMock = vi.fn(async () => ({ ran: false }));
+vi.mock('./goalFidelityFollowUp.js', () => ({
+  runGoalFidelityFollowUp: (...args) => runGoalFidelityFollowUpMock(...args),
+}));
+
+vi.mock('./agentCompletion.js', () => ({ processAgentCompletion: vi.fn(async () => null) }));
+vi.mock('./agentSummaryExtraction.js', () => ({ extractSimplifySummaries: vi.fn(() => null), extractFinalSummary: vi.fn(() => null) }));
+
+const getGoalFidelityConfigMock = vi.fn(async () => ({ enabled: true, backend: 'ollama', model: 'example-model', effort: null }));
+const runLocalGoalFidelityReviewMock = vi.fn();
+vi.mock('./codeReview.js', async (importOriginal) => ({
+  ...(await importOriginal()),
+  getGoalFidelityConfig: (...args) => getGoalFidelityConfigMock(...args),
+  runLocalGoalFidelityReview: (...args) => runLocalGoalFidelityReviewMock(...args),
+}));
+
+import { execGit } from '../lib/execGit.js';
+import { execGh, findPullRequestForBranch, getPullRequestState } from './github.js';
+import { execGlab } from './gitlab.js';
+import { resolveForgeForRepo } from './git.js';
+import { getAgentRecord } from './cosAgentLifecycle.js';
+import { detectPrimaryCheckoutDrift, PRIMARY_CHECKOUT_MUTATED_REASON } from '../lib/primaryCheckoutGuard.js';
+import { finalizeAgent } from './agentFinalization.js';
+import { cosEvents, emitLog } from './cosEvents.js';
+import { completeAgentRun } from './agentRunTracking.js';
+import { resolveFailedTaskUpdate } from './agentErrorAnalysis.js';
+import { declaresNoCommitCriterion, getTaskOutputHook, isProgrammaticIoTaskType, resolveTaskHookType } from './taskTypeHooks.js';
+import { GOAL_FIDELITY_CATEGORY, GOAL_FIDELITY_HOLD_EVENT } from '../lib/goalFidelity.js';
+import { resolveRepoForgeTarget } from '../lib/workTracker.js';
+
+const verdict = (overrides = {}) => ({
+  ok: true,
+  backend: 'ollama',
+  model: 'example-model',
+  effort: null,
+  verdict: 'ship',
+  missing: [],
+  unrequested: [],
+  evidence: 'the suite was run',
+  ...overrides,
+});
+
+describe('finalizeAgent — private report delivery', () => {
+  const finishPrivate = () => finalize({
+    task: { id: 'private-task', taskType: 'internal', metadata: { analysisType: 'private-security-assessment' } },
+    workspacePath: null,
+    runId: 'private-run',
+    outputBuffer: 'synthetic private evidence',
+  });
+
+  beforeEach(() => {
+    resolveTaskHookType.mockReturnValue('private-security-assessment');
+    isProgrammaticIoTaskType.mockReturnValue(true);
+    resolveFailedTaskUpdate.mockResolvedValue({ status: 'blocked' });
+  });
+
+  it('records success only after the report hook accepts delivery', async () => {
+    getTaskOutputHook.mockResolvedValue(async () => ({ accepted: true, reportId: 'report-example' }));
+    expect(await finishPrivate()).toMatchObject({ success: true });
+    expect(completion()).toMatchObject({ success: true, validationPassed: true });
+    expect(updateTaskMock).toHaveBeenCalledWith('private-task', { status: 'completed' }, 'internal');
+    expect(completeAgentRun).toHaveBeenCalledWith('private-run', 'Private security assessment: see the local Review Hub report.', 0, 1000, null, null);
+    expect(runLocalGoalFidelityReviewMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['missing hook', null],
+    ['missing acceptance', async () => ({})],
+    ['invalid report', async () => ({ accepted: false, permanent: true, reason: 'private-security-report-missing-or-invalid' })],
+    ['report storage failure', async () => { throw new Error('synthetic storage unavailable'); }],
+  ])('blocks an exit-zero private run on %s and records the same failed run verdict', async (_label, hook) => {
+    getTaskOutputHook.mockResolvedValue(hook);
+    expect(await finishPrivate()).toMatchObject({ success: false });
+    expect(completion()).toMatchObject({ success: false, validationPassed: false });
+    expect(updateTaskMock).toHaveBeenCalledWith('private-task', { status: 'blocked' }, 'internal');
+    expect(completeAgentRun).toHaveBeenCalledWith('private-run', 'Private security assessment report was not verified; inspect the local assessment archive.', 0, 1000, expect.any(Object), false);
+  });
+
+  it('fails closed when report delivery outlives the completion timeout', async () => {
+    vi.useFakeTimers();
+    let settle;
+    getTaskOutputHook.mockResolvedValue(() => new Promise(resolve => { settle = resolve; }));
+    try {
+      const finished = finishPrivate();
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+      expect(await finished).toMatchObject({ success: false });
+      expect(updateTaskMock).toHaveBeenCalledWith('private-task', { status: 'blocked' }, 'internal');
+      expect(completeAgentRun.mock.calls[0][5]).toBe(false);
+      settle({ accepted: true, reportId: 'late-report' });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(updateTaskMock).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+const finalize = (overrides = {}) => finalizeAgent({
+  agentId: 'agent-1',
+  task: { id: 'task-1', taskType: 'internal', description: 'Add a retry to the uploader', metadata: {} },
+  runId: null,
+  providerId: 'claude-code',
+  success: true,
+  exitCode: 0,
+  duration: 1000,
+  outputBuffer: 'done',
+  errorAnalysis: null,
+  workspacePath: '/example/worktree',
+  prExpected: false,
+  ...overrides,
+});
+
+const completion = () => completeAgentMock.mock.calls[0][1];
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  execGit.mockResolvedValue({ stdout: 'claim/issue-42', exitCode: 0 });
+  resolveForgeForRepo.mockResolvedValue({ cli: 'gh', env: { GH_TOKEN: 'synthetic-token' } });
+  resolveRepoForgeTarget.mockResolvedValue(null);
+  execGh.mockResolvedValue(JSON.stringify({ number: 42, title: 'Retry the opening line', body: 'Retry transient synthesis failures and clear the pending opening after success.' }));
+  getTaskOutputHook.mockResolvedValue(null);
+  isProgrammaticIoTaskType.mockReturnValue(false);
+  declaresNoCommitCriterion.mockReturnValue(false);
+  resolveTaskHookType.mockImplementation(task => task?.metadata?.analysisType || task?.metadata?.taskAnalysisType || task?.taskType || null);
+  resolveFailedTaskUpdate.mockImplementation(async (_task, analysis) => ({
+    status: 'pending',
+    metadata: { lastErrorCategory: analysis?.category || null },
+  }));
+  getGoalFidelityConfigMock.mockResolvedValue({ enabled: true, backend: 'ollama', model: 'example-model', effort: null });
+  runWindowDiffMock.mockResolvedValue({ diff: 'diff --git a/a.js b/a.js', base: 'abc', truncated: false, reason: null });
+  runLocalGoalFidelityReviewMock.mockResolvedValue(verdict());
+});
+
+describe('finalizeAgent — goal-fidelity gate', () => {
+  it('judges the run-window diff against the TASK objective, not the agent transcript', async () => {
+    await finalize();
+    const [args] = runLocalGoalFidelityReviewMock.mock.calls[0];
+    expect(args.objective).toContain('Add a retry to the uploader');
+    expect(args.objective).not.toContain('done');
+    expect(args.diff).toBe('diff --git a/a.js b/a.js');
+    expect(args.backend).toBe('ollama');
+  });
+
+  it('passes task screenshots into the objective when a terse request depends on the pictured runtime error', async () => {
+    const screenshots = ['/api/screenshots/superclass-error.png'];
+    const task = {
+      id: 'screenshot-context-task',
+      taskType: 'internal',
+      description: 'Another instance with the latest code is seeing this',
+      metadata: { screenshots },
+    };
+    const diff = [
+      'diff --git a/client/vite.config.js b/client/vite.config.js',
+      '+// Keep generated chunks in strict execution order.',
+      'diff --git a/client/src/utils/staleChunkReload.js b/client/src/utils/staleChunkReload.js',
+      '+// Recover recognized superclass module-evaluation failures after lazy imports.',
+      '+if (error.message.includes("The superclass is not a constructor")) reloadStaleChunk();',
+      'diff --git a/client/src/utils/staleChunkReload.test.js b/client/src/utils/staleChunkReload.test.js',
+      '+it("recovers from the superclass module-evaluation error", ...)',
+    ].join('\n');
+    runWindowDiffMock.mockResolvedValue({ diff, base: 'abc', truncated: false, reason: null });
+
+    await finalize({ task });
+
+    const [review] = runLocalGoalFidelityReviewMock.mock.calls[0];
+    expect(review.objective).toContain('Another instance with the latest code is seeing this');
+    expect(review.objective).toContain('Task-provided screenshots are part of this objective');
+    expect(review.objectiveScreenshots).toEqual(screenshots);
+    expect(review.diff).toBe(diff);
+    expect(completion()).toMatchObject({ success: true });
+  });
+
+  describe('dependency audit summary with work outside the diff (#7899)', () => {
+    // Synthetic reconstruction: the deliverable is a completed inventory and
+    // audit, with no warranted bump. The only committed change is its note.
+    const task = {
+      id: 'dependency-audit', taskType: 'internal',
+      description: 'Inventory all security alerts, resolve open automated dependency PRs, then audit dependencies.',
+      metadata: {
+        analysisType: 'dependency-updates',
+        prompt: 'Paginate the alert and PR inventories. Report unavailable scanners as coverage gaps. Update dependencies only when warranted.',
+      },
+    };
+    const auditDiff = [
+      'diff --git a/docs/DEPS.md b/docs/DEPS.md',
+      'index abc1234..def5678 100644',
+      '--- a/docs/DEPS.md',
+      '+++ b/docs/DEPS.md',
+      '@@ -1,3 +1,3 @@',
+      ' # Dependency audit',
+      '-**Last audited:** previous sweep',
+      '-**Verdict:** prior audit results',
+      '+**Last audited:** routine sweep; no open security alerts',
+      '+**Verdict:** dependencies current; a peer-constrained upgrade remains tracked.',
+      '',
+    ].join('\n');
+    const outputBuffer = 'Paginated alerts: 0. Open PR inventory (limit 500): 0. Dependency guards passed. Python scanner unavailable; coverage gap disclosed.';
+    const finish = (overrides = {}) => finalize({ task, outputBuffer, ...overrides });
+
+    beforeEach(() => {
+      execGit.mockResolvedValue({ stdout: 'https://github.com/example/project.git', exitCode: 0 });
+      resolveForgeForRepo.mockResolvedValue({ cli: 'gh', host: 'github.com', owner: 'example', env: { GH_TOKEN: 'synthetic-token' } });
+      execGh.mockResolvedValue('[[]]');
+      runWindowDiffMock.mockResolvedValue({ diff: auditDiff, base: 'abc', truncated: false, reason: null });
+      runLocalGoalFidelityReviewMock.mockResolvedValue(verdict({
+        verdict: 'rethink', missing: ['Security inventory and bot PR resolution'],
+        unrequested: ['The audit note'], evidence: 'Only an audit note is visible.',
+      }));
+    });
+
+    it('declines the diff-only judgement after independent empty inventories, without inventing a ship verdict or follow-up', async () => {
+      runLocalGoalFidelityReviewMock.mockResolvedValue(verdict({
+        verdict: 'fix-first', missing: ['Security inventory and bot PR resolution'],
+        unrequested: ['The audit note'], evidence: 'Only an audit note is visible.',
+      }));
+      await finish();
+
+      expect(completion()).toMatchObject({ success: true });
+      expect(completion().goalFidelity).toBeUndefined();
+      expect(execGh.mock.calls).toEqual(['dependabot/alerts', 'pulls'].map(resource => [
+        ['api', '--hostname', 'github.com', '--paginate', '--slurp', `repos/example/project/${resource}?state=open&per_page=100`],
+        30_000, { cwd: '/example/worktree', env: { GH_TOKEN: 'synthetic-token' } },
+      ]));
+      expect(runLocalGoalFidelityReviewMock).not.toHaveBeenCalled();
+      expect(emitLog).toHaveBeenCalledWith('warn', expect.stringContaining('not judgeable from a diff'), expect.any(Object));
+      expect(cosEvents.emit).not.toHaveBeenCalledWith(GOAL_FIDELITY_HOLD_EVENT, expect.anything());
+      expect(runGoalFidelityFollowUpMock).not.toHaveBeenCalled();
+      expect(updateTaskMock).toHaveBeenCalledWith(task.id, { status: 'completed' }, 'internal');
+    });
+
+    it.each([
+      ['an open alert on a later page', 'dependabot/alerts', '[[], [{"number":42}]]'],
+      ['an open PR', 'pulls', '[[{"number":7}]]'],
+      ['an access-error response', 'dependabot/alerts', '{"message":"Forbidden"}'],
+      ['no pages returned', 'pulls', '[]'],
+      ['a malformed response', 'pulls', 'not JSON'],
+    ])('retains review and its hold for %s even when the transcript claims zero', async (_label, resource, response) => {
+      execGh.mockImplementation(async args => args.at(-1).includes(`/${resource}?`) ? response : '[[]]');
+      await finish();
+      expect(runLocalGoalFidelityReviewMock).toHaveBeenCalledWith(expect.objectContaining({ diff: auditDiff }));
+      expect(completion()).toMatchObject({ success: false, completionReason: GOAL_FIDELITY_CATEGORY });
+    });
+
+    it('does not fall back to ambient credentials when the owner-pinned resolver fails', async () => {
+      resolveForgeForRepo.mockRejectedValue(new Error('Credential unavailable'));
+      await finish();
+      expect(execGh).not.toHaveBeenCalled();
+      expect(completion()).toMatchObject({ success: false, completionReason: GOAL_FIDELITY_CATEGORY });
+    });
+
+    it('keeps unsupported forges on the ordinary review path without calling GitHub', async () => {
+      execGit.mockResolvedValue({ stdout: 'https://gitlab.example.com/example/project.git', exitCode: 0 });
+      resolveForgeForRepo.mockResolvedValue({ cli: 'glab', host: 'gitlab.example.com', owner: 'example' });
+      await finish();
+      expect(execGh).not.toHaveBeenCalled();
+      expect(completion()).toMatchObject({ success: false, completionReason: GOAL_FIDELITY_CATEGORY });
+    });
+
+    it.each([
+      ['a dependency bump', `${auditDiff}diff --git a/package.json b/package.json\n+{"dependencies":{"example":"2.0.0"}}\n`, false],
+      ['an unrelated documentation edit', `${auditDiff}+Remove the supported installation instructions.\n`, false],
+      ['a different document', auditDiff.replaceAll('docs/DEPS.md', 'docs/INSTALL.md'), false],
+      ['a file mode change', auditDiff.replace('index ', 'old mode 100644\nnew mode 100755\nindex '), false],
+      ['a truncated diff', auditDiff, true],
+    ])('still judges %s without consulting forge inventories', async (_label, diff, truncated) => {
+      runWindowDiffMock.mockResolvedValue({ diff, base: 'abc', truncated, reason: null });
+      await finish();
+      expect(execGh).not.toHaveBeenCalled();
+      expect(runLocalGoalFidelityReviewMock).toHaveBeenCalledWith(expect.objectContaining({ diff }));
+      expect(completion()).toMatchObject({ success: false, completionReason: GOAL_FIDELITY_CATEGORY });
+    });
+
+    it('still holds an ordinary implementation task that delivered only the audit note', async () => {
+      await finish({ task: { id: 'feature-task', taskType: 'internal', description: 'Implement dependency inventory automation', metadata: {} } });
+      expect(execGh).not.toHaveBeenCalled();
+      expect(completion()).toMatchObject({ success: false, completionReason: GOAL_FIDELITY_CATEGORY });
+    });
+
+    it('judges selected issue requirements when a dependency task is also marked as a claim', async () => {
+      execGit.mockResolvedValue({ stdout: 'claim/issue-42', exitCode: 0 });
+      execGh.mockResolvedValue(JSON.stringify({ number: 42, title: 'Implement inventory', body: 'Implement automated dependency inventory.' }));
+      await finish({ task: { ...task, metadata: { ...task.metadata, claimFlow: true } } });
+      expect(execGh).toHaveBeenCalledTimes(1);
+      expect(runLocalGoalFidelityReviewMock).toHaveBeenCalledWith(expect.objectContaining({
+        objective: expect.stringContaining('Implement automated dependency inventory.'), diff: auditDiff,
+      }));
+      expect(completion()).toMatchObject({ success: false, completionReason: GOAL_FIDELITY_CATEGORY });
+    });
+
+    it('respects the disabled gate before performing extra forge queries', async () => {
+      getGoalFidelityConfigMock.mockResolvedValue(null);
+      await finish();
+      expect(execGh).not.toHaveBeenCalled();
+      expect(runLocalGoalFidelityReviewMock).not.toHaveBeenCalled();
+    });
+  });
+
+  it.each([
+    { swarmCount: 3, analysisType: 'claim-issue' },
+    { swarmCount: '3', analysisType: 'claim-issue-gitlab' },
+    { analysisType: 'branch-reconcile' },
+  ])('skips coordinator review before reading a diff or calling a model: %j', async metadata => {
+    runLocalGoalFidelityReviewMock.mockResolvedValue(verdict({ verdict: 'rethink' }));
+    await finalize({ task: { id: 'task-1', taskType: 'internal', description: 'Complete the batch', metadata } });
+    expect(completion()).toMatchObject({ success: true });
+    expect(completion().goalFidelity).toBeUndefined();
+    expect(runWindowDiffMock).not.toHaveBeenCalled();
+    expect(runLocalGoalFidelityReviewMock).not.toHaveBeenCalled();
+    expect(cosEvents.emit).not.toHaveBeenCalledWith(GOAL_FIDELITY_HOLD_EVENT, expect.anything());
+    expect(updateTaskMock).toHaveBeenCalledWith('task-1', expect.objectContaining({ status: 'completed' }), 'internal');
+  });
+
+  it.each([
+    { analysisType: 'do-release' },
+    { prRemediationFollowUp: true },
+    { noCodeOutput: true },
+    { creativeDirector: { projectId: 'example-project' } },
+    { analysisType: 'reference-watch', worktreeChangesExpected: false },
+    { discardWorktree: true },
+  ])('leaves a declared no-commit task unjudged without reading the checkout diff: %j', async metadata => {
+    declaresNoCommitCriterion.mockReturnValue(true);
+    runLocalGoalFidelityReviewMock.mockResolvedValue(verdict({ verdict: 'rethink' }));
+
+    await finalize({ task: { id: 'task-1', taskType: 'internal', description: 'Complete the external action', metadata } });
+
+    expect(declaresNoCommitCriterion).toHaveBeenCalledWith(expect.objectContaining({ metadata }));
+    expect(runWindowDiffMock).not.toHaveBeenCalled();
+    expect(runLocalGoalFidelityReviewMock).not.toHaveBeenCalled();
+    expect(completion()).toMatchObject({ success: true });
+    expect(completion().goalFidelity).toBeUndefined();
+    expect(cosEvents.emit).not.toHaveBeenCalledWith(GOAL_FIDELITY_HOLD_EVENT, expect.anything());
+  });
+
+  it.each([0, 1, undefined])('still judges single-issue claims with swarmCount %s', async swarmCount => {
+    await finalize({ task: { id: 'task-1', description: 'Fix the uploader', metadata: { analysisType: 'claim-issue', swarmCount } } });
+    expect(runLocalGoalFidelityReviewMock).toHaveBeenCalledOnce();
+    expect(runLocalGoalFidelityReviewMock.mock.calls[0][0].objective).toContain('Retry transient synthesis failures');
+    expect(runLocalGoalFidelityReviewMock.mock.calls[0][0].objective).not.toContain('Fix the uploader');
+    expect(execGh).toHaveBeenCalledWith(['issue', 'view', '42', '--json', 'number,title,body'], 30000, { cwd: '/example/worktree', env: { GH_TOKEN: 'synthetic-token' } });
+    expect(completion().goalFidelity).toMatchObject({ verdict: 'ship' });
+  });
+
+  it('resolves GitLab requirements for a manually marked claim and still holds unrelated work', async () => {
+    resolveForgeForRepo.mockResolvedValue({ cli: 'glab' });
+    execGlab.mockResolvedValue(JSON.stringify({ iid: 42, title: 'Retry opening', description: 'Retry synthesis failures.' }));
+    runLocalGoalFidelityReviewMock.mockResolvedValue(verdict({ verdict: 'rethink', missing: ['Retry synthesis failures'] }));
+    await finalize({ task: { id: 'task-1', description: 'Claim and ship', metadata: { claimFlow: true } } });
+    expect(runLocalGoalFidelityReviewMock.mock.calls[0][0].objective).toContain('Retry synthesis failures.');
+    expect(completion().completionReason).toBe(GOAL_FIDELITY_CATEGORY);
+  });
+
+  it.each(['no branch', 'missing body', 'wrong issue', 'oversized body', 'forge unavailable', 'credentials unavailable'])(
+    'leaves a claim unjudged when requirements are unavailable: %s', async reason => {
+      if (reason === 'no branch') execGit.mockResolvedValue({ stdout: 'main', exitCode: 0 });
+      if (reason === 'missing body') execGh.mockResolvedValue('{}');
+      if (reason === 'wrong issue') execGh.mockResolvedValue(JSON.stringify({ number: 43, title: 'Other', body: 'Other requirements' }));
+      if (reason === 'oversized body') execGh.mockResolvedValue(JSON.stringify({ number: 42, title: 'Large', body: 'x'.repeat(8000) }));
+      if (reason === 'forge unavailable') execGh.mockRejectedValue(new Error('Unavailable'));
+      if (reason === 'credentials unavailable') resolveForgeForRepo.mockRejectedValue(new Error('Unavailable'));
+      await finalize({ task: { id: 'task-1', description: 'Claim an issue and ship a PR', metadata: { analysisType: 'claim-issue' } } });
+      expect(completion()).toMatchObject({ success: true });
+      expect(completion().goalFidelity).toBeUndefined();
+      expect(runLocalGoalFidelityReviewMock).not.toHaveBeenCalled();
+      expect(runWindowDiffMock).not.toHaveBeenCalled();
+      if (reason === 'credentials unavailable') expect(execGh).not.toHaveBeenCalled();
+    }
+  );
+
+  it('records a passing verdict without disturbing the run — absence is what means "never judged"', async () => {
+    await finalize();
+    const result = completion();
+    expect(result.success).toBe(true);
+    expect(result.goalFidelity).toMatchObject({ verdict: 'ship', model: 'example-model' });
+    expect(updateTaskMock).toHaveBeenCalledWith('task-1', expect.objectContaining({ status: 'completed' }), 'internal');
+  });
+
+  it('records fix-first as advisory: named gaps, but the run still ships', async () => {
+    runLocalGoalFidelityReviewMock.mockResolvedValue(verdict({ verdict: 'fix-first', missing: ['the retry backoff'] }));
+    await finalize();
+    const result = completion();
+    expect(result.success).toBe(true);
+    expect(result.goalFidelity.missing).toEqual(['the retry backoff']);
+  });
+
+  it('holds a rethink verdict as needs-attention and raises it for the human', async () => {
+    runLocalGoalFidelityReviewMock.mockResolvedValue(verdict({
+      verdict: 'rethink',
+      missing: ['the retry'],
+      unrequested: ['an unrelated logging refactor'],
+    }));
+    const finalized = await finalize({ runId: 'fidelity-held-run', prExpected: true });
+    expect(finalized).toMatchObject({ success: false, cleanupEvidence: { ok: true } });
+    expect(completeAgentRun).toHaveBeenCalledWith('fidelity-held-run', 'done', 0, 1000,
+      expect.objectContaining({ category: GOAL_FIDELITY_CATEGORY }), false);
+
+    const result = completion();
+    expect(result.success).toBe(false);
+    expect(result.completionReason).toBe(GOAL_FIDELITY_CATEGORY);
+    expect(result.errorAnalysis.category).toBe(GOAL_FIDELITY_CATEGORY);
+    expect(result.error).toContain('stated objective');
+    expect(result.errorAnalysis.suggestedFix).toContain('the retry');
+    expect(updateTaskMock).not.toHaveBeenCalledWith('task-1', expect.objectContaining({ status: 'completed' }), 'internal');
+    expect(cosEvents.emit).toHaveBeenCalledWith(GOAL_FIDELITY_HOLD_EVENT, expect.objectContaining({
+      agentId: 'agent-1',
+      taskId: 'task-1',
+      review: expect.objectContaining({ verdict: 'rethink' }),
+    }));
+  });
+
+  it('preserves a drift diagnosis over a missing PR and skips fidelity', async () => {
+    getAgentRecord.mockResolvedValueOnce({ metadata: { primaryCheckoutBaseline: {} } });
+    detectPrimaryCheckoutDrift.mockResolvedValueOnce({
+      drifted: true, category: 'primary-checkout-mutated', message: 'Primary checkout changed',
+    });
+    findPullRequestForBranch.mockResolvedValueOnce({ status: 'none' });
+    const finished = await finalize({ prExpected: true, runId: 'drift-and-pr' });
+    expect(finished).toMatchObject({ success: false, cleanupEvidence: { ok: false } });
+    expect(completion()).toMatchObject({
+      error: 'Primary checkout changed', completionReason: PRIMARY_CHECKOUT_MUTATED_REASON,
+    });
+    expect(runLocalGoalFidelityReviewMock).not.toHaveBeenCalled();
+    expect(completeAgentRun.mock.calls[0][5]).toBe(false);
+  });
+
+  it('preserves a missing PR diagnosis without running fidelity', async () => {
+    findPullRequestForBranch.mockResolvedValueOnce({ status: 'none' });
+    await finalize({ prExpected: true });
+    expect(completion()).toMatchObject({ success: false, completionReason: 'pr-missing' });
+    expect(runLocalGoalFidelityReviewMock).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('keeps a reported failure authoritative in run history (terminated: %s)', async terminatedByUser => {
+    const analysis = { category: 'unknown', message: 'Run did not complete' };
+    const finished = await finalize({
+      success: false, terminatedByUser, runId: 'failed-run', errorAnalysis: analysis,
+      completionReason: terminatedByUser ? 'user-terminated' : 'failed',
+    });
+    expect(finished).toMatchObject({ success: false, cleanupEvidence: { ok: true } });
+    expect(completeAgentRun).toHaveBeenCalledWith('failed-run', 'done', 0, 1000, analysis, false);
+    expect(completion()).toMatchObject({
+      success: false, completionReason: terminatedByUser ? 'user-terminated' : 'failed',
+    });
+    if (terminatedByUser) {
+      expect(updateTaskMock).toHaveBeenCalledWith('task-1', expect.objectContaining({
+        status: 'blocked', metadata: expect.objectContaining({ blockedCategory: 'user-terminated' }),
+      }), 'internal');
+    }
+    expect(runLocalGoalFidelityReviewMock).not.toHaveBeenCalled();
+  });
+
+  it('fails OPEN: a gate that is off, a diff git could not read, or a reviewer that errored leaves the run alone', async () => {
+    for (const arrange of [
+      () => getGoalFidelityConfigMock.mockResolvedValue(null),
+      () => runWindowDiffMock.mockResolvedValue({ diff: null, base: null, truncated: false, reason: 'could not read the run window diff' }),
+      () => runWindowDiffMock.mockResolvedValue({ diff: '', base: 'abc', truncated: false, reason: null }),
+      () => runLocalGoalFidelityReviewMock.mockResolvedValue({ ok: false, error: 'ollama is not reachable' }),
+      () => runLocalGoalFidelityReviewMock.mockRejectedValue(new Error('socket hang up')),
+    ]) {
+      vi.clearAllMocks();
+      getGoalFidelityConfigMock.mockResolvedValue({ enabled: true, backend: 'ollama', model: 'example-model', effort: null });
+      runWindowDiffMock.mockResolvedValue({ diff: 'diff --git a/a.js b/a.js', base: 'abc', truncated: false, reason: null });
+      runLocalGoalFidelityReviewMock.mockResolvedValue(verdict());
+      arrange();
+
+      await finalize();
+      const result = completion();
+      expect(result.success).toBe(true);
+      expect(result.goalFidelity).toBeUndefined();
+      expect(cosEvents.emit).not.toHaveBeenCalledWith(GOAL_FIDELITY_HOLD_EVENT, expect.anything());
+    }
+  });
+
+// The follow-up is what carries a finding past this run's record — but the
+  // filer reaches the network, so a failure there must never change the run's
+  // own verdict.
+  describe('follow-up dispatch', () => {
+    beforeEach(() => {
+      runLocalGoalFidelityReviewMock.mockResolvedValue(verdict({ verdict: 'rethink', missing: ['the retry'] }));
+    });
+
+    it.each(['draft', 'leave-open'])('retains findings without filing issues or queuing unrestricted followups for %s', async prCompletion => {
+      await finalize({ task: { id: 'task-1', taskType: 'internal', description: 'Add a retry', metadata: { prCompletion } } });
+      expect(runGoalFidelityFollowUpMock).not.toHaveBeenCalled();
+      expect(completion().goalFidelity.verdict).toBe('rethink');
+      expect(cosEvents.emit).toHaveBeenCalledWith(GOAL_FIDELITY_HOLD_EVENT, expect.anything());
+    });
+
+    it('hands the follow-up the review, and records what it did on the run', async () => {
+      runGoalFidelityFollowUpMock.mockResolvedValue({
+        ran: true,
+        issue: { number: 42, url: 'https://example.com/issues/42', duplicate: false },
+        task: { id: 'cos-9' },
+      });
+      await finalize();
+      expect(runGoalFidelityFollowUpMock).toHaveBeenCalledWith(expect.objectContaining({
+        agentId: 'agent-1', review: expect.objectContaining({ verdict: 'rethink' }),
+      }));
+      expect(completion().goalFidelity.followUp).toEqual({
+        issue: { number: 42, url: 'https://example.com/issues/42', duplicate: false },
+        taskId: 'cos-9',
+      });
+    });
+
+    it('does not raise a separate hold alert when a follow-up task carries the finding', async () => {
+      runGoalFidelityFollowUpMock.mockResolvedValue({
+        ran: true,
+        task: { id: 'cos-9', approvalRequired: true, duplicate: false },
+      });
+      await finalize();
+      expect(completion().success).toBe(false);
+      expect(completion().goalFidelity.followUp).toMatchObject({ taskId: 'cos-9', taskApprovalRequired: true });
+      expect(cosEvents.emit).not.toHaveBeenCalledWith(GOAL_FIDELITY_HOLD_EVENT, expect.anything());
+    });
+
+    it('hands investigators the selected issue objective and the commits actually reviewed', async () => {
+      const head = 'a'.repeat(40);
+      const base = 'b'.repeat(40);
+      execGit.mockImplementation(async args => ({ stdout: args[0] === 'rev-parse' && args[1] === 'HEAD' ? head : 'claim/issue-42', exitCode: 0 }));
+      runWindowDiffMock.mockResolvedValue({ diff: 'diff --git a/a.js b/a.js', base, truncated: false, reason: null });
+      resolveRepoForgeTarget.mockResolvedValue({ forge: 'github', webHost: 'github.com', fullName: 'example/project' });
+      await finalize({ task: { id: 'task-1', description: 'PRIVATE LOCAL OUTER TASK', metadata: { claimFlow: true } } });
+      expect(runWindowDiffMock).toHaveBeenCalledWith('/example/worktree', expect.any(Number), { maxChars: 60_000, head });
+      const { context } = runGoalFidelityFollowUpMock.mock.calls[0][0];
+      expect(context).toEqual({ base, head, objective: runLocalGoalFidelityReviewMock.mock.calls[0][0].objective,
+        publication: { source: 'tracker-issue', title: 'Retry the opening line', tracker: 'github',
+          webHost: 'github.com', fullName: 'example/project', number: 42 } });
+      expect(execGh).toHaveBeenCalledWith(['issue', 'view', '42', '--json', 'number,title,body', '--repo', 'github.com/example/project'],
+        30000, { cwd: '/example/worktree', env: { GH_TOKEN: 'synthetic-token' } });
+      expect(Object.isFrozen(context)).toBe(true);
+      expect(Object.isFrozen(context.publication)).toBe(true);
+      expect(context.objective).toContain('Retry transient synthesis failures');
+      expect(context.objective).not.toContain('PRIVATE LOCAL OUTER TASK');
+      expect(completion().goalFidelity).not.toHaveProperty('context');
+    });
+
+    it('keeps local objectives local even when task metadata claims publication provenance', async () => {
+      await finalize({ task: { id: 'task-1', description: 'Fix journal search\nPRIVATE JOURNAL RECORD',
+        metadata: { publication: { source: 'tracker-issue', title: 'Pretend public' } } } });
+      const { context } = runGoalFidelityFollowUpMock.mock.calls[0][0];
+      expect(context.objective).toContain('PRIVATE JOURNAL RECORD');
+      expect(context).not.toHaveProperty('publication');
+    });
+
+// The card reads these to decide what to call the task and whether to still
+    // offer the manual fallback, so the producer's verdict has to survive the
+    // completion write, not just the log line.
+    it("persists the producer's hold and duplicate verdict alongside the task id", async () => {
+      runGoalFidelityFollowUpMock.mockResolvedValue({
+        ran: true, task: { id: 'cos-9', approvalRequired: true, duplicate: false },
+      });
+      await finalize();
+      expect(completion().goalFidelity.followUp).toEqual({ taskId: 'cos-9', taskApprovalRequired: true });
+    });
+
+    it('omits the hold flags for an ordinary queued task', async () => {
+      runGoalFidelityFollowUpMock.mockResolvedValue({
+        ran: true, task: { id: 'cos-9', approvalRequired: false, duplicate: false },
+      });
+      await finalize();
+      expect(completion().goalFidelity.followUp).toEqual({ taskId: 'cos-9' });
+    });
+
+    it('records the reason when an arm could not run', async () => {
+      runGoalFidelityFollowUpMock.mockResolvedValue({ ran: true, issueError: 'gh unreachable', task: null, taskError: 'circuit open' });
+      await finalize();
+      expect(completion().goalFidelity.followUp).toEqual({ issueError: 'gh unreachable', taskError: 'circuit open' });
+    });
+
+    it('leaves no followUp key when nothing was configured', async () => {
+      runGoalFidelityFollowUpMock.mockResolvedValue({ ran: false });
+      await finalize();
+      expect(completion().goalFidelity.followUp).toBeUndefined();
+    });
+
+    it('a throwing follow-up does not change the run verdict', async () => {
+      runGoalFidelityFollowUpMock.mockRejectedValue(new Error('forge exploded'));
+      await finalize();
+      // Still held by the rethink verdict — and held for THAT reason, not the throw.
+      expect(completion()).toMatchObject({ success: false, completionReason: GOAL_FIDELITY_CATEGORY });
+      expect(completion().goalFidelity.followUp).toBeUndefined();
+    });
+
+    // No trigger fires on `ship`, so the overwhelmingly common verdict must not
+    // even resolve the follow-up's module graph (the apps roster, both forge
+    // CLIs, the JIRA client) to be told there is nothing to act on.
+    it('is never consulted on a clean verdict', async () => {
+      runLocalGoalFidelityReviewMock.mockResolvedValue(verdict({ verdict: 'ship' }));
+      await finalize();
+      expect(runGoalFidelityFollowUpMock).not.toHaveBeenCalled();
+      expect(completion().success).toBe(true);
+    });
+
+    it('is consulted on the advisory fix-first verdict, which a wider trigger acts on', async () => {
+      runLocalGoalFidelityReviewMock.mockResolvedValue(verdict({ verdict: 'fix-first' }));
+      await finalize();
+      expect(runGoalFidelityFollowUpMock).toHaveBeenCalled();
+      // fix-first is advisory — it records a finding without holding the run.
+      expect(completion().success).toBe(true);
+    });
+  });
+
+  // #7653 — see `mergeOutcomeObjective` (lib/goalFidelity.js) for the run this
+  // gate wrongly held.
+  describe('a merge-shaped objective is settled by the forge, not by a diff', () => {
+    const mergeFollowUp = (metadata = {}) => ({
+      id: 'task-1',
+      taskType: 'internal',
+      description: '[Review Loop] Resolve and merge PR #7653 for PortOS',
+      metadata: {
+        reviewLoopFollowUp: true,
+        reviewLoopPRNumber: 7653,
+        reviewLoopPRBranch: 'claim/issue-7625',
+        ...metadata,
+      },
+    });
+
+    it('records a forge-established ship without reading a diff or calling a model', async () => {
+      declaresNoCommitCriterion.mockReturnValue(true);
+      runLocalGoalFidelityReviewMock.mockResolvedValue(verdict({ verdict: 'rethink', unrequested: ['Resolve and merge PR #7653'] }));
+      await finalize({ task: mergeFollowUp() });
+
+      expect(getPullRequestState).toHaveBeenCalledWith('7653', { cwd: '/example/worktree', env: { GH_TOKEN: 'synthetic-token' } });
+      expect(runWindowDiffMock).not.toHaveBeenCalled();
+      expect(runLocalGoalFidelityReviewMock).not.toHaveBeenCalled();
+      expect(completion()).toMatchObject({ success: true });
+      expect(completion().goalFidelity).toMatchObject({ verdict: 'ship', source: 'forge-outcome' });
+      expect(completion().goalFidelity.model).toBeUndefined();
+      expect(cosEvents.emit).not.toHaveBeenCalledWith(GOAL_FIDELITY_HOLD_EVENT, expect.anything());
+    });
+
+    it.each([
+      ['an unmerged PR', { status: 'known', state: 'OPEN', detail: null }],
+      ['an unreadable forge', { status: 'unavailable', state: null, detail: 'gh failed' }],
+    ])('leaves the run untouched and the model uncalled for %s', async (_label, view) => {
+      getPullRequestState.mockResolvedValue(view);
+      runLocalGoalFidelityReviewMock.mockResolvedValue(verdict({ verdict: 'rethink' }));
+      await finalize({ task: mergeFollowUp() });
+
+      expect(runLocalGoalFidelityReviewMock).not.toHaveBeenCalled();
+      expect(completion()).toMatchObject({ success: true });
+      expect(completion().goalFidelity).toBeUndefined();
+    });
+
+    // A leave-open follow-up's objective is the review fixes, which ARE ordinary
+    // diff — it must keep the model review a merge objective skips.
+    it('does not divert a leave-open follow-up, whose deliverable is a diff', async () => {
+      declaresNoCommitCriterion.mockReturnValue(true);
+      await finalize({ task: mergeFollowUp({ reviewLoopLeaveOpen: 'true' }) });
+
+      expect(getPullRequestState).not.toHaveBeenCalled();
+      expect(runLocalGoalFidelityReviewMock).toHaveBeenCalledOnce();
+      expect(completion().goalFidelity).toMatchObject({ verdict: 'ship', model: 'example-model' });
+    });
+  });
+
+  it('never re-judges a run that already failed — the original diagnosis is the better one', async () => {
+    await finalize({ success: false, errorAnalysis: { category: 'timeout', message: 'agent timed out' } });
+    expect(runLocalGoalFidelityReviewMock).not.toHaveBeenCalled();
+    expect(completion().errorAnalysis.category).toBe('timeout');
+  });
+});

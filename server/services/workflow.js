@@ -1,0 +1,705 @@
+/**
+ * Workflow Service
+ *
+ * Defines the canonical project-maintenance workflow across PortOS scheduled
+ * tasks (taskSchedule.js, per-app improvement tasks) and autonomous jobs
+ * (autonomousJobs.js, system-level recurring jobs).
+ *
+ * The workflow is a conceptual ordering — actual execution remains driven by
+ * each item's own schedule. The `runAfter` field on a task type encodes a
+ * hard dependency (taskSchedule already enforces it); stage ordering here is
+ * a recommendation surfaced in the visualizer so users can reason about
+ * how their schedule fits together.
+ *
+ * Stages (in canonical order):
+ *   1. hygiene  — reset state: cleanup branches and old agent data
+ *   2. review   — review existing in-flight work (open PRs, codebase review)
+ *   3. plan     — replan based on current state of the repo
+ *   4. audit    — quality/security audits that don't depend on planning
+ *   5. build    — implement new work from the (now fresh) plan
+ *   6. report   — externalize status (JIRA, briefing, etc.)
+ *   7. ambient  — recurring jobs that don't fit the dev-loop ordering
+ */
+
+import { getScheduleStatus } from './taskSchedule.js';
+import { TASK_READINESS_REASON } from '../lib/taskReadinessReasons.js';
+import { DEFAULT_PERPETUAL_RECHECK_MS } from './taskScheduleConstants.js';
+import { AUDIT_TASK_TYPES } from '../lib/auditCatalog.js';
+import { dedupeByKey } from '../lib/arrayUtils.js';
+import * as autonomousJobs from './autonomousJobs.js';
+import { checkJobGate, hasGate, getRegisteredGates } from './jobGates.js';
+import { parseCronToNextRun, parseRecurrenceToNextRun } from './eventScheduler.js';
+import { getLocalParts, nextLocalTime } from '../lib/timezone.js';
+import { getUserTimezone } from './userTimezone.js';
+
+const HOUR = 3_600_000;
+const DAY = 24 * HOUR;
+const MAX_OCCURRENCES_PER_NODE = 200;
+// Nominal runtime drawn for one perpetual drain. A drain has no scheduled end —
+// it runs until its work-detector finds nothing actionable — but painting that
+// as a band from Now to the horizon made every perpetual task read as "always
+// running" and hid the one thing the timeline exists to show: when it next
+// starts. One bar per recurrence at a fixed nominal length restores that.
+const PERPETUAL_NOMINAL_RUN_MS = HOUR;
+
+/**
+ * Stage definitions. `taskTypes` are entries from taskSchedule's tasks map;
+ * `jobIds` are entries from autonomousJobs. An item can appear in only one
+ * stage; orphans are reported under the `ambient` stage by getWorkflowGraph().
+ */
+export const WORKFLOW_STAGES = [
+  {
+    id: 'hygiene',
+    label: 'Hygiene',
+    description: 'Reset state: clean up merged branches and stale agent data so downstream stages start clean.',
+    taskTypes: ['repo-sync', 'branch-reconcile', 'stash-cleanup'],
+    jobIds: ['job-agent-data-cleanup']
+  },
+  {
+    id: 'review',
+    label: 'Review',
+    description: 'Review existing in-flight work — open pull requests and the current codebase — before planning new work.',
+    taskTypes: ['pr-reviewer', 'code-reviewer-a', 'code-reviewer-b', 'reference-watch'],
+    jobIds: ['job-brain-review']
+  },
+  {
+    id: 'plan',
+    label: 'Plan',
+    description: 'Audit PLAN.md against what actually shipped, surface gaps, and plan new features into the work tracker for the build stage to claim.',
+    taskTypes: ['do-replan', 'plan-feature', 'media-render-research'],
+    jobIds: []
+  },
+  {
+    id: 'audit',
+    label: 'Audit',
+    description: 'Quality, security, and accessibility audits. Independent of the plan, but typically scheduled lighter than build work.',
+    // Derived, not restated: the audit stage IS the audit catalog. Listing the
+    // types by hand made this a fourth edit site per new audit type and needed
+    // a parity test whose only job was to catch the copy going stale.
+    // `dependency-updates` is the one deliberate extra — it audits the manifest
+    // but carries no file-issues/do-work toggle, so it is not a catalog type.
+    taskTypes: [...AUDIT_TASK_TYPES, 'dependency-updates'],
+    jobIds: ['job-wiki-maintenance', 'job-refresh-local-llm-catalog', 'job-refresh-cli-provider-catalogs']
+  },
+  {
+    id: 'build',
+    label: 'Build',
+    description: 'Implement the next planned feature. Gated on do-replan so new work is grounded in a fresh plan.',
+    taskTypes: ['feature-ideas', 'plan-task', 'claim-issue'],
+    jobIds: []
+  },
+  {
+    id: 'report',
+    label: 'Report',
+    description: 'Externalize status — JIRA tickets, daily briefing, releases — once the build cycle has settled.',
+    taskTypes: ['jira-sprint-manager', 'jira-status-report', 'do-release'],
+    jobIds: ['job-daily-briefing', 'job-datadog-error-monitor']
+  },
+  {
+    id: 'ambient',
+    label: 'Ambient',
+    description: 'Recurring jobs that run independently of the dev loop — system health, repo maintenance, personal prompts.',
+    taskTypes: [],
+    jobIds: [
+      'job-github-repo-maintenance',
+      'job-system-health-check',
+      'job-autobiography-prompt',
+      'job-moltworld-exploration',
+      'job-goal-check-in'
+    ]
+  }
+];
+
+const STAGE_INDEX = new Map(WORKFLOW_STAGES.map((s, i) => [s.id, i]));
+
+/**
+ * Build a reverse map from task type / job id → stage id.
+ * Used to classify items the schedule contains that we haven't categorized.
+ */
+function buildItemStageMap() {
+  const map = new Map();
+  for (const stage of WORKFLOW_STAGES) {
+    for (const t of stage.taskTypes) map.set(`task:${t}`, stage.id);
+    for (const j of stage.jobIds) map.set(`job:${j}`, stage.id);
+  }
+  return map;
+}
+
+/**
+ * Build the workflow graph for the visualizer.
+ *
+ * Returns:
+ *   { stages: [...], nodes: [...], edges: [...], generatedAt }
+ *
+ * - nodes: every scheduled task type and every autonomous job, with
+ *   { id, kind ('task'|'job'), stage, label, schedule, enabled, lastRun,
+ *     runAfter, gate, blocked }
+ * - edges: explicit runAfter dependencies and inter-stage flow hints
+ *   { from, to, kind: 'depends-on' | 'stage-flow' }
+ *   `depends-on` edges connect node ids (`task:foo` → `task:bar`).
+ *   `stage-flow` edges connect entries in the `stages` list (bare stage ids
+ *   like `plan` → `build`); they have no corresponding entries in `nodes`.
+ */
+export async function getWorkflowGraph({ horizonHours = 24, from = new Date() } = {}) {
+  const safeHorizonHours = Math.min(24 * 14, Math.max(1, Number(horizonHours) || 24));
+  const start = Number.isNaN(new Date(from).getTime()) ? new Date() : new Date(from);
+  const [scheduleStatus, jobs, timezone] = await Promise.all([
+    getScheduleStatus(),
+    autonomousJobs.getAllJobs(),
+    getUserTimezone()
+  ]);
+
+  const itemStage = buildItemStageMap();
+  const nodes = [];
+  const edges = [];
+
+  // Task nodes — getScheduleStatus returns flat objects spreading interval + execution + status
+  for (const [taskType, info] of Object.entries(scheduleStatus.tasks || {})) {
+    const stageId = itemStage.get(`task:${taskType}`) || 'ambient';
+    const runAfter = Array.isArray(info.runAfter) ? info.runAfter : [];
+    nodes.push({
+      id: `task:${taskType}`,
+      kind: 'task',
+      stage: stageId,
+      label: taskType,
+      enabled: !!info.enabled,
+      schedule: {
+        type: info.type,
+        perpetual: info.perpetual === true,
+        autoStart: info.autoStart ?? (info.perpetual === true),
+        intervalMs: info.intervalMs ?? null,
+        effectiveIntervalMs: info.adjustedIntervalMs ?? info.intervalMs ?? null,
+        cronExpression: info.cronExpression ?? null,
+        recheckCron: info.recheckCron ?? null,
+        recheckIntervalMs: info.recheckIntervalMs ?? null,
+        weekdaysOnly: !!info.weekdaysOnly
+      },
+      lastRun: info.lastRun || null,
+      runCount: info.runCount || 0,
+      runAfter,
+      gate: null,
+      // Only true gating reasons (waiting on hard prerequisites) are surfaced as `blocked`
+      // — that field drives warning styling in the UI. Other shouldRun=false states (cooldown,
+      // weekday-only, disabled-for-app, etc.) are exposed via `statusReason` so the UI can
+      // render them as neutral "waiting" rather than a warning.
+      blocked: info.status?.reason === TASK_READINESS_REASON.WAITING_ON_DEPENDENCIES ? info.status.reason : null,
+      statusReason: info.status?.shouldRun === false ? info.status.reason : null,
+      shouldRun: info.status?.shouldRun === true,
+      // Why the task is due right now (e.g. 'weekly-due', 'cron-catch-up',
+      // 'once-first-run'). Surfaced only for shouldRun=true so the timeline can
+      // explain a NOW marker that sits far from the task's next cadence slot —
+      // a catch-up or first run reads as a bug otherwise (issue: NOW markers on
+      // weekly/Sunday tasks). `missedSlot` is the cron slot catch-up recovers.
+      runReason: info.status?.shouldRun === true ? (info.status.reason || null) : null,
+      missedSlot: info.status?.missedSlot || null,
+      pendingDeps: info.status?.pendingDeps || [],
+      nextRunAt: info.status?.nextRunAt || info.perpetualStatus?.nextRecheckAt || null,
+      perpetualStatus: info.perpetualStatus || null,
+      // Per-app overrides so the timeline can expand a task row to show/edit
+      // which apps run it (mirrors the Schedule tab's PerAppOverrideList).
+      // `taskMetadata`/`managedAgentOptions` are the global defaults the
+      // per-app rows inherit from and render "(inherited)" against.
+      appOverrides: info.appOverrides || {},
+      enabledAppCount: info.enabledAppCount || 0,
+      totalAppCount: info.totalAppCount || 0,
+      // Cron cadences that live on an APP rather than on this task's global
+      // row — most visibly a task left on-demand globally that one app puts on
+      // a clock. Those launches are real, so the timeline projects them below
+      // and the UI must not file the track under "no clock time".
+      appSchedules: Array.isArray(info.appSchedules) ? info.appSchedules : [],
+      taskMetadata: info.taskMetadata || null,
+      managedAgentOptions: info.managedAgentOptions || null,
+      // The task's provider/model pin — the per-app rows render their
+      // "Inherit (…)" label from it and pin over it.
+      providerId: info.providerId || null,
+      model: info.model || null
+    });
+
+    for (const dep of runAfter) {
+      edges.push({ from: `task:${dep}`, to: `task:${taskType}`, kind: 'depends-on' });
+    }
+  }
+
+  // Job nodes — include gate metadata and last-known evaluation. Gate checks may perform I/O
+  // (inbox counts, goals lookups, etc.), so run them in parallel rather than sequentially.
+  const gateIds = new Set(getRegisteredGates());
+  const gateResults = await Promise.all(
+    jobs.map(job => (gateIds.has(job.id) ? checkGateSafe(job.id) : Promise.resolve(null)))
+  );
+  for (let i = 0; i < jobs.length; i++) {
+    const job = jobs[i];
+    const stageId = itemStage.get(`job:${job.id}`) || 'ambient';
+    const gateInfo = gateResults[i];
+    nodes.push({
+      id: `job:${job.id}`,
+      kind: 'job',
+      stage: stageId,
+      label: job.name || job.id,
+      enabled: !!job.enabled,
+      schedule: {
+        type: job.interval || (job.cronExpression ? 'cron' : 'custom'),
+        intervalMs: job.intervalMs ?? null,
+        cronExpression: job.cronExpression ?? null,
+        cronSchedule: job.cronSchedule ?? null,
+        scheduledTime: job.scheduledTime ?? null,
+        weekdaysOnly: !!job.weekdaysOnly
+      },
+      lastRun: job.lastRun || null,
+      runCount: job.runCount || 0,
+      runAfter: [],
+      gate: gateInfo,
+      // Jobs without gates are implicitly runnable; gate.shouldRun=false => blocked
+      blocked: gateInfo && gateInfo.shouldRun === false ? gateInfo.reason : null,
+      shouldRun: gateInfo ? gateInfo.shouldRun !== false : true
+    });
+  }
+
+  // Stage-flow edges — chain stages in canonical order so the visualizer can
+  // render a left-to-right pipeline. Skip empty stages. These edges target bare
+  // stage ids (matching the `stages` list), not node ids.
+  const populatedStages = WORKFLOW_STAGES.filter(stage =>
+    nodes.some(n => n.stage === stage.id)
+  );
+  for (let i = 0; i < populatedStages.length - 1; i++) {
+    edges.push({
+      from: populatedStages[i].id,
+      to: populatedStages[i + 1].id,
+      kind: 'stage-flow'
+    });
+  }
+
+  // Sort stages by canonical order
+  const stages = WORKFLOW_STAGES.map(s => ({
+    id: s.id,
+    label: s.label,
+    description: s.description,
+    order: STAGE_INDEX.get(s.id),
+    nodeCount: nodes.filter(n => n.stage === s.id).length,
+    enabledCount: nodes.filter(n => n.stage === s.id && n.enabled).length
+  }));
+
+  const generatedAt = new Date().toISOString();
+  const timeline = projectWorkflowTimeline(nodes, {
+    start,
+    end: new Date(start.getTime() + safeHorizonHours * HOUR),
+    timezone
+  });
+
+  return {
+    generatedAt,
+    timezone,
+    stages,
+    nodes,
+    edges,
+    timeline
+  };
+}
+
+/**
+ * Project heterogeneous scheduler definitions onto one clock. Occurrences are
+ * launch/recheck instants; windows are bounded runtime bars for perpetual
+ * drains — one at Now when a drain is live, plus one per projected recurrence.
+ * Flexible rotation/on-demand tasks intentionally have neither because the
+ * scheduler does not promise them a wall-clock position.
+ */
+export function projectWorkflowTimeline(nodes, { start, end, timezone = 'UTC' }) {
+  const startMs = new Date(start).getTime();
+  const endMs = new Date(end).getTime();
+  const occurrences = [];
+  const windows = [];
+
+  for (const node of nodes.filter(item => item.enabled)) {
+    // Collected per node so the global cadence and any per-app schedules can be
+    // reconciled before they reach the shared list — two sources landing on the
+    // same instant are ONE launch, not a stack of identical markers.
+    const nodeOccurrences = [];
+    projectGlobalCadence(node, startMs, endMs, timezone, nodeOccurrences, windows);
+    appendAppScheduleOccurrences(node, startMs, endMs, timezone, nodeOccurrences);
+    occurrences.push(...mergeOccurrences(nodeOccurrences));
+  }
+
+  occurrences.sort((a, b) => new Date(a.at) - new Date(b.at) || a.nodeId.localeCompare(b.nodeId));
+  const collisionOccurrenceIds = findCollisionOccurrenceIds(occurrences);
+
+  return {
+    startAt: new Date(startMs).toISOString(),
+    endAt: new Date(endMs).toISOString(),
+    timezone,
+    occurrences: occurrences.map(item => ({ ...item, collision: collisionOccurrenceIds.has(item.id) })),
+    windows
+  };
+}
+
+/**
+ * Project the cadence the task/job itself declares — its global row. A task an
+ * app schedules on its own is handled separately by appendAppScheduleOccurrences,
+ * so this returning empty no longer means "nothing runs".
+ */
+function projectGlobalCadence(node, startMs, endMs, timezone, occurrences, windows) {
+  const schedule = node.schedule || {};
+  if (node.kind === 'task' && schedule.type === 'on-demand' && schedule.autoStart === false) return;
+  if (node.kind === 'task' && schedule.perpetual) {
+    projectPerpetual(node, startMs, endMs, timezone, occurrences, windows);
+    return;
+  }
+
+  if (schedule.cronSchedule) {
+    const dueNow = isRecurrenceDueNow(node, schedule.cronSchedule, startMs, timezone);
+    if (dueNow) {
+      occurrences.push(makeOccurrence(node, startMs, 'launch', nodeDueNow(node)));
+    }
+    appendRecurrenceOccurrences({
+      node,
+      rule: schedule.cronSchedule,
+      startMs,
+      endMs,
+      timezone,
+      target: occurrences,
+      kind: 'launch',
+      skipStart: dueNow
+    });
+    return;
+  }
+
+  if (schedule.cronExpression) {
+    const dueNow = isCronDueNow(node, schedule.cronExpression, startMs, timezone);
+    if (dueNow) {
+      occurrences.push(makeOccurrence(node, startMs, 'launch', nodeDueNow(node)));
+    }
+    // When a due-now marker was emitted, start the projection strictly after
+    // startMs so a cron slot landing exactly on the current minute doesn't
+    // produce a duplicate occurrence id at the same instant.
+    appendCronOccurrences({
+      node,
+      expression: schedule.cronExpression,
+      startMs,
+      endMs,
+      timezone,
+      target: occurrences,
+      kind: 'launch',
+      skipStart: dueNow
+    });
+    return;
+  }
+
+  if (node.kind === 'job') {
+    projectIntervalJob(node, startMs, endMs, timezone, occurrences);
+    return;
+  }
+
+  // Anything left is an on-demand task (or a cron task with an unusable
+  // expression): its GLOBAL row promises no wall-clock position. Per-app
+  // schedules, if any, are added by the caller.
+}
+
+/**
+ * Project the cron cadences apps pin for themselves (`node.appSchedules`) —
+ * the launches that exist nowhere on the task's global row. Without these, a
+ * task left on-demand globally but scheduled by one app draws an empty track
+ * and reads as "never runs on a clock", which is the opposite of the truth.
+ *
+ * Apps sharing one expression share one marker: the track answers "when does
+ * this task launch", and five identical squares stacked at 07:00 answer it
+ * worse than one square labelled with five apps.
+ */
+function appendAppScheduleOccurrences(node, startMs, endMs, timezone, target) {
+  const schedules = node.kind === 'task' && Array.isArray(node.appSchedules) ? node.appSchedules : [];
+  if (schedules.length === 0) return;
+
+  const byExpression = new Map();
+  for (const entry of schedules) {
+    if (!entry?.cronExpression) continue;
+    if (!byExpression.has(entry.cronExpression)) byExpression.set(entry.cronExpression, []);
+    byExpression.get(entry.cronExpression).push(entry);
+  }
+
+  for (const [expression, entries] of byExpression) {
+    // Due-now is per APP (each carries its own last run and backoff), so the
+    // marker at Now names only the apps actually due and borrows that app's
+    // reason rather than the task's global one.
+    const due = entries.filter(entry => entry.shouldRun);
+    if (due.length > 0) {
+      target.push(makeOccurrence(node, startMs, 'launch', dueNowExtra(due[0], { apps: due.map(entry => entry.appId) })));
+    }
+    appendCronOccurrences({
+      node,
+      expression,
+      startMs,
+      endMs,
+      timezone,
+      target,
+      kind: 'launch',
+      skipStart: due.length > 0,
+      extra: { apps: entries.map(entry => entry.appId) }
+    });
+  }
+}
+
+/**
+ * Collapse occurrences that land on the same instant for one node. Two sources
+ * can produce a launch there: the global cadence and an app override sharing
+ * its slot, or two apps on the same cron. A marker from the global cadence
+ * carries no app list, so merging one in drops the list rather than naming a
+ * misleading subset of the apps the launch covers.
+ */
+function mergeOccurrences(items) {
+  // `pick` folds the two rather than choosing one, which is a superset of what
+  // dedupeByKey's survivor contract asks for — the id is the instant, so both
+  // sides describe the same launch and dropping either would lose a state.
+  return dedupeByKey(items, item => item.id, (held, item) => {
+    const merged = { ...held };
+    if (held.apps && item.apps) merged.apps = [...new Set([...held.apps, ...item.apps])];
+    else delete merged.apps;
+    if (item.dueNow && !held.dueNow) {
+      merged.dueNow = true;
+      merged.reason = item.reason ?? null;
+      merged.missedSlot = item.missedSlot ?? null;
+    }
+    return merged;
+  });
+}
+
+function appendRecurrenceOccurrences({ node, rule, startMs, endMs, timezone, target, kind, skipStart = false }) {
+  let cursor = new Date(skipStart ? startMs : startMs - 60_000);
+  const searchBound = new Date(endMs);
+  for (let i = 0; i < MAX_OCCURRENCES_PER_NODE; i++) {
+    const next = parseRecurrenceToNextRun(rule, cursor, timezone, searchBound);
+    if (!next || next.getTime() >= endMs) return;
+    if (next.getTime() >= startMs && isAllowedWeekday(node, next.getTime(), timezone)) {
+      target.push(makeOccurrence(node, next.getTime(), kind));
+    }
+    cursor = next;
+  }
+}
+
+function appendCronOccurrences({ node, expression, startMs, endMs, timezone, target, kind, skipStart = false, extra = {} }) {
+  // parseCronToNextRun searches strictly after its cursor, so startMs - 60s
+  // makes a slot exactly at startMs eligible (unless the caller already
+  // emitted a due-now marker there — skipStart).
+  let cursor = new Date(skipStart ? startMs : startMs - 60_000);
+  // Bound the parser's minute-stepping search at the window end so a sparse
+  // cron (monthly/yearly) with no in-window slot returns null quickly instead
+  // of scanning up to its 2-year cap on every timeline request.
+  const searchBound = new Date(endMs);
+  for (let i = 0; i < MAX_OCCURRENCES_PER_NODE; i++) {
+    let next;
+    try {
+      next = parseCronToNextRun(expression, cursor, timezone, searchBound);
+    } catch {
+      return;
+    }
+    if (!next || next.getTime() >= endMs) return;
+    // shouldRunTask refuses weekday-only tasks on weekends regardless of the
+    // schedule type, so weekend cron slots would never actually dispatch.
+    if (next.getTime() >= startMs && isAllowedWeekday(node, next.getTime(), timezone)) {
+      target.push(makeOccurrence(node, next.getTime(), kind, extra));
+    }
+    cursor = next;
+  }
+}
+
+function projectPerpetual(node, startMs, endMs, timezone, occurrences, windows) {
+  const perpetual = node.perpetualStatus;
+  const allTrackedAppsParked = perpetual?.trackedAppCount > 0 && perpetual.parkedAppCount === perpetual.trackedAppCount;
+  const draining = node.shouldRun && !perpetual?.globalParked && !allTrackedAppsParked && node.statusReason !== TASK_READINESS_REASON.PERPETUAL_PARKED;
+
+  // A cron+perpetual task rechecks on its own expression (computePerpetualRecheckAt
+  // derives the park from it); an on-demand one uses `recheckCron`.
+  const recheckCron = node.schedule?.cronExpression || node.schedule?.recheckCron;
+  const rechecks = [];
+  if (recheckCron) {
+    appendCronOccurrences({
+      node,
+      expression: recheckCron,
+      startMs,
+      endMs,
+      timezone,
+      target: rechecks,
+      kind: 'recheck'
+    });
+  } else {
+    const nextRecheckMs = node.nextRunAt ? Date.parse(node.nextRunAt) : NaN;
+    const cadence = node.schedule?.recheckIntervalMs || DEFAULT_PERPETUAL_RECHECK_MS;
+    if (Number.isFinite(nextRecheckMs)) {
+      appendIntervalOccurrences({
+        node,
+        firstMs: nextRecheckMs,
+        cadence,
+        startMs,
+        endMs,
+        timezone,
+        target: rechecks,
+        kind: 'recheck'
+      });
+    }
+  }
+  occurrences.push(...rechecks);
+
+  // Each recurrence gets its own bounded runtime bar, so a perpetual task reads
+  // as "starts here, runs about this long" rather than one endless band. A
+  // recheck cadence shorter than the nominal run (nothing enforces a minimum)
+  // would stack bars straight back into that band, so a recurrence already
+  // inside the preceding bar is skipped rather than drawn over it.
+  let coveredUntilMs = -Infinity;
+  if (draining) {
+    windows.push(makePerpetualWindow(node, startMs, endMs, 'draining'));
+    coveredUntilMs = startMs + PERPETUAL_NOMINAL_RUN_MS;
+  }
+  for (const recheck of rechecks) {
+    const atMs = Date.parse(recheck.at);
+    if (atMs < coveredUntilMs) continue;
+    windows.push(makePerpetualWindow(node, atMs, endMs, 'scheduled'));
+    coveredUntilMs = atMs + PERPETUAL_NOMINAL_RUN_MS;
+  }
+}
+
+function makePerpetualWindow(node, atMs, endMs, state) {
+  return {
+    id: `${node.id}:${state}:${atMs}`,
+    nodeId: node.id,
+    startAt: new Date(atMs).toISOString(),
+    // Nominal, not a promise: the drain runs until its work-detector reports
+    // nothing actionable, which may be shorter or longer than the bar.
+    endAt: new Date(Math.min(atMs + PERPETUAL_NOMINAL_RUN_MS, endMs)).toISOString(),
+    kind: 'perpetual',
+    // 'draining' = a drain the scheduler considers live right now;
+    // 'scheduled' = a future recurrence that will start a drain.
+    state
+  };
+}
+
+function projectIntervalJob(node, startMs, endMs, timezone, occurrences) {
+  const cadence = node.schedule?.intervalMs;
+  if (!cadence) return;
+  const lastRunMs = node.lastRun ? new Date(node.lastRun).getTime() : NaN;
+  let nextMs = Number.isFinite(lastRunMs) ? lastRunMs + cadence : startMs;
+  const timeMatch = String(node.schedule?.scheduledTime || '').match(/^([01]\d|2[0-3]):([0-5]\d)$/);
+  if (isIntervalJobDueNow(node, startMs, timezone)) {
+    occurrences.push(makeOccurrence(node, startMs, 'launch', nodeDueNow(node)));
+    nextMs = startMs + cadence;
+  }
+  // Fast-forward a stale anchor (lastRun many cadences ago but not due right
+  // now, e.g. a weekday-only job viewed on a weekend) — stepping one cadence
+  // per capped iteration could otherwise exhaust the budget before reaching
+  // the window and render an active job with zero markers.
+  if (nextMs < startMs) {
+    nextMs += Math.ceil((startMs - nextMs) / cadence) * cadence;
+  }
+
+  for (let i = 0; i < MAX_OCCURRENCES_PER_NODE && nextMs < endMs; i++) {
+    if (timeMatch) {
+      nextMs = nextLocalTime(nextMs - 60_000, Number(timeMatch[1]), Number(timeMatch[2]), timezone);
+    }
+    if (nextMs >= startMs && nextMs < endMs && isAllowedWeekday(node, nextMs, timezone)) {
+      occurrences.push(makeOccurrence(node, nextMs, 'launch'));
+    }
+    nextMs += cadence;
+  }
+}
+
+function isCronDueNow(node, expression, startMs, timezone) {
+  if (node.kind === 'task') return node.shouldRun === true;
+  if (!node.lastRun) return false;
+  try {
+    // Only "is there a slot at or before startMs" matters — bound the search
+    // there so a sparse cron doesn't scan far past the answer.
+    const next = parseCronToNextRun(expression, new Date(node.lastRun), timezone, new Date(startMs + 60_000));
+    return !!next && next.getTime() <= startMs;
+  } catch {
+    return false;
+  }
+}
+
+function isRecurrenceDueNow(node, rule, startMs, timezone) {
+  if (node.kind === 'task') return node.shouldRun === true;
+  if (!node.lastRun) return false;
+  const next = parseRecurrenceToNextRun(rule, new Date(node.lastRun), timezone, new Date(startMs + 60_000));
+  return !!next && next.getTime() <= startMs;
+}
+
+function isIntervalJobDueNow(node, startMs, timezone) {
+  const cadence = node.schedule?.intervalMs;
+  if (!cadence || !isAllowedWeekday(node, startMs, timezone)) return false;
+  const lastRunMs = node.lastRun ? new Date(node.lastRun).getTime() : 0;
+  if (startMs - lastRunMs < cadence) return false;
+
+  const match = String(node.schedule?.scheduledTime || '').match(/^([01]\d|2[0-3]):([0-5]\d)$/);
+  if (!match) return true;
+  const localNow = getLocalParts(new Date(startMs), timezone);
+  let targetMs = nextLocalTime(startMs - DAY, Number(match[1]), Number(match[2]), timezone);
+  let targetLocal = getLocalParts(new Date(targetMs), timezone);
+  if (targetLocal.year !== localNow.year || targetLocal.month !== localNow.month || targetLocal.day !== localNow.day) {
+    targetMs = nextLocalTime(targetMs + 1, Number(match[1]), Number(match[2]), timezone);
+  }
+  return targetMs <= startMs && lastRunMs < targetMs;
+}
+
+function isAllowedWeekday(node, atMs, timezone) {
+  if (!node.schedule?.weekdaysOnly) return true;
+  const day = getLocalParts(new Date(atMs), timezone).dayOfWeek;
+  return day >= 1 && day <= 5;
+}
+
+function appendIntervalOccurrences({ node, firstMs, cadence, startMs, endMs, timezone, target, kind }) {
+  if (!Number.isFinite(firstMs) || !Number.isFinite(cadence) || cadence <= 0) return;
+  let nextMs = firstMs;
+  if (nextMs < startMs) nextMs += Math.ceil((startMs - nextMs) / cadence) * cadence;
+  for (let i = 0; i < MAX_OCCURRENCES_PER_NODE && nextMs < endMs; i++, nextMs += cadence) {
+    // Skip (not shift) weekend slots for weekday-only tasks — mirrors
+    // shouldRunTask's weekend refusal, which applies to every schedule type.
+    if (isAllowedWeekday(node, nextMs, timezone)) {
+      target.push(makeOccurrence(node, nextMs, kind));
+    }
+  }
+}
+
+function makeOccurrence(node, atMs, kind, extra = {}) {
+  return {
+    id: `${node.id}:${kind}:${atMs}`,
+    nodeId: node.id,
+    at: new Date(atMs).toISOString(),
+    kind,
+    ...extra
+  };
+}
+
+// A launch pinned to the window start (NOW) fires because the scheduler already
+// considers the task due — a catch-up, first run, or elapsed interval — NOT
+// because a cadence slot happens to land now. Tag it so the UI can distinguish
+// it from an on-cadence launch (a NOW marker next to "Sun at 07:00" otherwise
+// reads as a bug). Future cadence slots never carry this flag.
+function dueNowExtra({ reason = null, missedSlot = null } = {}, extra = {}) {
+  return { dueNow: true, reason: reason || null, missedSlot: missedSlot || null, ...extra };
+}
+
+// A node's global cadence reports its due-now reason on the node itself; a
+// per-app one reports it on the app's own schedule entry. Same shape, two
+// sources — named so the call sites read as "why is THIS due".
+const nodeDueNow = node => dueNowExtra({ reason: node?.runReason, missedSlot: node?.missedSlot });
+
+function findCollisionOccurrenceIds(occurrences) {
+  const ids = new Set();
+  const launches = occurrences.filter(item => item.kind === 'launch');
+  const threshold = 15 * 60_000;
+  for (let i = 0; i < launches.length; i++) {
+    for (let j = i + 1; j < launches.length; j++) {
+      const delta = new Date(launches[j].at) - new Date(launches[i].at);
+      if (delta > threshold) break;
+      if (launches[i].nodeId !== launches[j].nodeId) {
+        ids.add(launches[i].id);
+        ids.add(launches[j].id);
+      }
+    }
+  }
+  return ids;
+}
+
+async function checkGateSafe(jobId) {
+  if (!hasGate(jobId)) return null;
+  const result = await checkJobGate(jobId).catch(err => ({
+    shouldRun: true,
+    reason: `gate-error: ${err?.message || err}`,
+    error: true
+  }));
+  return result;
+}

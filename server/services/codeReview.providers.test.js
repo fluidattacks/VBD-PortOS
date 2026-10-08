@@ -1,0 +1,340 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { access } from 'node:fs/promises';
+import { codeReviewSettingsSchema, sanitizeTaskMetadata } from '../lib/cosValidation.js';
+import { resolveReviewerConfig, buildReviewWithArgs, isReviewerConfigFault } from '../lib/reviewerConfig.js';
+import { localReviewBridgeRequest } from '../lib/localReviewBridge.js';
+
+vi.mock('./settings.js', () => ({ getSettings: vi.fn(), settingsEvents: { on: vi.fn() } }));
+vi.mock('./providers.js', () => ({ getProviderById: vi.fn(), listProviders: vi.fn() }));
+vi.mock('../lib/aiToolkitState.js', () => ({ getAIToolkitInstance: () => ({}) }));
+vi.mock('./aiProvider.js', () => ({ callProviderAISimple: vi.fn() }));
+vi.mock('../lib/cliProviderRun.js', () => ({ runCliProviderPrompt: vi.fn() }));
+vi.mock('./lmStudioManager.js', () => ({ getBaseUrl: vi.fn() }));
+vi.mock('./ollamaManager.js', () => ({ getBaseUrl: vi.fn(), getModelCapabilities: vi.fn() }));
+
+const { getProviderById, listProviders } = await import('./providers.js');
+const { callProviderAISimple } = await import('./aiProvider.js');
+const { runCliProviderPrompt } = await import('../lib/cliProviderRun.js');
+const { REMOTE_CODE_REVIEW_TIMEOUT_DEFAULT_MS, REMOTE_CODE_REVIEW_TIMEOUT_CEILING_MS, getLocalCodeReviewTimeoutMs, pickCodeReviewDefaults, runLocalCodeReview, runLocalClaimCommentReview, getProviderReviewUnsupported, getReviewerConfigHealth, pickAvailableReviewerGroups } = await import('./codeReview.js');
+
+const backend = 'provider:example-gpu';
+const provider = { id: 'example-gpu', name: 'Example GPU', type: 'api', enabled: true,
+  endpoint: 'https://gpu.example.com/v1', apiKey: 'example-key', defaultModel: 'default-coder',
+  fallbackProvider: 'other-provider', models: ['default-coder', 'pinned-coder'] };
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  getProviderById.mockResolvedValue(provider);
+  listProviders.mockResolvedValue([provider]);
+  callProviderAISimple.mockResolvedValue({ text: 'NO FINDINGS' });
+});
+
+describe('configured provider reviewers', () => {
+  it('selects the first fallback group whose reviewers are not paused', () => {
+    expect(pickAvailableReviewerGroups({ reviewerFallbackGroups: [['ollama'], ['codex']], reviewerHealth: { ollama: { pausedUntil: 200 } } }, 100)).toEqual(['codex']);
+    expect(pickAvailableReviewerGroups({ reviewerFallbackGroups: [['ollama'], ['codex']], reviewerHealth: { ollama: { pausedUntil: 50 } } }, 100)).toEqual(['ollama']);
+  });
+
+  it('persists repeated tier memberships and explicit disable without adding task-local fallback schemas', () => {
+    const raw = { reviewers: ['codex'], reviewerFallbackGroups: [[backend, 'codex'], [backend]], usernames: ['example-bot'] };
+    const settings = codeReviewSettingsSchema.parse(raw);
+    expect(pickCodeReviewDefaults({ codeReview: settings })).toMatchObject({
+      reviewers: [backend, 'codex'], reviewerFallbackGroups: [[backend, 'codex'], [backend]], usernames: ['example-bot'],
+    });
+    const cleared = codeReviewSettingsSchema.parse({ ...raw, reviewerFallbackGroups: [] });
+    expect(pickCodeReviewDefaults({ codeReview: cleared })).toMatchObject({ reviewers: [], reviewerFallbackGroups: [], usernames: ['example-bot'] });
+    expect(codeReviewSettingsSchema.safeParse({ reviewerFallbackGroups: [[]] }).success).toBe(false);
+    expect(sanitizeTaskMetadata({ reviewerFallbackGroups: [[backend]], reviewers: ['codex'] })).not.toHaveProperty('reviewerFallbackGroups');
+  });
+
+  it('keeps a saved provider/model through settings, task metadata, prompt generation and execution', async () => {
+    const settings = codeReviewSettingsSchema.parse({ reviewers: ['codex', backend],
+      providerModels: { [backend]: 'pinned-coder' }, codexModel: 'example-cloud-model',
+      optionalReviewers: [backend], reviewerMaxRounds: { [backend]: 1 } });
+    const defaults = pickCodeReviewDefaults({ codeReview: settings });
+    const config = resolveReviewerConfig({}, defaults, defaults.reviewers);
+    const task = sanitizeTaskMetadata(config);
+    expect(task.reviewers).toEqual([backend, 'codex']);
+    expect(task.reviewerModels).toEqual({ [backend]: 'pinned-coder', codex: 'example-cloud-model' });
+    expect(task.optionalReviewers).toEqual([backend]);
+    expect(task.reviewerMaxRounds).toEqual({ [backend]: 1 });
+    const { buildLocalReviewerInstructions } = await import('./cosTaskPrompts.js');
+    const instructions = buildLocalReviewerInstructions(task.reviewers, task.reviewerModels);
+    expect(instructions).toContain(backend);
+    expect(instructions).toContain('pinned-coder');
+    expect(buildReviewWithArgs(task.reviewers)).not.toContain(backend);
+    const result = await runLocalCodeReview({ backend, model: task.reviewerModels[backend], diff: 'diff --git a/example.js b/example.js' });
+    expect(result).toMatchObject({ ok: true, backend, model: 'pinned-coder', findings: 'NO FINDINGS' });
+    expect(getProviderById).toHaveBeenCalledWith('example-gpu');
+    expect(callProviderAISimple).toHaveBeenCalledWith(
+      expect.objectContaining({ id: provider.id, endpoint: provider.endpoint, apiKey: provider.apiKey, fallbackProvider: null }),
+      'pinned-coder', expect.stringContaining('untrusted contributor-controlled data'),
+      expect.objectContaining({ allowModelRecovery: false }),
+    );
+    expect(runCliProviderPrompt).not.toHaveBeenCalled();
+    expect(resolveReviewerConfig({ reviewerModels: {} }, defaults, defaults.reviewers).reviewerModels).toEqual({});
+  });
+
+  it.each([false, true])('keeps malformed verdicts inconclusive for required/optional provider policy (optional=%s)', async optional => {
+    const config = resolveReviewerConfig({}, pickCodeReviewDefaults({ codeReview: {
+      reviewers: [backend], optionalReviewers: optional ? [backend] : [],
+    } }), [backend]);
+    callProviderAISimple.mockResolvedValue({ text: '## Blocking\n- `example.js:12`: An unfinished finding\nNo findings.' });
+    const result = await runLocalCodeReview({ backend, diff: 'example diff' });
+    expect(result).toMatchObject({ ok: false, code: 'MALFORMED_REVIEW' });
+    expect(isReviewerConfigFault(result.code)).toBe(false);
+    expect(result).not.toHaveProperty('findings');
+    const { buildLocalReviewerInstructions } = await import('./cosTaskPrompts.js');
+    const instructions = buildLocalReviewerInstructions(config.reviewers);
+    expect(instructions).toContain('select(.ok == true and (.verdict == "clean" or .verdict == "findings"))');
+    expect(instructions).toContain('For a required local reviewer, record `REVIEW_STATUS=review-blocked`');
+    expect(instructions).toContain('an optional inconclusive result remains non-blocking');
+    expect(config.optionalReviewers.includes(backend)).toBe(optional);
+  });
+
+  it('uses only this provider default when unpinned and returns provider failure without substitution', async () => {
+    callProviderAISimple.mockResolvedValue({ error: 'Selected model is unavailable' });
+    expect(await runLocalCodeReview({ backend, diff: 'example diff' })).toMatchObject({ ok: false, error: 'Selected model is unavailable' });
+    expect(callProviderAISimple).toHaveBeenCalledTimes(1);
+    expect(callProviderAISimple.mock.calls[0][1]).toBe('default-coder');
+  });
+
+  it.each([null, { ...provider, enabled: false }])('refuses a missing or disabled provider before inference', async record => {
+    getProviderById.mockResolvedValue(record);
+    expect(await runLocalCodeReview({ backend, diff: 'example diff' })).toMatchObject({ ok: false, code: 'REVIEWER_UNAVAILABLE' });
+    expect(callProviderAISimple).not.toHaveBeenCalled();
+    expect(runCliProviderPrompt).not.toHaveBeenCalled();
+  });
+
+  it('runs saved provider model/effort defaults through the ordinary CLI recipe and task overrides', async () => {
+    const cli = { ...provider, type: 'tui', command: 'claude' };
+    getProviderById.mockResolvedValue(cli);
+    runCliProviderPrompt.mockResolvedValue({ text: '{"type":"result","result":"NO FINDINGS"}', partial: false, streamFormat: 'stream-json' });
+    const settings = codeReviewSettingsSchema.parse({
+      reviewers: [backend], providerModels: { [backend]: 'pinned-coder' }, providerEfforts: { [backend]: 'HIGH' },
+      claudeEffort: 'medium',
+    });
+    const defaults = pickCodeReviewDefaults({ codeReview: settings });
+    expect(defaults.providerEfforts).toEqual({ [backend]: 'high' });
+    const task = sanitizeTaskMetadata(resolveReviewerConfig({}, defaults, defaults.reviewers));
+    expect(task.reviewerEfforts).toEqual({ [backend]: 'high', claude: 'medium' });
+    const result = await runLocalCodeReview({ backend, model: task.reviewerModels[backend], effort: task.reviewerEfforts[backend], diff: 'example diff' });
+    expect(result).toMatchObject({ ok: true, findings: 'NO FINDINGS', effort: 'high' });
+    const args = runCliProviderPrompt.mock.calls[0][0];
+    expect(args).toMatchObject({ provider: { ...cli, effort: 'high' }, model: 'pinned-coder', safetyProfile: 'public-review-gate' });
+    await expect(access(args.cwd)).rejects.toThrow();
+    expect(callProviderAISimple).not.toHaveBeenCalled();
+
+    const override = resolveReviewerConfig({ reviewerEfforts: { [backend]: 'low' } }, defaults, defaults.reviewers);
+    await runLocalCodeReview({ backend, model: override.reviewerModels[backend], effort: override.reviewerEfforts[backend], diff: 'example diff' });
+    expect(runCliProviderPrompt.mock.lastCall[0]).toMatchObject({ provider: { id: provider.id, effort: 'low' }, model: 'pinned-coder' });
+    const cleared = resolveReviewerConfig({ reviewerModels: {}, reviewerEfforts: {} }, defaults, defaults.reviewers);
+    expect(cleared).toMatchObject({ reviewerModels: {}, reviewerEfforts: {} });
+    await runLocalCodeReview({ backend, model: cleared.reviewerModels[backend], effort: cleared.reviewerEfforts[backend], diff: 'example diff' });
+    expect(runCliProviderPrompt.mock.lastCall[0]).toMatchObject({ provider: cli, model: 'default-coder' });
+    expect(runCliProviderPrompt.mock.lastCall[0].provider).not.toHaveProperty('effort');
+
+    runCliProviderPrompt.mockResolvedValue({ text: '{"type":"result","is_error":true,"result":"incomplete"}', partial: false, streamFormat: 'stream-json' });
+    expect(await runLocalCodeReview({ backend, diff: 'example diff' })).toMatchObject({ ok: false });
+    runCliProviderPrompt.mockResolvedValue({ text: 'NO FINDINGS', partial: true });
+    expect(await runLocalCodeReview({ backend, diff: 'example diff' })).toMatchObject({ ok: false });
+  });
+
+  it('reports an oversized-input spawn failure as a specific non-verdict, not a credential fault (#10273)', async () => {
+    getProviderById.mockResolvedValue({ ...provider, type: 'tui', command: 'claude' });
+    runCliProviderPrompt.mockResolvedValue({ error: "Prompt is too large for agy's command-line transport (E2BIG); the run was not started. Reduce the input size.", code: 'E2BIG' });
+    const result = await runLocalCodeReview({ backend, diff: 'example diff' });
+    expect(result).toMatchObject({ ok: false, code: 'E2BIG' });
+    expect(result.error).toMatch(/too large/);
+    expect(result.error).not.toMatch(/credential/i);
+    expect(result).not.toHaveProperty('findings');
+  });
+
+  // #7720: a bootstrap-credentialed harness has a maintained no-tool recipe and
+  // must be usable as a reviewer, not refused at selection time. The record
+  // reaches the CLI spawn with its `credentialBootstrap` intact — that is what
+  // `applyCredentialBootstrap` wraps under the gate's no-tool profile, so the
+  // bootstrap mints the credential into the harness it execs. A record that
+  // instead PRINTS assignments supplies them through `bootstrapEnv`, which the
+  // wrap does not replace.
+  it('runs a bootstrap reviewer on the wrap alone, and passes minted env when the record prints one', async () => {
+    const cli = { ...provider, type: 'cli', command: 'claude', credentialBootstrap: { command: 'example-wrapper', args: ['run'] } };
+    getProviderById.mockResolvedValue(cli);
+    listProviders.mockResolvedValue([cli]);
+    runCliProviderPrompt.mockResolvedValue({ text: 'NO FINDINGS', partial: false });
+    expect(await getProviderReviewUnsupported()).toEqual({});
+    expect(await runLocalCodeReview({ backend, diff: 'example diff' })).toMatchObject({ ok: true, findings: 'NO FINDINGS' });
+    expect(runCliProviderPrompt).toHaveBeenCalledWith(expect.objectContaining({
+      provider: expect.objectContaining({ credentialBootstrap: cli.credentialBootstrap }),
+      bootstrapEnv: {},
+      safetyProfile: 'public-review-gate',
+    }));
+
+    cli.credentialBootstrap.envCommand = [process.execPath, '-e', 'console.log("ANTHROPIC_AUTH_TOKEN=example-minted-token")'];
+    expect(await getProviderReviewUnsupported()).toEqual({});
+    expect(await runLocalCodeReview({ backend, diff: 'example diff' })).toMatchObject({ ok: true, findings: 'NO FINDINGS' });
+    expect(runCliProviderPrompt).toHaveBeenCalledWith(expect.objectContaining({
+      bootstrapEnv: { ANTHROPIC_AUTH_TOKEN: 'example-minted-token' },
+      safetyProfile: 'public-review-gate',
+    }));
+
+    // A credential command that FAILS is still a failed review, not a silent
+    // spawn with no credential.
+    cli.credentialBootstrap.envCommand = [process.execPath, '-e', 'console.error("example-secret"); process.exit(1)'];
+    runCliProviderPrompt.mockClear();
+    expect(await runLocalCodeReview({ backend, diff: 'example diff' })).toMatchObject({
+      ok: false, error: 'Reviewer credential setup or execution failed.',
+    });
+    expect(runCliProviderPrompt).not.toHaveBeenCalled();
+  });
+
+  it('refuses an unsupported effort before invoking the provider', async () => {
+    getProviderById.mockResolvedValue({ ...provider, type: 'tui', command: 'codex', defaultModel: 'gpt-6-astra' });
+    expect(await runLocalCodeReview({ backend, effort: 'minimal', diff: 'example diff' })).toMatchObject({ ok: false, error: expect.stringContaining('reasoning effort') });
+    expect(callProviderAISimple).not.toHaveBeenCalled();
+    expect(runCliProviderPrompt).not.toHaveBeenCalled();
+  });
+
+  // Regression: the claim bridge must launch a configured agy reviewer even
+  // though agy cannot enforce a no-tool/read-only posture.
+  it('runs ordinary and claim reviews in scratch without requiring an enforced mode', async () => {
+    for (const command of ['agy', 'custom-agent']) {
+      getProviderById.mockResolvedValue({ ...provider, type: 'cli', command });
+      runCliProviderPrompt.mockResolvedValue({ text: 'NO FINDINGS', partial: false });
+      const claimRequest = localReviewBridgeRequest({ kind: 'claim-review', backend, diff: 'example diff' }, process.cwd());
+      expect(await runLocalCodeReview({ backend, model: 'pinned-coder', diff: 'example diff', cwd: process.cwd() })).toMatchObject({ ok: true });
+      const args = runCliProviderPrompt.mock.lastCall[0];
+      expect(args).toMatchObject({ safetyProfile: 'public-review-gate', codeReview: true });
+      expect(args.cwd).not.toBe(process.cwd());
+      await expect(access(args.cwd)).rejects.toThrow();
+      runCliProviderPrompt.mockClear();
+      expect(await runLocalCodeReview(claimRequest)).toMatchObject({ ok: true, findings: 'NO FINDINGS' });
+      const claimArgs = runCliProviderPrompt.mock.lastCall[0];
+      expect(claimArgs).toMatchObject({ safetyProfile: 'public-review-gate', codeReview: true,
+        prompt: expect.stringContaining('Perform a review only: do not edit files') });
+      expect(claimArgs.cwd).not.toBe(process.cwd());
+      await expect(access(claimArgs.cwd)).rejects.toThrow();
+    }
+  });
+
+  it('keeps public-comment screening fail-closed for harnesses with no enforced reviewer mode', async () => {
+    getProviderById.mockResolvedValue({ ...provider, type: 'cli', command: 'custom-agent' });
+    expect(await runLocalClaimCommentReview({ backend, comments: [{ login: 'example-user', type: 'User', body: 'I will work on this' }] })).toMatchObject({ ok: false, code: 'REVIEWER_UNSUPPORTED' });
+    expect(runCliProviderPrompt).not.toHaveBeenCalled();
+  });
+
+  it('isolates an explicitly tool-free review even when a repository was supplied', async () => {
+    getProviderById.mockResolvedValue({ ...provider, type: 'cli', command: 'claude' });
+    runCliProviderPrompt.mockResolvedValue({ text: 'NO FINDINGS', partial: false });
+    const claimRequest = localReviewBridgeRequest({ kind: 'claim-review', backend, diff: 'example diff' }, process.cwd());
+    expect(await runLocalCodeReview(claimRequest)).toMatchObject({ ok: true });
+    const args = runCliProviderPrompt.mock.lastCall[0];
+    expect(args.safetyProfile).toBe('public-review-gate');
+    expect(args.cwd).not.toBe(process.cwd());
+    await expect(access(args.cwd)).rejects.toThrow();
+  });
+
+  // #7660: a reviewer that can never answer used to be indistinguishable from
+  // one that timed out, so the claim gate waited out an outage with no end and
+  // every PR stalled looking like it was merely pending.
+  it('separates a configuration fault from a reviewer that ran and failed', async () => {
+    expect(isReviewerConfigFault('REVIEWER_UNSUPPORTED')).toBe(true);
+    expect(isReviewerConfigFault('REVIEWER_UNAVAILABLE')).toBe(true);
+    expect(isReviewerConfigFault('NO_MODEL')).toBe(true);
+    callProviderAISimple.mockResolvedValue({ error: 'upstream timed out' });
+    const ranAndFailed = await runLocalCodeReview({ backend, diff: 'example diff' });
+    expect(ranAndFailed.ok).toBe(false);
+    expect(isReviewerConfigFault(ranAndFailed.code)).toBe(false);
+  });
+
+  it('gives a remote API reviewer its own timeout budget instead of the local diff-size formula', async () => {
+    const diff = 'x'.repeat(42 * 1024);
+    const budgetOf = () => callProviderAISimple.mock.calls.at(-1)[0].timeout;
+
+    await runLocalCodeReview({ backend, diff });
+    expect(budgetOf()).toBe(REMOTE_CODE_REVIEW_TIMEOUT_DEFAULT_MS);
+    expect(budgetOf()).toBeGreaterThan(getLocalCodeReviewTimeoutMs(diff));
+
+    getProviderById.mockResolvedValue({ ...provider, timeout: 450_000 });
+    await runLocalCodeReview({ backend, diff });
+    expect(budgetOf()).toBe(450_000);
+
+    getProviderById.mockResolvedValue({ ...provider, timeout: 99_999_999 });
+    await runLocalCodeReview({ backend, diff });
+    expect(budgetOf()).toBe(REMOTE_CODE_REVIEW_TIMEOUT_CEILING_MS);
+
+    await runLocalCodeReview({ backend, diff, timeoutMs: 5_000 });
+    expect(budgetOf()).toBe(5_000);
+  });
+
+  it('names the effective remote budget and the diff size in a timeout failure', async () => {
+    getProviderById.mockResolvedValue({ ...provider, timeout: 450_000 });
+    callProviderAISimple.mockResolvedValue({ error: 'Provider request failed: This operation was aborted' });
+    const result = await runLocalCodeReview({ backend, diff: 'x'.repeat(42 * 1024) });
+    expect(result.error).toContain('timed out after 450000ms');
+    expect(result.error).toContain('42 KiB');
+  });
+
+  describe('getProviderReviewUnsupported', () => {
+    // Any CLI with a command can review code (confined when it has no enforced
+    // mode), so only a missing command is reported.
+    it('names only providers with no command to run', async () => {
+      listProviders.mockResolvedValue([
+        provider,
+        { ...provider, id: 'supported-cli', type: 'cli', command: 'claude' },
+        { ...provider, id: 'read-only-cli', type: 'cli', command: 'agy' },
+        { ...provider, id: 'hosted-harness', type: 'cli', command: 'custom-agent' },
+        { ...provider, id: 'no-command', type: 'cli' },
+        { ...provider, id: 'switched-off', type: 'cli', command: 'custom-agent', enabled: false },
+      ]);
+      const unsupported = await getProviderReviewUnsupported();
+      // The capable provider is ABSENT rather than false, so "nobody fetched
+      // this map" and "nothing is wrong here" read the same to a picker.
+      expect(unsupported).toEqual({
+        'provider:no-command': 'REVIEWER_UNSUPPORTED',
+      });
+      expect(unsupported['provider:example-gpu']).toBeUndefined();
+      expect(unsupported['provider:supported-cli']).toBeUndefined();
+      expect(unsupported['provider:read-only-cli']).toBeUndefined();
+      expect(unsupported['provider:hosted-harness']).toBeUndefined();
+      // A disabled provider is already badged `disabled` by the picker's own
+      // provider-record check; reporting it here would badge one fact twice.
+      expect(unsupported['provider:switched-off']).toBeUndefined();
+    });
+
+    // A fault stored before the provider gained a reviewer mode would otherwise
+    // keep the health warning up until some later review happened to succeed.
+    it('drops a stored unsupported fault for a provider that can review now', async () => {
+      const { getSettings } = await import('./settings.js');
+      getSettings.mockResolvedValue({ codeReview: { reviewerHealth: {
+        'provider:agy-cli': { code: 'REVIEWER_UNSUPPORTED', lastFailureAt: 1 },
+        'provider:no-command': { code: 'REVIEWER_UNSUPPORTED', lastFailureAt: 1 },
+      } } });
+      listProviders.mockResolvedValue([
+        { ...provider, id: 'agy-cli', type: 'cli', command: 'agy' },
+        { ...provider, id: 'no-command', type: 'cli' },
+      ]);
+      expect(await getReviewerConfigHealth()).toEqual({
+        status: 'warning',
+        configFaults: { 'provider:no-command': { code: 'REVIEWER_UNSUPPORTED', lastFailureAt: 1 } },
+      });
+    });
+
+    it('agrees with what the dispatch actually does, rather than keeping its own copy of the rule', async () => {
+      const harness = { ...provider, id: 'no-command', type: 'cli' };
+      listProviders.mockResolvedValue([harness]);
+      getProviderById.mockResolvedValue(harness);
+      const warned = await getProviderReviewUnsupported();
+      const ran = await runLocalCodeReview({ backend: 'provider:no-command', diff: 'example diff' });
+      expect(warned['provider:no-command']).toBe(ran.code);
+    });
+
+    it('reports nothing, and clears no stored fault, when the provider store cannot be read', async () => {
+      listProviders.mockRejectedValue(new Error('provider store unreadable'));
+      expect(await getProviderReviewUnsupported()).toEqual({});
+      const { getSettings } = await import('./settings.js');
+      getSettings.mockResolvedValue({ codeReview: { reviewerHealth: { 'provider:agy-cli': { code: 'REVIEWER_UNSUPPORTED', lastFailureAt: 1 } } } });
+      expect((await getReviewerConfigHealth()).configFaults).toHaveProperty('provider:agy-cli');
+    });
+  });
+});

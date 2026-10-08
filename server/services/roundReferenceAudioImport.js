@@ -1,0 +1,152 @@
+/**
+ * Round reference-audio import (#2120) — the deferred convenience path from the
+ * reference-audio analysis feature (#2106). Download + extract the audio from a
+ * reference URL (a layered TikTok performance, a YouTube clip, …) via yt-dlp and
+ * land it in the uploads dir, so it can be attached to a round reference and
+ * analyzed exactly like an uploaded file or a mic capture.
+ *
+ * Reuses the shared yt-dlp download core (`ytdlpAudioImport.js`) — same job/SSE
+ * shape as the YouTube track import (#1945). The two differences from that path:
+ *   1. URL scope — ANY public http(s) URL (SSRF-guarded), not YouTube-only. yt-dlp
+ *      decides what it can actually extract; a scrape failure degrades to a clear
+ *      error (upload/mic capture remain the primary attach paths).
+ *   2. Output — lands in PATHS.uploads and returns a `filename` for the
+ *      reference's `audioFilename`, rather than the music library + a Track.
+ */
+
+import { randomUUID } from 'crypto';
+import { shortId, importFileToUploads } from '../lib/fileUtils.js';
+import { assertPublicHttpUrl } from '../lib/safeUrlFetch.js';
+import { broadcastSse, attachSseClient as attachSse, closeJobAfterDelay } from '../lib/sseUtils.js';
+import { killWithEscalation } from '../lib/killWithEscalation.js';
+import { resolveYtDlpBinaries, downloadAudioToTempMp3, cleanupYtDlpTemp } from './ytdlpAudioImport.js';
+import { attachReferenceAudio } from './rounds.js';
+import { withBackupAssetPublication } from '../lib/backupSnapshotBoundary.js';
+
+// Reference performances are short clips — bound resource use so a mistyped
+// link to a long archive/livestream can't download + transcode unbounded.
+export const REFERENCE_AUDIO_MAX_BYTES = 60 * 1024 * 1024; // 60MB
+export const REFERENCE_AUDIO_MAX_DURATION_SEC = 20 * 60; // 20 minutes
+
+// jobId -> { clients, lastPayload, process, canceled }
+const importJobs = new Map();
+
+export const attachReferenceAudioSseClient = (jobId, res) => attachSse(importJobs, jobId, res);
+
+// The job map is module-private, which left cancelReferenceAudioImport
+// untestable. Exposing it lets a test register a fake job and actually run the
+// cancel — same rationale as videoDownload.js's __testing export.
+export const __testing = { importJobs };
+
+/**
+ * Cancel an in-flight import. Returns false if the job is unknown or already
+ * cancelled.
+ *
+ * `job.process` is transient — it is null while the job is awaiting setup and
+ * again during post-processing (runYtDlp clears it on exit) — so cancellation
+ * is recorded as a `job.canceled` flag the kickoff re-checks at each phase
+ * boundary, and the child is only signalled when one is actually running.
+ */
+export function cancelReferenceAudioImport(jobId) {
+  const job = importJobs.get(jobId);
+  // The job lingers in the map after it ends (closeJobAfterDelay evicts it on
+  // a timer), so a terminal status — not just the flag — is what makes a cancel
+  // for an already-finished import report false.
+  if (!job || job.canceled || job.status !== 'running') return false;
+  job.canceled = true;
+  const proc = job.process;
+  if (proc) killWithEscalation(proc, { label: 'yt-dlp reference audio', stillRunning: () => job.process === proc });
+  return true;
+}
+
+/**
+ * Kick off a reference-audio download. Returns `{ jobId }` immediately; the
+ * download+extract runs detached and streams progress over SSE. Terminal
+ * frames: `{ type: 'complete', filename, attached }`, `{ type: 'error', error }`, or
+ * `{ type: 'canceled' }`. Throws (before returning a jobId) on an unsafe URL or
+ * a missing yt-dlp/ffmpeg binary, so those surface as real HTTP errors.
+ *
+ * Given the round + reference the download is for, the finished file is attached
+ * to that saved reference server-side (#9943) rather than left for the client to
+ * carry until Save — `attached` reports whether that happened. A reference that
+ * is still an unsaved draft has nothing server-side to attach to, so it stays the
+ * client's job (`attached: false`).
+ */
+export async function startReferenceAudioImport(url, { roundId = null, referenceId = null } = {}) {
+  // SSRF guard: http(s) only, reject loopback/link-local/metadata AND private
+  // LAN hosts (blockPrivate) — yt-dlp fetches the URL itself, so it never
+  // reaches our SSRF-guarded fetcher; validate before handing it the URL.
+  await assertPublicHttpUrl(url, { blockPrivate: true });
+  const { ytDlp, ffmpeg } = await resolveYtDlpBinaries();
+
+  const jobId = randomUUID();
+  const tempPrefix = `portos-refaudio-${jobId}`;
+  const job = { id: jobId, status: 'running', clients: [], process: null, canceled: false };
+  importJobs.set(jobId, job);
+  console.log(`🎧 Reference-audio import ${shortId(jobId)} — ${url}`);
+
+  (async () => {
+    // Cancel can land in three windows: before the spawn, while yt-dlp runs
+    // (the core reports `canceled`), or during post-processing after the child
+    // has exited. Only the middle one is the core's to detect — `job.process`
+    // is null in the other two, so the flag is what carries them. The guard is
+    // re-run at each phase boundary rather than only after the download, so
+    // adding an await ahead of the spawn can't silently reopen window one.
+    const abortIfCanceled = async (canceled = job.canceled) => {
+      if (!canceled) return false;
+      console.log(`🛑 Reference-audio import ${shortId(jobId)} cancelled`);
+      broadcastSse(job, { type: 'canceled' });
+      await cleanupYtDlpTemp(tempPrefix);
+      return true;
+    };
+
+    try {
+      if (await abortIfCanceled()) return;
+      const result = await downloadAudioToTempMp3({
+        url, ytDlp, ffmpeg, tempPrefix,
+        maxBytes: REFERENCE_AUDIO_MAX_BYTES,
+        maxDurationSec: REFERENCE_AUDIO_MAX_DURATION_SEC,
+        onProgress: (p) => broadcastSse(job, { type: 'progress', ...p }),
+        registerProcess: (proc) => { job.process = proc; },
+      });
+
+      // The core reports `canceled` only for a kill we issued, so the two
+      // signals normally agree — check both so an externally-killed child
+      // still ends as a cancel rather than a failure.
+      if (await abortIfCanceled(job.canceled || result.outcome === 'canceled')) return;
+      if (result.outcome === 'failed') {
+        throw new Error(result.reason);
+      }
+
+      broadcastSse(job, { type: 'progress', percent: 100, stage: 'importing' });
+      const { title, outPath } = result;
+      const { filename } = await importFileToUploads(outPath, `${title || 'Reference Audio'}.mp3`);
+
+      // A failed attach must not turn a finished download into an error frame:
+      // the file is in uploads and the client can still attach it on Save. The
+      // round row first names the imported file, so it commits under the backup
+      // lease (#9982): a row that waits out a cut names only bytes it copied.
+      const attached = roundId && referenceId
+        ? await withBackupAssetPublication(() => attachReferenceAudio(roundId, referenceId, filename)).catch((err) => {
+            console.error(`❌ Reference-audio import ${shortId(jobId)} could not attach ${filename}: ${err?.message || err}`);
+            return false;
+          })
+        : false;
+
+      console.log(`🎧 Reference-audio import ${shortId(jobId)} complete — ${filename}${attached ? ' (attached)' : ''}`);
+      broadcastSse(job, { type: 'complete', filename, title: title || null, attached });
+    } catch (err) {
+      console.error(`❌ Reference-audio import ${shortId(jobId)} failed: ${err?.message || err}`);
+      broadcastSse(job, { type: 'error', error: err?.message || String(err) });
+      // The core cleans temp on canceled/failed; this catch covers a throw from
+      // the post-complete landing (importFileToUploads), whose produced outPath
+      // the core handed off and no longer owns.
+      await cleanupYtDlpTemp(tempPrefix);
+    } finally {
+      job.status = 'done';
+      closeJobAfterDelay(importJobs, jobId);
+    }
+  })();
+
+  return { jobId };
+}

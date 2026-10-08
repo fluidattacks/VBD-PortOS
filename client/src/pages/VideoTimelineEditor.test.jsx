@@ -1,0 +1,474 @@
+import { StrictMode } from 'react';
+import { createMemoryRouter, RouterProvider } from 'react-router';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { render, screen, waitFor, fireEvent, within, act } from '@testing-library/react';
+import { awaitPageLoaded } from '../test/pageLoadBarrier';
+
+// The editor's pure rules live in lib/videoTimelineModel.js and its blocks in
+// components/media/VideoTimelineLanes.jsx, both tested there. What only exists
+// here is the page's own wiring: which lanes render, what counts as a missing
+// source, and the lane caps.
+
+vi.mock('@dnd-kit/sortable', async () => {
+  const actual = await vi.importActual('@dnd-kit/sortable');
+  return {
+    ...actual,
+    useSortable: () => ({
+      attributes: {}, listeners: {}, setNodeRef: () => {}, transform: null, transition: null, isDragging: false,
+    }),
+  };
+});
+
+const toastError = vi.hoisted(() => vi.fn());
+vi.mock('../components/ui/Toast', () => ({
+  default: Object.assign(vi.fn(), { error: toastError, success: vi.fn() }),
+}));
+
+vi.mock('../hooks/useSseProgress', () => ({
+  useSseProgress: () => ({ latest: null, closed: false }),
+  isTerminalSseFrame: () => false,
+}));
+
+const api = vi.hoisted(() => ({
+  project: null,
+  getTimelineProject: vi.fn(),
+  getGalleryImages: vi.fn(),
+  history: [],
+  gallery: [],
+  music: { tracks: [] },
+  galleryThrows: false,
+  updateTimelineProject: vi.fn(async () => ({ updatedAt: 'u2' })),
+}));
+
+vi.mock('../services/api', () => ({
+  getTimelineProject: (...args) => api.getTimelineProject(...args),
+  listVideoHistory: async () => api.history,
+  getGalleryImages: (...args) => api.getGalleryImages(...args),
+  listMusicLibrary: async () => api.music,
+  updateTimelineProject: (...args) => api.updateTimelineProject(...args),
+  renderTimelineProject: async () => ({ jobId: 'j1' }),
+}));
+
+vi.mock('../services/apiImageVideo', () => ({
+  listImageGalleryPage: async ({ limit, offset }) => ({ items: api.gallery.slice(offset, offset + limit), total: api.gallery.length, offset, limit }),
+}));
+
+const VideoTimelineEditor = (await import('./VideoTimelineEditor')).default;
+
+const CLIP_A = '11111111-1111-4111-8111-111111111111';
+
+const project = (over = {}) => ({
+  id: 'p1', name: 'Example Project', updatedAt: 'u1', schemaVersion: 2,
+  segments: [], overlays: [], audio: { clipVolume: 1, tracks: [] }, clips: [], ...over,
+});
+
+const clipSegment = { type: 'clip', clipId: CLIP_A, inSec: 0, outSec: 4, fadeInSec: 0, fadeOutSec: 0, volume: 1 };
+const stillSegment = { type: 'still', assetKind: 'images', assetFile: 'plate.png', durationSec: 3, fadeInSec: 0, fadeOutSec: 0 };
+const overlayEntry = { type: 'image', assetKind: 'images', assetFile: 'logo.png', startSec: 0, durationSec: 2, x: 0, y: 0, width: 0.25, opacity: 1, fadeInSec: 0, fadeOutSec: 0 };
+const bedEntry = { assetKind: 'music', assetFile: 'bed.mp3', startSec: 0, offsetSec: 0, durationSec: 4, volume: 1, fadeInSec: 0, fadeOutSec: 0 };
+
+beforeEach(() => {
+  Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1024 });
+  window.matchMedia = vi.fn((query) => ({
+    matches: query === '(min-width: 64rem)' && window.innerWidth >= 1024,
+    media: query,
+    addEventListener: vi.fn(),
+    removeEventListener: vi.fn(),
+  }));
+  toastError.mockClear();
+  api.project = project();
+  api.history = [{ id: CLIP_A, prompt: 'A dramatic sunrise', filename: 'a.mp4', thumbnail: 'a.jpg', width: 1920, height: 1080, fps: 24, numFrames: 96 }];
+  api.gallery = [{ filename: 'plate.png' }, { filename: 'logo.png' }];
+  api.music = { tracks: [{ filename: 'bed.mp3', label: 'Bed' }] };
+  api.galleryThrows = false;
+  api.getTimelineProject.mockReset().mockImplementation(async () => api.project);
+  api.getGalleryImages.mockReset().mockImplementation(async (filenames) => {
+    if (api.galleryThrows) throw new Error('network');
+    return api.gallery.filter(row => filenames.includes(row.filename));
+  });
+  api.updateTimelineProject.mockReset().mockResolvedValue({ updatedAt: 'u2' });
+});
+
+const renderEditorRoute = ({ strict = false } = {}) => {
+  const router = createMemoryRouter([
+    { path: '/media/timeline/:projectId', element: <VideoTimelineEditor /> },
+  ], { initialEntries: ['/media/timeline/p1'] });
+  const provider = <RouterProvider router={router} />;
+  return { ...render(strict ? <StrictMode>{provider}</StrictMode> : provider), router };
+};
+
+const renderEditor = async () => {
+  renderEditorRoute();
+  await awaitPageLoaded('Loading timeline project');
+};
+
+const deferred = () => {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+};
+
+describe('route and refresh ownership', () => {
+  it('keeps B lanes and its save token after a late A read completes', async () => {
+    const oldRead = deferred();
+    api.getTimelineProject.mockImplementation((id) => id === 'p1' ? oldRead.promise : Promise.resolve(project({
+      id: 'p2', name: 'Example B', updatedAt: 'b1', segments: [{ ...stillSegment, assetFile: 'logo.png' }],
+    })));
+    const view = renderEditorRoute();
+
+    await act(async () => { await view.router.navigate('/media/timeline/p2'); });
+    expect(await screen.findByRole('textbox', { name: 'Project name' })).toHaveValue('Example B');
+    await act(async () => { oldRead.resolve(project({ name: 'Example A', segments: [stillSegment] })); });
+
+    expect(api.getTimelineProject).toHaveBeenCalledWith('p1', { silent: true });
+    expect(api.getTimelineProject).toHaveBeenCalledWith('p2', { silent: true });
+    expect(view.router.state.location.pathname).toBe('/media/timeline/p2');
+    expect(screen.getByRole('textbox', { name: 'Project name' })).toHaveValue('Example B');
+    expect(screen.getByRole('button', { name: 'Remove logo.png from timeline' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Remove plate.png from timeline' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Add to timeline' }));
+    view.unmount();
+    await waitFor(() => expect(api.updateTimelineProject).toHaveBeenCalledOnce());
+    expect(api.updateTimelineProject).toHaveBeenCalledWith('p2', expect.objectContaining({
+      expectedUpdatedAt: 'b1',
+      segments: [expect.objectContaining({ assetFile: 'logo.png' }), expect.objectContaining({ clipId: CLIP_A })],
+    }), { silent: true });
+  });
+
+  it('flushes A once through its existing write tail without owning B pending edits or token', async () => {
+    const firstSave = deferred();
+    api.getTimelineProject.mockImplementation(async (id) => project({
+      id, name: id === 'p1' ? 'Example A' : 'Example B', updatedAt: id === 'p1' ? 'a1' : 'b1',
+    }));
+    api.updateTimelineProject.mockImplementationOnce(() => firstSave.promise).mockResolvedValue({ updatedAt: 'a3' });
+    const view = renderEditorRoute();
+    await awaitPageLoaded('Loading timeline project');
+    fireEvent.click(screen.getByRole('button', { name: 'Add to timeline' }));
+    await waitFor(() => expect(api.updateTimelineProject).toHaveBeenCalledOnce(), { timeout: 1500 });
+    fireEvent.click(screen.getByRole('button', { name: 'Add to timeline' }));
+    await act(async () => { await view.router.navigate('/media/timeline/p2'); });
+    expect(await screen.findByRole('textbox', { name: 'Project name' })).toHaveValue('Example B');
+    expect(screen.getByText(/Add clips, stills, overlays and audio/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Add to timeline' }));
+
+    await act(async () => { firstSave.resolve({ updatedAt: 'a2' }); });
+    expect(api.updateTimelineProject).toHaveBeenCalledTimes(2);
+    expect(api.updateTimelineProject.mock.calls[1]).toEqual(['p1', expect.objectContaining({
+      expectedUpdatedAt: 'a2', segments: [expect.objectContaining({ clipId: CLIP_A }), expect.objectContaining({ clipId: CLIP_A })],
+    }), { silent: true }]);
+    expect(screen.getByRole('textbox', { name: 'Project name' })).toHaveValue('Example B');
+    const pendingUnload = new Event('beforeunload', { cancelable: true });
+    window.dispatchEvent(pendingUnload);
+    expect(pendingUnload.defaultPrevented).toBe(true);
+
+    view.unmount();
+    await waitFor(() => expect(api.updateTimelineProject).toHaveBeenCalledTimes(3));
+    expect(api.updateTimelineProject.mock.calls[2]).toEqual(['p2', expect.objectContaining({
+      expectedUpdatedAt: 'b1', segments: [expect.objectContaining({ clipId: CLIP_A })],
+    }), { silent: true }]);
+  });
+
+  it('keeps the current StrictMode load pending when the disposed setup completes', async () => {
+    const disposedRead = deferred();
+    const currentRead = deferred();
+    api.getTimelineProject.mockImplementationOnce(() => disposedRead.promise).mockImplementationOnce(() => currentRead.promise);
+    const view = renderEditorRoute({ strict: true });
+    expect(api.getTimelineProject).toHaveBeenCalledTimes(2);
+
+    await act(async () => { disposedRead.resolve(project({ name: 'Obsolete project', updatedAt: 'old' })); });
+    expect(screen.getByLabelText('Loading timeline project')).toBeInTheDocument();
+    await act(async () => { currentRead.resolve(project({ name: 'Current project', updatedAt: 'current' })); });
+    expect(screen.getByRole('textbox', { name: 'Project name' })).toHaveValue('Current project');
+    fireEvent.click(screen.getByRole('button', { name: 'Add to timeline' }));
+    view.unmount();
+    await waitFor(() => expect(api.updateTimelineProject).toHaveBeenCalledOnce());
+    expect(api.updateTimelineProject.mock.calls[0][1].expectedUpdatedAt).toBe('current');
+  });
+
+  it('drops a superseded refresh that was already waiting for its image catalogue', async () => {
+    const oldGallery = deferred();
+    const secondSave = deferred();
+    api.getTimelineProject.mockResolvedValueOnce(project({ segments: [clipSegment] }))
+      .mockResolvedValueOnce(project({ name: 'Obsolete project', updatedAt: 'old', segments: [stillSegment] }))
+      .mockResolvedValueOnce(project({ name: 'Current project', updatedAt: 'current', segments: [{ ...stillSegment, assetFile: 'logo.png' }] }));
+    api.getGalleryImages.mockResolvedValueOnce([])
+      .mockImplementationOnce(() => oldGallery.promise)
+      .mockResolvedValueOnce([{ filename: 'logo.png' }]);
+    const conflict = Object.assign(new Error('conflict'), { code: 'CONFLICT' });
+    api.updateTimelineProject.mockRejectedValueOnce(conflict).mockImplementationOnce(() => secondSave.promise);
+    const view = renderEditorRoute();
+    await awaitPageLoaded('Loading timeline project');
+    fireEvent.click(screen.getByRole('button', { name: 'Render' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Render' }));
+    await waitFor(() => expect(api.getGalleryImages).toHaveBeenCalledTimes(2));
+    await act(async () => { secondSave.reject(conflict); });
+    expect(await screen.findByRole('textbox', { name: 'Project name' })).toHaveValue('Current project');
+    await act(async () => { oldGallery.resolve([]); });
+
+    expect(screen.getByRole('textbox', { name: 'Project name' })).toHaveValue('Current project');
+    expect(screen.getByRole('button', { name: 'Remove logo.png from timeline' })).toBeInTheDocument();
+    expect(screen.queryByText('(missing)')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Add to timeline' }));
+    view.unmount();
+    await waitFor(() => expect(api.updateTimelineProject).toHaveBeenCalledTimes(3));
+    expect(api.updateTimelineProject.mock.calls[2][1].expectedUpdatedAt).toBe('current');
+  });
+
+  it('ignores an obsolete same-project reload error after a newer conflict reload succeeds', async () => {
+    const oldReload = deferred();
+    const currentReload = deferred();
+    api.getTimelineProject.mockResolvedValueOnce(project({ segments: [clipSegment] }))
+      .mockImplementationOnce(() => oldReload.promise)
+      .mockImplementationOnce(() => currentReload.promise);
+    const conflict = Object.assign(new Error('conflict'), { code: 'CONFLICT' });
+    api.updateTimelineProject.mockRejectedValueOnce(conflict).mockRejectedValueOnce(conflict);
+    const view = renderEditorRoute();
+    await awaitPageLoaded('Loading timeline project');
+    // Both render attempts flush a save and start a conflict refresh.
+    fireEvent.click(screen.getByRole('button', { name: 'Render' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Render' }));
+    await waitFor(() => expect(api.getTimelineProject).toHaveBeenCalledTimes(3));
+    await act(async () => { currentReload.resolve(project({ name: 'Current project', updatedAt: 'current' })); });
+    await act(async () => { oldReload.reject(new Error('Obsolete failure')); });
+
+    expect(screen.getByRole('textbox', { name: 'Project name' })).toHaveValue('Current project');
+    expect(screen.queryByText('Obsolete failure')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Add to timeline' }));
+    view.unmount();
+    await waitFor(() => expect(api.updateTimelineProject).toHaveBeenCalledTimes(3));
+    expect(api.updateTimelineProject.mock.calls[2][1].expectedUpdatedAt).toBe('current');
+  });
+});
+
+describe('pending lane saves', () => {
+  it('flushes the latest edit exactly once when unmounted before the debounce', async () => {
+    const view = renderEditorRoute();
+    await awaitPageLoaded('Loading timeline project');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Add to timeline' }));
+    view.unmount();
+
+    await waitFor(() => expect(api.updateTimelineProject).toHaveBeenCalledTimes(1));
+    expect(api.updateTimelineProject.mock.calls[0][1].segments).toHaveLength(1);
+    expect(api.updateTimelineProject.mock.calls[0][1].segments[0].clipId).toBe(CLIP_A);
+  });
+
+  it('does not save on unmount when no lane edit is pending', async () => {
+    const view = renderEditorRoute();
+    await awaitPageLoaded('Loading timeline project');
+
+    view.unmount();
+
+    expect(api.updateTimelineProject).not.toHaveBeenCalled();
+  });
+
+  it('prevents unload only while a debounced save is pending', async () => {
+    const view = renderEditorRoute();
+    await awaitPageLoaded('Loading timeline project');
+    fireEvent.click(screen.getByRole('button', { name: 'Add to timeline' }));
+
+    const pendingUnload = new Event('beforeunload', { cancelable: true });
+    window.dispatchEvent(pendingUnload);
+    expect(pendingUnload.defaultPrevented).toBe(true);
+
+    await waitFor(() => expect(api.updateTimelineProject).toHaveBeenCalledTimes(1), { timeout: 1500 });
+    const savedUnload = new Event('beforeunload', { cancelable: true });
+    window.dispatchEvent(savedUnload);
+    expect(savedUnload.defaultPrevented).toBe(false);
+    view.unmount();
+  });
+
+  it('keeps the leave warning after a save fails', async () => {
+    const view = renderEditorRoute();
+    await awaitPageLoaded('Loading timeline project');
+    api.updateTimelineProject.mockRejectedValueOnce(new Error('offline'));
+    fireEvent.click(screen.getByRole('button', { name: 'Add to timeline' }));
+
+    await waitFor(() => expect(api.updateTimelineProject).toHaveBeenCalledOnce(), { timeout: 1500 });
+    const failedSaveUnload = new Event('beforeunload', { cancelable: true });
+    window.dispatchEvent(failedSaveUnload);
+    expect(failedSaveUnload.defaultPrevented).toBe(true);
+    expect(toastError).toHaveBeenCalledWith('Save failed: offline');
+    view.unmount();
+  });
+});
+
+describe('lane visibility', () => {
+  it('shows the empty-timeline hint only when EVERY lane is empty', async () => {
+    await renderEditor();
+    expect(screen.getByText(/Add clips, stills, overlays and audio/)).toBeInTheDocument();
+  });
+
+  it('renders the free lanes for a project whose video lane is empty', async () => {
+    // Overlays and beds added to an empty project would otherwise be
+    // unselectable and unremovable on reload.
+    api.project = project({ overlays: [overlayEntry], audio: { clipVolume: 1, tracks: [bedEntry] } });
+    await renderEditor();
+
+    expect(screen.queryByText(/Add clips, stills, overlays and audio/)).not.toBeInTheDocument();
+    expect(screen.getByText('Add a clip or a still from the library')).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: 'Remove logo.png from timeline' })).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: 'Remove bed.mp3 from timeline' })).toBeInTheDocument();
+  });
+
+  it('summarises every lane in the header, not just the video lane', async () => {
+    api.project = project({ segments: [clipSegment, stillSegment], overlays: [overlayEntry], audio: { clipVolume: 1, tracks: [bedEntry] } });
+    await renderEditor();
+    expect(screen.getByText(/2 segments · 1 overlays · 1 beds/)).toBeInTheDocument();
+  });
+});
+
+describe('missing-source detection', () => {
+  it('flags a still whose gallery file is gone', async () => {
+    api.gallery = [{ filename: 'logo.png' }];
+    api.project = project({ segments: [stillSegment] });
+    await renderEditor();
+    expect(screen.getByText('(missing)')).toBeInTheDocument();
+  });
+
+  it('says nothing when the gallery fetch FAILED — an unloaded catalogue is not evidence of absence', async () => {
+    // Collapsing a failed fetch into "empty" would mark every still and
+    // overlay missing even though the server can still render them.
+    api.galleryThrows = true;
+    api.project = project({ segments: [stillSegment], overlays: [overlayEntry] });
+    await renderEditor();
+    expect(screen.queryByText('(missing)')).not.toBeInTheDocument();
+  });
+
+  it('does not flag an asset kind it has no catalogue for', async () => {
+    api.project = project({ audio: { clipVolume: 1, tracks: [{ ...bedEntry, assetKind: 'audio', assetFile: 'vo.wav' }] } });
+    await renderEditor();
+    expect(screen.queryByText('(missing)')).not.toBeInTheDocument();
+  });
+});
+
+describe('header layout — mobile overflow regression (#5425)', () => {
+  it('header container carries flex-wrap so it can reflow on narrow viewports', async () => {
+    await renderEditor();
+    // The header must be able to reflow the right-side buttons at narrow widths
+    // without allowing the project-name input to preserve its min-content width.
+    const titleInput = screen.getByRole('textbox', { name: 'Project name' });
+    const titleRow = titleInput.parentElement;
+    const headerDiv = titleRow?.parentElement;
+    expect(headerDiv).toHaveClass('flex', 'flex-wrap');
+    expect(headerDiv).toContainElement(screen.getByRole('button', { name: 'Hide library' }));
+    expect(headerDiv).toContainElement(screen.getByRole('button', { name: 'Render' }));
+    expect(titleRow).toHaveClass('flex-1', 'min-w-[120px]');
+    expect(titleInput).toHaveClass('flex-1', 'min-w-0');
+  });
+
+  it('summary span is hidden on small screens (carries hidden sm:inline)', async () => {
+    api.project = project({ segments: [clipSegment], overlays: [overlayEntry], audio: { clipVolume: 1, tracks: [bedEntry] } });
+    await renderEditor();
+    const summarySpan = screen.getByText(/1 segments · 1 overlays · 1 beds/);
+    expect(summarySpan).toHaveClass('hidden', 'sm:inline');
+  });
+});
+
+describe('workspace layout — mobile library regression (#5424)', () => {
+  it('starts with the library hidden and keeps the workspace before it when opened', async () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 375 });
+    await renderEditor();
+
+    const showLibrary = screen.getByRole('button', { name: 'Show library' });
+    const workspace = screen.getByRole('button', { name: 'Play' }).parentElement?.parentElement;
+    const inspector = screen.getByText('Inspector').parentElement;
+    expect(screen.queryByRole('tablist', { name: 'Clip library' })).not.toBeInTheDocument();
+    expect(showLibrary).toHaveAttribute('aria-expanded', 'false');
+    expect(showLibrary).toHaveAttribute('aria-controls', 'timeline-library');
+    expect(workspace?.parentElement).toHaveClass('lg:grid-cols-[1fr_240px]');
+    expect(workspace).toHaveClass('order-1', 'lg:order-2');
+    expect(workspace?.compareDocumentPosition(inspector) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    fireEvent.click(showLibrary);
+
+    const library = screen.getByRole('tablist', { name: 'Clip library' }).parentElement;
+    expect(screen.getByRole('button', { name: 'Hide library' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Hide library' })).toHaveAttribute('aria-expanded', 'true');
+    expect(workspace?.parentElement).toHaveClass('lg:grid-cols-[260px_1fr_240px]');
+    expect(library).toHaveAttribute('id', 'timeline-library');
+    expect(library).toHaveClass('order-2', 'lg:order-1');
+    expect(workspace?.compareDocumentPosition(library) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Add to timeline' }));
+    await waitFor(() => expect(
+      screen.getByRole('button', { name: 'Remove A dramatic sunrise from timeline' }),
+    ).toBeInTheDocument());
+
+    const mountedLibrary = library;
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1024 });
+    fireEvent(window, new Event('resize'));
+    expect(screen.getByRole('tablist', { name: 'Clip library' }).parentElement).toBe(mountedLibrary);
+  });
+
+  it('keeps the desktop library visible in the original left-rail grid position', async () => {
+    await renderEditor();
+
+    const library = screen.getByRole('tablist', { name: 'Clip library' }).parentElement;
+    const workspace = screen.getByRole('button', { name: 'Play' }).parentElement?.parentElement;
+    expect(screen.getByRole('button', { name: 'Hide library' })).toBeInTheDocument();
+    expect(workspace?.parentElement).toHaveClass('lg:grid-cols-[260px_1fr_240px]');
+    expect(workspace).toHaveClass('order-1', 'lg:order-2');
+    expect(library).toHaveClass('order-2', 'lg:order-1');
+    expect(workspace?.compareDocumentPosition(library) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Hide library' }));
+    expect(workspace?.parentElement).toHaveClass('lg:grid-cols-[1fr_240px]');
+  });
+
+  it('keeps one tab stop on the Clip library bar and switches it with arrow keys (#7244)', async () => {
+    await renderEditor();
+
+    const tablist = screen.getByRole('tablist', { name: 'Clip library' });
+    const [clips, stills, audio] = within(tablist).getAllByRole('tab');
+    expect(clips).toHaveAttribute('tabindex', '0');
+    expect(stills).toHaveAttribute('tabindex', '-1');
+    expect(audio).toHaveAttribute('tabindex', '-1');
+
+    clips.focus();
+    fireEvent.keyDown(clips, { key: 'ArrowRight' });
+    // The arrow key moves the tab stop and switches the library pane together.
+    expect(stills).toHaveAttribute('aria-selected', 'true');
+    expect(stills).toHaveAttribute('tabindex', '0');
+    expect(document.activeElement).toBe(stills);
+    expect(screen.getByPlaceholderText('Search images…')).toBeInTheDocument();
+    // The stills pane fires its gallery fetch on selection — settle it so the
+    // update doesn't land outside act.
+    await act(async () => {});
+  });
+});
+
+// The Stills tab arrives with the GALLERY, which `renderEditor` does not wait
+// for — it only waits out the "Loading project…" text. A synchronous getByRole
+// therefore races the gallery render, and the heavier the fixture the likelier
+// it loses: the cap test below mounts 51 gallery entries and flaked on CI's
+// shared runners while passing locally every time. findByRole waits.
+describe('lane caps', () => {
+  it('refuses an add past the overlay cap with a message naming the lane', async () => {
+    // One entry over the cap 400s every later debounced save, with nothing
+    // telling the user which lane to trim.
+    api.project = project({
+      segments: [clipSegment],
+      overlays: Array.from({ length: 50 }, (_, i) => ({ ...overlayEntry, assetFile: `logo${i}.png` })),
+    });
+    api.gallery = [{ filename: 'plate.png' }, ...Array.from({ length: 50 }, (_, i) => ({ filename: `logo${i}.png` }))];
+    await renderEditor();
+
+    fireEvent.click(await screen.findByRole('tab', { name: /Stills/ }));
+    fireEvent.click((await screen.findAllByRole('button', { name: 'Overlay' }))[0]);
+
+    expect(toastError).toHaveBeenCalledWith(expect.stringContaining('Overlay lane limit reached (50)'));
+  });
+
+  it('allows the add when the lane is under the cap', async () => {
+    api.project = project({ segments: [clipSegment] });
+    await renderEditor();
+
+    fireEvent.click(await screen.findByRole('tab', { name: /Stills/ }));
+    fireEvent.click((await screen.findAllByRole('button', { name: 'Overlay' }))[0]);
+
+    expect(toastError).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Remove plate.png from timeline' })).toBeInTheDocument());
+  });
+});

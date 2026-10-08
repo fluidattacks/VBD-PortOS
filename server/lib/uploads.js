@@ -1,0 +1,257 @@
+/** Upload staging, validation, persistence, and local-file serving helpers. */
+import { readFile, stat, unlink } from 'fs/promises';
+import { randomUUID } from 'crypto';
+import { join, resolve as resolvePath } from 'path';
+import { MIRRORED_MIME_TYPES } from './beeperAttachmentPaths.js';
+import { ServerError } from './errorHandler.js';
+import { copyFileGuarded, ensureDir, pathExists, renameGuarded, unlinkGuarded, writeFileGuarded } from './fileCore.js';
+import { detectImageFormat, getFileExtension, getMimeType, RISKY_MIME_TYPES, sanitizeFilename } from './mimeTypes.js';
+import { PATHS } from './paths.js';
+import { assertSafeFilename, isPathInsideDir } from './pathSafety.js';
+
+/**
+ * Move a temp file into `destDir` and return the persisted filename, using the
+ * `/api/uploads` route's naming (`<uuid8>-<sanitized-name>`) so a
+ * server-produced file is served and referenced exactly like a user upload.
+ *
+ * copyFile + unlink instead of rename — the source usually lives in
+ * `os.tmpdir()`, which may sit on a different filesystem (rename across devices
+ * throws EXDEV on Linux); copy works regardless. The temp unlink is best-effort
+ * cleanup. When `extensions` is supplied, the persisted name must use one of
+ * those extensions. A persisted extension determines the Content-Type for
+ * files that may live under a static mount, so it must never come from a
+ * client-supplied filename. Returns `{ filename, sizeBytes }`.
+ */
+export async function importFileToDir(tempPath, originalName, destDir, { extensions } = {}) {
+  const extension = getFileExtension(originalName);
+  if (extensions && !extensions.map((item) => item.toLowerCase()).includes(extension)) {
+    throw new ServerError('Invalid file type', { status: 400, code: 'INVALID_FILE_TYPE' });
+  }
+  await ensureDir(destDir);
+  const id = randomUUID();
+  const filename = `${id.slice(0, 8)}-${sanitizeFilename(originalName)}`;
+  const dest = join(destDir, filename);
+  await copyFileGuarded(tempPath, dest);
+  await unlink(tempPath).catch(() => {});
+  const s = await stat(dest).catch(() => null);
+  return { id, filename, sizeBytes: s?.size ?? 0 };
+}
+
+/**
+ * `importFileToDir` pinned to the uploads dir (`PATHS.uploads`) — the common
+ * case (e.g. a yt-dlp audio extraction, #2120).
+ */
+export async function importFileToUploads(tempPath, originalName) {
+  return importFileToDir(tempPath, originalName, PATHS.uploads);
+}
+
+// Widest supported image signature (WebP needs 12 bytes: `RIFF….WEBP`). A payload
+// shorter than this can't hold a complete header for any format we accept.
+const MIN_IMAGE_BYTES = 12;
+
+// POSIX NAME_MAX — the per-component filename limit on ext4/APFS/HFS+. A longer
+// component makes the write fail with ENAMETOOLONG.
+const MAX_FILENAME_BYTES = 255;
+
+/**
+ * Persist a base64-encoded IMAGE into `dir`, deriving the format from the bytes
+ * rather than trusting the client: decode → size cap → magic-byte sniff → force
+ * the extension to the detected format → sanitize + containment guard → write.
+ *
+ * This is the sibling of `saveBase64Upload` for the paths that must be certain
+ * they wrote an image (they hand the file to an image-gen backend or to an agent
+ * that will read it), so an extension allowlist isn't enough. Naming is the
+ * CALLER's call — pass a name that is already unique if later uploads must not
+ * overwrite this one, since `dir` is a shared bucket. The bytes are staged in a
+ * short-named sibling file and renamed into place, so a write that fails midway
+ * (ENOSPC, …) never truncates an image already stored under the final name.
+ * `stagePrefix` lets an owner keep its recovery prefix on the stage name (the
+ * Persistent Mind sweeps `mind-<attachmentId>-*` images when a cleanup fails).
+ *
+ * Throws ServerError with the status/code/message contract `routes/screenshots.js`
+ * established (`FILE_TOO_LARGE`, `INVALID_FILE_TYPE`, `INVALID_FILENAME` — all
+ * 400) so callers keep their pinned responses.
+ *
+ * @param {string} dir - Destination directory (created if missing).
+ * @param {{ filename: string, data: string }} upload - Desired base name (the
+ *   extension is replaced with the detected one) + base64 payload.
+ * @param {{ maxBytes: number, stagePrefix?: string }} opts
+ * @returns {Promise<{ filename: string, filePath: string, size: number,
+ *   format: string, mime: string }>}
+ */
+export async function saveImageUpload(dir, { filename, data }, { maxBytes, stagePrefix = '' }) {
+  const buffer = Buffer.from(data, 'base64');
+  if (buffer.length > maxBytes) {
+    throw new ServerError(`File exceeds maximum size of ${maxBytes / 1024 / 1024}MB`, { status: 400, code: 'FILE_TOO_LARGE' });
+  }
+
+  // Floor before the sniff, because the per-format signatures are short (a JPEG is
+  // 3 bytes, a GIF header 6) and would happily "detect" a truncated payload — which
+  // then saves as a success and hands a consumer a path to an unreadable file. 12
+  // bytes is the widest signature (WebP's RIFF….WEBP), so anything under it cannot
+  // be a complete header for ANY supported format, let alone a complete image.
+  if (buffer.length < MIN_IMAGE_BYTES) {
+    throw new ServerError('Invalid image file - only PNG, JPEG, GIF, and WebP are supported', { status: 400, code: 'INVALID_FILE_TYPE' });
+  }
+
+  const detected = detectImageFormat(buffer);
+  if (!detected) {
+    throw new ServerError('Invalid image file - only PNG, JPEG, GIF, and WebP are supported', { status: 400, code: 'INVALID_FILE_TYPE' });
+  }
+
+  // The DETECTED extension always wins over whatever the client claimed, so the
+  // file on disk can't advertise a type its bytes contradict. Strip a matching
+  // extension off the base rather than appending a second one, then clamp the base
+  // so `base + ext` fits NAME_MAX — a caller that prefixes the name (see
+  // services/shellImageDrop.js) can otherwise push a legitimately-long client
+  // filename past the limit and turn the write into an ENAMETOOLONG 500.
+  const safeName = sanitizeFilename(filename);
+  const base = safeName.toLowerCase().endsWith(detected.ext)
+    ? safeName.slice(0, -detected.ext.length)
+    : safeName;
+  // sanitizeFilename leaves only ASCII, so slicing chars is slicing bytes.
+  const fname = `${base.slice(0, MAX_FILENAME_BYTES - detected.ext.length)}${detected.ext}`;
+  const filePath = join(dir, fname);
+  if (!isPathInsideDir(dir, filePath)) {
+    throw new ServerError('Invalid filename', { status: 400, code: 'INVALID_FILENAME' });
+  }
+
+  await ensureDir(dir);
+  // Stage + rename rather than atomicWrite: the stored name is clamped to
+  // NAME_MAX just above, and atomicWrite's `.<pid>.<ts>.<uuid>.tmp` suffix would
+  // push the temp file past it (#6176). The stage name is short and fixed-size
+  // whatever the final name is. Both paths are in `dir`, so rename is atomic.
+  const stagePath = join(dir, `${stagePrefix}.stage-${randomUUID().slice(0, 8)}${detected.ext}`);
+  if (!isPathInsideDir(dir, stagePath)) {
+    throw new ServerError('Invalid filename', { status: 400, code: 'INVALID_FILENAME' });
+  }
+  const published = await writeFileGuarded(stagePath, buffer)
+    .then(() => renameGuarded(stagePath, filePath))
+    .then(() => null, (error) => error);
+  if (published) {
+    // Best-effort: a stage that survives keeps its owner prefix for sweeps.
+    await unlinkGuarded(stagePath).catch(() => {});
+    throw published;
+  }
+
+  return { filename: fname, filePath, size: buffer.length, format: detected.format, mime: detected.mime };
+}
+
+/**
+ * Persist a base64-encoded upload into `dir` with the shared attachment
+ * pipeline: extension allowlist → base64 decode → size cap → ensureDir →
+ * `<uuid8>-<sanitized-name>` naming → containment guard → write.
+ *
+ * Throws ServerError with the exact status/code/message contract the
+ * attachment routes established (`INVALID_FILE_TYPE`, `FILE_TOO_LARGE`,
+ * `INVALID_FILENAME` — all 400), so refactored routes keep their pinned
+ * responses. Consolidates `routes/attachments.js`, `routes/brainSongbook.js`,
+ * and `routes/uploads.js` — the last keeps its own richer response shape
+ * (`originalName` / `sizeFormatted` / `createdAt`) around these fields.
+ *
+ * @param {string} dir - Destination directory (created if missing).
+ * @param {{ filename: string, data: string }} upload - Original filename +
+ *   base64 payload (validated as present by the calling route).
+ * @param {{ allowedExtensions: Set<string>, maxBytes: number }} opts
+ * @returns {Promise<{ id: string, filename: string, filePath: string,
+ *   buffer: Buffer, size: number, mime: string }>} `id` is the full UUID whose
+ *   first 8 chars prefix `filename`.
+ */
+export async function saveBase64Upload(dir, { filename, data }, { allowedExtensions, maxBytes }) {
+  const ext = getFileExtension(filename);
+  if (!ext || !allowedExtensions.has(ext)) {
+    const allowedList = [...allowedExtensions].join(', ');
+    throw new ServerError(`File type not allowed. Supported: ${allowedList}`, { status: 400, code: 'INVALID_FILE_TYPE' });
+  }
+
+  const buffer = Buffer.from(data, 'base64');
+  if (buffer.length > maxBytes) {
+    throw new ServerError(`File exceeds maximum size of ${maxBytes / 1024 / 1024}MB`, { status: 400, code: 'FILE_TOO_LARGE' });
+  }
+
+  await ensureDir(dir);
+
+  // Unique uuid prefix avoids collisions; sanitize kills traversal characters.
+  const id = randomUUID();
+  const fname = `${id.slice(0, 8)}-${sanitizeFilename(filename)}`;
+  const filePath = join(dir, fname);
+  // Double-check the path is within the destination dir (defense in depth).
+  if (!isPathInsideDir(dir, filePath)) {
+    throw new ServerError('Invalid filename', { status: 400, code: 'INVALID_FILENAME' });
+  }
+
+  await writeFileGuarded(filePath, buffer);
+
+  return { id, filename: fname, filePath, buffer, size: buffer.length, mime: getMimeType(getFileExtension(fname)) };
+}
+
+/**
+ * A declared media type reduced to a bare, comparable `type/subtype`:
+ * parameters dropped, whitespace trimmed on BOTH sides of the split (a value
+ * like ` text/html ;charset=utf-8` leaves a trailing space otherwise), case
+ * folded. Returns `''` for anything that is not a non-empty string.
+ */
+function normalizeDeclaredMimeType(value) {
+  return typeof value === 'string' ? value.split(';')[0].trim().toLowerCase() : '';
+}
+
+/**
+ * Serve a machine-local file from `dir` by user-supplied filename with the
+ * shared safety pipeline: sanitize → containment guard (400
+ * `INVALID_FILENAME`) → existence check (404, message/code parametrized via
+ * `missingError` so routes keep their contracts) → `X-Content-Type-Options:
+ * nosniff` → attachment disposition for RISKY_MIME_TYPES → `res.sendFile`.
+ *
+ * Mirrors the exact serving behavior of `routes/attachments.js`.
+ *
+ * `contentType` overrides the extension-derived type for a store whose
+ * filenames carry no meaning. The Beeper attachment mirror (#37) is the
+ * caller: it is content-addressed (`<sha256>.<ext>`), and the source it
+ * downloads from (`GET /v1/assets/serve`) sends no `Content-Type` header at
+ * all, so the type Beeper declared in the message payload is the only real
+ * answer and the extension is decoration.
+ *
+ * That declared type is written by a REMOTE SENDER and this route is on the
+ * authenticated dashboard origin, so the override is normalized and bounded
+ * rather than trusted:
+ *
+ *   - Normalized first — parameters dropped, trimmed, lowercased. A media type
+ *     is case-insensitive (RFC 2045) while `RISKY_MIME_TYPES` is a lowercase
+ *     set, so `text/HTML` walked straight past the guard until this step
+ *     existed and executed inline on the dashboard's own origin.
+ *   - Bounded second — only a type the mirror itself can produce
+ *     (`MIRRORED_MIME_TYPES`) is echoed; anything else is served as
+ *     `application/octet-stream` instead of whatever was declared.
+ *
+ * The disposition decision is then taken on the declared type as well as the
+ * served one, so downgrading a `text/html` to octet-stream never costs it the
+ * attachment header it earned.
+ *
+ * @param {import('express').Response} res
+ * @param {string} dir - The containing directory.
+ * @param {string} filename - Raw user-supplied filename.
+ * @param {{ missingError?: { message: string, code: string }, contentType?: string }} [opts]
+ */
+export async function serveLocalFile(res, dir, filename, { missingError, contentType } = {}) {
+  const safeFilename = sanitizeFilename(filename);
+  const filePath = resolvePath(dir, safeFilename);
+
+  if (!isPathInsideDir(dir, filePath)) {
+    throw new ServerError('Invalid filename', { status: 400, code: 'INVALID_FILENAME' });
+  }
+
+  if (!(await pathExists(filePath))) {
+    const { message = 'Attachment not found', code = 'NOT_FOUND' } = missingError || {};
+    throw new ServerError(message, { status: 404, code });
+  }
+
+  const declared = normalizeDeclaredMimeType(contentType);
+  const mimeType = declared
+    ? (MIRRORED_MIME_TYPES.has(declared) ? declared : 'application/octet-stream')
+    : getMimeType(getFileExtension(safeFilename));
+  res.set('X-Content-Type-Options', 'nosniff');
+  if (RISKY_MIME_TYPES.has(mimeType) || RISKY_MIME_TYPES.has(declared)) {
+    res.set('Content-Disposition', `attachment; filename="${safeFilename}"`);
+  }
+  res.type(mimeType).sendFile(filePath);
+}

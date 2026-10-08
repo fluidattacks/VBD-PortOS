@@ -1,0 +1,216 @@
+/**
+ * Layered Intelligence — reasoning-prompt assembly
+ * (#2842 split of layeredIntelligence.js).
+ *
+ * Deterministic: given the gathered sources, open issues and config, produces the
+ * exact JSON-only string sent to the reasoning model.
+ */
+
+import { PLANNED_WORK_GUIDANCE, LI_PROPOSAL_PLAYBOOK, LI_PLAYBOOK_GUIDANCE } from './constants.js';
+import { MANDATORY_DISPATCH_HINT_GUIDANCE } from '../../lib/dispatchLabels.js';
+import { isScopeAllowed } from './config.js';
+import { extractSlugFromBody } from './dedup.js';
+
+// Source keys that buildPrompt renders as their OWN dedicated block (with tailored
+// guidance) instead of dumping into the generic "### <key>\n<value>" source list.
+// Keeping them in one named set — rather than accreting `&& k !== 'x'` clauses on the
+// filter — documents WHY these keys are special and gives the next dedicated-block
+// signal a single edit point.
+const BESPOKE_SOURCE_BLOCK_KEYS = new Set(['plannedWork', 'productMetrics', 'scopeGuidance', 'churnSignals']);
+
+/**
+ * Build the JSON-only reasoning prompt for one app. Deterministic: given the
+ * gathered sources, open issues, and config, produces the exact string sent to
+ * the model. Meta/self scopes are only offered when the app is PortOS.
+ * `outcomesReport` (from computeOutcomesReport) is injected as a `liOutcomes`
+ * block with calibration guidance when non-empty (#2428). `selfEvalReport` (from
+ * computeSelfEvalSummary) is injected as a `liSelfEval` block the same way (#2700).
+ * `sources.scopeGuidance` (from computeScopeAwareness) is injected as a
+ * `liScopeAwareness` block the same way (#2760). `proposalExecutionReport` (from
+ * computeProposalExecutionAwareness) is injected as a `liProposalExecution` block —
+ * the TRUE per-proposal-domain execution record #2760 could only approximate (#2765).
+ * `crossReferenceReport` (from computeCrossReferenceAnalysis) is injected as a
+ * `liCrossReference` block that names domains LI proposes well but executes poorly (#2764 §3).
+ * `deliveryThrottleReport` is injected as an always-on `liDeliveryThrottle` signal
+ * by the LI hook, independent of the optional self-evaluation source (#3160).
+ * `hardExclusionNotice` (from computeHardExclusionNotice, #2824) is injected as a
+ * prominent `liHardExclusions` block ABOVE the allowed scopes when LI's execution
+ * health is degraded — the reasoner-facing mirror of the deterministic filing gate.
+ * Finally, the static `liPlaybook` block (LI_PROPOSAL_PLAYBOOK, #2763) is ALWAYS
+ * appended: the a-priori scope/task-type/goal rule set LI needs from run one, before
+ * any per-app outcome data exists.
+ */
+export function buildPrompt({ app, config, sources = {}, openIssues = [], isPortos = false, outcomesReport = '', selfEvalReport = '', deliveryThrottleReport = '', proposalExecutionReport = '', crossReferenceReport = '', hardExclusionNotice = '' }) {
+  const allowed = (config.allowedScopes || []).filter(s =>
+    isScopeAllowed({ scope: s, allowedScopes: config.allowedScopes, isPortos })
+  );
+  const scopeLines = allowed.map(s => `  - ${s}`).join('\n');
+  // plannedWork renders as its OWN block (below) rather than inside the generic
+  // source list, so the cross-reference guidance is guaranteed to sit directly
+  // under the committed backlog it refers to instead of drifting to wherever
+  // object key order happens to put it.
+  const sourceBlocks = Object.entries(sources)
+    .filter(([k]) => !BESPOKE_SOURCE_BLOCK_KEYS.has(k))
+    .filter(([, v]) => typeof v === 'string' && v.trim())
+    .map(([k, v]) => `### ${k}\n${v.trim()}`)
+    .join('\n\n');
+  const openList = openIssues.length
+    ? openIssues.map(i => `- #${i.number ?? '?'} [${i.slug || extractSlugFromBody(i.body) || 'no-slug'}] ${i.title || ''}`).join('\n')
+    : '(none)';
+
+  // Nudge a managed app with no own-performance signal (no METRICS.md gathered)
+  // toward adding one, so future runs can judge real performance. PortOS is exempt
+  // — it measures itself through cosMetrics. Also gate on the source being ENABLED:
+  // if the user deliberately turned appMetrics off, a METRICS.md may well exist, so
+  // "add a METRICS.md" would be a misleading (and possibly redundant) proposal.
+  const hasAppMetrics = Boolean(typeof sources.appMetrics === 'string' && sources.appMetrics.trim());
+  const appMetricsEnabled = config.sources?.appMetrics !== false;
+  const metricsGuidance = (!isPortos && appMetricsEnabled && !hasAppMetrics)
+    ? '\nThis app exposes no own-performance metrics yet (no METRICS.md). If you lack the data to judge how it is doing against its goals, a high-value app-data-gap proposal is to add a METRICS.md documenting how the app measures success — its user-success/KPI signals and where its production telemetry or data lives — so future runs can reason about real performance.\n'
+    : '';
+
+  const handoffNote = config.handoff?.enabled
+    ? '\nHand-off: a proposal you mark BOTH "complexity":"trivial" AND "safe":true may be handed directly to a coding agent to implement now (not just filed). Only mark a proposal trivial+safe when it is small, self-contained, and carries no regression or data-loss risk — when in doubt, use a higher complexity or "safe":false so a human triages it first. Note: even a trivial+safe proposal is filed for a human (not auto-handed-off) when it falls in a domain where LI\'s own past hand-offs chronically fail, so prefer to narrow such a proposal to a slice an agent can actually finish.\n'
+    : '';
+
+  // The committed backlog (#2698) + the instruction to check against it. Emitted
+  // whenever gatherPlannedWork produced ANY string — including its explicit
+  // "could not be read" marker, which must still reach the reasoner: silently
+  // dropping an unavailable read would look identical to "this app has nothing
+  // planned" and license a proposal straight into committed work.
+  const plannedWorkBlock = (typeof sources.plannedWork === 'string' && sources.plannedWork.trim())
+    ? `\n### plannedWork\n${sources.plannedWork.trim()}\n\n${PLANNED_WORK_GUIDANCE}\n`
+    : '';
+
+  // PortOS product-success telemetry: keep the interpretation next to the
+  // aggregate signal so inactivity is evaluated as product evidence, not as a
+  // generic request to add more telemetry.
+  const productMetricsBlock = (isPortos && typeof sources.productMetrics === 'string' && sources.productMetrics.trim())
+    ? `\n### productMetrics\n${sources.productMetrics.trim()}\n\nThese are current PortOS product-engagement signals. Treat an inactive daily POST or overdue creative feedback as evidence that the product should improve its prompts, visibility, or action flow only when that signal appears in the source. An omitted feature is not an inactive feature and must not be treated as a missing metric or improvement target. Prefer a concrete user-facing improvement grounded in these numbers; do not propose generic telemetry when the signal already identifies the engagement gap. If the source says unavailable, do not infer zero activity.\n`
+    : '';
+
+  // Feedback loop (#2428): show the reasoner how its own past proposals fared so
+  // it can calibrate scope/merge-rate instead of proposing in a vacuum.
+  const outcomesBlock = (typeof outcomesReport === 'string' && outcomesReport.trim())
+    ? `\n### liOutcomes\n${outcomesReport.trim()}\n\nUse this data to calibrate your proposal: prefer scopes with higher merge rates, avoid patterns that were repeatedly rejected, and consider that lower-merge scopes may need more justification.\n`
+    : '';
+
+  // Self-evaluation (#2700): the loop's own quality check BEFORE it files, so it
+  // can decline instead of learning only from a later rejection. Carries its own
+  // low-confidence / degraded-execution guidance (computeSelfEvalSummary), which is
+  // why no extra instruction sentence is appended here — the block is self-contained
+  // and its guidance is conditional on what the signals actually say.
+  const selfEvalBlock = (typeof selfEvalReport === 'string' && selfEvalReport.trim())
+    ? `\n### liSelfEval\n${selfEvalReport.trim()}\n\nWeigh this against the sources above before you commit to a proposal. Filing nothing (proposal: null) is a legitimate, and sometimes the correct, outcome — a marginal issue costs the user triage time and lowers your merge rate further.\n`
+    : '';
+
+  // Delivery throttle (#3160): a single numeric filing signal derived from LI's
+  // approval-to-completion health. The hook supplies it on every run, even when the
+  // optional selfEval source is off, so a source toggle cannot silently restore full
+  // proposal volume while downstream delivery is stopped.
+  const deliveryThrottleBlock = (typeof deliveryThrottleReport === 'string' && deliveryThrottleReport.trim())
+    ? `\n### liDeliveryThrottle\n${deliveryThrottleReport.trim()}\n`
+    : '';
+
+  // Scope-awareness (#2760): install-wide completion rates by CoS task TYPE — directional
+  // context for how reliably different KINDS of work get finished here. PortOS-only
+  // (codex P2): these rates are this install's own CoS execution history, meaningless to
+  // a managed app, so the block is gated on isPortos even if a managed app enabled the
+  // cosMetrics source. It is context, not a rule (codex P1): a proposal does not map 1:1
+  // onto a listed type, so treat a low-completion type as a reason for extra scrutiny /
+  // a narrower scope, not a hard veto.
+  const scopeGuidanceBlock = (isPortos && typeof sources.scopeGuidance === 'string' && sources.scopeGuidance.trim())
+    ? `\n### liScopeAwareness\n${sources.scopeGuidance.trim()}\n\nThese are per-task-type completion rates for THIS install — how reliably each KIND of work tends to get finished, not a per-proposal record (your proposals don't map 1:1 onto these types). Use it as directional context: a proposal whose implementation resembles a low-completion type deserves extra scrutiny or a narrower scope; high-completion kinds are safer bets. A low rate on self-improve:layered-intelligence is LI's OWN reasoning-run rate — a direct signal to propose conservatively. Where the liProposalExecution block below covers a domain, prefer it: it is a direct per-proposal record, whereas these buckets are only directional.\n`
+    : '';
+
+  // Churn awareness: these are instance-local measurements from PortOS's own
+  // learning ring, not user-approved tracker work. Keep the signal visible to
+  // the PortOS reasoner while making the filing decision explicit: investigate,
+  // scope a concrete planned fix, and otherwise return proposal: null.
+  const churnSignalsBlock = (isPortos && typeof sources.churnSignals === 'string' && sources.churnSignals.trim())
+    ? `\n### liChurnSignals\n${sources.churnSignals.trim()}\n\nTreat these as evidence for investigation, not an automatic filing instruction. If you can establish a reproducible PortOS defect and describe a concrete fix that belongs in planned work, propose that fix; if the signal is transient, expected, already addressed, or not specific enough to scope, return proposal: null.\n`
+    : '';
+
+  // Per-proposal-domain execution record (#2765): unlike liScopeAwareness above —
+  // which borrows install-wide per-task-TYPE rates a proposal only loosely maps onto —
+  // this keys on how LI's OWN proposals in each domain actually fared once handed off
+  // and executed. It carries NO "directional only" caveat because the mapping is real,
+  // so it is the authoritative avoid/prefer signal wherever it has data. The report is
+  // pre-gated on the outcomes source by the caller (built from the same records), so no
+  // isPortos re-check here — the block simply renders when execution history exists.
+  const proposalExecutionBlock = (typeof proposalExecutionReport === 'string' && proposalExecutionReport.trim())
+    ? `\n### liProposalExecution\n${proposalExecutionReport.trim()}\n\nThis is a DIRECT record of how LI's own proposals in each domain fared once implemented — not directional context. Favor domains LI executes reliably; for a low-execution domain, either narrow the proposal to a slice an agent can finish or justify why it is still the highest-value work despite the track record.\n`
+    : '';
+
+  // Cross-reference (#2764 §3): the CONTRAST liOutcomes and liProposalExecution can't
+  // show on their own — a domain LI proposes well (merges) but executes poorly (its
+  // hand-offs fail with a named cause). It carries its own actionable guidance in the
+  // header, so no extra instruction sentence is appended. Gated on the outcomes source
+  // by the caller (built from the same records), so no isPortos re-check here.
+  const crossReferenceBlock = (typeof crossReferenceReport === 'string' && crossReferenceReport.trim())
+    ? `\n### liCrossReference\n${crossReferenceReport.trim()}\n`
+    : '';
+
+  // Proposal Playbook (#2763): the STANDING, a-priori rule set — always rendered.
+  // Unlike the data blocks above (which appear only once enough per-app outcome data
+  // accumulates), the playbook is the guidance LI needs from run one, when it would
+  // otherwise be proposing blind. It sits last so it is the freshest instruction
+  // before the JSON contract, and its guidance sentence defers to any live data block
+  // above that has real numbers contradicting a general rule.
+  const playbookBlock = LI_PROPOSAL_PLAYBOOK
+    ? `\n### liPlaybook\n${LI_PROPOSAL_PLAYBOOK}\n\n${LI_PLAYBOOK_GUIDANCE}\n`
+    : '';
+
+  // Hard exclusion gate (#2824): rendered ABOVE the allowed scopes and sources as a
+  // hard constraint so the reasoner sees what is off-limits before it picks a scope.
+  // Non-empty only when the deterministic filing gate is armed (execution health
+  // degraded), so a healthy loop's prompt is unchanged. Even if the reasoner reasons
+  // past this, computeHardExclusionGate drops the proposal before it is filed.
+  const hardExclusionBlock = (typeof hardExclusionNotice === 'string' && hardExclusionNotice.trim())
+    ? `\n### liHardExclusions\n${hardExclusionNotice.trim()}\n`
+    : '';
+
+  return `You are the Layered Intelligence reasoner for the app "${app.name}". Your purpose is to turn evidence about how THIS app performs against its OWN goals${isPortos ? '' : ', not how well PortOS\'s tooling manages it'} into AT MOST ONE decision-complete tracker issue that improves the app. Start with the app's own performance metrics (user success, KPIs, production telemetry), not a generic code-quality audit. You never write code; you return structured JSON that a deterministic system validates, deduplicates, and files. Choose the proposal's model, effort, and contributor flags using the shared contract below. Return JSON only; the deterministic filer performs the label commands and planner attribution. Do not execute them yourself.
+
+${MANDATORY_DISPATCH_HINT_GUIDANCE}
+
+Decision path (follow in order):
+1. If a metric shows a meaningful gap, identify the single highest-value app improvement that can plausibly move that metric and file that proposal.
+2. If the metrics are missing, stale, unavailable, or too narrow/inconclusive to support an app improvement, inspect this repository READ-ONLY to understand the relevant user flow, architecture, existing instrumentation, and documented data sources. Do not edit files, and do not substitute an unrelated code audit for missing product evidence.
+3. If that inspection reveals a SPECIFIC visibility gap that prevents the app from being evaluated against a named goal, file an app-data-gap proposal for the minimum metrics, instrumentation, or context needed. Name the goal, the unanswered product question, where the signal should come from, and acceptance criteria that make a future run actionable; never file a generic "add more telemetry" issue.
+4. Return proposal: null only when the available evidence is sufficient and shows no worthwhile improvement, the needed visibility already exists, no decision-complete proposal fits an allowed scope, or a filing safety/delivery gate below requires no proposal. Inconclusive metrics alone are not evidence that the app is healthy.
+${handoffNote}${metricsGuidance}${hardExclusionBlock}
+Rules & guidance from the operator:
+${config.rules?.trim() || '(none)'}
+
+Allowed proposal scopes (you MUST pick one of these for any proposal):
+${scopeLines || '  (none — return proposal: null)'}
+${isPortos ? '' : 'Note: meta/self scopes are unavailable on this app; frame any data need as an "app-data-gap" against this app.\n'}
+Already-open tracked issues (DO NOT duplicate these — reuse their slug only if genuinely the same work):
+${openList}
+
+Gathered sources:
+${sourceBlocks || (plannedWorkBlock ? '(no other sources available — you may propose an app-data-gap to add telemetry)' : '(no sources available — you may propose an app-data-gap to add telemetry)')}
+${plannedWorkBlock}${productMetricsBlock}${outcomesBlock}${selfEvalBlock}${deliveryThrottleBlock}${scopeGuidanceBlock}${churnSignalsBlock}${proposalExecutionBlock}${crossReferenceBlock}${playbookBlock}
+Respond with JSON only (no markdown fences):
+{
+  "analysis": "brief reasoning summary",
+  "proposal": {              // null if nothing worth filing this run
+    "scope": "<one allowed scope>",
+    "slug": "kebab-stable-id",
+    "title": "short imperative title",
+    "body": "markdown detail for the coding agent",
+    "value": "why this is the single highest-value item now",
+    "complexity": "trivial | moderate | complex",   // honest effort/risk estimate
+    "safe": false,           // true ONLY if a coding agent could implement it end-to-end with no regression/data-loss risk
+    "model": "light | medium | heavy | ultra",   // REQUIRED dispatch capability. Independent of complexity.
+    "effort": "low | medium | high | xhigh | max",   // REQUIRED reasoning budget; independent of model AND of complexity
+    "goodFirstIssue": false, // true ONLY if a new contributor can ship this without deep repo context (not implied by model:light)
+    "helpWanted": false      // true ONLY under the shared help wanted criteria above
+  },
+  "pause": {                 // null if not pausing
+    "blockOnIssue": "this" or <existing issue number>,
+    "reason": "why the loop should pause on this app until resolved"
+  }
+}`;
+}

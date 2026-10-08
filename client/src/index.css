@@ -1,0 +1,2088 @@
+@import "tailwindcss";
+
+/* Compact notification actions only when the primary input can both hover and
+   target precisely. Viewport width alone does not identify a mouse or trackpad. */
+@media (hover: hover) and (pointer: fine) and (min-width: 640px) {
+  .notification-action {
+    min-width: 0;
+    min-height: 0;
+    margin-block: 0;
+    padding: 0.25rem;
+    opacity: 0;
+  }
+
+  .group:hover .notification-action,
+  .group:focus-within .notification-action {
+    opacity: 1;
+  }
+
+  .notification-mark-read {
+    min-height: 0;
+    margin-block: 0;
+  }
+}
+
+/* Viewport is both wide AND tall enough to host a canvas overlay (a legend/key)
+   without blanketing the graph under it. Width alone is the wrong signal: a
+   landscape phone is wider than `sm` but only ~390px tall, so a `sm:`-only rule
+   force-shows the overlay over a floored canvas. Named here rather than written
+   inline as `sm:[@media(min-height:800px)]:` because Tailwind's source scanner
+   does not extract that arbitrary-variant form from JSX — it compiles when fed
+   the candidate directly but is silently absent from the build. */
+@custom-variant roomy-viewport (@media (width >= 40rem) and (min-height: 800px));
+
+@theme {
+  --color-port-bg: rgb(var(--port-bg));
+  --color-port-card: rgb(var(--port-card));
+  --color-port-border: rgb(var(--port-border));
+  --color-port-accent: rgb(var(--port-accent));
+  /* Secondary accent — purple/violet semantic home for AI-generated,
+     recommendation, and other "secondary emphasis" content that previously
+     had no theme token (issue #1909). Tuned per-theme in portosThemes.js. */
+  --color-port-accent-2: rgb(var(--port-accent-2));
+  --color-port-success: rgb(var(--port-success));
+  --color-port-warning: rgb(var(--port-warning));
+  --color-port-error: rgb(var(--port-error));
+  --color-port-text: rgb(var(--port-text));
+  --color-port-text-muted: rgb(var(--port-text-muted));
+  --color-port-text-subtle: rgb(var(--port-text-subtle));
+  --color-port-accent-text: rgb(var(--port-accent-text));
+  --color-port-accent-2-text: rgb(var(--port-accent-2-text));
+  --color-port-success-text: rgb(var(--port-success-text));
+  --color-port-warning-text: rgb(var(--port-warning-text));
+  --color-port-error-text: rgb(var(--port-error-text));
+  --color-port-on-accent: rgb(var(--port-on-accent));
+  --color-port-on-accent-2: rgb(var(--port-on-accent-2));
+  --color-port-on-success: rgb(var(--port-on-success));
+  --color-port-on-warning: rgb(var(--port-on-warning));
+  --color-port-on-error: rgb(var(--port-on-error));
+
+  --animate-scanline: scanline 5s linear infinite;
+}
+
+/* Default theme CSS vars (Classic Midnight) - overridden by JS on load */
+:root {
+  /* Heading typography — every theme may override; the effects layer's glitch
+     rests on --port-heading-glow so it never dictates a theme's title look. */
+  --port-heading-tracking: 0;
+  --port-heading-glow: none;
+  --port-title-tracking: var(--port-heading-tracking);
+  --port-title-transform: none;
+  --port-bg: 15 15 15;
+  --port-card: 26 26 26;
+  --port-border: 42 42 42;
+  --port-accent: 37 99 235;
+  --port-accent-2: 168 85 247;
+  --port-accent-text: 96 165 250;
+  --port-accent-2-text: 216 180 254;
+  --port-success: 34 197 94;
+  --port-warning: 245 158 11;
+  --port-error: 239 68 68;
+  --port-success-text: 134 239 172;
+  --port-warning-text: 252 211 77;
+  --port-error-text: 253 164 175;
+  --port-on-accent: 255 255 255;
+  --port-on-accent-2: 37 7 56;
+  --port-on-success: 5 46 22;
+  --port-on-warning: 17 24 39;
+  --port-on-error: 48 8 8;
+  --port-text: 212 212 216;
+  --port-text-muted: 161 161 170;
+  --port-text-subtle: 140 140 149;
+  --port-control-text: 212 212 216;
+  --port-focus-ring: 37 99 235;
+  /* Writers Room "light reading" theme — sepia paper tone used by the prose
+     textarea, the AI panel's Evaluate/Format/Adapt result containers, and
+     the per-scene cards. Centralized so the shade can be tweaked once. */
+  --wr-reading-paper: #f5f1e8;
+  /* Ink color paired with the sepia reading paper above — dark text on light
+     paper, intentionally fixed (not app-theme-following) so it stays legible
+     regardless of the active theme. Centralized so the shade tweaks once. */
+  --wr-reading-ink: #1a1a1a;
+  --port-bg-alpha: 1;
+  --port-card-alpha: 1;
+  /* Floor for a CONTENT-CARD fill (see the `bg-port-card/NN` block below).
+     A card written as `bg-port-card/40` used to render at 40% of the card
+     color over the page background — on themes whose card and page colors are
+     close by design (every day theme; Phosphor Paper is 251/246/232 on
+     243/237/220), that dissolved the card into the page and left a border
+     floating around nothing. The floor keeps a card reading as a raised
+     surface; translucent themes set their own lower value so glass stays
+     glass. State variants (hover/active) are deliberately NOT floored — they
+     need the full alpha range to register as feedback. */
+  --port-card-min-alpha: 1;
+  --port-border-alpha: 1;
+  --port-sidebar-alpha: 1;
+  --port-overlay-alpha: 0.72;
+  --port-panel-padding-scale: 1;
+  --port-radius-sm: 0.25rem;
+  --port-radius-md: 0.375rem;
+  --port-radius-lg: 0.5rem;
+  --port-radius-xl: 0.75rem;
+  --port-radius-pill: 9999px;
+  --port-font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --port-font-display: var(--port-font-ui);
+  --port-font-mono: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+  --port-motion-fast: 120ms;
+  --port-motion-medium: 220ms;
+  --port-motion-slow: 420ms;
+  --port-shadow-card: none;
+  --port-shadow-elevated: 0 18px 45px rgb(0 0 0 / 0.35);
+  --port-shadow-interactive: none;
+  --port-backdrop-filter: none;
+  --port-border-style: solid;
+  --port-body-gradient: none;
+  --port-body-texture: none;
+  --port-body-size: cover, cover;
+  --port-body-overlay-opacity: 0;
+  --port-app-backdrop: rgb(var(--port-bg));
+  --port-sidebar-bg: rgb(var(--port-card));
+  --port-input-bg: rgb(var(--port-bg));
+  --port-control-bg: rgb(var(--port-border));
+  --port-control-bg-hover: rgb(64 64 64);
+  --port-control-border: rgb(var(--port-border));
+  --port-active-bg: rgb(var(--port-accent) / 0.1);
+  --port-hover-bg: rgb(var(--port-border) / 0.5);
+  --port-terminal-bg: rgb(7 7 7);
+  --port-terminal-text: rgb(212 212 216);
+  --port-chart-1: 37 99 235;
+  --port-chart-2: 34 197 94;
+  --port-chart-3: 245 158 11;
+  --port-chart-4: 236 72 153;
+  --port-chart-grid: 64 64 64;
+  /* Surface & control tokens — same "tokens over per-theme selector blocks"
+     pattern as the heading tokens above. Card border/alpha default to the
+     generic border tokens so an unset theme renders identically to the plain
+     `.border-port-border` rule; the rest default to a true no-op (`none` /
+     `auto`) so an unset theme paints nothing extra. */
+  --port-card-border-color: var(--port-border);
+  --port-card-border-alpha: var(--port-border-alpha);
+  --port-card-surface-image: none;
+  --port-card-surface-size: auto;
+  --port-focus-shadow: 0 0 0 4px rgb(var(--port-focus-ring) / 0.2);
+  /* Only read by the theme-scoped focus rule below (Lumen Glass, Lumen Glass
+     Day, Kestrel Neon) — deliberately separate from --port-focus-shadow so a
+     theme's stronger glow can't leak onto the [role="button"]/[tabindex="0"]
+     elements the generic rule also covers. */
+  --port-focus-glow: none;
+  --port-nav-active-rule: none;
+  /* `inherit`, not `none` — `text-shadow` is naturally inherited, and Black
+     ICE's body-wide glow used to reach this element through that inheritance.
+     Declaring `none` here would silently cancel it for every theme. */
+  --port-nav-active-glow: inherit;
+  --port-code-glow: none;
+}
+
+/* Self-hosted UI/mono webfonts.
+ *
+ * Four theme stacks in themes/portosThemes.js front `Inter`, and one fronts
+ * `IBM Plex Mono`. These used to come from fonts.googleapis.com, which never
+ * resolves on the private-Tailscale install PortOS is designed for — so the
+ * intended typography was simply never seen offline. Vendored under
+ * public/fonts/ instead (see #3812), matching the GeistPixel precedent below.
+ *
+ * Only the weights the stacks actually use are shipped (Inter 400/500/600/700,
+ * IBM Plex Mono 400/500/600), woff2 only — every browser PortOS targets
+ * supports it. Both families are SIL Open Font License 1.1; each family's
+ * license text sits beside the files as public/fonts/<Family>-OFL.txt.
+ *
+ * Subsetting: latin + latin-ext, the same tradeoff Google's default subset
+ * makes, to keep the payload near 275KB total. A character outside that range
+ * falls back per-glyph to the next family in the stack (every stack in
+ * portosThemes.js ends in a system font), so it degrades rather than tofus.
+ */
+@font-face {
+  font-family: 'Inter';
+  src: url('/fonts/Inter-Regular.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Inter';
+  src: url('/fonts/Inter-Medium.woff2') format('woff2');
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Inter';
+  src: url('/fonts/Inter-SemiBold.woff2') format('woff2');
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Inter';
+  src: url('/fonts/Inter-Bold.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'IBM Plex Mono';
+  src: url('/fonts/IBMPlexMono-Regular.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'IBM Plex Mono';
+  src: url('/fonts/IBMPlexMono-Medium.woff2') format('woff2');
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'IBM Plex Mono';
+  src: url('/fonts/IBMPlexMono-SemiBold.woff2') format('woff2');
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* Geist Pixel font for OpenWorld */
+@font-face {
+  font-family: 'GeistPixelSquare';
+  src: url('/fonts/GeistPixel-Square.woff2') format('woff2');
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'GeistPixelGrid';
+  src: url('/fonts/GeistPixel-Grid.woff2') format('woff2');
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+
+.font-pixel {
+  font-family: 'GeistPixelSquare', 'Courier New', monospace;
+}
+
+.font-pixel-grid {
+  font-family: 'GeistPixelGrid', 'Courier New', monospace;
+}
+
+html, body, #root {
+  width: 100%;
+  max-width: 100vw;
+  overflow-x: hidden;
+}
+
+body {
+  background-color: rgb(var(--port-bg));
+  color: rgb(var(--port-text));
+  font-family: var(--port-font-ui);
+  letter-spacing: 0;
+}
+
+#root {
+  min-height: 100vh;
+  min-height: 100dvh;
+}
+
+/* Tailwind v4 sorts generated utility classes into a canonical order (by
+   bucket, then alphabetically) rather than preserving JSX className source
+   order, so pairing `h-screen h-[100dvh]` on one element does NOT give
+   `h-[100dvh]` cascade priority as the "h-screen now, h-[100dvh] override"
+   naming suggests — `.h-screen` is emitted after `.h-[100dvh]` in the
+   compiled stylesheet and wins outright, silently defeating the dvh fix.
+   This plain-CSS class declares the same property twice in real source
+   order (mirrors the #root rule above) so the dvh value reliably overrides
+   the vh fallback in browsers that support it. */
+.h-dvh-screen {
+  height: 100vh;
+  height: 100dvh;
+}
+
+/* The full-width route's <main> clips its page without being a scroll box.
+   `overflow: hidden` still scrolls programmatically: an absolutely positioned
+   descendant (an `sr-only` label) inside the page's own scroller takes <main>
+   as its containing block, so it widens <main>'s scroll range, and any
+   scrollIntoView() or focus() past the page scroller's end then scrolls <main>
+   itself, shifting the whole page up with no way for the user to scroll it
+   back (the Music Video "Verify lyric timing" link). `clip` can't scroll;
+   `hidden` stays as the fallback for engines without it. */
+.overflow-clip-safe {
+  overflow: hidden;
+  overflow: clip;
+}
+
+/* Both classes above are unlayered, so they beat every `@layer utilities`
+   rule whatever its specificity, including the `print:h-auto` and
+   `print:overflow-visible` beside them in Layout.jsx. Restate the print
+   values here so a printed page still grows to its content. */
+@media print {
+  .h-dvh-screen { height: auto; }
+  .overflow-clip-safe { overflow: visible; }
+}
+
+/* dvh-aware sizing utilities. iOS Safari's retractable browser chrome makes
+   100vh taller than the visible viewport, so surfaces sized to 100vh spill
+   *under* the chrome. These size to 100dvh — the visible dynamic viewport —
+   while keeping a 100vh fallback for engines that predate dvh.
+
+   The fallback uses an @supports gate rather than the two-declaration idiom
+   (`height: 100vh; height: 100dvh;`) that .h-dvh-screen above can rely on: here
+   the value is wrapped in var()/min()/calc(), so BOTH declarations are
+   valid-at-parse-time (pending substitution) and the 100dvh one wins the
+   cascade, then computes to *invalid* (not "fall back to the previous
+   declaration") on engines without dvh — dropping the constraint entirely.
+   Gating the dvh value behind `@supports (height: 1dvh)` keeps the 100vh base
+   as the real fallback on those engines.
+
+   Parametrized so one utility serves the plain, capped, and inset variants:
+     --dvh-cap    upper bound for the size            (default: the full viewport)
+     --dvh-inset  amount subtracted from the viewport (default: 0px)
+   Defined with @utility so responsive variants (sm:, lg:, xl:) are available;
+   drive the caps per-breakpoint with arbitrary-property utilities, e.g.
+   `lg:min-h-dvh-cap lg:[--dvh-cap:460px] lg:[--dvh-inset:1rem]`. */
+@utility max-h-dvh-cap {
+  max-height: min(var(--dvh-cap, 100vh), calc(100vh - var(--dvh-inset, 0px)));
+  @supports (height: 1dvh) {
+    max-height: min(var(--dvh-cap-dynamic, var(--dvh-cap, 100dvh)), calc(100dvh - var(--dvh-inset, 0px)));
+  }
+}
+@utility min-h-dvh-cap {
+  min-height: min(var(--dvh-cap, 100vh), calc(100vh - var(--dvh-inset, 0px)));
+  @supports (height: 1dvh) {
+    min-height: min(var(--dvh-cap, 100dvh), calc(100dvh - var(--dvh-inset, 0px)));
+  }
+}
+@utility h-dvh-cap {
+  height: min(var(--dvh-cap, 100vh), calc(100vh - var(--dvh-inset, 0px)));
+  @supports (height: 1dvh) {
+    height: min(var(--dvh-cap, 100dvh), calc(100dvh - var(--dvh-inset, 0px)));
+  }
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background-image: var(--port-body-texture), var(--port-body-gradient);
+  background-attachment: fixed;
+  background-size: var(--port-body-size);
+  opacity: var(--port-body-overlay-opacity);
+}
+
+html[data-port-theme] body,
+html[data-port-theme] button,
+html[data-port-theme] input,
+html[data-port-theme] textarea,
+html[data-port-theme] select {
+  font-family: var(--port-font-ui);
+}
+
+html[data-port-theme] .font-mono,
+html[data-port-theme] pre,
+html[data-port-theme] code,
+html[data-port-theme] kbd {
+  font-family: var(--port-font-mono);
+}
+
+/* Code/input glow + caret, tokenized (#6248) — was Kestrel-only (a
+   `data-port-theme-family` rule plus a per-mode text-shadow); the caret now
+   tracks the accent everywhere, and `--port-code-glow` (default `none`) lets
+   any theme add the text-shadow Black ICE (both modes) and Kestrel Neon use. */
+html[data-port-theme] :is(pre, code, textarea, input) {
+  caret-color: rgb(var(--port-accent));
+  text-shadow: var(--port-code-glow);
+}
+
+html[data-port-theme] h1,
+html[data-port-theme] h2,
+html[data-port-theme] h3 {
+  font-family: var(--port-font-display);
+  letter-spacing: var(--port-heading-tracking);
+  text-shadow: var(--port-heading-glow);
+}
+
+html[data-port-theme] h1 {
+  letter-spacing: var(--port-title-tracking);
+  text-transform: var(--port-title-transform);
+}
+
+html[data-port-theme] .bg-port-bg {
+  background-color: rgb(var(--port-bg) / var(--port-bg-alpha)) !important;
+}
+
+html[data-port-theme] .bg-port-card {
+  background-color: rgb(var(--port-card) / var(--port-card-alpha)) !important;
+}
+
+/* Any surface with no dimmed backdrop behind it — a floating menu/popover
+   (e.g. the schedule "Run on App" picker) or a slide-over modal panel (the
+   shared `Drawer`) whose mobile width sits directly over the page it was
+   opened from — must stay fully opaque even on translucent ("glass") card
+   themes, or the arbitrary content behind it bleeds through and becomes
+   unreadable/illegible (WebKit especially). Use the themed card color with no
+   alpha. */
+.port-opaque-surface,
+html[data-port-theme] .port-opaque-surface {
+  background-color: rgb(var(--port-card)) !important;
+}
+
+/*
+ * Tailwind opacity modifiers (e.g. bg-port-bg/50, hover:bg-port-card/30) skip
+ * the per-theme alpha tokens unless we restate them here — Tailwind v4 emits
+ * color-mix(...) on the raw color and ignores --port-X-alpha. Each rule below
+ * scales --port-X-alpha by the requested opacity so semi-transparent surfaces
+ * stay consistent with each theme's intent (notably translucent themes like
+ * Lumen Glass) across base + state variants (hover/active/focus where used).
+ */
+html[data-port-theme] [class~="bg-port-bg/20"],
+html[data-port-theme] [class~="hover:bg-port-bg/20"]:hover { background-color: rgb(var(--port-bg) / calc(var(--port-bg-alpha) * 0.2)) !important; }
+html[data-port-theme] [class~="bg-port-bg/30"],
+html[data-port-theme] [class~="hover:bg-port-bg/30"]:hover { background-color: rgb(var(--port-bg) / calc(var(--port-bg-alpha) * 0.3)) !important; }
+html[data-port-theme] [class~="bg-port-bg/40"],
+html[data-port-theme] [class~="hover:bg-port-bg/40"]:hover { background-color: rgb(var(--port-bg) / calc(var(--port-bg-alpha) * 0.4)) !important; }
+html[data-port-theme] [class~="bg-port-bg/50"],
+html[data-port-theme] [class~="hover:bg-port-bg/50"]:hover { background-color: rgb(var(--port-bg) / calc(var(--port-bg-alpha) * 0.5)) !important; }
+html[data-port-theme] [class~="bg-port-bg/60"],
+html[data-port-theme] [class~="hover:bg-port-bg/60"]:hover { background-color: rgb(var(--port-bg) / calc(var(--port-bg-alpha) * 0.6)) !important; }
+html[data-port-theme] [class~="bg-port-bg/70"],
+html[data-port-theme] [class~="hover:bg-port-bg/70"]:hover { background-color: rgb(var(--port-bg) / calc(var(--port-bg-alpha) * 0.7)) !important; }
+html[data-port-theme] [class~="bg-port-bg/80"],
+html[data-port-theme] [class~="hover:bg-port-bg/80"]:hover { background-color: rgb(var(--port-bg) / calc(var(--port-bg-alpha) * 0.8)) !important; }
+html[data-port-theme] [class~="bg-port-bg/90"],
+html[data-port-theme] [class~="hover:bg-port-bg/90"]:hover { background-color: rgb(var(--port-bg) / calc(var(--port-bg-alpha) * 0.9)) !important; }
+
+/*
+ * Card fills carry a per-theme floor (`--port-card-min-alpha`), so a card
+ * written at any opacity still reads as a surface raised off the page instead
+ * of dissolving into it. `max()` means a theme that WANTS translucency (Lumen
+ * Glass) simply sets a lower floor — the modifier's intent is preserved, its
+ * ability to vanish is not.
+ *
+ * State variants are split into their own rules and left unfloored: a hover
+ * that lands on the same color as the resting fill is not feedback.
+ */
+html[data-port-theme] [class~="bg-port-card/30"] { background-color: rgb(var(--port-card) / max(var(--port-card-min-alpha), calc(var(--port-card-alpha) * 0.3))) !important; }
+html[data-port-theme] [class~="bg-port-card/40"] { background-color: rgb(var(--port-card) / max(var(--port-card-min-alpha), calc(var(--port-card-alpha) * 0.4))) !important; }
+html[data-port-theme] [class~="bg-port-card/50"] { background-color: rgb(var(--port-card) / max(var(--port-card-min-alpha), calc(var(--port-card-alpha) * 0.5))) !important; }
+html[data-port-theme] [class~="bg-port-card/60"] { background-color: rgb(var(--port-card) / max(var(--port-card-min-alpha), calc(var(--port-card-alpha) * 0.6))) !important; }
+html[data-port-theme] [class~="bg-port-card/70"] { background-color: rgb(var(--port-card) / max(var(--port-card-min-alpha), calc(var(--port-card-alpha) * 0.7))) !important; }
+html[data-port-theme] [class~="bg-port-card/80"] { background-color: rgb(var(--port-card) / max(var(--port-card-min-alpha), calc(var(--port-card-alpha) * 0.8))) !important; }
+html[data-port-theme] [class~="bg-port-card/90"] { background-color: rgb(var(--port-card) / max(var(--port-card-min-alpha), calc(var(--port-card-alpha) * 0.9))) !important; }
+html[data-port-theme] [class~="bg-port-card/95"] { background-color: rgb(var(--port-card) / max(var(--port-card-min-alpha), calc(var(--port-card-alpha) * 0.95))) !important; }
+
+html[data-port-theme] [class~="hover:bg-port-card/30"]:hover { background-color: rgb(var(--port-card) / calc(var(--port-card-alpha) * 0.3)) !important; }
+html[data-port-theme] [class~="hover:bg-port-card/40"]:hover { background-color: rgb(var(--port-card) / calc(var(--port-card-alpha) * 0.4)) !important; }
+html[data-port-theme] [class~="hover:bg-port-card/50"]:hover,
+html[data-port-theme] [class~="active:bg-port-card/50"]:active { background-color: rgb(var(--port-card) / calc(var(--port-card-alpha) * 0.5)) !important; }
+html[data-port-theme] [class~="hover:bg-port-card/60"]:hover { background-color: rgb(var(--port-card) / calc(var(--port-card-alpha) * 0.6)) !important; }
+html[data-port-theme] [class~="hover:bg-port-card/70"]:hover { background-color: rgb(var(--port-card) / calc(var(--port-card-alpha) * 0.7)) !important; }
+html[data-port-theme] [class~="hover:bg-port-card/80"]:hover { background-color: rgb(var(--port-card) / calc(var(--port-card-alpha) * 0.8)) !important; }
+html[data-port-theme] [class~="hover:bg-port-card/90"]:hover { background-color: rgb(var(--port-card) / calc(var(--port-card-alpha) * 0.9)) !important; }
+html[data-port-theme] [class~="hover:bg-port-card/95"]:hover { background-color: rgb(var(--port-card) / calc(var(--port-card-alpha) * 0.95)) !important; }
+
+html[data-port-theme] .border-port-border,
+html[data-port-theme] .divide-port-border > :not([hidden]) ~ :not([hidden]) {
+  border-color: rgb(var(--port-border) / var(--port-border-alpha)) !important;
+  border-style: var(--port-border-style);
+}
+
+html[data-port-theme] [class~="border-port-border/20"] { border-color: rgb(var(--port-border) / calc(var(--port-border-alpha) * 0.2)) !important; border-style: var(--port-border-style); }
+html[data-port-theme] [class~="border-port-border/30"] { border-color: rgb(var(--port-border) / calc(var(--port-border-alpha) * 0.3)) !important; border-style: var(--port-border-style); }
+html[data-port-theme] [class~="border-port-border/40"] { border-color: rgb(var(--port-border) / calc(var(--port-border-alpha) * 0.4)) !important; border-style: var(--port-border-style); }
+html[data-port-theme] [class~="border-port-border/50"],
+html[data-port-theme] [class~="divide-port-border/50"] > :not([hidden]) ~ :not([hidden]) { border-color: rgb(var(--port-border) / calc(var(--port-border-alpha) * 0.5)) !important; border-style: var(--port-border-style); }
+html[data-port-theme] [class~="border-port-border/60"] { border-color: rgb(var(--port-border) / calc(var(--port-border-alpha) * 0.6)) !important; border-style: var(--port-border-style); }
+html[data-port-theme] [class~="border-port-border/80"] { border-color: rgb(var(--port-border) / calc(var(--port-border-alpha) * 0.8)) !important; border-style: var(--port-border-style); }
+
+html[data-port-theme] .rounded {
+  border-radius: var(--port-radius-md) !important;
+}
+
+html[data-port-theme] .rounded-lg {
+  border-radius: var(--port-radius-lg) !important;
+}
+
+html[data-port-theme] .rounded-xl,
+html[data-port-theme] .rounded-2xl {
+  border-radius: var(--port-radius-xl) !important;
+}
+
+html[data-port-theme] input,
+html[data-port-theme] textarea,
+html[data-port-theme] select {
+  background: var(--port-input-bg) !important;
+  border-color: var(--port-control-border) !important;
+  color: rgb(var(--port-text));
+  transition:
+    border-color var(--port-motion-fast) ease,
+    box-shadow var(--port-motion-fast) ease,
+    background var(--port-motion-fast) ease;
+}
+
+html[data-port-theme] input::placeholder,
+html[data-port-theme] textarea::placeholder {
+  color: rgb(var(--port-text-muted) / 0.62);
+}
+
+html[data-port-theme] button,
+html[data-port-theme] a,
+html[data-port-theme] [role="button"] {
+  transition:
+    background-color var(--port-motion-fast) ease,
+    border-color var(--port-motion-fast) ease,
+    box-shadow var(--port-motion-fast) ease,
+    color var(--port-motion-fast) ease;
+}
+
+/* === Shared foreground color contract ===
+   Components still contain a large amount of legacy Tailwind color utility
+   text. These selectors make those utilities aliases of the theme contract at
+   runtime, so the eight themes share the same readable roles:
+
+   - primary text: normal labels and controls
+   - muted text: supporting copy and metadata
+   - subtle text: tertiary labels, unavailable states, and tiny annotations
+   - semantic text: accent, secondary accent, success, warning, and error
+
+   Filled controls use the matching `--port-on-*` token below instead. Keeping
+   fill ink and surface ink separate is what prevents a color that is readable
+   as a status label from becoming unreadable inside a bright badge. Opacity
+   variants are intentionally promoted to the role's full readable value: a
+   small text label cannot rely on a decorative alpha to remain legible.
+ */
+html[data-port-theme] :is(
+  [class*="text-white"], [class*="text-zinc-50"], [class*="text-zinc-100"],
+  [class*="text-neutral-50"], [class*="text-neutral-100"],
+  [class*="text-gray-50"], [class*="text-gray-100"],
+  [class*="text-slate-50"], [class*="text-slate-100"]
+) {
+  color: rgb(var(--port-text)) !important;
+}
+
+html[data-port-theme] :is(
+  [class*="text-zinc-200"], [class*="text-zinc-300"],
+  [class*="text-neutral-200"], [class*="text-neutral-300"],
+  [class*="text-gray-200"], [class*="text-gray-300"],
+  [class*="text-slate-200"], [class*="text-slate-300"]
+) {
+  color: rgb(var(--port-text) / 0.85) !important;
+}
+
+html[data-port-theme] :is(
+  [class*="text-zinc-400"], [class*="text-zinc-500"],
+  [class*="text-neutral-400"], [class*="text-neutral-500"],
+  [class*="text-gray-400"], [class*="text-gray-500"],
+  [class*="text-slate-400"], [class*="text-slate-500"]
+) {
+  color: rgb(var(--port-text-muted)) !important;
+}
+
+html[data-port-theme] :is(
+  [class*="text-zinc-600"], [class*="text-zinc-700"],
+  [class*="text-neutral-600"], [class*="text-neutral-700"],
+  [class*="text-gray-600"], [class*="text-gray-700"],
+  [class*="text-slate-600"], [class*="text-slate-700"]
+) {
+  color: rgb(var(--port-text-subtle)) !important;
+}
+
+html[data-port-theme] :is(
+  [class*="text-zinc-800"], [class*="text-zinc-900"],
+  [class*="text-neutral-800"], [class*="text-neutral-900"],
+  [class*="text-gray-800"], [class*="text-gray-900"],
+  [class*="text-slate-800"], [class*="text-slate-900"]
+) {
+  color: rgb(var(--port-text)) !important;
+}
+
+/* Hue families are semantic aliases. This keeps legacy utility names useful
+   while making their actual foreground color follow the active theme. */
+html[data-port-theme] :is(
+  [class*="text-cyan-"], [class*="text-sky-"], [class*="text-blue-"],
+  [class*="text-indigo-"], .text-port-accent
+) {
+  color: rgb(var(--port-accent-text)) !important;
+}
+
+html[data-port-theme] :is(
+  [class*="text-violet-"], [class*="text-purple-"],
+  [class*="text-fuchsia-"], [class*="text-pink-"], .text-port-accent-2
+) {
+  color: rgb(var(--port-accent-2-text)) !important;
+}
+
+html[data-port-theme] :is(
+  [class*="text-red-"], [class*="text-rose-"], .text-port-error
+) {
+  color: rgb(var(--port-error-text)) !important;
+}
+
+html[data-port-theme] :is(
+  [class*="text-orange-"], [class*="text-amber-"], [class*="text-yellow-"],
+  .text-port-warning
+) {
+  color: rgb(var(--port-warning-text)) !important;
+}
+
+html[data-port-theme] :is(
+  [class*="text-lime-"], [class*="text-green-"], [class*="text-emerald-"],
+  [class*="text-teal-"], .text-port-success
+) {
+  color: rgb(var(--port-success-text)) !important;
+}
+
+html[data-port-theme] .text-port-text { color: rgb(var(--port-text)) !important; }
+html[data-port-theme] .text-port-text-muted { color: rgb(var(--port-text-muted)) !important; }
+html[data-port-theme] .text-port-text-subtle { color: rgb(var(--port-text-subtle)) !important; }
+/* Opacity-bearing semantic text utilities still need the semantic foreground
+   role, not the raw fill color. The hue-family aliases above already cover
+   legacy Tailwind variants; these selectors close the same gap for PortOS
+   utility names such as `text-port-warning/90`. */
+html[data-port-theme] :is([class^="text-port-text-muted/"], [class*=" text-port-text-muted/"]) {
+  color: rgb(var(--port-text-muted)) !important;
+}
+html[data-port-theme] :is([class^="text-port-text-subtle/"], [class*=" text-port-text-subtle/"]) {
+  color: rgb(var(--port-text-subtle)) !important;
+}
+html[data-port-theme] :is([class^="text-port-accent/"], [class*=" text-port-accent/"]) {
+  color: rgb(var(--port-accent-text)) !important;
+}
+html[data-port-theme] :is([class^="text-port-accent-2/"], [class*=" text-port-accent-2/"]) {
+  color: rgb(var(--port-accent-2-text)) !important;
+}
+html[data-port-theme] :is([class^="text-port-success/"], [class*=" text-port-success/"]) {
+  color: rgb(var(--port-success-text)) !important;
+}
+html[data-port-theme] :is([class^="text-port-warning/"], [class*=" text-port-warning/"]) {
+  color: rgb(var(--port-warning-text)) !important;
+}
+html[data-port-theme] :is([class^="text-port-error/"], [class*=" text-port-error/"]) {
+  color: rgb(var(--port-error-text)) !important;
+}
+
+/* Filled semantic controls use their own ink token. */
+html[data-port-theme] :is(
+  .bg-port-accent,
+  [class~="bg-port-accent/40"], [class~="bg-port-accent/50"], [class~="bg-port-accent/60"],
+  [class~="bg-port-accent/70"], [class~="bg-port-accent/75"], [class~="bg-port-accent/80"],
+  [class~="bg-port-accent/90"], [class~="bg-port-accent/95"], [class~="bg-port-accent/100"]
+):is([class~="text-white"], [class~="text-black"]) {
+  background-color: rgb(var(--port-accent)) !important;
+  color: rgb(var(--port-on-accent)) !important;
+}
+html[data-port-theme] :is(
+  .bg-port-accent-2,
+  [class~="bg-port-accent-2/40"], [class~="bg-port-accent-2/50"], [class~="bg-port-accent-2/60"],
+  [class~="bg-port-accent-2/70"], [class~="bg-port-accent-2/75"], [class~="bg-port-accent-2/80"],
+  [class~="bg-port-accent-2/90"], [class~="bg-port-accent-2/95"], [class~="bg-port-accent-2/100"]
+):is([class~="text-white"], [class~="text-black"]) {
+  background-color: rgb(var(--port-accent-2)) !important;
+  color: rgb(var(--port-on-accent-2)) !important;
+}
+html[data-port-theme] :is(
+  .bg-port-success,
+  [class~="bg-port-success/40"], [class~="bg-port-success/50"], [class~="bg-port-success/60"],
+  [class~="bg-port-success/70"], [class~="bg-port-success/75"], [class~="bg-port-success/80"],
+  [class~="bg-port-success/90"], [class~="bg-port-success/95"], [class~="bg-port-success/100"]
+):is([class~="text-white"], [class~="text-black"]) {
+  background-color: rgb(var(--port-success)) !important;
+  color: rgb(var(--port-on-success)) !important;
+}
+html[data-port-theme] :is(
+  .bg-port-warning,
+  [class~="bg-port-warning/40"], [class~="bg-port-warning/50"], [class~="bg-port-warning/60"],
+  [class~="bg-port-warning/70"], [class~="bg-port-warning/75"], [class~="bg-port-warning/80"],
+  [class~="bg-port-warning/90"], [class~="bg-port-warning/95"], [class~="bg-port-warning/100"]
+):is([class~="text-white"], [class~="text-black"]) {
+  background-color: rgb(var(--port-warning)) !important;
+  color: rgb(var(--port-on-warning)) !important;
+}
+html[data-port-theme] :is(
+  .bg-port-error,
+  [class~="bg-port-error/40"], [class~="bg-port-error/50"], [class~="bg-port-error/60"],
+  [class~="bg-port-error/70"], [class~="bg-port-error/75"], [class~="bg-port-error/80"],
+  [class~="bg-port-error/90"], [class~="bg-port-error/95"], [class~="bg-port-error/100"]
+):is([class~="text-white"], [class~="text-black"]) {
+  background-color: rgb(var(--port-error)) !important;
+  color: rgb(var(--port-on-error)) !important;
+}
+
+/* A semantic tint stops being a tonal surface at 40% opacity. Existing
+   controls still use surface-text classes on those high-opacity states, so
+   promote the fill and its semantic text together. The state-aware selectors
+   include Tailwind's variant prefix; matching the class without its pseudo
+   state would make a hover fill active before the pointer arrives. */
+html[data-port-theme] :is(
+  [class~="bg-port-accent/40"], [class~="bg-port-accent/50"], [class~="bg-port-accent/60"],
+  [class~="bg-port-accent/70"], [class~="bg-port-accent/75"], [class~="bg-port-accent/80"],
+  [class~="bg-port-accent/90"], [class~="bg-port-accent/95"], [class~="bg-port-accent/100"],
+  [class*="hover:bg-port-accent/4"]:hover, [class*="hover:bg-port-accent/5"]:hover,
+  [class*="hover:bg-port-accent/6"]:hover, [class*="hover:bg-port-accent/7"]:hover,
+  [class*="hover:bg-port-accent/8"]:hover, [class*="hover:bg-port-accent/9"]:hover,
+  [class*="hover:bg-port-accent/100"]:hover,
+  [class*="active:bg-port-accent/4"]:active, [class*="active:bg-port-accent/5"]:active,
+  [class*="active:bg-port-accent/6"]:active, [class*="active:bg-port-accent/7"]:active,
+  [class*="active:bg-port-accent/8"]:active, [class*="active:bg-port-accent/9"]:active,
+  [class*="active:bg-port-accent/100"]:active
+):is(
+  [class~="text-port-accent"], [class^="text-port-accent/"], [class*=" text-port-accent/"],
+  [class*="text-cyan-"], [class*="text-sky-"], [class*="text-blue-"], [class*="text-indigo-"]
+) {
+  background-color: rgb(var(--port-accent)) !important;
+  color: rgb(var(--port-on-accent)) !important;
+}
+
+html[data-port-theme] :is(
+  [class~="bg-port-accent-2/40"], [class~="bg-port-accent-2/50"], [class~="bg-port-accent-2/60"],
+  [class~="bg-port-accent-2/70"], [class~="bg-port-accent-2/75"], [class~="bg-port-accent-2/80"],
+  [class~="bg-port-accent-2/90"], [class~="bg-port-accent-2/95"], [class~="bg-port-accent-2/100"],
+  [class*="hover:bg-port-accent-2/4"]:hover, [class*="hover:bg-port-accent-2/5"]:hover,
+  [class*="hover:bg-port-accent-2/6"]:hover, [class*="hover:bg-port-accent-2/7"]:hover,
+  [class*="hover:bg-port-accent-2/8"]:hover, [class*="hover:bg-port-accent-2/9"]:hover,
+  [class*="hover:bg-port-accent-2/100"]:hover,
+  [class*="active:bg-port-accent-2/4"]:active, [class*="active:bg-port-accent-2/5"]:active,
+  [class*="active:bg-port-accent-2/6"]:active, [class*="active:bg-port-accent-2/7"]:active,
+  [class*="active:bg-port-accent-2/8"]:active, [class*="active:bg-port-accent-2/9"]:active,
+  [class*="active:bg-port-accent-2/100"]:active
+):is(
+  [class~="text-port-accent-2"], [class^="text-port-accent-2/"], [class*=" text-port-accent-2/"],
+  [class*="text-violet-"], [class*="text-purple-"], [class*="text-fuchsia-"], [class*="text-pink-"]
+) {
+  background-color: rgb(var(--port-accent-2)) !important;
+  color: rgb(var(--port-on-accent-2)) !important;
+}
+
+html[data-port-theme] :is(
+  [class~="bg-port-success/40"], [class~="bg-port-success/50"], [class~="bg-port-success/60"],
+  [class~="bg-port-success/70"], [class~="bg-port-success/75"], [class~="bg-port-success/80"],
+  [class~="bg-port-success/90"], [class~="bg-port-success/95"], [class~="bg-port-success/100"],
+  [class*="hover:bg-port-success/4"]:hover, [class*="hover:bg-port-success/5"]:hover,
+  [class*="hover:bg-port-success/6"]:hover, [class*="hover:bg-port-success/7"]:hover,
+  [class*="hover:bg-port-success/8"]:hover, [class*="hover:bg-port-success/9"]:hover,
+  [class*="hover:bg-port-success/100"]:hover,
+  [class*="active:bg-port-success/4"]:active, [class*="active:bg-port-success/5"]:active,
+  [class*="active:bg-port-success/6"]:active, [class*="active:bg-port-success/7"]:active,
+  [class*="active:bg-port-success/8"]:active, [class*="active:bg-port-success/9"]:active,
+  [class*="active:bg-port-success/100"]:active
+):is(
+  [class~="text-port-success"], [class^="text-port-success/"], [class*=" text-port-success/"],
+  [class*="text-lime-"], [class*="text-green-"], [class*="text-emerald-"], [class*="text-teal-"]
+) {
+  background-color: rgb(var(--port-success)) !important;
+  color: rgb(var(--port-on-success)) !important;
+}
+
+html[data-port-theme] :is(
+  [class~="bg-port-warning/40"], [class~="bg-port-warning/50"], [class~="bg-port-warning/60"],
+  [class~="bg-port-warning/70"], [class~="bg-port-warning/75"], [class~="bg-port-warning/80"],
+  [class~="bg-port-warning/90"], [class~="bg-port-warning/95"], [class~="bg-port-warning/100"],
+  [class*="hover:bg-port-warning/4"]:hover, [class*="hover:bg-port-warning/5"]:hover,
+  [class*="hover:bg-port-warning/6"]:hover, [class*="hover:bg-port-warning/7"]:hover,
+  [class*="hover:bg-port-warning/8"]:hover, [class*="hover:bg-port-warning/9"]:hover,
+  [class*="hover:bg-port-warning/100"]:hover,
+  [class*="active:bg-port-warning/4"]:active, [class*="active:bg-port-warning/5"]:active,
+  [class*="active:bg-port-warning/6"]:active, [class*="active:bg-port-warning/7"]:active,
+  [class*="active:bg-port-warning/8"]:active, [class*="active:bg-port-warning/9"]:active,
+  [class*="active:bg-port-warning/100"]:active
+):is(
+  [class~="text-port-warning"], [class^="text-port-warning/"], [class*=" text-port-warning/"],
+  [class*="text-orange-"], [class*="text-amber-"], [class*="text-yellow-"]
+) {
+  background-color: rgb(var(--port-warning)) !important;
+  color: rgb(var(--port-on-warning)) !important;
+}
+
+html[data-port-theme] :is(
+  [class~="bg-port-error/40"], [class~="bg-port-error/50"], [class~="bg-port-error/60"],
+  [class~="bg-port-error/70"], [class~="bg-port-error/75"], [class~="bg-port-error/80"],
+  [class~="bg-port-error/90"], [class~="bg-port-error/95"], [class~="bg-port-error/100"],
+  [class*="hover:bg-port-error/4"]:hover, [class*="hover:bg-port-error/5"]:hover,
+  [class*="hover:bg-port-error/6"]:hover, [class*="hover:bg-port-error/7"]:hover,
+  [class*="hover:bg-port-error/8"]:hover, [class*="hover:bg-port-error/9"]:hover,
+  [class*="hover:bg-port-error/100"]:hover,
+  [class*="active:bg-port-error/4"]:active, [class*="active:bg-port-error/5"]:active,
+  [class*="active:bg-port-error/6"]:active, [class*="active:bg-port-error/7"]:active,
+  [class*="active:bg-port-error/8"]:active, [class*="active:bg-port-error/9"]:active,
+  [class*="active:bg-port-error/100"]:active
+):is(
+  [class~="text-port-error"], [class^="text-port-error/"], [class*=" text-port-error/"],
+  [class*="text-red-"], [class*="text-rose-"]
+) {
+  background-color: rgb(var(--port-error)) !important;
+  color: rgb(var(--port-on-error)) !important;
+}
+
+/* Solid legacy semantic fills are aliases too. This covers provider/status
+   buttons whose class names still come from a data-driven palette (for example
+   `bg-purple-500 text-white`) while leaving low-opacity decorative tints alone.
+   The paired ink token is applied to both historical white and black text. */
+html[data-port-theme] :is(
+  .bg-blue-500, .bg-blue-600, .bg-blue-700,
+  .bg-cyan-400, .bg-cyan-500, .bg-sky-500, .bg-sky-600,
+  .bg-indigo-500, .bg-indigo-600
+):is([class~="text-white"], [class~="text-black"]) {
+  background-color: rgb(var(--port-accent)) !important;
+  color: rgb(var(--port-on-accent)) !important;
+}
+
+html[data-port-theme] :is(
+  .bg-purple-500, .bg-purple-600, .bg-violet-500, .bg-violet-600,
+  .bg-fuchsia-500, .bg-pink-500
+):is([class~="text-white"], [class~="text-black"]) {
+  background-color: rgb(var(--port-accent-2)) !important;
+  color: rgb(var(--port-on-accent-2)) !important;
+}
+
+html[data-port-theme] :is(
+  .bg-green-400, .bg-green-500, .bg-green-600,
+  .bg-emerald-400, .bg-emerald-500, .bg-emerald-600,
+  .bg-lime-400, .bg-lime-500, .bg-teal-500, .bg-teal-600
+):is([class~="text-white"], [class~="text-black"]) {
+  background-color: rgb(var(--port-success)) !important;
+  color: rgb(var(--port-on-success)) !important;
+}
+
+html[data-port-theme] :is(
+  .bg-yellow-400, .bg-yellow-500, .bg-yellow-600,
+  .bg-amber-400, .bg-amber-500, .bg-amber-600,
+  .bg-orange-400, .bg-orange-500, .bg-orange-600
+):is([class~="text-white"], [class~="text-black"]) {
+  background-color: rgb(var(--port-warning)) !important;
+  color: rgb(var(--port-on-warning)) !important;
+}
+
+html[data-port-theme] :is(
+  .bg-red-400, .bg-red-500, .bg-red-600, .bg-red-700,
+  .bg-rose-400, .bg-rose-500, .bg-rose-600
+):is([class~="text-white"], [class~="text-black"]) {
+  background-color: rgb(var(--port-error)) !important;
+  color: rgb(var(--port-on-error)) !important;
+}
+
+html[data-port-theme] :is(
+  [class~="hover:bg-blue-400"], [class~="hover:bg-blue-500"], [class~="hover:bg-blue-600"],
+  [class~="hover:bg-cyan-400"], [class~="hover:bg-cyan-500"], [class~="hover:bg-sky-500"],
+  [class~="hover:bg-sky-600"], [class~="hover:bg-indigo-500"], [class~="hover:bg-indigo-600"]
+):hover { background-color: rgb(var(--port-accent)) !important; }
+
+html[data-port-theme] :is(
+  [class~="hover:bg-purple-400"], [class~="hover:bg-purple-500"], [class~="hover:bg-purple-600"],
+  [class~="hover:bg-violet-400"], [class~="hover:bg-violet-500"], [class~="hover:bg-violet-600"],
+  [class~="hover:bg-fuchsia-500"], [class~="hover:bg-pink-500"]
+):hover { background-color: rgb(var(--port-accent-2)) !important; }
+
+html[data-port-theme] :is(
+  [class~="hover:bg-green-400"], [class~="hover:bg-green-500"], [class~="hover:bg-green-600"],
+  [class~="hover:bg-emerald-400"], [class~="hover:bg-emerald-500"], [class~="hover:bg-emerald-600"],
+  [class~="hover:bg-lime-400"], [class~="hover:bg-lime-500"], [class~="hover:bg-teal-500"], [class~="hover:bg-teal-600"]
+):hover { background-color: rgb(var(--port-success)) !important; }
+
+html[data-port-theme] :is(
+  [class~="hover:bg-yellow-400"], [class~="hover:bg-yellow-500"], [class~="hover:bg-yellow-600"],
+  [class~="hover:bg-amber-400"], [class~="hover:bg-amber-500"], [class~="hover:bg-amber-600"],
+  [class~="hover:bg-orange-400"], [class~="hover:bg-orange-500"], [class~="hover:bg-orange-600"]
+):hover { background-color: rgb(var(--port-warning)) !important; }
+
+html[data-port-theme] :is(
+  [class~="hover:bg-red-400"], [class~="hover:bg-red-500"], [class~="hover:bg-red-600"], [class~="hover:bg-red-700"],
+  [class~="hover:bg-rose-400"], [class~="hover:bg-rose-500"], [class~="hover:bg-rose-600"]
+):hover { background-color: rgb(var(--port-error)) !important; }
+
+/* Shared neutral surface contract. Legacy dark gray utilities are common in
+   settings, diagnostics, and imported provider panels; treating them as
+   theme aliases keeps their text/background pairing readable in both modes.
+   White/black utilities are intentionally excluded because they are also used
+   for fixed media, scrims, and canvas chrome with their own contracts below. */
+html[data-port-theme] :is(.bg-gray-800, .bg-zinc-800, .bg-neutral-800, .bg-slate-800) {
+  background-color: rgb(var(--port-card) / var(--port-card-alpha)) !important;
+}
+
+html[data-port-theme] :is(.bg-gray-900, .bg-zinc-900, .bg-neutral-900, .bg-slate-900) {
+  background-color: rgb(var(--port-bg) / var(--port-bg-alpha)) !important;
+}
+
+html[data-port-theme] :is(.bg-gray-700, .bg-zinc-700, .bg-neutral-700, .bg-slate-700, .bg-gray-600, .bg-zinc-600, .bg-neutral-600, .bg-slate-600) {
+  background-color: var(--port-control-bg) !important;
+}
+
+html[data-port-theme] :is(.bg-gray-500, .bg-zinc-500, .bg-neutral-500, .bg-slate-500) {
+  background-color: var(--port-control-bg-hover) !important;
+}
+
+/* Every rounded/bordered CONTENT CARD gets the theme's card elevation, at any
+   fill opacity. Listing only `/50` meant a card written `bg-port-card/40` — the
+   other common spelling — silently lost both its shadow and its glass blur, so
+   two adjacent cards on one page could sit at different elevations for no
+   reason a reader could see. */
+html[data-port-theme] :is(
+  .bg-port-card,
+  [class~="bg-port-card/30"],
+  [class~="bg-port-card/40"],
+  [class~="bg-port-card/50"],
+  [class~="bg-port-card/60"],
+  [class~="bg-port-card/70"],
+  [class~="bg-port-card/80"],
+  [class~="bg-port-card/90"],
+  [class~="bg-port-card/95"]
+):is(.border, .rounded, .rounded-lg, .rounded-xl, .rounded-2xl) {
+  backdrop-filter: var(--port-backdrop-filter);
+  box-shadow: var(--port-shadow-card);
+}
+
+/* Card top wash, tokenized (#6248) — was 8 near-identical per-theme selector
+   blocks differing only in a border alpha and a background-image. The image
+   half is safe to share unconditionally (default `none`/`auto` is a true
+   no-op). The border half is NOT shared here — see the theme-scoped rule
+   below: an unconditional `border-color` here would out-specificity a
+   component's own semantic border class (`border-port-accent` for a
+   "selected" card, `border-port-error`, …) on every theme, not just the ones
+   that used to override it. */
+html[data-port-theme] :is(.bg-port-card, [class~="bg-port-card/50"]):is(.border, .rounded, .rounded-lg, .rounded-xl, .rounded-2xl) {
+  background-image: var(--port-card-surface-image);
+  background-size: var(--port-card-surface-size);
+}
+
+/* Card border tint, tokenized (#6248) — scoped to the exact themes that
+   overrode it before (specificity matters here: this selector shape is what
+   let the theme tint win over `.border-port-border` while still losing to a
+   component's own semantic border class at equal specificity elsewhere). A
+   theme not listed here never applied this override and still doesn't. */
+html:is([data-port-theme="lumen-glass"], [data-port-theme="lumen-glass-day"], [data-port-theme="black-ice-terminal"], [data-port-theme="black-ice-terminal-day"], [data-port-theme-family="blueprint"], [data-port-theme-family="kestrel"])
+  :is(.bg-port-card, [class~="bg-port-card/50"]):is(.border, .rounded, .rounded-lg, .rounded-xl, .rounded-2xl) {
+  border-color: rgb(var(--port-card-border-color) / var(--port-card-border-alpha)) !important;
+}
+
+html[data-port-theme] :is(.shadow-lg, .shadow-xl, .shadow-2xl) {
+  box-shadow: var(--port-shadow-elevated) !important;
+}
+
+html[data-port-theme] #root > .bg-port-bg {
+  background: var(--port-app-backdrop) !important;
+}
+
+/* Scoped to the app shell's OWN nav landmarks (`.port-app-sidebar` /
+   `.port-app-topbar` in Layout.jsx), not the bare `aside`/`header` tag — a
+   bare-tag selector here also matched every unrelated `<aside class="...
+   bg-port-card ...">` in the app, including the shared slide-over `Drawer`
+   panel (`components/Drawer.jsx`), silently swapping its opaque card fill for
+   the sidebar's translucent gradient + blur (tuned to sit against the
+   persistent app background, not to obscure a modal's arbitrary scrolled
+   content underneath). `Drawer.jsx`'s panel now carries `.port-opaque-surface`
+   (above) instead, the same fix as the analogous floating-menu case. */
+html[data-port-theme] .port-app-sidebar.bg-port-card,
+html[data-port-theme] .port-app-topbar.bg-port-card {
+  background: var(--port-sidebar-bg) !important;
+  backdrop-filter: var(--port-backdrop-filter);
+}
+
+html[data-port-theme] aside nav a,
+html[data-port-theme] aside nav button,
+html[data-port-theme] header a,
+html[data-port-theme] header button {
+  border-radius: var(--port-radius-lg) !important;
+}
+
+html[data-port-theme] aside nav :is(a, button):hover,
+html[data-port-theme] header :is(a, button):hover {
+  background: var(--port-hover-bg) !important;
+}
+
+html[data-port-theme] [class~="bg-port-accent/10"],
+html[data-port-theme] [class~="bg-port-accent/20"],
+html[data-port-theme] aside nav [aria-current="page"] {
+  background: var(--port-active-bg) !important;
+}
+
+/* Active-nav accent rule + glow, tokenized (#6248) — was 4 near-identical
+   per-theme `aside nav [aria-current="page"]` blocks (a border-left color and,
+   for Kestrel Neon only, a text-shadow). Doesn't touch `background` — that
+   stays on the `!important` rule above. */
+html[data-port-theme] aside nav [aria-current="page"] {
+  border-left: var(--port-nav-active-rule);
+  text-shadow: var(--port-nav-active-glow);
+}
+
+/* Tonal semantic surfaces keep their alpha/background treatment, but legacy
+   literal white/black ink must follow the semantic foreground role. This is
+   the safe pairing for /5 through /30 chips; higher-opacity fills use the
+   matching `--port-on-*` token above. */
+html[data-port-theme] :is(
+  [class~="bg-port-accent/5"], [class~="bg-port-accent/8"], [class~="bg-port-accent/10"],
+  [class~="bg-port-accent/15"], [class~="bg-port-accent/20"], [class~="bg-port-accent/25"], [class~="bg-port-accent/30"]
+):is(
+  [class~="text-white"], [class~="text-black"],
+  [class^="text-white/"], [class*=" text-white/"],
+  [class^="text-black/"], [class*=" text-black/"]
+) {
+  color: rgb(var(--port-accent-text)) !important;
+}
+html[data-port-theme] :is(
+  [class~="bg-port-accent-2/5"], [class~="bg-port-accent-2/10"], [class~="bg-port-accent-2/15"],
+  [class~="bg-port-accent-2/20"], [class~="bg-port-accent-2/25"], [class~="bg-port-accent-2/30"]
+):is(
+  [class~="text-white"], [class~="text-black"],
+  [class^="text-white/"], [class*=" text-white/"],
+  [class^="text-black/"], [class*=" text-black/"]
+) {
+  color: rgb(var(--port-accent-2-text)) !important;
+}
+html[data-port-theme] :is(
+  [class~="bg-port-success/5"], [class~="bg-port-success/10"], [class~="bg-port-success/15"],
+  [class~="bg-port-success/20"], [class~="bg-port-success/25"], [class~="bg-port-success/30"]
+):is(
+  [class~="text-white"], [class~="text-black"],
+  [class^="text-white/"], [class*=" text-white/"],
+  [class^="text-black/"], [class*=" text-black/"]
+) {
+  color: rgb(var(--port-success-text)) !important;
+}
+html[data-port-theme] :is(
+  [class~="bg-port-warning/5"], [class~="bg-port-warning/10"], [class~="bg-port-warning/15"],
+  [class~="bg-port-warning/20"], [class~="bg-port-warning/25"], [class~="bg-port-warning/30"]
+):is(
+  [class~="text-white"], [class~="text-black"],
+  [class^="text-white/"], [class*=" text-white/"],
+  [class^="text-black/"], [class*=" text-black/"]
+) {
+  color: rgb(var(--port-warning-text)) !important;
+}
+html[data-port-theme] :is(
+  [class~="bg-port-error/5"], [class~="bg-port-error/10"], [class~="bg-port-error/15"],
+  [class~="bg-port-error/20"], [class~="bg-port-error/25"], [class~="bg-port-error/30"]
+):is(
+  [class~="text-white"], [class~="text-black"],
+  [class^="text-white/"], [class*=" text-white/"],
+  [class^="text-black/"], [class*=" text-black/"]
+) {
+  color: rgb(var(--port-error-text)) !important;
+}
+
+html[data-port-theme] .bg-port-border {
+  background: var(--port-control-bg) !important;
+}
+
+html[data-port-theme] [class~="bg-port-border/20"] { background: color-mix(in srgb, var(--port-control-bg) 20%, transparent) !important; }
+html[data-port-theme] [class~="bg-port-border/30"] { background: color-mix(in srgb, var(--port-control-bg) 30%, transparent) !important; }
+html[data-port-theme] [class~="bg-port-border/40"] { background: color-mix(in srgb, var(--port-control-bg) 40%, transparent) !important; }
+html[data-port-theme] [class~="bg-port-border/50"] { background: color-mix(in srgb, var(--port-control-bg) 50%, transparent) !important; }
+html[data-port-theme] [class~="bg-port-border/60"] { background: color-mix(in srgb, var(--port-control-bg) 60%, transparent) !important; }
+html[data-port-theme] [class~="bg-port-border/70"] { background: color-mix(in srgb, var(--port-control-bg) 70%, transparent) !important; }
+html[data-port-theme] [class~="bg-port-border/80"] { background: color-mix(in srgb, var(--port-control-bg) 80%, transparent) !important; }
+
+html[data-port-theme] [class~="hover:bg-port-border"]:hover {
+  background: var(--port-control-bg-hover) !important;
+}
+
+html[data-port-theme] [class~="hover:bg-port-border/20"]:hover { background: color-mix(in srgb, var(--port-control-bg-hover) 20%, transparent) !important; }
+html[data-port-theme] [class~="hover:bg-port-border/30"]:hover { background: color-mix(in srgb, var(--port-control-bg-hover) 30%, transparent) !important; }
+html[data-port-theme] [class~="hover:bg-port-border/50"]:hover,
+html[data-port-theme] [class~="focus:bg-port-border/50"]:focus { background: color-mix(in srgb, var(--port-control-bg-hover) 50%, transparent) !important; }
+html[data-port-theme] [class~="hover:bg-port-border/70"]:hover { background: color-mix(in srgb, var(--port-control-bg-hover) 70%, transparent) !important; }
+html[data-port-theme] [class~="hover:bg-port-border/80"]:hover { background: color-mix(in srgb, var(--port-control-bg-hover) 80%, transparent) !important; }
+
+html[data-port-theme] :is(.bg-port-border, [class~="bg-port-border/50"]):is([class~="text-gray-400"], [class~="text-gray-500"]) {
+  color: rgb(var(--port-control-text)) !important;
+}
+
+html[data-port-theme] .bg-port-accent {
+  box-shadow: var(--port-shadow-interactive);
+}
+
+html[data-port-theme] [class~="bg-port-accent"]:is([class~="text-white"], [class~="text-black"]) {
+  color: rgb(var(--port-on-accent)) !important;
+}
+
+html[data-port-theme] [class~="bg-port-success"]:is([class~="text-white"], [class~="text-black"]) {
+  color: rgb(var(--port-on-success)) !important;
+}
+
+/* Hardcoded Tailwind green/emerald backgrounds with white text fail WCAG AA
+   contrast (white on #22c55e ≈ 2.0). Route through --port-on-success so themed
+   dark text wins automatically — mirrors the bg-port-success rule above for
+   components that bypass the theme token. */
+html[data-port-theme] :is(
+  .bg-green-400, .bg-green-500, .bg-green-600,
+  .bg-emerald-400, .bg-emerald-500, .bg-emerald-600,
+  .bg-lime-400, .bg-lime-500
+):is([class~="text-white"], [class~="text-black"]) {
+  color: rgb(var(--port-on-success)) !important;
+}
+
+html[data-port-theme] [class~="bg-port-warning"]:is([class~="text-white"], [class~="text-black"]) {
+  color: rgb(var(--port-on-warning)) !important;
+}
+
+html[data-port-theme] [class~="bg-port-error"]:is([class~="text-white"], [class~="text-black"]) {
+  color: rgb(var(--port-on-error)) !important;
+}
+
+html[data-port-theme] :is(.bg-port-error, .bg-port-warning, .bg-port-success, .bg-port-accent):not([class~="rounded"]):not([class*="rounded-"]) {
+  border-radius: var(--port-radius-lg);
+}
+
+html[data-port-theme] .recharts-cartesian-grid line,
+html[data-port-theme] .recharts-polar-grid-angle line,
+html[data-port-theme] .recharts-polar-grid-concentric circle {
+  stroke: rgb(var(--port-chart-grid) / 0.34);
+}
+
+html[data-port-theme="lumen-glass"] main {
+  background:
+    linear-gradient(180deg, rgb(255 255 255 / 0.035), transparent 240px);
+}
+
+html[data-port-theme="black-ice-terminal"] body {
+  text-shadow: 0 0 12px rgb(var(--port-accent) / 0.08);
+}
+
+html[data-port-theme="black-ice-terminal"] :is(h1, h2, h3, h4, .text-lg, .text-xl, .text-2xl, .text-3xl) {
+  color: rgb(var(--port-text));
+}
+
+html[data-port-theme="blueprint-ops"] :is(h1, h2, h3) {
+  border-left: 3px solid rgb(var(--port-accent) / 0.72);
+  padding-left: 0.55rem;
+}
+
+html[data-port-theme="blueprint-ops"] aside :is(h1, h2, h3),
+html[data-port-theme="blueprint-ops"] header :is(h1, h2, h3) {
+  border-left: 0;
+  padding-left: 0;
+}
+
+/* === Day mode: remap hardcoded Tailwind dark utilities onto theme tokens. */
+html[data-port-theme-mode="day"] :is(.text-white, .text-zinc-50, .text-zinc-100, .text-neutral-50, .text-neutral-100, .text-gray-50, .text-gray-100, .text-slate-50, .text-slate-100) {
+  color: rgb(var(--port-text)) !important;
+}
+
+html[data-port-theme-mode="day"] :is(.text-zinc-200, .text-zinc-300, .text-neutral-200, .text-neutral-300, .text-gray-200, .text-gray-300, .text-slate-200, .text-slate-300) {
+  color: rgb(var(--port-text) / 0.85) !important;
+}
+
+html[data-port-theme-mode="day"] :is(.text-zinc-400, .text-zinc-500, .text-neutral-400, .text-neutral-500, .text-gray-400, .text-gray-500, .text-slate-400, .text-slate-500) {
+  color: rgb(var(--port-text-muted)) !important;
+}
+
+html[data-port-theme-mode="day"] :is(.bg-white, .bg-zinc-50, .bg-neutral-50, .bg-gray-50, .bg-slate-50) {
+  background-color: rgb(var(--port-card) / var(--port-card-alpha)) !important;
+}
+
+html[data-port-theme-mode="day"] [class~="bg-slate-900/40"],
+html[data-port-theme-mode="day"] [class~="bg-slate-900/60"],
+html[data-port-theme-mode="day"] [class~="bg-slate-900/80"],
+html[data-port-theme-mode="day"] [class~="bg-slate-950/40"],
+html[data-port-theme-mode="day"] [class~="bg-gray-900/50"],
+html[data-port-theme-mode="day"] [class~="bg-zinc-950/40"],
+html[data-port-theme-mode="day"] [class~="bg-stone-950/40"],
+html[data-port-theme-mode="day"] [class~="bg-indigo-950/40"] {
+  background-color: rgb(var(--port-card) / 0.6) !important;
+}
+
+html[data-port-theme-mode="day"] [class~="bg-slate-800/80"]:hover {
+  background-color: rgb(var(--port-card) / 0.85) !important;
+}
+
+/* Tailwind gradient utilities resolve to --tw-gradient-from/-to; override
+ * the resolved values, not the class. */
+html[data-port-theme-mode="day"] [class~="from-slate-900/80"] {
+  --tw-gradient-from: rgb(var(--port-card) / 0.6) !important;
+  --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to, rgb(var(--port-card) / 0)) !important;
+}
+
+html[data-port-theme-mode="day"] [class~="to-slate-900/40"] {
+  --tw-gradient-to: rgb(var(--port-card) / 0.3) !important;
+}
+
+html[data-port-theme-mode="day"] [class~="border-gray-700"],
+html[data-port-theme-mode="day"] [class~="border-gray-700/40"],
+html[data-port-theme-mode="day"] [class~="border-gray-700/50"],
+html[data-port-theme-mode="day"] [class~="border-slate-700/50"] {
+  border-color: rgb(var(--port-border) / calc(var(--port-border-alpha) * 1.4)) !important;
+}
+
+/* Day-mode alpha variants and interaction states need separate compositing
+   values; the solid neutral aliases live in the shared contract above. */
+
+/* Toggle off-state track. The global bg-gray-600 → --port-control-bg remap
+   above turns ToggleSwitch's inactive track into the same cream as the page,
+   making the toggle (and its white knob) nearly invisible on light themes
+   like Phosphor Paper. This class keeps the dark-theme gray-600 look while
+   swapping to a contrasting muted tone in day mode. */
+.port-toggle-track-off {
+  background-color: rgb(75 85 99);
+}
+html[data-port-theme-mode="day"] .port-toggle-track-off {
+  background-color: rgb(var(--port-text-muted) / 0.7) !important;
+}
+
+html[data-port-theme-mode="day"] [class~="bg-gray-800/30"],
+html[data-port-theme-mode="day"] [class~="bg-gray-800/40"],
+html[data-port-theme-mode="day"] [class~="bg-gray-800/50"],
+html[data-port-theme-mode="day"] [class~="bg-gray-800/60"],
+html[data-port-theme-mode="day"] [class~="bg-gray-800/70"],
+html[data-port-theme-mode="day"] [class~="bg-slate-800/80"] {
+  background-color: rgb(var(--port-card) / 0.55) !important;
+}
+
+html[data-port-theme-mode="day"] [class~="bg-gray-700/40"],
+html[data-port-theme-mode="day"] [class~="bg-gray-600/20"],
+html[data-port-theme-mode="day"] [class~="bg-gray-600/30"] {
+  background-color: var(--port-control-bg) !important;
+}
+
+html[data-port-theme-mode="day"] [class~="bg-gray-500/10"],
+html[data-port-theme-mode="day"] [class~="bg-gray-500/15"],
+html[data-port-theme-mode="day"] [class~="bg-gray-500/20"] {
+  background-color: rgb(var(--port-card) / 0.25) !important;
+}
+
+html[data-port-theme-mode="day"] [class~="hover:bg-gray-800"]:hover,
+html[data-port-theme-mode="day"] [class~="hover:bg-gray-900"]:hover {
+  background-color: rgb(var(--port-card) / calc(var(--port-card-alpha) * 0.85)) !important;
+}
+
+html[data-port-theme-mode="day"] [class~="hover:bg-gray-500"]:hover,
+html[data-port-theme-mode="day"] [class~="hover:bg-gray-600"]:hover,
+html[data-port-theme-mode="day"] [class~="hover:bg-gray-700"]:hover {
+  background-color: var(--port-control-bg-hover) !important;
+}
+
+html[data-port-theme-mode="day"] [class~="hover:bg-gray-500/20"]:hover {
+  background-color: rgb(var(--port-card) / 0.25) !important;
+}
+
+html[data-port-theme-mode="day"] [class~="hover:bg-slate-800/80"]:hover {
+  background-color: rgb(var(--port-card) / 0.7) !important;
+}
+
+/* Borders — gray-500/600/800 used on inputs, dividers, button outlines. */
+html[data-port-theme-mode="day"] :is(.border-gray-500, .border-gray-600, .border-gray-800, .border-zinc-700, .border-zinc-800, .border-slate-800) {
+  border-color: rgb(var(--port-border) / calc(var(--port-border-alpha) * 1.4)) !important;
+}
+
+html[data-port-theme-mode="day"] [class~="border-gray-500/30"],
+html[data-port-theme-mode="day"] [class~="border-gray-600/40"],
+html[data-port-theme-mode="day"] [class~="border-slate-500/40"],
+html[data-port-theme-mode="day"] [class~="border-slate-500/50"],
+html[data-port-theme-mode="day"] [class~="border-zinc-500/40"] {
+  border-color: rgb(var(--port-border) / calc(var(--port-border-alpha) * 0.7)) !important;
+}
+
+html[data-port-theme-mode="day"] [class~="border-indigo-500/20"],
+html[data-port-theme-mode="day"] [class~="border-indigo-500/30"],
+html[data-port-theme-mode="day"] [class~="border-indigo-500/40"] {
+  border-color: rgb(var(--port-accent) / 0.32) !important;
+}
+
+html[data-port-theme-mode="day"] [class~="bg-indigo-500/10"] {
+  background-color: rgb(var(--port-accent) / 0.1) !important;
+}
+html[data-port-theme-mode="day"] [class~="bg-indigo-500/15"] {
+  background-color: rgb(var(--port-accent) / 0.14) !important;
+}
+html[data-port-theme-mode="day"] [class~="bg-indigo-500/20"] {
+  background-color: rgb(var(--port-accent) / 0.18) !important;
+}
+
+/* Legacy hue utilities are normalized by the shared foreground contract
+   above for both day and night. Keeping one rule set prevents a day-only
+   literal palette from drifting away from the eight theme tokens. */
+
+/* hover variants of near-white utilities — without these, hover:text-white on a
+ * gray-on-light element flashes pure white-on-light and becomes unreadable
+ * (e.g. <summary>Summary</summary> in ArcCanvas). Mirrors the base remap above. */
+html[data-port-theme-mode="day"] [class~="hover:text-white"]:hover,
+html[data-port-theme-mode="day"] [class~="hover:text-zinc-50"]:hover,
+html[data-port-theme-mode="day"] [class~="hover:text-zinc-100"]:hover,
+html[data-port-theme-mode="day"] [class~="hover:text-neutral-50"]:hover,
+html[data-port-theme-mode="day"] [class~="hover:text-neutral-100"]:hover,
+html[data-port-theme-mode="day"] [class~="hover:text-gray-50"]:hover,
+html[data-port-theme-mode="day"] [class~="hover:text-gray-100"]:hover,
+html[data-port-theme-mode="day"] [class~="hover:text-slate-50"]:hover,
+html[data-port-theme-mode="day"] [class~="hover:text-slate-100"]:hover {
+  color: rgb(var(--port-text)) !important;
+}
+
+/* Fixed black overlays are intentionally outside the theme surface palette
+ * (media scrims, lightbox controls, and timeline labels). Keep their light
+ * utility ink light in day mode instead of applying the page-text remap. */
+html[data-port-theme-mode="day"] :is(.bg-black, [class^="bg-black/"], [class*=" bg-black/"]):is(
+  [class~="text-white"], [class^="text-white/"], [class*=" text-white/"],
+  [class~="text-zinc-50"], [class~="text-zinc-100"], [class^="text-zinc-50/"], [class^="text-zinc-100/"], [class*=" text-zinc-50/"], [class*=" text-zinc-100/"],
+  [class~="text-neutral-50"], [class~="text-neutral-100"], [class^="text-neutral-50/"], [class^="text-neutral-100/"], [class*=" text-neutral-50/"], [class*=" text-neutral-100/"],
+  [class~="text-gray-50"], [class~="text-gray-100"], [class^="text-gray-50/"], [class^="text-gray-100/"], [class*=" text-gray-50/"], [class*=" text-gray-100/"],
+  [class~="text-slate-50"], [class~="text-slate-100"], [class^="text-slate-50/"], [class^="text-slate-100/"], [class*=" text-slate-50/"], [class*=" text-slate-100/"]
+) {
+  color: rgb(255 255 255) !important;
+}
+html[data-port-theme-mode="day"] :is(.bg-black, [class^="bg-black/"], [class*=" bg-black/"]):is(
+  [class~="text-zinc-200"], [class~="text-zinc-300"], [class^="text-zinc-200/"], [class^="text-zinc-300/"], [class*=" text-zinc-200/"], [class*=" text-zinc-300/"],
+  [class~="text-neutral-200"], [class~="text-neutral-300"], [class^="text-neutral-200/"], [class^="text-neutral-300/"], [class*=" text-neutral-200/"], [class*=" text-neutral-300/"],
+  [class~="text-gray-200"], [class~="text-gray-300"], [class^="text-gray-200/"], [class^="text-gray-300/"], [class*=" text-gray-200/"], [class*=" text-gray-300/"],
+  [class~="text-slate-200"], [class~="text-slate-300"], [class^="text-slate-200/"], [class^="text-slate-300/"], [class*=" text-slate-200/"], [class*=" text-slate-300/"]
+) {
+  color: rgb(212 212 216) !important;
+}
+html[data-port-theme-mode="day"] :is(.bg-black, [class^="bg-black/"], [class*=" bg-black/"]):is(
+  [class~="text-zinc-400"], [class~="text-zinc-500"], [class^="text-zinc-400/"], [class^="text-zinc-500/"], [class*=" text-zinc-400/"], [class*=" text-zinc-500/"],
+  [class~="text-neutral-400"], [class~="text-neutral-500"], [class^="text-neutral-400/"], [class^="text-neutral-500/"], [class*=" text-neutral-400/"], [class*=" text-neutral-500/"],
+  [class~="text-gray-400"], [class~="text-gray-500"], [class^="text-gray-400/"], [class^="text-gray-500/"], [class*=" text-gray-400/"], [class*=" text-gray-500/"],
+  [class~="text-slate-400"], [class~="text-slate-500"], [class^="text-slate-400/"], [class^="text-slate-500/"], [class*=" text-slate-400/"], [class*=" text-slate-500/"]
+) {
+  color: rgb(161 161 170) !important;
+}
+html[data-port-theme-mode="day"] :is(.bg-black, [class^="bg-black/"], [class*=" bg-black/"]):is(
+  [class*="hover:text-white"], [class*="hover:text-zinc-50"], [class*="hover:text-zinc-100"],
+  [class*="hover:text-neutral-50"], [class*="hover:text-neutral-100"],
+  [class*="hover:text-gray-50"], [class*="hover:text-gray-100"],
+  [class*="hover:text-slate-50"], [class*="hover:text-slate-100"]
+):hover {
+  color: rgb(255 255 255) !important;
+}
+
+/* Keep text contrast on always-dark panels (e.g. video overlays, 3D canvas control panels, HUDs) in day mode */
+html[data-port-theme-mode="day"] .always-dark :is(.text-white, .text-zinc-50, .text-zinc-100, .text-neutral-50, .text-neutral-100, .text-gray-50, .text-gray-100, .text-slate-50, .text-slate-100) {
+  color: rgb(255 255 255) !important;
+}
+html[data-port-theme-mode="day"] .always-dark :is(.text-zinc-200, .text-zinc-300, .text-neutral-200, .text-neutral-300, .text-gray-200, .text-gray-300, .text-slate-200, .text-slate-300) {
+  color: rgb(212 212 216) !important;
+}
+html[data-port-theme-mode="day"] .always-dark :is(.text-zinc-400, .text-zinc-500, .text-neutral-400, .text-neutral-500, .text-gray-400, .text-gray-500, .text-slate-400, .text-slate-500) {
+  color: rgb(161 161 170) !important;
+}
+html[data-port-theme-mode="day"] .always-dark [class~="hover:text-white"]:hover,
+html[data-port-theme-mode="day"] .always-dark [class~="hover:text-zinc-100"]:hover,
+html[data-port-theme-mode="day"] .always-dark [class~="hover:text-neutral-100"]:hover,
+html[data-port-theme-mode="day"] .always-dark [class~="hover:text-gray-100"]:hover,
+html[data-port-theme-mode="day"] .always-dark [class~="hover:text-slate-100"]:hover {
+  color: rgb(255 255 255) !important;
+}
+
+/* === Media overlay chrome ===
+   Labels, status bars, badges, and small control panels that float over an
+   image, a video, or a 3D canvas.
+
+   The old idiom — `bg-black/65 text-white` — breaks on a day theme: the remap
+   above rewrites `text-white` to the theme's dark ink while the black scrim
+   stays black, so the label renders dark-on-black. `.always-dark` pins the text
+   back to white but leaves a black slab floating over a cream page.
+
+   These classes take the theme's own card + text pairing instead, so overlay
+   chrome matches the page and its contrast is the theme's own card contrast —
+   over a dark canvas, a light one, or a photograph. Written as a literal alpha
+   rather than `bg-port-card/NN` (floored opaque for content cards) or
+   `--port-overlay-alpha` (tuned for full-screen modal backdrops, and low enough
+   on several themes to drop muted ink under AA once an arbitrary image shows
+   through). At 0.9 there is nothing left for a `backdrop-blur` to soften, so
+   don't add one.
+
+   This is the successor to the two older answers to the same problem, and the
+   rule for picking between the three is:
+   - `.port-media-overlay*` — the default for new overlay chrome.
+   - `.always-dark` (above) — only when the surface underneath is genuinely
+     fixed-dark regardless of theme: video-player chrome, a terminal, a
+     full-screen lightbox. */
+.port-media-overlay {
+  background-color: rgb(var(--port-card) / 0.9);
+}
+
+/* Solid variant for a small label sitting directly on photography, where even
+   10% show-through takes its contrast from whatever pixels it lands on. Same
+   fill as `.port-opaque-surface` (above) for the same reason — an opaque themed
+   surface with arbitrary content behind it and no backdrop to sit on — but no
+   `!important`, since these labels are not fighting a `bg-port-card/NN`. */
+.port-media-overlay-strong {
+  background-color: rgb(var(--port-card));
+}
+
+/* Zero-specificity so the default ink is a fallback, not an override: an
+   overlay that carries its own `text-port-success` / `text-port-text-muted`
+   utility keeps it. */
+:where(.port-media-overlay, .port-media-overlay-strong) {
+  color: rgb(var(--port-text));
+}
+
+/* Interactive overlay chrome — buttons inside an overlay panel, and buttons
+   that ARE one. `hover:bg-white/15` is the companion idiom to the black scrim
+   and disappears against a light one.
+
+   The state tint rides on `background-image` so it composites OVER whatever
+   scrim the element already carries instead of replacing it — a button that is
+   its own `.port-media-overlay-strong` would otherwise go transparent on
+   hover. That is also why the app-wide `--port-hover-bg` / `--port-active-bg`
+   pair isn't reused here: `--port-active-bg` is a gradient on six of the eight
+   themes, so it cannot ride this mechanism, and a hover that reused its token
+   while pressed did not would drift the two states apart. */
+.port-media-overlay-item:hover,
+.port-media-overlay-item[aria-pressed="true"] {
+  background-image: linear-gradient(
+    var(--port-overlay-item-tint),
+    var(--port-overlay-item-tint)
+  );
+}
+
+.port-media-overlay-item:hover {
+  --port-overlay-item-tint: rgb(var(--port-text) / 0.12);
+}
+
+.port-media-overlay-item[aria-pressed="true"] {
+  --port-overlay-item-tint: rgb(var(--port-accent) / 0.22);
+}
+
+.port-media-overlay-item[aria-pressed="true"]:hover {
+  --port-overlay-item-tint: rgb(var(--port-accent) / 0.32);
+}
+
+.port-media-overlay-divider {
+  background-color: rgb(var(--port-text) / 0.2);
+}
+
+/* === Classic Noon === */
+/* Classic Noon uses the classic card surface directly; keeping the selector
+   explicit makes the day variant's card fill part of the theme contract. */
+html[data-port-theme="classic-noon"] .bg-port-card {
+  background-color: rgb(var(--port-card) / var(--port-card-alpha)) !important;
+}
+
+/* === Lumen Glass Day === */
+/* This theme's card-border coverage predates the shared card-border rule
+   above and was always wider — every `bg-port-card/NN` fill opacity, not just
+   `.bg-port-card`/`/50` — so it stays as its own selector rather than
+   widening the shared rule (and changing the other 7 themes' rarer alpha
+   variants along with it). Still token-driven now: no literal alpha left
+   here. `box-shadow` isn't restated — the wide-list elevation rule above
+   already applies `--port-shadow-card` to every one of these classes. */
+html[data-port-theme="lumen-glass-day"] :is(
+  [class~="bg-port-card/30"],
+  [class~="bg-port-card/40"],
+  [class~="bg-port-card/60"],
+  [class~="bg-port-card/70"],
+  [class~="bg-port-card/80"],
+  [class~="bg-port-card/90"],
+  [class~="bg-port-card/95"]
+):is(.border, .rounded, .rounded-lg, .rounded-xl, .rounded-2xl) {
+  border-color: rgb(var(--port-card-border-color) / var(--port-card-border-alpha)) !important;
+}
+
+html[data-port-theme="lumen-glass-day"] body::before {
+  background-attachment: fixed;
+  animation: portos-glass-drift-a 32s ease-in-out infinite alternate;
+  will-change: background-position;
+}
+
+html[data-port-theme="lumen-glass-day"] body::after {
+  content: "";
+  position: fixed;
+  inset: -10vh -10vw;
+  z-index: -1;
+  pointer-events: none;
+  background: radial-gradient(40vw 40vw at 30vw 70vh, rgb(var(--port-accent) / 0.16) 0%, transparent 60%);
+  filter: blur(80px);
+  opacity: 0.7;
+  animation: portos-glass-drift-b 44s ease-in-out -8s infinite alternate;
+  will-change: transform;
+}
+
+@keyframes portos-glass-drift-a {
+  0%   { background-position: 0 0, 0 0, 0 0, 0 0, 0 0; }
+  100% { background-position: 0 0, 0 0, 0 0, 10vw -5vh, -8vw 6vh; }
+}
+
+@keyframes portos-glass-drift-b {
+  0%   { transform: translate(0, 0) scale(1); }
+  100% { transform: translate(8vw, -4vh) scale(1.15); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html[data-port-theme="lumen-glass-day"] body::before,
+  html[data-port-theme="lumen-glass-day"] body::after {
+    animation: none;
+  }
+}
+
+/* === Phosphor Paper (Black ICE Day) === */
+html[data-port-theme="black-ice-terminal-day"] body {
+  text-shadow: 0 0 8px rgb(var(--port-accent) / 0.04);
+}
+
+/* === Drafting Paper (Blueprint Day) === */
+html[data-port-theme="blueprint-ops-day"] :is(h1, h2, h3) {
+  border-left: 3px solid rgb(var(--port-accent) / 0.72);
+  padding-left: 0.55rem;
+}
+
+html[data-port-theme="blueprint-ops-day"] aside :is(h1, h2, h3),
+html[data-port-theme="blueprint-ops-day"] header :is(h1, h2, h3) {
+  border-left: 0;
+  padding-left: 0;
+}
+
+/* === Theme effects layer ===
+   A theme opts into full-screen effects by listing them in `effects` in
+   portosThemes.js (registry: THEME_EFFECTS; catalogue and tokens:
+   docs/themes/README.md). useTheme publishes that list as
+   html[data-port-theme-effects="scanlines vignette …"], and each block below
+   keys on the ~= attribute selector, parameterized by --port-fx-* tokens the
+   theme declares (defaults here).
+
+   Everything paints on the dedicated <div class="port-fx-layer"> main.jsx
+   renders beside the app, never on body/#root pseudo-elements a theme might
+   also style. Its two pseudo-elements are the shared slots: ::before is
+   below-content (grid floor), ::after the static above-content overlay
+   (scanlines + vignette, composed in one background list — an unlisted effect
+   resolves to a transparent layer). Its three children are the effects that
+   need an opacity or an animation of their own, since the overlay has exactly
+   one of each for its whole list: .port-fx-aurora is the second below-content
+   slot (mutually exclusive with the grid floor), .port-fx-sweep the moving
+   band, .port-fx-grain the static noise tile. The sweep and the aurora animate
+   transform only, so they stay on the compositor instead of repainting a
+   blended full-screen layer. A child is an inert empty <span> until its effect
+   is listed — the rules below are what give it a position at all. */
+:root {
+  --port-fx-scanline-color: rgb(255 255 255 / 0.025);
+  --port-fx-scanline-period: 5px;
+  --port-fx-overlay-blend: screen;
+  --port-fx-overlay-opacity: 0.22;
+  --port-fx-vignette-color: rgb(0 0 0 / 0.55);
+  --port-fx-sweep-color: rgb(var(--port-accent) / 0.07);
+  --port-fx-sweep-duration: 7s;
+  --port-fx-grid-floor-x: rgb(var(--port-accent-2) / 0.18);
+  --port-fx-grid-floor-y: rgb(var(--port-accent) / 0.18);
+  --port-fx-grid-floor-opacity: 0.45;
+  --port-fx-grid-floor-duration: 3s;
+  --port-fx-glitch-period: 9s;
+  /* Ambient bloom (aurora) and material noise (grain) paint on their own
+     children of .port-fx-layer rather than sharing the overlay, so each keeps
+     an independent opacity — the overlay's is one value for the whole list. */
+  --port-fx-aurora-a: rgb(var(--port-accent) / 0.5);
+  --port-fx-aurora-b: rgb(var(--port-accent-2) / 0.4);
+  --port-fx-aurora-opacity: 0.5;
+  --port-fx-aurora-blur: 70px;
+  --port-fx-aurora-duration: 38s;
+  --port-fx-grain-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='g'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix type='saturate' values='0'/></filter><rect width='100%25' height='100%25' filter='url(%23g)'/></svg>");
+  --port-fx-grain-size: 160px 160px;
+  /* `overlay` is the canonical film-grain blend and the one default that reads
+     on a dark page as well as a light one. All three themes that currently list
+     `grain` are light and override it to `multiply`, which is what print stock
+     actually does to ink — that is a per-theme choice, not a sign this default
+     is wrong for the next dark theme to adopt the effect. */
+  --port-fx-grain-blend: overlay;
+  --port-fx-grain-opacity: 0.06;
+}
+
+html[data-port-theme-effects~="scanlines"] { --port-fx-scanline-active: var(--port-fx-scanline-color); }
+html[data-port-theme-effects~="vignette"] { --port-fx-vignette-active: var(--port-fx-vignette-color); }
+
+.port-fx-layer,
+.port-fx-aurora,
+.port-fx-grain,
+.port-fx-sweep {
+  pointer-events: none;
+}
+
+html:is([data-port-theme-effects~="scanlines"], [data-port-theme-effects~="vignette"]) .port-fx-layer::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 9998;
+  pointer-events: none;
+  background:
+    radial-gradient(ellipse at center, transparent 58%, var(--port-fx-vignette-active, transparent) 100%),
+    repeating-linear-gradient(
+      0deg,
+      transparent 0 calc(var(--port-fx-scanline-period) - 1px),
+      var(--port-fx-scanline-active, transparent) calc(var(--port-fx-scanline-period) - 1px) var(--port-fx-scanline-period)
+    );
+  mix-blend-mode: var(--port-fx-overlay-blend);
+  opacity: var(--port-fx-overlay-opacity);
+}
+
+html[data-port-theme-effects~="sweep"] .port-fx-sweep {
+  position: fixed;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: 18vh;
+  z-index: 9998;
+  background: linear-gradient(180deg, transparent, var(--port-fx-sweep-color), transparent);
+  transform: translate3d(0, -100%, 0);
+  will-change: transform;
+  animation: portos-fx-sweep var(--port-fx-sweep-duration) linear infinite;
+}
+
+@keyframes portos-fx-sweep {
+  to { transform: translate3d(0, 100vh, 0); }
+}
+
+/* Perspective grid floor: three viewports wide and one tall, hinged at its
+   bottom edge and tilted away so the near rows stay full size while the far
+   rows converge toward a horizon about a quarter of the way up the screen.
+   The extra width keeps the foreshortened far edge wider than the viewport.
+   Motion is a plane-local translate of exactly one row, so the loop is
+   seamless and the masked texture is rasterized once. */
+html[data-port-theme-effects~="grid-floor"] .port-fx-layer::before {
+  content: "";
+  position: fixed;
+  left: -100%;
+  right: -100%;
+  bottom: -6%;
+  height: 100%;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    linear-gradient(90deg, var(--port-fx-grid-floor-x) 1px, transparent 1px) 0 0 / 60px 100%,
+    linear-gradient(0deg, var(--port-fx-grid-floor-y) 1px, transparent 1px) 0 0 / 100% 40px;
+  transform: perspective(1200px) rotateX(60deg) translateY(0);
+  transform-origin: 50% 100%;
+  mask-image: linear-gradient(180deg, transparent 30%, #000 75%);
+  -webkit-mask-image: linear-gradient(180deg, transparent 30%, #000 75%);
+  opacity: var(--port-fx-grid-floor-opacity);
+  will-change: transform;
+  animation: portos-fx-gridmove var(--port-fx-grid-floor-duration) linear infinite;
+}
+
+@keyframes portos-fx-gridmove {
+  to { transform: perspective(1200px) rotateX(60deg) translateY(40px); }
+}
+
+/* Ambient aurora: two slow, heavily blurred color blooms drifting behind the
+   app. The below-content sibling of the grid floor — a theme picks one or the
+   other, never both, so they never fight for the same depth. */
+html[data-port-theme-effects~="aurora"] .port-fx-aurora {
+  position: fixed;
+  inset: -20vh -20vw;
+  z-index: -1;
+  background:
+    radial-gradient(38vw 38vw at 24% 26%, var(--port-fx-aurora-a) 0%, transparent 62%),
+    radial-gradient(44vw 44vw at 78% 78%, var(--port-fx-aurora-b) 0%, transparent 62%);
+  filter: blur(var(--port-fx-aurora-blur));
+  opacity: var(--port-fx-aurora-opacity);
+  will-change: transform;
+  animation: portos-fx-aurora var(--port-fx-aurora-duration) ease-in-out infinite alternate;
+}
+
+@keyframes portos-fx-aurora {
+  from { transform: translate3d(0, 0, 0) scale(1); }
+  to { transform: translate3d(5vw, -4vh, 0) scale(1.14); }
+}
+
+/* Material grain: a static monochrome noise tile blended over the app, so a
+   paper or frosted-glass theme reads as a surface instead of flat fill. Its
+   own element, and its own opacity, so a theme can run it under scanlines at
+   a different strength. */
+html[data-port-theme-effects~="grain"] .port-fx-grain {
+  position: fixed;
+  inset: 0;
+  z-index: 9997;
+  background-image: var(--port-fx-grain-image);
+  background-size: var(--port-fx-grain-size);
+  mix-blend-mode: var(--port-fx-grain-blend);
+  opacity: var(--port-fx-grain-opacity);
+}
+
+/* Page titles glitch every few seconds: at rest (the theme's own heading glow)
+   for most of the cycle, then a two-step chromatic split between the accents. */
+html[data-port-theme-effects~="glitch"] h1 {
+  animation: portos-fx-glitch var(--port-fx-glitch-period) steps(2) infinite;
+}
+
+@keyframes portos-fx-glitch {
+  0%, 92%, 100% { text-shadow: var(--port-heading-glow); transform: none; }
+  94% { text-shadow: -3px 0 rgb(var(--port-accent-2)), 3px 0 rgb(var(--port-accent)); transform: translate(-1px, 1px); }
+  96% { text-shadow: 4px 0 rgb(var(--port-accent-2)), -4px 0 rgb(var(--port-accent)); transform: translate(2px, -1px); }
+  98% { text-shadow: -1px 0 rgb(var(--port-accent-2)), 1px 0 rgb(var(--port-accent)); transform: translate(1px, 0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html[data-port-theme-effects] .port-fx-sweep,
+  html[data-port-theme-effects] .port-fx-aurora,
+  html[data-port-theme-effects] .port-fx-layer::before,
+  html[data-port-theme-effects] h1 {
+    animation: none;
+  }
+}
+
+/* === Kestrel (CRT boot terminal) — shared by Neon and Dawn === */
+/* Card border color/image and the nav-active rule are identical for both
+   Kestrel themes, so they live once in kestrelShellTokens (portosThemes.js)
+   rather than as a `data-port-theme-family` selector — the shared rules above
+   already read them. Only the border ALPHA differs night vs. dawn, so it's
+   the one thing still set per-theme here (was --port-kestrel-card-border-alpha). */
+html[data-port-theme="kestrel-neon"] {
+  --port-card-border-alpha: 0.3;
+}
+
+html[data-port-theme="kestrel-neon-day"] {
+  --port-card-border-alpha: 0.26;
+}
+
+html[data-port-theme="kestrel-neon"] body {
+  text-shadow: 0 0 10px rgb(var(--port-accent) / 0.08);
+}
+
+/* Accessibility: Global focus styles for keyboard navigation */
+*:focus-visible {
+  outline: 2px solid rgb(var(--port-focus-ring));
+  outline-offset: 2px;
+}
+
+/* Form fields (input/textarea/select/contenteditable) get the SAME solid,
+   opaque `*:focus-visible` ring as everything else — no dimmer variant.
+   A prior rule here dropped them to a 1px outline at 35% alpha to avoid a
+   "harsh" ring on prose textareas (Writers Room), but `:focus-visible`
+   fires on both keyboard AND pointer focus for text-entry elements (a
+   browser heuristic distinct from buttons/links, where a mouse click never
+   matches it), so the low-alpha ring was also the ONLY keyboard indicator a
+   field ever got — and at 35% alpha composited over a themed input
+   background it fell to ~1.7-1.8:1, well under the 3:1 WCAG non-text
+   contrast floor (#7524). `--port-focus-ring` at full opacity already
+   clears >=3:1 against every theme's page/card/input surface (see
+   portosThemes.test.js), so removing the exception fixes contrast without
+   a per-theme token change. Distinguishing "soft on click, strong on Tab"
+   for text fields would need JS-based input-modality tracking (no keyboard
+   click/keyboard split exists in CSS for this element class) — out of
+   scope for this fix; theme focus glows below remain as decoration. */
+
+/* Accessibility: Remove focus outline for mouse users while keeping it for keyboard */
+*:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* Accessibility: High contrast focus for important interactive elements */
+button:focus-visible,
+a:focus-visible,
+[role="button"]:focus-visible,
+[tabindex="0"]:focus-visible {
+  outline: 2px solid rgb(var(--port-focus-ring));
+  outline-offset: 2px;
+  box-shadow: var(--port-focus-shadow);
+}
+
+/* Field + button/link focus glow, tokenized (#6248) — was 3 per-theme copies
+   of this exact `:is(input, textarea, select):focus, button:focus-visible,
+   a:focus-visible` block. Kept theme-scoped rather than folded into the bare
+   `button:focus-visible` rule above: that rule's specificity is lower than
+   `.bg-port-accent`'s `box-shadow: var(--port-shadow-interactive)`, so an
+   accent-colored button would lose its focus glow to the interactive shadow.
+   Keeping the per-theme selector SHAPE (specificity, not the values) is what
+   lets the listed themes' stronger glow win.
+   The list is opt-in and must stay in sync with the manifests: `--port-focus-glow`
+   defaults to `none`, so adding a theme here without declaring the token would
+   replace its accent button's interactive shadow with nothing on focus.
+   A DIFFERENT token than the generic rule's `--port-focus-shadow` on purpose
+   — that rule also covers `[role="button"]`/`[tabindex="0"]`, which this
+   selector (matching the original) never did, so reusing the same token
+   would leak the stronger glow onto elements it was never meant to reach. */
+html:is([data-port-theme-family="glass"], [data-port-theme-family="terminal"], [data-port-theme="blueprint-ops"], [data-port-theme="kestrel-neon"]) :is(input, textarea, select):focus,
+html:is([data-port-theme-family="glass"], [data-port-theme-family="terminal"], [data-port-theme="blueprint-ops"], [data-port-theme="kestrel-neon"]) button:focus-visible,
+html:is([data-port-theme-family="glass"], [data-port-theme-family="terminal"], [data-port-theme="blueprint-ops"], [data-port-theme="kestrel-neon"]) a:focus-visible {
+  box-shadow: var(--port-focus-glow);
+}
+
+/* DRY pointer cursor for interactive elements. Tailwind v4 dropped the
+   default `cursor: pointer` on <button>, so without this rule every clickable
+   needs `cursor-pointer` added by hand. Disabled elements override via the
+   rule below; if you need a non-semantic clickable (e.g. a <div> acting as a
+   row trigger), give it role="button" so it's covered here and accessible. */
+button,
+a[href],
+summary,
+select,
+label[for],
+label:has(input[type="checkbox"]),
+label:has(input[type="radio"]),
+input[type="checkbox"],
+input[type="radio"],
+input[type="submit"],
+input[type="button"],
+input[type="reset"],
+input[type="file"],
+input[type="range"],
+input[type="color"],
+[role="button"],
+[role="link"],
+[role="tab"],
+[role="menuitem"],
+[role="menuitemcheckbox"],
+[role="menuitemradio"],
+[role="option"],
+[role="checkbox"],
+[role="radio"],
+[role="switch"] {
+  cursor: pointer;
+}
+
+/* DRY left-alignment for flex buttons, same rationale as the cursor rule above.
+   Tailwind preflight leaves the UA `text-align: center` on <button>. Inside a
+   flex button the label is an anonymous flex item, so a label that WRAPS
+   centers every line — a two-line section header (chevron + icon + label)
+   renders as a ragged centered stack on a phone while reading fine on desktop,
+   which is why it goes unnoticed. Single-line labels are unaffected: the item
+   is sized to its content, so there is no slack for text-align to act on.
+
+   It corrects preflight, so it belongs in `@layer base` — and the layer is
+   load-bearing, not decorative. Tailwind emits `.text-center` into
+   `@layer utilities`, and an UNLAYERED rule beats every layered one no matter
+   how low its specificity, so writing this at the top level (as the cursor
+   rule above is) would override `text-center` on all ~38 flex buttons that ask
+   for it. From `base`, utilities come later in the cascade and win — which is
+   what `:where()`'s zero specificity also guarantees within the layer.
+
+   Being in the earliest layer does NOT weaken the fix, which is the tempting
+   misreading: the centering it overrides comes from the browser's UA
+   stylesheet, not from preflight (preflight never touches button text-align —
+   grep the build, this is the only author rule that sets it). Author styles
+   beat UA styles in every layer, because layers order rules *within* an origin
+   and never across origins. So on a flex button with no `text-*` utility this
+   wins; on one that asks for `text-center` the utility wins. Both intended.
+   `justify-center` buttons are excluded because there the centering is the
+   intent. Deliberately NOT a blanket `button { text-align: left }` — non-flex
+   full-width buttons rely on the centered default and would visibly shift. */
+@layer base {
+  button:where(.flex, .inline-flex):not(
+    :where([class*="justify-center"], [class*="justify-around"], [class*="justify-evenly"])
+  ) {
+    text-align: left;
+  }
+
+  /* Prevent WebKit/Safari composite-layer ghosting where an active/animating button
+     (e.g. animate-spin, dynamic label expansion) promotes to a hardware-accelerated layer
+     on the fly, leaving behind a stale rasterized frame of the static button in the
+     ancestor's shared backing store. Giving buttons their own isolated stacking context
+     and GPU compositing layer up front ensures the ancestor backing store never retains
+     stale button pixels.
+     Uses :where() to keep specificity at (0,0,0) so author transform utilities
+     (e.g., hover:scale-105, active:scale-95) continue to win cleanly. */
+  :where(button, [role="button"]) {
+    isolation: isolate;
+    -webkit-backface-visibility: hidden;
+    backface-visibility: hidden;
+    transform: translateZ(0);
+  }
+}
+
+/* Accessibility: Ensure disabled elements are perceivable but not interactive */
+[disabled],
+[aria-disabled="true"] {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+/* Accessibility: Reduce motion for users who prefer it */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgb(var(--port-card));
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgb(var(--port-text-muted));
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgb(var(--port-text));
+}
+
+/* Hide scrollbar utility */
+.scrollbar-hide {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+.scrollbar-hide::-webkit-scrollbar {
+  display: none;
+}
+
+/* Custom animations */
+/* WebKit/Safari hardware acceleration & subpixel stabilization for spinning icons.
+   Prevents anti-aliasing flickering, jitter, and stale rasterized frames during CSS rotation. */
+.animate-spin {
+  -webkit-backface-visibility: hidden;
+  backface-visibility: hidden;
+  transform: translateZ(0);
+  will-change: transform;
+}
+
+@keyframes pulse-soft {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.7;
+  }
+}
+
+.animate-pulse-soft {
+  animation: pulse-soft 2s ease-in-out infinite;
+}
+
+/* Manuscript editorial-finding anchor reveal (#1601): a brief tint pulse drawn
+   over the offending text when its finding opens, so the eye lands on the exact
+   passage after the scroll-to. Honors prefers-reduced-motion via the global
+   reduce block above (animation collapses to ~instant). Paired with
+   `useAnchorReveal` — keep the 1.2s duration in sync with FLASH_MS there. */
+@keyframes portos-anchor-flash {
+  0%   { background-color: rgba(59, 130, 246, 0.5); }
+  100% { background-color: rgba(59, 130, 246, 0); }
+}
+.manuscript-anchor-flash {
+  animation: portos-anchor-flash 1.2s ease-out;
+  border-radius: 2px;
+}
+
+/* Chief of Staff Character Animations */
+.cos-character {
+  filter: drop-shadow(0 0 20px rgba(99, 102, 241, 0.3));
+}
+
+.antenna-light { animation: cos-pulse 2s ease-in-out infinite; }
+.status-light { animation: cos-pulse 1.5s ease-in-out infinite; }
+
+@keyframes cos-pulse {
+  0%, 100% { opacity: 0.6; transform: scale(1); }
+  50% { opacity: 1; transform: scale(1.2); }
+}
+
+.eye { animation: cos-blink 4s ease-in-out infinite; }
+.eye-right { animation-delay: 0.1s; }
+
+@keyframes cos-blink {
+  0%, 45%, 55%, 100% { transform: scaleY(1); }
+  50% { transform: scaleY(0.1); }
+}
+
+.pupil { animation: cos-lookAround 6s ease-in-out infinite; }
+
+@keyframes cos-lookAround {
+  0%, 40%, 60%, 100% { transform: translateX(0); }
+  45%, 55% { transform: translateX(3px); }
+}
+
+.arm { transform-origin: center top; }
+.arm-coding { animation: cos-type 0.3s ease-in-out infinite alternate; }
+.hand-coding { animation: cos-typeHand 0.3s ease-in-out infinite alternate; }
+
+@keyframes cos-type {
+  from { transform: rotate(-3deg); }
+  to { transform: rotate(3deg); }
+}
+
+@keyframes cos-typeHand {
+  from { transform: translateY(0); }
+  to { transform: translateY(5px); }
+}
+
+.arm-thinking, .arm-ideating { animation: cos-wave 2s ease-in-out infinite; }
+
+@keyframes cos-wave {
+  0%, 100% { transform: rotate(0deg); }
+  50% { transform: rotate(-5deg); }
+}
+
+.code-line { animation: cos-codePulse 0.5s ease-in-out infinite alternate; }
+.code-line-0 { animation-delay: 0s; }
+.code-line-1 { animation-delay: 0.1s; }
+.code-line-2 { animation-delay: 0.2s; }
+.code-line-3 { animation-delay: 0.3s; }
+
+@keyframes cos-codePulse {
+  from { opacity: 0.4; }
+  to { opacity: 1; }
+}
+
+.thinking-dot { animation: cos-bounce 0.6s ease-in-out infinite; }
+.thinking-dot-0 { animation-delay: 0s; }
+.thinking-dot-1 { animation-delay: 0.2s; }
+.thinking-dot-2 { animation-delay: 0.4s; }
+
+@keyframes cos-bounce {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-5px); }
+}
+
+.scan-line { animation: cos-scan 1.5s ease-in-out infinite; }
+
+@keyframes cos-scan {
+  0% { transform: translateY(-10px); opacity: 0; }
+  50% { opacity: 1; }
+  100% { transform: translateY(10px); opacity: 0; }
+}
+
+.check {
+  stroke-dasharray: 20;
+  stroke-dashoffset: 20;
+  animation: cos-drawCheck 0.5s ease forwards;
+}
+.check-0 { animation-delay: 0s; }
+.check-1 { animation-delay: 0.3s; }
+.check-2 { animation-delay: 0.6s; }
+
+@keyframes cos-drawCheck {
+  to { stroke-dashoffset: 0; }
+}
+
+.bulb, .bulb-glow { animation: cos-glow 1s ease-in-out infinite alternate; }
+
+@keyframes cos-glow {
+  from { opacity: 0.5; transform: scale(0.9); }
+  to { opacity: 1; transform: scale(1.1); }
+}
+
+.cos-z { animation: cos-float 2s ease-in-out infinite; }
+.cos-z-1 { animation-delay: 0s; }
+.cos-z-2 { animation-delay: 0.3s; }
+.cos-z-3 { animation-delay: 0.6s; }
+
+@keyframes cos-float {
+  0%, 100% { transform: translateY(0) translateX(0); opacity: 0.8; }
+  50% { transform: translateY(-5px) translateX(5px); opacity: 1; }
+}
+
+.plan-cell { animation: cos-planPulse 1.5s ease-in-out infinite; }
+
+@keyframes cos-planPulse {
+  0%, 100% { opacity: 0.3; }
+  50% { opacity: 0.9; }
+}
+
+.mouth-open { animation: cos-talk 0.15s ease-in-out infinite alternate; }
+
+@keyframes cos-talk {
+  from { transform: scaleY(0.6); }
+  to { transform: scaleY(1.2); }
+}
+
+.cos-particle { animation: cos-floatParticle 3s ease-in-out infinite; }
+.cos-particle-0 { animation-delay: 0s; }
+.cos-particle-1 { animation-delay: 0.5s; }
+.cos-particle-2 { animation-delay: 1s; }
+.cos-particle-3 { animation-delay: 1.5s; }
+.cos-particle-4 { animation-delay: 2s; }
+.cos-particle-5 { animation-delay: 2.5s; }
+
+@keyframes cos-floatParticle {
+  0%, 100% { transform: translateY(0) scale(1); opacity: 0.3; }
+  50% { transform: translateY(-10px) scale(1.5); opacity: 0.8; }
+}

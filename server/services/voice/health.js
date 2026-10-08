@@ -1,0 +1,82 @@
+import { invalidateModelObservation } from '../modelObservation.js';
+// Voice stack health checks — whisper.cpp + LLM provider + (when active) Piper.
+
+import { existsSync } from 'fs';
+import { join } from 'path';
+import { getVoiceConfig, expandPath, voiceHome, PIPER_BIN_NAME } from './config.js';
+import { which } from './bootstrap.js';
+import { resolveLlmEndpoint, authHeaders } from './llm.js';
+import { fetchWithTimeout } from '../../lib/fetchWithTimeout.js';
+import { checkSetup as checkFaceTimeSetup } from './facetimeBridge.js';
+import { inspectVoiceAsset, isVoiceAssetUsable } from '../../lib/voiceModelAssets.js';
+
+const PROBE_TIMEOUT_MS = 1500;
+const CACHE_TTL_MS = 3000;
+let cache = null;
+
+const probe = async (url, headers = {}) => {
+  const started = Date.now();
+  try {
+    const res = await fetchWithTimeout(url, { method: 'GET', headers }, PROBE_TIMEOUT_MS);
+    const latencyMs = Date.now() - started;
+    if (!res.ok) return { ok: false, state: 'bad_status', status: res.status, latencyMs };
+    return { ok: true, status: res.status, latencyMs };
+  } catch (err) {
+    const name = err?.name || '';
+    const code = err?.cause?.code || err?.code || '';
+    if (name === 'AbortError') return { ok: false, state: 'timeout', latencyMs: Date.now() - started };
+    if (code === 'ECONNREFUSED') return { ok: false, state: 'down', error: code };
+    return { ok: false, state: 'error', error: err?.message || String(err) };
+  }
+};
+
+export const checkAll = async (cfg) => {
+  const voice = cfg || await getVoiceConfig();
+  const sttEngine = voice.stt?.engine || 'whisper';
+  const llmProvider = voice.llm?.provider || 'lmstudio';
+  // Provider is part of the cache key so switching the voice LLM provider in
+  // Settings re-probes the new endpoint instead of serving the stale badge.
+  const cacheKey = `${sttEngine}|${voice.tts.engine}|${voice.stt.endpoint}|${llmProvider}`;
+  if (cache && cache.key === cacheKey && Date.now() - cache.ts < CACHE_TTL_MS) {
+    return cache.value;
+  }
+
+  // LLM probe: hit the configured provider's OpenAI-compatible /models endpoint
+  // (with apiKey when the provider needs auth) so the badge reflects whichever
+  // provider drives voice, not just LM Studio.
+  const { apiBase, apiKey } = await resolveLlmEndpoint(llmProvider);
+  const probes = [probe(`${apiBase}/models`, authHeaders(apiKey))];
+  const labels = ['llm'];
+  if (sttEngine === 'whisper') {
+    probes.unshift(probe(voice.stt.endpoint));
+    labels.unshift('whisper');
+  }
+
+  const results = await Promise.all(probes);
+  const out = Object.fromEntries(labels.map((k, i) => [k, results[i]]));
+
+  if (voice.tts.engine === 'piper') {
+    // CLI-mode piper has no server to probe — check binary + selected voice.
+    const localPiper = join(voiceHome(), 'piper', PIPER_BIN_NAME);
+    const [hasBin, voicePath] = [existsSync(localPiper) || !!(await which('piper')), expandPath(voice.tts.piper?.voicePath || '')];
+    // A voice file that exists may still be a truncated download or lack its
+    // .onnx.json sidecar — both fail at synthesis time, so neither is "ready".
+    const voiceAsset = voicePath ? inspectVoiceAsset('piper', voicePath) : { state: 'missing' };
+    out.piper = hasBin && isVoiceAssetUsable(voiceAsset.state)
+      ? { ok: true, state: 'ready' }
+      : { ok: false, state: !hasBin ? 'no binary' : (voiceAsset.state === 'incomplete' ? 'voice incomplete' : 'voice missing') };
+  }
+
+  if (sttEngine === 'web-speech') {
+    out['web-speech'] = { ok: true, state: 'browser-native' };
+  }
+  out.facetime = await checkFaceTimeSetup(voice);
+
+  cache = { key: cacheKey, ts: Date.now(), value: out };
+  return out;
+};
+
+export const invalidateHealthCache = () => {
+  cache = null;
+  invalidateModelObservation('voice-readiness');
+};

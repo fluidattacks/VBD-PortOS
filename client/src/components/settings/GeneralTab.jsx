@@ -1,0 +1,353 @@
+import MaintenancePanel from './MaintenancePanel.jsx';
+import { useState, useEffect, useMemo } from 'react';
+import { Clock3, MapPin, Palette, Save } from 'lucide-react';
+import toast from '../ui/Toast';
+import FormField from '../ui/FormField';
+import UnsavedChangesConfirm from '../ui/UnsavedChangesConfirm';
+import BrailleSpinner from '../BrailleSpinner';
+import ThemePickerPanel from '../ThemePickerPanel';
+import useUnsavedChangesGuard from '../../hooks/useUnsavedChangesGuard';
+import { getSettings, updateSettings } from '../../services/api';
+
+// Coordinate inputs are free text so a partially-typed "-" or "37." isn't
+// clobbered mid-edit; parse + range-check only on save. Both blank = clear.
+// Trim first so a whitespace-only field counts as blank (and never coerces to
+// Number('  ') === 0, which would pin the same 0,0 this feature guards against).
+const isBlank = (v) => v == null || String(v).trim() === '';
+const parseCoord = (v) => {
+  if (isBlank(v)) return null;
+  const n = Number(String(v).trim());
+  return Number.isFinite(n) ? n : NaN; // NaN signals "non-empty but not a number"
+};
+
+export function GeneralTab() {
+  const [loading, setLoading] = useState(true);
+  const [timezone, setTimezone] = useState('');
+  const [savedTimezone, setSavedTimezone] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [timezoneError, setTimezoneError] = useState('');
+  const [lat, setLat] = useState('');
+  const [lon, setLon] = useState('');
+  const [savedLocation, setSavedLocation] = useState(null);
+  const [savingLocation, setSavingLocation] = useState(false);
+  const [locationError, setLocationError] = useState('');
+  const detectedTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const allTimezones = useMemo(() => Intl.supportedValuesOf?.('timeZone') ?? [], []);
+  const timezoneDirty = savedTimezone !== null && timezone !== savedTimezone;
+  const locationDirty = savedLocation !== null
+    && (lat !== savedLocation.lat || lon !== savedLocation.lon);
+  const dirty = timezoneDirty || locationDirty;
+  const hasDiscardableChanges = (timezoneDirty && !saving)
+    || (locationDirty && !savingLocation);
+  const routeGuard = useUnsavedChangesGuard(dirty);
+
+  useEffect(() => {
+    let current = true;
+    getSettings({ silent: true })
+      .then(settings => {
+        if (!current) return;
+        const nextTimezone = settings?.timezone || '';
+        const nextLat = settings?.location?.lat != null ? String(settings.location.lat) : '';
+        const nextLon = settings?.location?.lon != null ? String(settings.location.lon) : '';
+        setTimezone(nextTimezone);
+        setSavedTimezone(nextTimezone);
+        setLat(nextLat);
+        setLon(nextLon);
+        setSavedLocation({ lat: nextLat, lon: nextLon });
+      })
+      .catch(() => {
+        if (!current) return;
+        // The empty fields remain usable after a failed load, so treat the
+        // displayed fallback as the baseline instead of leaving edits outside
+        // dirty tracking.
+        setSavedTimezone('');
+        setSavedLocation({ lat: '', lon: '' });
+        toast.error('Failed to load settings');
+      })
+      .finally(() => {
+        if (current) setLoading(false);
+      });
+    return () => { current = false; };
+  }, []);
+
+  const handleSaveLocation = async () => {
+    const submittedLat = lat;
+    const submittedLon = lon;
+    // Both-or-neither: weather needs a full pair, and a half-set pair would
+    // silently mix a custom value with the tool's default coordinate.
+    if (isBlank(lat) !== isBlank(lon)) {
+      const message = 'Enter both latitude and longitude, or clear both.';
+      setLocationError(message);
+      toast.error(message);
+      return;
+    }
+    const parsedLat = parseCoord(lat);
+    const parsedLon = parseCoord(lon);
+    if (Number.isNaN(parsedLat) || Number.isNaN(parsedLon)) {
+      const message = 'Latitude and longitude must be numbers.';
+      setLocationError(message);
+      toast.error(message);
+      return;
+    }
+    if (parsedLat !== null && (parsedLat < -90 || parsedLat > 90)) {
+      const message = 'Latitude must be between -90 and 90.';
+      setLocationError(message);
+      toast.error(message);
+      return;
+    }
+    if (parsedLon !== null && (parsedLon < -180 || parsedLon > 180)) {
+      const message = 'Longitude must be between -180 and 180.';
+      setLocationError(message);
+      toast.error(message);
+      return;
+    }
+    setLocationError('');
+    setSavingLocation(true);
+    try {
+      await updateSettings({ location: { lat: parsedLat, lon: parsedLon } }, { silent: true });
+      const nextLat = parsedLat === null ? '' : String(parsedLat);
+      const nextLon = parsedLon === null ? '' : String(parsedLon);
+      setSavedLocation({ lat: nextLat, lon: nextLon });
+      setLat(current => current === submittedLat ? nextLat : current);
+      setLon(current => current === submittedLon ? nextLon : current);
+      toast.success(parsedLat === null ? 'Location cleared' : `Location set to ${parsedLat}, ${parsedLon}`);
+    } catch (err) {
+      const message = err.message || 'Failed to save location';
+      setLocationError(message);
+      toast.error(message);
+    } finally {
+      setSavingLocation(false);
+    }
+  };
+
+  const handleSave = async (tz) => {
+    const submittedTimezone = timezone;
+    const tzToSave = tz || detectedTz;
+    if (!tzToSave) {
+      const message = 'Timezone is required.';
+      setTimezoneError(message);
+      toast.error(message);
+      return;
+    }
+
+    // Validate timezone string
+    let isValid;
+    if (allTimezones.length > 0) {
+      isValid = allTimezones.includes(tzToSave);
+    } else {
+      try {
+        new Intl.DateTimeFormat('en-US', { timeZone: tzToSave });
+        isValid = true;
+      } catch { isValid = false; }
+    }
+    if (!isValid) {
+      const message = 'Invalid timezone. Please select a valid IANA timezone.';
+      setTimezoneError(message);
+      toast.error(message);
+      return;
+    }
+
+    setTimezoneError('');
+    setSaving(true);
+    try {
+      await updateSettings({ timezone: tzToSave }, { silent: true });
+      setSavedTimezone(tzToSave);
+      setTimezone(current => current === submittedTimezone ? tzToSave : current);
+      toast.success(`Timezone set to ${tzToSave}`);
+    } catch (err) {
+      const message = err.message || 'Failed to save timezone';
+      setTimezoneError(message);
+      toast.error(message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const discardAndExit = () => {
+    // A stale /settings/:tab URL can fall back to General on both sides of the
+    // navigation, preserving this component instance. Reset the sections that
+    // are not actively being persisted before releasing the parked route.
+    if (!saving) setTimezone(savedTimezone ?? '');
+    if (!savingLocation) {
+      setLat(savedLocation?.lat ?? '');
+      setLon(savedLocation?.lon ?? '');
+    }
+    routeGuard.proceed();
+  };
+
+  if (loading) return <BrailleSpinner />;
+
+  return (
+    <section
+      aria-labelledby="general-settings-heading"
+      data-testid="general-settings-workspace"
+      className="@container space-y-4"
+    >
+      <h2 id="general-settings-heading" className="sr-only">General settings</h2>
+      <MaintenancePanel />
+      <UnsavedChangesConfirm
+        guard={routeGuard}
+        when={hasDiscardableChanges}
+        question="Discard your unsaved General settings changes?"
+        label="Discard unsaved General settings changes"
+        onDiscard={discardAndExit}
+      />
+      <div className="grid grid-cols-1 @min-[52rem]:grid-cols-2 gap-4 items-start">
+      <div data-testid="general-timezone-card" className="min-w-0 bg-port-card border border-port-border rounded-xl p-4 sm:p-5">
+        <h3 className="flex items-center gap-2 text-base font-semibold text-white mb-2">
+          <Clock3 size={17} className="text-port-accent shrink-0" aria-hidden="true" />
+          Timezone
+        </h3>
+        <p className="text-sm text-gray-400 mb-4">
+          Used for job scheduling (cron expressions & scheduled times) and briefing dates.
+        </p>
+        <FormField
+          label="Timezone (IANA)"
+          labelClassName="sr-only"
+          className="flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3"
+        >
+          <input
+            id="timezone-input"
+            type="text"
+            value={timezone}
+            onChange={e => {
+              setTimezone(e.target.value);
+              if (timezoneError) setTimezoneError('');
+            }}
+            disabled={saving}
+            placeholder={detectedTz}
+            className="w-full sm:flex-1 sm:max-w-xs min-w-0 px-3 py-2 bg-port-bg border border-port-border rounded-lg text-white text-sm disabled:opacity-50"
+            list="tz-list"
+          />
+          <button
+            onClick={() => handleSave(timezone)}
+            disabled={saving}
+            className="inline-flex items-center justify-center min-h-[40px] px-4 py-2 bg-port-accent/20 hover:bg-port-accent/30 text-port-accent rounded-lg text-sm transition-colors disabled:opacity-50 whitespace-nowrap"
+          >
+            <Save size={14} className="inline mr-1" />
+            {saving ? 'Saving...' : 'Save'}
+          </button>
+          {timezoneDirty && (
+            <span
+              className="text-xs text-port-warning"
+              role="status"
+              aria-label="Timezone has unsaved changes"
+            >
+              Unsaved changes
+            </span>
+          )}
+          {!timezone && (
+            <button
+              onClick={() => handleSave(detectedTz)}
+              disabled={saving}
+              className="inline-flex items-center justify-center min-h-[40px] px-3 py-2 text-sm text-gray-400 hover:text-white transition-colors truncate"
+              title={`Use detected: ${detectedTz}`}
+            >
+              <span className="truncate">Use detected: {detectedTz}</span>
+            </button>
+          )}
+        </FormField>
+        {timezoneError && (
+          <p role="alert" className="mt-3 text-sm text-port-error break-words">
+            {timezoneError}
+          </p>
+        )}
+        {timezone && timezone !== detectedTz && (
+          <p className="text-xs text-gray-500 mt-2 break-all">
+            Browser detected: {detectedTz}
+          </p>
+        )}
+        <datalist id="tz-list">
+          {allTimezones.map(tz => (
+            <option key={tz} value={tz} />
+          ))}
+        </datalist>
+      </div>
+
+      <div data-testid="general-location-card" className="min-w-0 bg-port-card border border-port-border rounded-xl p-4 sm:p-5">
+        <h3 className="flex items-center gap-2 text-base font-semibold text-white mb-2">
+          <MapPin size={17} className="text-port-accent shrink-0" aria-hidden="true" />
+          Location
+        </h3>
+        <p className="text-sm text-gray-400 mb-4">
+          Your home coordinates. Used by the voice assistant&apos;s weather command when you
+          ask &ldquo;what&apos;s the weather?&rdquo; without naming a place. Leave both blank to use a default location.
+        </p>
+        <div className="flex flex-col sm:flex-row sm:items-end gap-2 sm:gap-3">
+          <FormField
+            label="Latitude (-90 to 90)"
+            className="flex-1 sm:max-w-[10rem]"
+            labelClassName="block text-xs text-gray-400 mb-1"
+          >
+            <input
+              id="loc-lat"
+              type="text"
+              inputMode="decimal"
+              value={lat}
+              onChange={e => {
+                setLat(e.target.value);
+                if (locationError) setLocationError('');
+              }}
+              disabled={savingLocation}
+              placeholder="37.7749"
+              className="w-full min-w-0 px-3 py-2 bg-port-bg border border-port-border rounded-lg text-white text-sm disabled:opacity-50"
+            />
+          </FormField>
+          <FormField
+            label="Longitude (-180 to 180)"
+            className="flex-1 sm:max-w-[10rem]"
+            labelClassName="block text-xs text-gray-400 mb-1"
+          >
+            <input
+              id="loc-lon"
+              type="text"
+              inputMode="decimal"
+              value={lon}
+              onChange={e => {
+                setLon(e.target.value);
+                if (locationError) setLocationError('');
+              }}
+              disabled={savingLocation}
+              placeholder="-122.4194"
+              className="w-full min-w-0 px-3 py-2 bg-port-bg border border-port-border rounded-lg text-white text-sm disabled:opacity-50"
+            />
+          </FormField>
+          <button
+            onClick={handleSaveLocation}
+            disabled={savingLocation}
+            className="inline-flex items-center justify-center min-h-[40px] px-4 py-2 bg-port-accent/20 hover:bg-port-accent/30 text-port-accent rounded-lg text-sm transition-colors disabled:opacity-50 whitespace-nowrap"
+          >
+            <Save size={14} className="inline mr-1" />
+            {savingLocation ? 'Saving...' : 'Save'}
+          </button>
+          {locationDirty && (
+            <span
+              className="text-xs text-port-warning"
+              role="status"
+              aria-label="Location has unsaved changes"
+            >
+              Unsaved changes
+            </span>
+          )}
+        </div>
+        {locationError && (
+          <p role="alert" className="mt-3 text-sm text-port-error break-words">
+            {locationError}
+          </p>
+        )}
+      </div>
+      </div>
+
+      <div data-testid="general-theme-card" className="bg-port-card border border-port-border rounded-xl p-4 sm:p-5">
+        <h3 className="flex items-center gap-2 text-base font-semibold text-white mb-2">
+          <Palette size={17} className="text-port-accent shrink-0" aria-hidden="true" />
+          Interface Theme
+        </h3>
+        <p className="text-sm text-gray-400 mb-4">Applies immediately and does not require a save.</p>
+        <ThemePickerPanel />
+      </div>
+    </section>
+  );
+}
+
+export default GeneralTab;

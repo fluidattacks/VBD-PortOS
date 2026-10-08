@@ -1,0 +1,294 @@
+/**
+ * "Ask Yourself" Routes
+ *
+ *   GET    /api/ask                       → list conversations (summaries)
+ *   GET    /api/ask/:id                   → full conversation
+ *   POST   /api/ask                       → SSE-stream a new turn (creates a
+ *                                            conversation if no `conversationId`
+ *                                            in body)
+ *   DELETE /api/ask/:id                   → delete a conversation
+ *   POST   /api/ask/:id/promote           → mark conversation exempt from
+ *                                            30-day auto-expiry
+ *   POST   /api/ask/:id/turns/:turnId/promote
+ *                                         → one-click promote an assistant
+ *                                            turn into a Brain note / CoS
+ *                                            task / Goal progress entry; also
+ *                                            pins the conversation so it
+ *                                            survives the 30-day expiry once
+ *                                            anything from it has been saved.
+ */
+
+import { Router } from 'express';
+import { z } from 'zod';
+import { asyncHandler, ServerError } from '../lib/errorHandler.js';
+import { validateRequest } from '../lib/validation.js';
+import { awaitWritableDrain } from '../lib/streamBackpressure.js';
+import { SSE_HEADERS } from '../lib/sseHeaders.js';
+import { onClientDisconnect } from '../lib/sseDownload.js';
+import * as convs from '../services/askConversations.js';
+import { resolveAskProvider, runAsk, VALID_MODES } from '../services/askService.js';
+import { requestHasHostControl } from '../services/authGate.js';
+import { ID_RE as CONV_ID_RE } from '../services/askConversations.js';
+import { promoteTurnById } from '../services/askPromote.js';
+
+const router = Router();
+
+// How many prior turns to include when assembling the prompt. The persisted
+// conversation file keeps everything; trimming here keeps the prompt bounded
+// against multi-turn token blowup.
+const PROMPT_HISTORY_TURNS = 12;
+
+// Sourced from `askConversations.ID_RE` so the route, the storage layer, and
+// the generator are guaranteed to agree on the canonical id shape — variable-
+// width regexes here let non-canonical ids through and break listConversations'
+// lexical-sort = chronological-sort invariant.
+const idSchema = z.string().regex(CONV_ID_RE, 'invalid conversation id');
+
+const askBodySchema = z.object({
+  conversationId: idSchema.optional(),
+  question: z.string().trim().min(1).max(4000),
+  mode: z.enum([...VALID_MODES]).optional().default('ask'),
+  providerId: z.string().min(1).max(100).optional(),
+  model: z.string().min(1).max(200).optional(),
+  maxSources: z.number().int().min(1).max(50).optional().default(12),
+  timeWindow: z.object({
+    days: z.number().int().min(1).max(365).optional(),
+    startDate: z.string().datetime().optional(),
+    endDate: z.string().datetime().optional(),
+  }).refine(
+    (w) => !(w.startDate && w.endDate) || Date.parse(w.startDate) <= Date.parse(w.endDate),
+    { message: 'startDate must be <= endDate', path: ['startDate'] },
+  ).optional(),
+});
+
+const promoteBodySchema = z.object({
+  promoted: z.boolean().optional().default(true),
+});
+
+// Promote-turn payloads vary by target — keep the discriminated union narrow
+// rather than a permissive bag so the route can fail-fast on a goal target
+// missing its goalId before we touch any service.
+const promoteTurnBodySchema = z.discriminatedUnion('target', [
+  z.object({ target: z.literal('brain') }),
+  z.object({ target: z.literal('task'), priority: z.enum(['LOW', 'MEDIUM', 'HIGH']).optional().default('MEDIUM') }),
+  z.object({ target: z.literal('goal'), goalId: z.string().min(1).max(200) }),
+]);
+
+router.get('/', asyncHandler(async (_req, res) => {
+  const conversations = await convs.listConversations({ limit: 100 });
+  res.json({ conversations });
+}));
+
+router.get('/:id', asyncHandler(async (req, res) => {
+  const id = validateRequest(idSchema, String(req.params.id));
+  const conv = await convs.getConversation(id);
+  if (!conv) throw new ServerError('Conversation not found', { status: 404, code: 'NOT_FOUND' });
+  res.json({ conversation: conv });
+}));
+
+router.delete('/:id', asyncHandler(async (req, res) => {
+  const id = validateRequest(idSchema, String(req.params.id));
+  const removed = await convs.deleteConversation(id);
+  if (!removed) throw new ServerError('Conversation not found', { status: 404, code: 'NOT_FOUND' });
+  res.json({ ok: true });
+}));
+
+router.post('/:id/promote', asyncHandler(async (req, res) => {
+  const id = validateRequest(idSchema, String(req.params.id));
+  const { promoted } = validateRequest(promoteBodySchema, req.body ?? {});
+  const conv = await convs.setPromoted(id, promoted);
+  if (!conv) throw new ServerError('Conversation not found', { status: 404, code: 'NOT_FOUND' });
+  res.json({ conversation: conv });
+}));
+
+// One-click promote an assistant turn into a Brain note, CoS task, or Goal
+// progress entry. Always sets the conversation `promoted` flag so anything
+// the user has saved elsewhere survives the 30-day expiry sweep.
+router.post('/:id/turns/:turnId/promote', asyncHandler(async (req, res) => {
+  const id = validateRequest(idSchema, String(req.params.id));
+  const turnId = String(req.params.turnId || '');
+  if (!turnId) throw new ServerError('turnId is required', { status: 400, code: 'VALIDATION_ERROR' });
+
+  const body = validateRequest(promoteTurnBodySchema, req.body ?? {});
+
+  const result = await promoteTurnById({
+    conversationId: id,
+    turnId,
+    target: body.target,
+    priority: body.priority,
+    goalId: body.goalId,
+  });
+  res.json({ ok: true, ...result });
+}));
+
+// Stream a new turn over SSE. Body { conversationId?, question, mode?, ... }.
+// If no conversationId, a new conversation is created and its id is
+// surfaced in the first SSE event so the client can deep-link.
+router.post('/', asyncHandler(async (req, res) => {
+  const body = validateRequest(askBodySchema, req.body ?? {});
+
+  // Resolved before any write or SSE handshake so a caller refused the
+  // provider (#9008: one that cannot run tool-free needs host control) gets a
+  // plain 403 and nothing is spawned or persisted.
+  const provider = await resolveAskProvider(body.providerId, { hasHostControl: requestHasHostControl(req) });
+
+  let conversation = body.conversationId
+    ? await convs.getConversation(body.conversationId)
+    : null;
+  if (body.conversationId && !conversation) {
+    throw new ServerError('Conversation not found', { status: 404, code: 'NOT_FOUND' });
+  }
+  if (!conversation) {
+    conversation = await convs.createConversation({ mode: body.mode, title: body.question });
+  }
+
+  // Persist the user turn before streaming so a mid-stream disconnect still
+  // leaves the question on disk — the user can reopen the conversation and
+  // see their own question waiting.
+  const { conversation: afterUser } = await convs.appendTurn(conversation.id, {
+    role: 'user',
+    content: body.question,
+    mode: body.mode,
+  });
+  conversation = afterUser;
+
+  // SSE handshake. Shared SSE_HEADERS plus `no-transform` — this stream must
+  // never be proxy-compressed/transformed, which the shared default omits.
+  res.set({ ...SSE_HEADERS, 'Cache-Control': 'no-cache, no-transform' });
+  res.flushHeaders?.();
+
+  // Propagate client disconnects (browser nav, tab close, abort) into
+  // provider streaming and the post-retrieval generator loop so we don't
+  // keep burning tokens/CPU on a stream nobody's reading. The retrieval
+  // fan-out itself doesn't currently take a signal — those queries are
+  // bounded (~hundreds of ms) so we let them finish; once retrieval
+  // returns, the abort short-circuits before any further SSE writes or
+  // provider work. `aborted` also gates further SSE writes (the socket is
+  // dead) but we still persist whatever assistant text was accumulated up
+  // to that point so the conversation isn't lossy on reconnect.
+  const abortController = new AbortController();
+  let aborted = false;
+  const onClose = () => {
+    aborted = true;
+    abortController.abort();
+  };
+  onClientDisconnect(req, res, onClose);
+
+  // Honour socket backpressure — for long answers with many delta frames,
+  // a slow reader could otherwise force Node to buffer unbounded SSE data
+  // in memory. If `res.write` returns false, `awaitWritableDrain` parks on
+  // the next `drain` (or `close`) before we queue more frames.
+  //
+  // Guard the write itself: between the `aborted` check and the syscall,
+  // the socket can transition to destroyed, in which case `res.write` would
+  // throw `ERR_STREAM_WRITE_AFTER_END`. Treat any throw as an abort so the
+  // disconnect doesn't bubble out as a 500 after we've already flushed
+  // SSE headers (which would also surface as ERR_HTTP_HEADERS_SENT noise).
+  const send = async (event, data) => {
+    if (aborted || res.writableEnded || res.destroyed) return;
+    const frame = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+    let writeOk;
+    try {
+      writeOk = res.write(frame);
+    } catch {
+      onClose();
+      return;
+    }
+    if (!writeOk) await awaitWritableDrain(res);
+  };
+
+  // Tell the client the conversation id up-front so it can deep-link the URL
+  // before the answer finishes streaming.
+  await send('open', { conversationId: conversation.id, mode: body.mode });
+
+  // Drop the just-appended user turn (we're about to answer it) plus take
+  // the last PROMPT_HISTORY_TURNS prior turns as multi-turn context.
+  const history = (conversation.turns || []).slice(-(PROMPT_HISTORY_TURNS + 1), -1);
+
+  // Accumulate deltas into an array and join once at the end; `+=` would be
+  // O(n²) on long answers where each chunk reallocates the running string.
+  // Mirrors `askService.runAsk`'s producer-side pattern.
+  const assistantChunks = [];
+  let assistantFallback = '';
+  let assistantSources = [];
+  let providerInfo = {};
+
+  // From here on, headers are flushed and the stream is "in SSE mode" —
+  // any thrown error must convert to a terminal SSE `error` frame instead
+  // of being thrown to asyncHandler (which would try to send a JSON 500
+  // body and trigger ERR_HTTP_HEADERS_SENT). The finally closes a still-live
+  // response; onClientDisconnect ignores that normal response close.
+  let streamErrored = false;
+  try {
+    for await (const evt of runAsk({
+      question: body.question,
+      mode: body.mode,
+      history,
+      timeWindow: body.timeWindow,
+      maxSources: body.maxSources,
+      providerId: body.providerId,
+      provider,
+      model: body.model,
+      signal: abortController.signal,
+    })) {
+      if (aborted) break;
+      if (evt.type === 'sources') {
+        assistantSources = evt.sources;
+        await send('sources', { sources: evt.sources });
+      } else if (evt.type === 'delta') {
+        assistantChunks.push(evt.text);
+        await send('delta', { text: evt.text });
+      } else if (evt.type === 'done') {
+        providerInfo = { providerId: evt.providerId, model: evt.model };
+        // Both API and CLI providers stream their text via `delta` events
+        // (CLI providers yield a single big chunk). The terminal `done`
+        // event also carries the full answer as a defensive fallback —
+        // capture it only if no deltas arrived.
+        if (assistantChunks.length === 0 && evt.answer) assistantFallback = evt.answer;
+      } else if (evt.type === 'error') {
+        streamErrored = true;
+        await send('error', { error: evt.error });
+      }
+    }
+
+    const assistantText = assistantChunks.length ? assistantChunks.join('') : assistantFallback;
+
+    // If the client bailed mid-stream we still persist whatever assistant
+    // text we accumulated so the conversation isn't silently lossy on
+    // reconnect — but a write failure here must not bubble out either.
+    let persistedAssistantTurn = null;
+    if (!streamErrored && assistantText) {
+      const result = await convs.appendTurn(conversation.id, {
+        role: 'assistant',
+        content: assistantText,
+        sources: assistantSources,
+        mode: body.mode,
+        ...providerInfo,
+      });
+      persistedAssistantTurn = result.turn;
+    }
+
+    if (!aborted) {
+      if (streamErrored) {
+        // Error event already flushed inside the loop — close the stream
+        // without a `done` frame so clients can cleanly distinguish
+        // failure (terminal `error`) from success (terminal `done`).
+      } else {
+        // Hand back the persisted turn so the client can append to local
+        // state instead of round-tripping a full conversation refetch.
+        await send('done', { conversationId: conversation.id, turn: persistedAssistantTurn });
+      }
+    }
+  } catch (err) {
+    streamErrored = true;
+    console.error(`❌ Ask SSE handler error: ${err?.message || err}`);
+    await send('error', { error: err?.message || 'internal error' }).catch(() => {});
+  } finally {
+    // Guard both `writableEnded` AND `destroyed` — if the client disconnected
+    // mid-stream the underlying socket may already be torn down, and calling
+    // `res.end()` on a destroyed stream throws an unhandled write error.
+    if (!res.writableEnded && !res.destroyed) res.end();
+  }
+}));
+
+export default router;

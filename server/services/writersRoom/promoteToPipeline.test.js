@@ -1,0 +1,274 @@
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'vitest';
+import { mkdtempSync, rmSync, readFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { makePathsProxy, mockNoPeerSync, mockNoPeers, ownTestBodies } from '../../lib/mockPathsDataRoot.js';
+
+let tempRoot;
+const roots = new Set();
+// Fail-fast cancellation can leave a test body writing into its fixture root;
+// drain every owned body before removing the roots (see ownTestBodies).
+const owned = ownTestBodies(it);
+const promotionTest = owned.it;
+
+async function cleanupFixtures() {
+  try {
+    await owned.drain();
+  } finally {
+    for (const root of roots) rmSync(root, { recursive: true, force: true });
+    roots.clear();
+  }
+}
+
+vi.mock('../../lib/fileUtils.js', async () => {
+  const actual = await vi.importActual('../../lib/fileUtils.js');
+  return makePathsProxy(actual, { dataRoot: () => tempRoot });
+});
+
+// Stub instances.js so promoteWorkToPipeline's non-ephemeral
+// createSeries/createIssue calls don't fan out to real peers via
+// peerSync's autoSubscribeRecordToAllPeers (which reads the live peer
+// registry through dataPath closure to the real PATHS).
+vi.mock('../instances.js', () => mockNoPeers());
+vi.mock('../sharing/peerSync.js', () => mockNoPeerSync());
+
+const wrLocal = await import('./local.js');
+const { promoteWorkToPipeline, ERR_NO_DRAFT_BODY } = await import('./promoteToPipeline.js');
+const { buildWorkBibleManifest, applyWorkBibleBytes, workBiblePath } = await import('./bibleSync.js');
+const { createCharacter } = await import('./characters.js');
+const { createPlace } = await import('./places.js');
+const { createObject } = await import('./objects.js');
+const seriesSvc = await import('../pipeline/series.js');
+const issuesSvc = await import('../pipeline/issues.js');
+const universeSvc = await import('../universeBuilder.js');
+
+beforeEach(() => {
+  tempRoot = mkdtempSync(join(tmpdir(), 'wr-promote-test-'));
+  roots.add(tempRoot);
+});
+
+afterEach(cleanupFixtures);
+afterAll(cleanupFixtures);
+
+async function seedWorkWithProse(prose = 'Once upon a time there was a paragraph.') {
+  const work = await wrLocal.createWork({ title: 'Test Work', kind: 'short-story' });
+  await wrLocal.saveDraftBody(work.id, prose);
+  return work;
+}
+
+describe('promoteWorkToPipeline', () => {
+  promotionTest('rejects a work whose active draft is empty', async () => {
+    const work = await wrLocal.createWork({ title: 'Blank', kind: 'short-story' });
+    let caught;
+    try {
+      await promoteWorkToPipeline(work.id);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeDefined();
+    expect(caught.code).toBe(ERR_NO_DRAFT_BODY);
+  });
+
+  promotionTest('creates a series + first issue and copies prose into stages.prose.output', async () => {
+    const work = await seedWorkWithProse('The vault loomed in the dark.');
+
+    const result = await promoteWorkToPipeline(work.id);
+
+    expect(result.reused).toBe(false);
+    expect(result.series.id).toMatch(/^ser-/);
+    expect(result.series.name).toBe('Test Work');
+    expect(result.series.writersRoomWorkId).toBe(work.id);
+    expect(result.issue.seriesId).toBe(result.series.id);
+    expect(result.issue.title).toBe('Test Work');
+    expect(result.issue.stages.prose.output).toBe('The vault loomed in the dark.');
+    expect(result.issue.stages.prose.status).toBe('edited');
+    // No script analysis yet → storyboards empty
+    expect(result.issue.stages.storyboards.scenes).toEqual([]);
+    expect(result.issue.stages.storyboards.status).toBe('empty');
+  });
+
+  promotionTest('records the bidirectional link on both sides', async () => {
+    const work = await seedWorkWithProse();
+    const { series, issue } = await promoteWorkToPipeline(work.id);
+
+    const reloadedWork = await wrLocal.getWork(work.id);
+    expect(reloadedWork.pipelineSeriesId).toBe(series.id);
+    expect(reloadedWork.pipelineIssueId).toBe(issue.id);
+
+    const reloadedSeries = await seriesSvc.getSeries(series.id);
+    expect(reloadedSeries.writersRoomWorkId).toBe(work.id);
+  });
+
+  promotionTest('carries over characters / places / objects bibles into the linked universe (Phase B.4)', async () => {
+    const work = await seedWorkWithProse();
+    await createCharacter(work.id, { name: 'Aria', physicalDescription: 'tall, freckles' });
+    await createPlace(work.id, { name: 'The Foundry', slugline: 'INT. FOUNDRY — NIGHT', description: 'molten light' });
+    await createObject(work.id, { name: 'The Locket', significance: "mother's keepsake" });
+
+    const { series } = await promoteWorkToPipeline(work.id);
+
+    // Phase B.4: canon lives on the universe, not the series. promote
+    // mints a fresh universe for the work and links the series via
+    // universeId; the series itself no longer carries the canon arrays.
+    expect(series.universeId).toBeTruthy();
+    const universe = await universeSvc.getUniverse(series.universeId);
+    expect(universe.name).toBe('Test Work');
+    expect(universe.characters).toHaveLength(1);
+    expect(universe.characters[0].name).toBe('Aria');
+    expect(universe.characters[0].physicalDescription).toBe('tall, freckles');
+    expect(universe.places).toHaveLength(1);
+    expect(universe.places[0].slugline).toBe('INT. FOUNDRY — NIGHT');
+    expect(universe.objects).toHaveLength(1);
+    expect(universe.objects[0].name).toBe('The Locket');
+  });
+
+  promotionTest('retains the authored character framework and valid relationship links (#6417)', async () => {
+    const work = await seedWorkWithProse();
+    const ines = await createCharacter(work.id, { name: 'Ines Mbeki', role: 'rival' });
+    await createCharacter(work.id, {
+      name: 'Wren Calloway',
+      ghost: 'Left behind at the relay station at nine.',
+      wound: 'Reads every silence as abandonment.',
+      lie: 'I only matter while I am useful.',
+      need: 'Being wanted is not the same as being needed.',
+      want: 'Buy back the family salvage license.',
+      motivations: 'Keep the crew fed.',
+      arcType: 'positive',
+      secrets: ['Sold the license years ago'],
+      psychology: {
+        theoryOfControl: 'If I stay useful, nobody leaves.',
+        assessment: 'assessed',
+        drives: { connection: { desire: 'To be kept', fear: 'To be set down' } },
+      },
+      sliders: { proactivity: 8, competence: 6 },
+      relationshipLinks: [{ targetCharacterId: ines.id, type: 'rival', description: 'Same salvage claim.' }],
+    });
+
+    // Simulate the receiver's missing bible landing before promotion.
+    const biblePath = workBiblePath(work.id, 'character');
+    const bytes = readFileSync(biblePath);
+    const [entry] = await buildWorkBibleManifest(work);
+    rmSync(biblePath);
+    expect(await applyWorkBibleBytes(entry, bytes, { via: 'peer-sync', peerId: 'peer-example' })).toBe(true);
+
+    const { series } = await promoteWorkToPipeline(work.id);
+    const universe = await universeSvc.getUniverse(series.universeId);
+    const wren = universe.characters.find((c) => c.name === 'Wren Calloway');
+
+    expect(wren).toMatchObject({
+      ghost: 'Left behind at the relay station at nine.',
+      wound: 'Reads every silence as abandonment.',
+      lie: 'I only matter while I am useful.',
+      need: 'Being wanted is not the same as being needed.',
+      want: 'Buy back the family salvage license.',
+      motivations: 'Keep the crew fed.',
+      arcType: 'positive',
+      secrets: ['Sold the license years ago'],
+    });
+    expect(wren.psychology.theoryOfControl).toBe('If I stay useful, nobody leaves.');
+    expect(wren.psychology.drives.connection.fear).toBe('To be set down');
+    expect(wren.sliders).toEqual({ proactivity: 8, likability: null, competence: 6 });
+    // Writers-room ids survive the copy, so the link still resolves to a
+    // character that exists in the promoted universe.
+    expect(wren.id).toMatch(/^wr-char-/);
+    expect(wren.relationshipLinks).toHaveLength(1);
+    const targetId = wren.relationshipLinks[0].targetCharacterId;
+    expect(universe.characters.some((c) => c.id === targetId)).toBe(true);
+  });
+
+  promotionTest('is idempotent: a second promote returns the same series/issue with reused=true', async () => {
+    const work = await seedWorkWithProse();
+    const first = await promoteWorkToPipeline(work.id);
+    const second = await promoteWorkToPipeline(work.id);
+
+    expect(second.reused).toBe(true);
+    expect(second.series.id).toBe(first.series.id);
+    expect(second.issue.id).toBe(first.issue.id);
+
+    // Side-effect check: no duplicate series in storage
+    const all = await seriesSvc.listSeries();
+    expect(all.filter((s) => s.writersRoomWorkId === work.id)).toHaveLength(1);
+  });
+
+  promotionTest('with force:true creates a fresh series even when the work is already linked', async () => {
+    const work = await seedWorkWithProse();
+    const first = await promoteWorkToPipeline(work.id);
+    const second = await promoteWorkToPipeline(work.id, { force: true });
+
+    expect(second.reused).toBe(false);
+    expect(second.series.id).not.toBe(first.series.id);
+    // Work's link points at the new series
+    const reloaded = await wrLocal.getWork(work.id);
+    expect(reloaded.pipelineSeriesId).toBe(second.series.id);
+  });
+
+  promotionTest('falls through to a fresh create if the work links to a deleted series', async () => {
+    const work = await seedWorkWithProse();
+    const first = await promoteWorkToPipeline(work.id);
+    await seriesSvc.deleteSeries(first.series.id);
+
+    const second = await promoteWorkToPipeline(work.id);
+    expect(second.reused).toBe(false);
+    expect(second.series.id).not.toBe(first.series.id);
+  });
+
+  promotionTest('falls through to a fresh create when the linked issue belongs to a different series (mismatched link)', async () => {
+    const work = await seedWorkWithProse();
+    const first = await promoteWorkToPipeline(work.id);
+    // Simulate a corrupted link: rewrite the work manifest to point at the
+    // first series but a DIFFERENT (unrelated) series' issue. Mirrors a
+    // manual edit, partial delete, or migration bug.
+    // ephemeral:true is defense-in-depth here. The file-top vi.mock of
+    // ./instances.js already stubs getPeers to return []; without that
+    // mock, autosubscribe-on-create would initial-push 'Strayer' to every
+    // real peer in data/instances.json. The ephemeral flag protects the
+    // wire even if the mock ever regresses or a future production code
+    // path bypasses getPeers.
+    const strayerSeries = await seriesSvc.createSeries({ name: 'Strayer', ephemeral: true });
+    const strayerIssue = await issuesSvc.createIssue({ seriesId: strayerSeries.id, title: 'Stray', ephemeral: true });
+    await wrLocal.linkToPipeline(work.id, { seriesId: first.series.id, issueId: strayerIssue.id });
+
+    const second = await promoteWorkToPipeline(work.id);
+    expect(second.reused).toBe(false);
+    // The new pair must be self-consistent (issue belongs to the new series).
+    expect(second.issue.seriesId).toBe(second.series.id);
+  });
+
+  promotionTest('populates storyboards scenes from a succeeded script analysis (visualPrompt → description)', async () => {
+    const work = await seedWorkWithProse();
+
+    // Hand-write a `script` analysis snapshot on disk to mimic a completed run
+    // — running the real LLM-driven evaluator would require provider stubs.
+    const fs = await import('fs/promises');
+    const analysisDir = join(tempRoot, 'writers-room', 'works', work.id, 'analysis');
+    await fs.mkdir(analysisDir, { recursive: true });
+    await fs.writeFile(join(analysisDir, 'script.json'), JSON.stringify({
+      id: 'script', workId: work.id, kind: 'script', status: 'succeeded',
+      result: {
+        title: 'The Pilot', logline: 'A heist gone wrong.',
+        scenes: [
+          { id: 'scene-01', heading: 'Scene 1 — Vault', slugline: 'INT. VAULT — NIGHT',
+            summary: 'They break in.', characters: ['ALICE'],
+            action: 'A drill bites.', dialogue: [{ character: 'ALICE', line: 'Quiet.' }],
+            visualPrompt: 'a high-tech vault, two figures in tactical gear',
+            sourceSegmentIds: [] },
+          { id: 'scene-02', heading: 'Scene 2 — Escape', slugline: 'EXT. ROOFTOP — DAWN',
+            summary: '...', characters: [], action: '', dialogue: [],
+            visualPrompt: 'a rooftop at first light', sourceSegmentIds: [] },
+        ],
+      },
+      createdAt: new Date().toISOString(), completedAt: new Date().toISOString(),
+    }));
+
+    const { issue } = await promoteWorkToPipeline(work.id);
+
+    expect(issue.stages.storyboards.scenes).toHaveLength(2);
+    expect(issue.stages.storyboards.status).toBe('ready');
+    expect(issue.stages.storyboards.scenes[0].description).toBe('a high-tech vault, two figures in tactical gear');
+    expect(issue.stages.storyboards.scenes[0].slugline).toBe('INT. VAULT — NIGHT');
+    expect(issue.stages.storyboards.scenes[0].imageJobId).toBeNull();
+    // Rich fields ride along
+    expect(issue.stages.storyboards.scenes[0].heading).toBe('Scene 1 — Vault');
+    expect(issue.stages.storyboards.scenes[0].dialogue[0]).toEqual({ character: 'ALICE', line: 'Quiet.' });
+  });
+});

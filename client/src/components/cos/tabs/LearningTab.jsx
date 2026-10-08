@@ -1,0 +1,1078 @@
+import { useState, useEffect, useCallback, useMemo } from 'react';
+import { Link } from 'react-router';
+import {
+  Brain,
+  RefreshCw,
+  TrendingUp,
+  TrendingDown,
+  Clock,
+  AlertTriangle,
+  Check,
+  CheckCircle,
+  XCircle,
+  SkipForward,
+  Zap,
+  BarChart2,
+  Timer,
+  Target,
+  ChevronDown,
+  ChevronRight,
+  Database,
+  RotateCcw,
+  Crosshair,
+  BookOpen,
+  Sparkles,
+  User,
+  Shield,
+  ShieldCheck,
+  ShieldAlert,
+  ShieldQuestion,
+  MessageSquare,
+  X,
+  Undo2
+} from 'lucide-react';
+import toast from '../../ui/Toast';
+import * as api from '../../../services/api';
+import BrailleSpinner from '../../BrailleSpinner';
+import { formatDurationMin, formatDateTime, formatDateNumeric } from '../../../utils/formatters';
+import { pluralize } from '../../../lib/textUtils';
+
+// Evidence pairing (issue #2617): when the server classified a task type on
+// its recency-windowed rate, label the percentage with the WINDOW's sample
+// count — rendering "0%" beside the lifetime total ("200 attempts") would
+// materially overstate the evidence behind the rate.
+export const runsLabel = (item, noun = 'runs') =>
+  item?.rateSource === 'windowed'
+    ? `${item.windowedCompleted} recent ${noun}`
+    : `${item?.completed} ${noun}`;
+
+/**
+ * The real task-type rows in a `/api/cos/learning/durations` payload, slowest
+ * first. `_`-prefixed keys are reserved aggregates, not task types: `_overall`,
+ * plus the execution-scoped maps from #8001. Skipping the whole prefix (rather
+ * than naming `_overall`) is what keeps a new reserved key out of the table —
+ * `_byExecution` carries no `avgDurationMs`, so it would render an empty row —
+ * and the count beside the heading is this list's length rather than a magic
+ * `keys.length - 1` offset. Pure; exported for its test.
+ */
+export function taskTypeDurationRows(durations) {
+  if (!durations) return [];
+  return Object.entries(durations)
+    .filter(([key]) => !key.startsWith('_'))
+    .sort((a, b) => b[1].avgDurationMs - a[1].avgDurationMs);
+}
+
+export function FeedbackSummary({ feedback }) {
+  if (!feedback?.total) return null;
+
+  const satisfaction = feedback.satisfactionRate ?? 0;
+  const satisfactionClass = satisfaction >= 80
+    ? 'text-port-success'
+    : satisfaction >= 60
+      ? 'text-port-warning'
+      : 'text-port-error';
+
+  return (
+    <div className="bg-port-card border border-port-border rounded-lg p-4">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div>
+          <div className="flex items-center gap-2">
+            <MessageSquare size={16} className="text-port-accent" />
+            <h4 className="text-sm font-medium text-white">User Feedback</h4>
+          </div>
+          <p className="text-xs text-gray-500 mt-1">
+            Durable ratings across live and archived agent runs
+          </p>
+        </div>
+        <div className="grid grid-cols-2 gap-4 sm:grid-cols-4 sm:gap-6 text-center">
+          <div>
+            <div className={`text-lg font-bold ${satisfactionClass}`}>{satisfaction}%</div>
+            <div className="text-[11px] text-gray-500">helpful</div>
+          </div>
+          <div>
+            <div className="text-lg font-bold text-port-success">{feedback.positive}</div>
+            <div className="text-[11px] text-gray-500">positive</div>
+          </div>
+          <div>
+            <div className="text-lg font-bold text-gray-300">{feedback.neutral}</div>
+            <div className="text-[11px] text-gray-500">neutral</div>
+          </div>
+          <div>
+            <div className="text-lg font-bold text-port-error">{feedback.negative}</div>
+            <div className="text-[11px] text-gray-500">negative</div>
+          </div>
+        </div>
+      </div>
+      <div className="text-xs text-gray-500 mt-3 pt-3 border-t border-port-border">
+        {feedback.total} rated run{feedback.total === 1 ? '' : 's'} retained in the current archive window
+      </div>
+    </div>
+  );
+}
+
+export default function LearningTab() {
+  const [learning, setLearning] = useState(null);
+  const [performance, setPerformance] = useState(null);
+  const [skipped, setSkipped] = useState(null);
+  const [durations, setDurations] = useState(null);
+  const [routing, setRouting] = useState(null);
+  const [confidence, setConfidence] = useState(null);
+  const [feedback, setFeedback] = useState(null);
+  const [dismissed, setDismissed] = useState([]);
+  const [showDismissed, setShowDismissed] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [backfilling, setBackfilling] = useState(false);
+  const [resettingType, setResettingType] = useState(null);
+  const [expandedSections, setExpandedSections] = useState({
+    confidence: true,
+    taskTypes: true,
+    skipped: true,
+    durations: false,
+    models: true,
+    routing: true,
+    errors: false,
+    standing: true
+  });
+
+  const loadData = useCallback(async () => {
+    setLoading(true);
+    const [learningData, performanceData, skippedData, durationsData, routingData, confidenceData, feedbackData, dismissedData] = await Promise.all([
+      api.getCosLearning().catch(() => null),
+      api.getCosLearningPerformance().catch(() => null),
+      api.getCosLearningSkipped().catch(() => null),
+      api.getCosLearningDurations().catch(() => null),
+      api.getCosLearningRouting().catch(() => null),
+      api.getCosLearningConfidence().catch(() => null),
+      api.getCosFeedbackStats({ silent: true }).catch(() => null),
+      api.getDismissedCosRecommendations().catch(() => null)
+    ]);
+    setLearning(learningData);
+    setPerformance(performanceData);
+    setSkipped(skippedData);
+    setDurations(durationsData);
+    setRouting(routingData);
+    setConfidence(confidenceData);
+    setFeedback(feedbackData);
+    setDismissed(dismissedData?.dismissed || []);
+    setLoading(false);
+  }, []);
+
+  const handleDismissRec = useCallback(async (rec) => {
+    // Optimistic update — remove from active recommendations immediately
+    setLearning(prev => prev ? {
+      ...prev,
+      recommendations: (prev.recommendations || []).filter(r => r.id !== rec.id)
+    } : prev);
+    setDismissed(prev => [{ id: rec.id, dismissedAt: new Date().toISOString(), snapshot: rec.snapshot ?? null }, ...prev]);
+    const result = await api.dismissCosRecommendation(rec.id, rec.snapshot ?? null).catch(() => null);
+    if (!result?.dismissed) {
+      toast.error('Failed to dismiss recommendation');
+      await loadData();
+      return;
+    }
+    toast.success('Dismissed — won\'t alert again unless the situation worsens');
+  }, [loadData]);
+
+  const handleRestoreRec = useCallback(async (id) => {
+    setDismissed(prev => prev.filter(d => d.id !== id));
+    const result = await api.restoreCosRecommendation(id).catch(() => null);
+    if (!result?.restored) {
+      toast.error('Failed to restore recommendation');
+    }
+    await loadData();
+  }, [loadData]);
+
+  const handleClearDismissed = useCallback(async () => {
+    setDismissed([]);
+    const result = await api.clearDismissedCosRecommendations().catch(() => null);
+    if (!result?.cleared) {
+      toast.error('Failed to clear dismissed list');
+    }
+    await loadData();
+  }, [loadData]);
+
+  useEffect(() => {
+    loadData();
+  }, [loadData]);
+
+  const handleBackfill = useCallback(async () => {
+    setBackfilling(true);
+    const result = await api.backfillCosLearning().catch(() => null);
+    if (result?.success) {
+      await loadData();
+    }
+    setBackfilling(false);
+  }, [loadData]);
+
+  const [resettingAll, setResettingAll] = useState(false);
+
+  const handleResetTaskType = useCallback(async (taskType) => {
+    setResettingType(taskType);
+    const result = await api.resetCosTaskTypeLearning(taskType).catch(() => null);
+    if (result?.reset) {
+      toast.success(`Reset learning data for ${taskType} — auto-approval re-enabled`);
+      await loadData();
+    } else {
+      toast.error(`Failed to reset learning data for ${taskType}`);
+    }
+    setResettingType(null);
+  }, [loadData]);
+
+  const handleResetAllLowConfidence = useCallback(async () => {
+    const lowItems = confidence?.levels?.low || [];
+    if (lowItems.length === 0) return;
+    setResettingAll(true);
+    let successCount = 0;
+    for (const item of lowItems) {
+      const result = await api.resetCosTaskTypeLearning(item.taskType).catch(() => null);
+      if (result?.reset) successCount++;
+    }
+    if (successCount > 0) {
+      toast.success(`Marked ${successCount} task type${successCount > 1 ? 's' : ''} resolved — auto-approval re-enabled`);
+      await loadData();
+    } else {
+      toast.error('Failed to reset task types');
+    }
+    setResettingAll(false);
+  }, [confidence, loadData]);
+
+  const toggleSection = useCallback((section) => {
+    setExpandedSections(prev => ({ ...prev, [section]: !prev[section] }));
+  }, []);
+
+  // Memoize helper functions to prevent re-creation on each render
+  const getSuccessRateColor = useCallback((rate) => {
+    if (rate >= 80) return 'text-port-success';
+    if (rate >= 60) return 'text-port-warning';
+    return 'text-port-error';
+  }, []);
+
+  const getSuccessRateBg = useCallback((rate) => {
+    if (rate >= 80) return 'bg-port-success';
+    if (rate >= 60) return 'bg-port-warning';
+    return 'bg-port-error';
+  }, []);
+
+  // Memoize sorted durations to avoid re-sorting on each render
+  const sortedDurations = useMemo(() => taskTypeDurationRows(durations), [durations]);
+
+  const hasData = learning?.totals?.completed > 0;
+
+  return (
+    <div className="space-y-6">
+      {/* Header */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+        <div className="flex items-center gap-3">
+          <Brain className="w-5 h-5 text-port-accent-2" />
+          <h3 className="text-lg font-semibold text-white">Learning Analytics</h3>
+        </div>
+        <div className="flex gap-2">
+          {!hasData && !loading && (
+            <button
+              onClick={handleBackfill}
+              disabled={backfilling}
+              className="flex items-center gap-2 px-3 py-1.5 text-sm bg-port-accent-2/20 hover:bg-port-accent-2/30 text-port-accent-2 rounded-lg transition-colors disabled:opacity-50"
+            >
+              <Database size={14} />
+              {backfilling ? 'Backfilling...' : 'Backfill History'}
+            </button>
+          )}
+          <button
+            onClick={loadData}
+            disabled={loading}
+            className="flex items-center gap-2 px-3 py-1.5 text-sm bg-port-border hover:bg-port-border/80 text-white rounded-lg transition-colors disabled:opacity-50"
+          >
+            <RefreshCw size={14} className={loading ? 'animate-spin' : ''} />
+            Refresh
+          </button>
+        </div>
+      </div>
+
+      {loading ? (
+        <div className="flex items-center justify-center py-12">
+          <BrailleSpinner text="Loading" />
+        </div>
+      ) : !hasData ? (
+        <div className="bg-port-card border border-port-border rounded-lg p-8 text-center">
+          <Brain className="w-12 h-12 text-gray-600 mx-auto mb-3" />
+          <p className="text-gray-400">No learning data available yet.</p>
+          <p className="text-gray-500 text-sm mt-1">
+            Complete some tasks to see performance analytics, or click &quot;Backfill History&quot; to import existing data.
+          </p>
+        </div>
+      ) : (
+        <>
+          {/* Overview Stats */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            <div className="bg-port-card border border-port-border rounded-lg p-4">
+              <div className="flex items-center gap-2 mb-1">
+                <Target size={14} className="text-port-accent" />
+                <span className="text-xs text-gray-500">Tasks Analyzed</span>
+              </div>
+              <div className="text-2xl font-bold text-white">{learning.totals.completed}</div>
+              <div className="text-xs text-gray-500">
+                {learning.totals.succeeded} success / {learning.totals.failed} failed
+              </div>
+            </div>
+
+            <div className="bg-port-card border border-port-border rounded-lg p-4">
+              <div className="flex items-center gap-2 mb-1">
+                <TrendingUp size={14} className={getSuccessRateColor(learning.totals.successRate)} />
+                <span className="text-xs text-gray-500">Success Rate</span>
+              </div>
+              <div className={`text-2xl font-bold ${getSuccessRateColor(learning.totals.successRate)}`}>
+                {learning.totals.successRate}%
+              </div>
+              <div className="w-full bg-port-border rounded-full h-1.5 mt-2">
+                <div
+                  className={`h-1.5 rounded-full ${getSuccessRateBg(learning.totals.successRate)}`}
+                  style={{ width: `${learning.totals.successRate}%` }}
+                />
+              </div>
+            </div>
+
+            <div className="bg-port-card border border-port-border rounded-lg p-4">
+              <div className="flex items-center gap-2 mb-1">
+                <Clock size={14} className="text-port-accent" />
+                <span className="text-xs text-gray-500">Avg Duration</span>
+              </div>
+              <div className="text-2xl font-bold text-port-accent">{learning.totals.avgDurationMin}m</div>
+              <div className="text-xs text-gray-500">per task</div>
+            </div>
+
+            <div className="bg-port-card border border-port-border rounded-lg p-4">
+              <div className="flex items-center gap-2 mb-1">
+                <SkipForward size={14} className={skipped?.skippedCount > 0 ? 'text-port-warning' : 'text-gray-500'} />
+                <span className="text-xs text-gray-500">Skipped Types</span>
+              </div>
+              <div className={`text-2xl font-bold ${skipped?.skippedCount > 0 ? 'text-port-warning' : 'text-gray-500'}`}>
+                {skipped?.skippedCount || 0}
+              </div>
+              <div className="text-xs text-gray-500">due to low success</div>
+            </div>
+          </div>
+
+          <FeedbackSummary feedback={feedback} />
+
+          {/* Recommendations */}
+          {(learning.recommendations?.length > 0 || dismissed.length > 0) && (
+            <div className="bg-gradient-to-r from-port-accent-2/10 to-port-accent/10 border border-port-accent-2/30 rounded-lg p-4">
+              <div className="flex items-center justify-between mb-3">
+                <h4 className="text-sm font-medium text-white flex items-center gap-2">
+                  <Zap size={14} className="text-yellow-400" />
+                  AI Recommendations
+                </h4>
+                {dismissed.length > 0 && (
+                  <button
+                    onClick={() => setShowDismissed(prev => !prev)}
+                    className="text-xs text-gray-400 hover:text-white flex items-center gap-1"
+                    title={showDismissed ? 'Hide dismissed' : 'Show dismissed'}
+                  >
+                    {showDismissed ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                    {dismissed.length} dismissed
+                  </button>
+                )}
+              </div>
+              {learning.recommendations?.length > 0 ? (
+                <div className="space-y-2">
+                  {learning.recommendations.map((rec) => (
+                    <div
+                      key={rec.id || rec.message}
+                      className={`text-sm p-2 rounded flex items-start gap-2 ${
+                        rec.type === 'warning' ? 'bg-yellow-500/10 text-yellow-400' :
+                        rec.type === 'action' ? 'bg-red-500/10 text-red-400' :
+                        rec.type === 'optimization' ? 'bg-port-success/10 text-port-success' :
+                        rec.type === 'suggestion' ? 'bg-port-accent/10 text-port-accent' :
+                        'bg-gray-500/10 text-gray-400'
+                      }`}
+                    >
+                      {rec.type === 'warning' && <AlertTriangle size={14} className="mt-0.5 shrink-0" />}
+                      {rec.type === 'action' && <XCircle size={14} className="mt-0.5 shrink-0" />}
+                      {rec.type === 'optimization' && <CheckCircle size={14} className="mt-0.5 shrink-0" />}
+                      {rec.type === 'suggestion' && <Zap size={14} className="mt-0.5 shrink-0" />}
+                      {rec.type === 'info' && <Target size={14} className="mt-0.5 shrink-0" />}
+                      <span className="flex-1">{rec.message}</span>
+                      {rec.id && (
+                        <button
+                          onClick={() => handleDismissRec(rec)}
+                          className="opacity-60 hover:opacity-100 transition-opacity shrink-0 -my-2 -mr-1 p-2 min-h-[40px] min-w-[40px] flex items-center justify-center"
+                          title="Dismiss — won't show again unless this situation worsens significantly"
+                          aria-label={`Dismiss recommendation: ${rec.message}`}
+                        >
+                          <X size={14} />
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="text-xs text-gray-500 italic">No active recommendations.</p>
+              )}
+              {showDismissed && dismissed.length > 0 && (
+                <div className="mt-3 pt-3 border-t border-port-border">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-xs text-gray-500">
+                      Dismissed (will re-alert only if the underlying situation gets significantly worse)
+                    </span>
+                    <button
+                      onClick={handleClearDismissed}
+                      className="text-xs text-port-accent hover:text-port-accent/80"
+                    >
+                      Clear all
+                    </button>
+                  </div>
+                  <div className="space-y-1">
+                    {dismissed.map((d) => (
+                      <div
+                        key={d.id}
+                        className="text-xs p-2 rounded bg-port-bg/50 flex items-center justify-between gap-2 text-gray-500"
+                      >
+                        <div className="flex-1 min-w-0">
+                          <div className="font-mono truncate">{d.id}</div>
+                          {d.dismissedAt && (
+                            <div className="text-gray-600 text-[10px]">
+                              dismissed {formatDateTime(d.dismissedAt)}
+                              {d.snapshot?.value !== undefined && (
+                                <span> · snapshot: {d.snapshot.value}{d.snapshot.kind === 'rate' ? '%' : ''}</span>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                        <button
+                          onClick={() => handleRestoreRec(d.id)}
+                          className="text-port-accent hover:text-port-accent/80 flex items-center gap-1 shrink-0 px-2 py-1 min-h-[40px]"
+                          title="Restore this recommendation"
+                        >
+                          <Undo2 size={12} />
+                          Restore
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Confidence & Autonomy */}
+          {confidence?.summary && (
+            <div>
+              <button
+                onClick={() => toggleSection('confidence')}
+                className="flex items-center gap-2 w-full text-left mb-3"
+              >
+                {expandedSections.confidence ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+                <Shield size={16} className="text-port-accent" />
+                <span className="font-medium text-white">Confidence & Autonomy</span>
+                <span className="text-xs text-gray-500">
+                  ({confidence.summary.total} task types)
+                </span>
+                {confidence.summary.requireApproval > 0 && (
+                  <span className="text-xs bg-port-warning/20 text-port-warning px-1.5 py-0.5 rounded ml-auto">
+                    {confidence.summary.requireApproval} require approval
+                  </span>
+                )}
+              </button>
+              {expandedSections.confidence && (
+                <div className="space-y-3">
+                  {/* Confidence Summary */}
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                    <div className="bg-port-card border border-port-success/30 rounded-lg p-3 text-center">
+                      <ShieldCheck size={16} className="text-port-success mx-auto mb-1" />
+                      <div className="text-lg font-bold text-port-success">{confidence.summary.high}</div>
+                      <div className="text-xs text-gray-500">High Confidence</div>
+                    </div>
+                    <div className="bg-port-card border border-port-accent/30 rounded-lg p-3 text-center">
+                      <Shield size={16} className="text-port-accent mx-auto mb-1" />
+                      <div className="text-lg font-bold text-port-accent">{confidence.summary.medium}</div>
+                      <div className="text-xs text-gray-500">Medium</div>
+                    </div>
+                    <div className="bg-port-card border border-port-warning/30 rounded-lg p-3 text-center">
+                      <ShieldAlert size={16} className="text-port-warning mx-auto mb-1" />
+                      <div className="text-lg font-bold text-port-warning">{confidence.summary.low}</div>
+                      <div className="text-xs text-gray-500">Low (Approval)</div>
+                    </div>
+                    <div className="bg-port-card border border-port-border rounded-lg p-3 text-center">
+                      <ShieldQuestion size={16} className="text-gray-400 mx-auto mb-1" />
+                      <div className="text-lg font-bold text-gray-400">{confidence.summary.new}</div>
+                      <div className="text-xs text-gray-500">New (No Data)</div>
+                    </div>
+                  </div>
+
+                  {/* Thresholds Info */}
+                  <div className="text-xs text-gray-500 bg-port-card border border-port-border rounded-lg px-3 py-2">
+                    Thresholds: High &ge; {confidence.thresholds.highThreshold}% &middot; Low &lt; {confidence.thresholds.lowThreshold}% &middot; Min samples: {confidence.thresholds.minSamples}
+                  </div>
+
+                  {[
+                    { items: confidence.levels.low, borderClass: 'border-port-warning/30', bgClass: 'bg-port-warning/10', textClass: 'text-port-warning', Icon: ShieldAlert, title: 'Requires Approval', desc: 'These task types have low success rates and will require human approval before spawning. Reset metrics to mark resolved and re-enable auto-approval.' },
+                    { items: confidence.levels.high, borderClass: 'border-port-success/30', bgClass: 'bg-port-success/10', textClass: 'text-port-success', Icon: ShieldCheck, title: 'High Confidence', desc: 'Consistently successful — auto-approved without hesitation' }
+                  ].filter(g => g.items?.length > 0).map(({ items, borderClass, bgClass, textClass, Icon, title, desc }) => (
+                    <div key={title} className={`bg-port-card border ${borderClass} rounded-lg overflow-hidden`}>
+                      <div className={`px-4 py-2 ${bgClass} border-b border-port-border flex flex-col sm:flex-row sm:items-center justify-between gap-2`}>
+                        <div>
+                          <span className={`text-sm font-medium ${textClass} flex items-center gap-2`}>
+                            <Icon size={14} />
+                            {title} ({items.length})
+                          </span>
+                          <p className="text-xs text-gray-500 mt-0.5">
+                            {desc}
+                            {title === 'Requires Approval' && (
+                              <> &middot; Review pending tasks on the <Link to="/cos/tasks" className="text-port-accent hover:underline">Tasks tab</Link>.</>
+                            )}
+                          </p>
+                        </div>
+                        {title === 'Requires Approval' && items.length > 1 && (
+                          <button
+                            type="button"
+                            onClick={handleResetAllLowConfidence}
+                            disabled={resettingAll || !!resettingType}
+                            className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs bg-port-success/10 hover:bg-port-success/20 text-port-success border border-port-success/30 rounded transition-colors disabled:opacity-50 shrink-0 self-start sm:self-auto min-h-[32px]"
+                            title="Mark all resolved — reset learning data to re-enable auto-approval"
+                            aria-label="Mark all resolved"
+                          >
+                            <Check size={12} className={resettingAll ? 'animate-spin' : ''} />
+                            {resettingAll ? 'Resolving all…' : 'Mark all resolved'}
+                          </button>
+                        )}
+                      </div>
+                      <div className="divide-y divide-port-border">
+                        {items.map((t) => (
+                          <div key={t.taskType} className="px-4 py-2 flex items-center justify-between">
+                            <span className="text-sm text-gray-300 font-mono">{t.taskType}</span>
+                            <div className="flex items-center gap-3">
+                              <span className="text-xs text-gray-500">{runsLabel(t)}</span>
+                              <span className={`text-sm ${textClass} font-medium`}>{t.successRate}%</span>
+                              {title === 'Requires Approval' && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleResetTaskType(t.taskType)}
+                                  disabled={resettingType === t.taskType || resettingAll}
+                                  className="inline-flex items-center gap-1 px-2.5 py-1 text-xs bg-port-success/10 hover:bg-port-success/20 text-port-success border border-port-success/30 rounded transition-colors disabled:opacity-50 min-h-[32px]"
+                                  title={`Mark ${t.taskType} resolved — reset learning metrics to restore auto-approval`}
+                                  aria-label={`Mark ${t.taskType} resolved`}
+                                >
+                                  <Check size={12} className={resettingType === t.taskType ? 'animate-spin' : ''} />
+                                  {resettingType === t.taskType ? 'Resolving…' : 'Mark resolved'}
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Task Type Performance */}
+          <div>
+            <button
+              onClick={() => toggleSection('taskTypes')}
+              className="flex items-center gap-2 w-full text-left mb-3"
+            >
+              {expandedSections.taskTypes ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+              <BarChart2 size={16} className="text-port-accent" />
+              <span className="font-medium text-white">Task Type Performance</span>
+              <span className="text-xs text-gray-500">
+                ({performance?.topPerformers?.length || 0} top, {performance?.needsAttention?.length || 0} need attention)
+              </span>
+            </button>
+            {expandedSections.taskTypes && (
+              <div className="space-y-4">
+                {/* Top Performers */}
+                {performance?.topPerformers?.length > 0 && (
+                  <div className="bg-port-card border border-port-border rounded-lg overflow-hidden">
+                    <div className="px-4 py-2 bg-port-success/10 border-b border-port-border">
+                      <span className="text-sm font-medium text-port-success flex items-center gap-2">
+                        <TrendingUp size={14} />
+                        Top Performers (80%+ success)
+                      </span>
+                    </div>
+                    <div className="divide-y divide-port-border">
+                      {performance.topPerformers.map((item, idx) => (
+                        <div key={idx} className="p-3 flex items-center justify-between">
+                          <div className="flex-1 min-w-0">
+                            <div className="text-sm text-white truncate">{item.taskType}</div>
+                            <div className="text-xs text-gray-500">
+                              {runsLabel(item, 'tasks')} • {item.avgDurationMin}m avg
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-3">
+                            <div className="w-24 bg-port-border rounded-full h-2">
+                              <div
+                                className="h-2 rounded-full bg-port-success"
+                                style={{ width: `${item.successRate}%` }}
+                              />
+                            </div>
+                            <span className="text-sm font-mono text-port-success w-12 text-right">
+                              {item.successRate}%
+                            </span>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Needs Attention */}
+                {performance?.needsAttention?.length > 0 && (
+                  <div className="bg-port-card border border-port-border rounded-lg overflow-hidden">
+                    <div className="px-4 py-2 bg-port-error/10 border-b border-port-border">
+                      <span className="text-sm font-medium text-port-error flex items-center gap-2">
+                        <TrendingDown size={14} />
+                        Needs Attention (&lt;50% success)
+                      </span>
+                    </div>
+                    <div className="divide-y divide-port-border">
+                      {performance.needsAttention.map((item, idx) => (
+                        <div key={idx} className="p-3 flex items-center justify-between">
+                          <div className="flex-1 min-w-0">
+                            <div className="text-sm text-white truncate">{item.taskType}</div>
+                            <div className="text-xs text-gray-500">
+                              {runsLabel(item, 'tasks')} • {item.avgDurationMin}m avg
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-3">
+                            <div className="w-24 bg-port-border rounded-full h-2">
+                              <div
+                                className="h-2 rounded-full bg-port-error"
+                                style={{ width: `${item.successRate}%` }}
+                              />
+                            </div>
+                            <span className="text-sm font-mono text-port-error w-12 text-right">
+                              {item.successRate}%
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => handleResetTaskType(item.taskType)}
+                              disabled={resettingType === item.taskType}
+                              className="inline-flex items-center gap-1 px-2 py-1 text-xs bg-port-accent/20 hover:bg-port-accent/30 text-port-accent rounded transition-colors disabled:opacity-50 min-h-[32px]"
+                              title="Reset learning data to re-enable this task type"
+                              aria-label={`Reset ${item.taskType}`}
+                            >
+                              <RotateCcw size={12} className={resettingType === item.taskType ? 'animate-spin' : ''} />
+                              Reset
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {performance?.topPerformers?.length === 0 && performance?.needsAttention?.length === 0 && (
+                  <div className="text-center py-4 text-gray-500 text-sm">
+                    Need at least 3 completed tasks per type to show performance data
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Skipped Task Types */}
+          {skipped?.skippedCount > 0 && (
+            <div>
+              <button
+                onClick={() => toggleSection('skipped')}
+                className="flex items-center gap-2 w-full text-left mb-3"
+              >
+                {expandedSections.skipped ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+                <SkipForward size={16} className="text-port-warning" />
+                <span className="font-medium text-white">Skipped Task Types</span>
+                <span className="text-xs text-port-warning">({skipped.skippedCount})</span>
+              </button>
+              {expandedSections.skipped && (
+                <div className="bg-port-warning/10 border border-port-warning/30 rounded-lg p-4">
+                  <p className="text-sm text-gray-400 mb-3">
+                    These task types have been automatically skipped due to very low success rates (&lt;30% with 5+ attempts).
+                  </p>
+                  <div className="space-y-2">
+                    {skipped.skippedTypes.map((item, idx) => (
+                      <div key={idx} className="flex items-center justify-between p-2 bg-port-bg rounded">
+                        <div>
+                          <span className="text-sm text-white">{item.taskType}</span>
+                          <span className="text-xs text-gray-500 ml-2">
+                            ({runsLabel(item, 'attempts')})
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-3">
+                          <span className="text-sm text-port-error font-mono">{item.successRate}%</span>
+                          <button
+                            onClick={() => handleResetTaskType(item.taskType)}
+                            disabled={resettingType === item.taskType}
+                            className="flex items-center gap-1 px-2 py-1 text-xs bg-port-accent/20 hover:bg-port-accent/30 text-port-accent rounded transition-colors disabled:opacity-50 min-h-[40px]"
+                            title="Reset learning data to re-enable this task type"
+                          >
+                            <RotateCcw size={12} className={resettingType === item.taskType ? 'animate-spin' : ''} />
+                            Reset
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  <p className="text-xs text-gray-500 mt-3">
+                    Reset clears historical metrics so the task type can be retried with a fresh start
+                  </p>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Duration Estimates */}
+          {durations && Object.keys(durations).length > 1 && (
+            <div>
+              <button
+                onClick={() => toggleSection('durations')}
+                className="flex items-center gap-2 w-full text-left mb-3"
+              >
+                {expandedSections.durations ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+                <Timer size={16} className="text-port-accent" />
+                <span className="font-medium text-white">Duration Estimates</span>
+                <span className="text-xs text-gray-500">
+                  ({sortedDurations.length} task types)
+                </span>
+              </button>
+              {expandedSections.durations && (
+                <div className="bg-port-card border border-port-border rounded-lg overflow-hidden">
+                  <table className="w-full text-sm">
+                    <thead className="bg-port-bg">
+                      <tr>
+                        <th className="text-left p-3 text-gray-500 font-medium">Task Type</th>
+                        <th className="text-right p-3 text-gray-500 font-medium">Avg</th>
+                        <th className="text-right p-3 text-gray-500 font-medium" title="P80 estimate used for progress bars">Est</th>
+                        <th className="text-right p-3 text-gray-500 font-medium hidden sm:table-cell">Samples</th>
+                        <th className="text-right p-3 text-gray-500 font-medium hidden sm:table-cell">Success</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {sortedDurations.map(([taskType, data], idx) => (
+                        <tr key={idx} className="border-t border-port-border">
+                          <td className="p-3 text-gray-300 truncate max-w-[200px]">{taskType}</td>
+                          <td className="p-3 text-right text-gray-500 font-mono">
+                            {data.avgDurationMs ? formatDurationMin(Math.round(data.avgDurationMs / 60000)) || '—' : '—'}
+                          </td>
+                          <td className="p-3 text-right text-port-accent font-mono" title="P80 estimate used for progress bars and ETAs">
+                            {(data.p80DurationMs || data.avgDurationMs) ? formatDurationMin(Math.round((data.p80DurationMs || data.avgDurationMs) / 60000)) || '—' : '—'}
+                          </td>
+                          <td className="p-3 text-right text-gray-500 hidden sm:table-cell">
+                            {data.completed}
+                          </td>
+                          <td className={`p-3 text-right font-mono hidden sm:table-cell ${getSuccessRateColor(data.successRate)}`}>
+                            {data.successRate}%
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Model Performance */}
+          {learning.insights?.modelEffectiveness?.length > 0 && (
+            <div>
+              <button
+                onClick={() => toggleSection('models')}
+                className="flex items-center gap-2 w-full text-left mb-3"
+              >
+                {expandedSections.models ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+                <Zap size={16} className="text-yellow-400" />
+                <span className="font-medium text-white">Model Performance</span>
+                <span className="text-xs text-gray-500">
+                  ({learning.insights.modelEffectiveness.length} tiers)
+                </span>
+              </button>
+              {expandedSections.models && (
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  {learning.insights.modelEffectiveness.map((model, idx) => {
+                    const tierLabels = {
+                      'light': { label: 'Haiku', desc: 'Fast, simple tasks' },
+                      'medium': { label: 'Sonnet', desc: 'Balanced performance' },
+                      'heavy': { label: 'Opus', desc: 'Complex tasks' },
+                      'user-specified': { label: 'User Selected', desc: 'Manual override' }
+                    };
+                    const info = tierLabels[model.tier] || { label: model.tier, desc: '' };
+
+                    return (
+                      <div key={idx} className="bg-port-card border border-port-border rounded-lg p-4">
+                        <div className="flex items-center justify-between mb-2">
+                          <span className="text-sm font-medium text-white">{info.label}</span>
+                          <span className={`text-lg font-bold ${getSuccessRateColor(model.successRate)}`}>
+                            {model.successRate}%
+                          </span>
+                        </div>
+                        <div className="w-full bg-port-border rounded-full h-2 mb-2">
+                          <div
+                            className={`h-2 rounded-full ${getSuccessRateBg(model.successRate)}`}
+                            style={{ width: `${model.successRate}%` }}
+                          />
+                        </div>
+                        <div className="flex justify-between text-xs text-gray-500">
+                          <span>{info.desc}</span>
+                          <span>{pluralize(model.completed, 'task')} • {model.avgDurationMin}m avg</span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Routing Accuracy */}
+          {routing?.matrix?.length > 0 && (
+            <div>
+              <button
+                onClick={() => toggleSection('routing')}
+                className="flex items-center gap-2 w-full text-left mb-3"
+              >
+                {expandedSections.routing ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+                <Crosshair size={16} className="text-orange-400" />
+                <span className="font-medium text-white">Routing Accuracy</span>
+                <span className="text-xs text-gray-500">
+                  ({routing.matrix.length} task types)
+                </span>
+                {routing.totalMisroutes > 0 && (
+                  <span className="text-xs text-port-error">
+                    ({routing.totalMisroutes} misroute{routing.totalMisroutes !== 1 ? 's' : ''})
+                  </span>
+                )}
+              </button>
+              {expandedSections.routing && (
+                <div className="space-y-4">
+                  {/* Misroutes Alert */}
+                  {routing.misroutes?.length > 0 && (
+                    <div className="bg-port-error/10 border border-port-error/30 rounded-lg p-4">
+                      <h4 className="text-sm font-medium text-port-error mb-2 flex items-center gap-2">
+                        <XCircle size={14} />
+                        Misroutes Detected
+                      </h4>
+                      <p className="text-xs text-gray-400 mb-3">
+                        These task type + model tier combinations have &lt;40% success with 3+ attempts. Routing never changes on its own — pin a model or tier on the task or schedule to act on this.
+                      </p>
+                      <div className="space-y-1">
+                        {routing.misroutes.map((m, idx) => (
+                          <div key={idx} className="flex items-center justify-between p-2 bg-port-bg rounded text-sm">
+                            <div className="flex items-center gap-2">
+                              <span className="text-white">{m.taskType}</span>
+                              <span className="text-gray-500">on</span>
+                              <span className="text-orange-400 font-medium">{m.tier}</span>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <span className="text-port-error font-mono">{m.successRate}%</span>
+                              <span className="text-xs text-gray-500">({m.failed} failed / {m.total})</span>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Tier Overview */}
+                  {routing.tierOverview?.length > 0 && (
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                      {routing.tierOverview.map((tier, idx) => {
+                        const tierLabels = {
+                          'light': 'Light', 'medium': 'Medium', 'heavy': 'Heavy', 'ultra': 'Ultra',
+                          'default': 'Default', 'user-specified': 'User'
+                        };
+                        return (
+                          <div key={idx} className="bg-port-card border border-port-border rounded-lg p-3">
+                            <div className="flex items-center justify-between mb-1">
+                              <span className="text-sm text-white">{tierLabels[tier.tier] || tier.tier}</span>
+                              <span className={`text-sm font-mono ${getSuccessRateColor(tier.successRate)}`}>
+                                {tier.successRate}%
+                              </span>
+                            </div>
+                            <div className="w-full bg-port-border rounded-full h-1.5 mb-1">
+                              <div
+                                className={`h-1.5 rounded-full ${getSuccessRateBg(tier.successRate)}`}
+                                style={{ width: `${tier.successRate}%` }}
+                              />
+                            </div>
+                            <div className="flex justify-between text-xs text-gray-500">
+                              <span>{tier.total} tasks across {tier.taskTypes} types</span>
+                              {tier.misroutes > 0 && (
+                                <span className="text-port-error">{tier.misroutes} misroute{tier.misroutes !== 1 ? 's' : ''}</span>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+
+                  {/* Full Matrix */}
+                  <div className="bg-port-card border border-port-border rounded-lg overflow-hidden">
+                    <table className="w-full text-sm">
+                      <thead className="bg-port-bg">
+                        <tr>
+                          <th className="text-left p-3 text-gray-500 font-medium">Task Type</th>
+                          <th className="text-left p-3 text-gray-500 font-medium">Tier</th>
+                          <th className="text-right p-3 text-gray-500 font-medium">Success</th>
+                          <th className="text-right p-3 text-gray-500 font-medium hidden sm:table-cell">Pass</th>
+                          <th className="text-right p-3 text-gray-500 font-medium hidden sm:table-cell">Fail</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {routing.matrix.map((entry) =>
+                          entry.tiers.map((tier, tIdx) => (
+                            <tr key={`${entry.taskType}-${tier.tier}`} className="border-t border-port-border">
+                              {tIdx === 0 ? (
+                                <td className="p-3 text-gray-300 max-w-[200px] align-top" rowSpan={entry.tiers.length}>
+                                  <div className="truncate">{entry.taskType}</div>
+                                  {entry.suggestion && (
+                                    <div className="text-xs text-gray-500 mt-1" title={entry.suggestion.reason || undefined}>
+                                      {entry.suggestion.tier && <>Suggests <span className="text-port-accent">{entry.suggestion.tier}</span></>}
+                                      {entry.suggestion.tier && entry.suggestion.avoidTiers.length > 0 && ' · '}
+                                      {entry.suggestion.avoidTiers.length > 0 && <>avoid <span className="text-orange-400">{entry.suggestion.avoidTiers.join(', ')}</span></>}
+                                    </div>
+                                  )}
+                                </td>
+                              ) : null}
+                              <td className="p-3 text-orange-400">{tier.tier}</td>
+                              <td className={`p-3 text-right font-mono ${getSuccessRateColor(tier.successRate)}`}>
+                                {tier.successRate}%
+                              </td>
+                              <td className="p-3 text-right text-port-success hidden sm:table-cell">{tier.succeeded}</td>
+                              <td className="p-3 text-right text-port-error hidden sm:table-cell">{tier.failed}</td>
+                            </tr>
+                          ))
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Error Patterns */}
+          {learning.insights?.commonErrors?.length > 0 && (
+            <div>
+              <button
+                onClick={() => toggleSection('errors')}
+                className="flex items-center gap-2 w-full text-left mb-3"
+              >
+                {expandedSections.errors ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+                <AlertTriangle size={16} className="text-port-error" />
+                <span className="font-medium text-white">Error Patterns</span>
+                <span className="text-xs text-gray-500">
+                  ({learning.insights.commonErrors.length} categories)
+                </span>
+              </button>
+              {expandedSections.errors && (
+                <div className="space-y-3">
+                  <div className="bg-port-card border border-port-border rounded-lg divide-y divide-port-border">
+                    {learning.insights.commonErrors.map((error, idx) => (
+                      <div key={idx} className="p-3">
+                        <div className="flex items-center justify-between mb-1">
+                          <span className="text-sm text-port-error font-medium">{error.category}</span>
+                          <span className="text-xs text-gray-500">{error.count} occurrences</span>
+                        </div>
+                        {error.affectedTypes?.length > 0 && (
+                          <div className="text-xs text-gray-500">
+                            Affects: {error.affectedTypes.join(', ')}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Recent Unknown Error Samples */}
+                  {learning.insights?.recentUnknownErrors?.length > 0 && (
+                    <div className="bg-port-card border border-port-warning/30 rounded-lg overflow-hidden">
+                      <div className="px-4 py-2 bg-port-warning/10 border-b border-port-border">
+                        <span className="text-sm font-medium text-port-warning flex items-center gap-2">
+                          <AlertTriangle size={14} />
+                          Recent Uncategorized Errors ({learning.insights.recentUnknownErrors.length})
+                        </span>
+                        <p className="text-xs text-gray-500 mt-1">
+                          Errors that didn&apos;t match known patterns — useful for identifying missing error categories
+                        </p>
+                      </div>
+                      <div className="divide-y divide-port-border max-h-64 overflow-y-auto">
+                        {learning.insights.recentUnknownErrors.slice(-10).reverse().map((err, idx) => (
+                          <div key={idx} className="p-3">
+                            <div className="flex items-center justify-between mb-1">
+                              <span className="text-xs text-gray-500 font-mono">{err.taskType}</span>
+                              <span className="text-xs text-gray-600">{formatDateNumeric(err.recordedAt)}</span>
+                            </div>
+                            <div className="text-sm text-gray-300 font-mono break-all">{err.message || 'No message'}</div>
+                            {err.details && (
+                              <div className="text-xs text-gray-500 mt-1 font-mono break-all line-clamp-2">{err.details}</div>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Standing Learnings / Operating Notes (issue #2443) */}
+          {learning.standingLearnings?.length > 0 && (
+            <div>
+              <button
+                onClick={() => toggleSection('standing')}
+                className="flex items-center gap-2 w-full text-left mb-3"
+              >
+                {expandedSections.standing ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+                <BookOpen size={16} className="text-port-accent" />
+                <span className="font-medium text-white">Standing Learnings</span>
+                <span className="text-xs text-gray-500">
+                  ({learning.standingLearnings.length} note{learning.standingLearnings.length === 1 ? '' : 's'})
+                </span>
+              </button>
+              {expandedSections.standing && (
+                <>
+                  <p className="text-xs text-gray-500 mb-3">
+                    Human-readable operating notes — recurring-failure incidents the agent auto-flagged, plus notes you recorded. Runtime-only (never committed to git).
+                  </p>
+                  <div className="bg-port-card border border-port-border rounded-lg divide-y divide-port-border">
+                    {learning.standingLearnings.map((note, idx) => {
+                      const isAuto = note.origin === 'auto-incident';
+                      return (
+                        <div key={idx} className="p-3">
+                          <div className="flex items-center justify-between gap-2 mb-1">
+                            <span className={`inline-flex items-center gap-1 text-xs font-medium px-1.5 py-0.5 rounded ${isAuto ? 'bg-port-warning/15 text-port-warning' : 'bg-port-border text-gray-300'}`}>
+                              {isAuto ? <Sparkles size={11} /> : <User size={11} />}
+                              {isAuto ? 'Auto-flagged' : 'Manual'}
+                            </span>
+                            {note.recordedAt && (
+                              <span className="text-xs text-gray-600">{formatDateTime(note.recordedAt)}</span>
+                            )}
+                          </div>
+                          <div className="text-sm text-gray-300">{note.message}</div>
+                          {(note.category || note.taskType) && (
+                            <div className="text-xs text-gray-500 mt-1 font-mono">
+                              {note.category ? `${note.category}` : ''}{note.category && note.taskType ? ' · ' : ''}{note.taskType || ''}
+                              {note.recurrenceCount ? ` · ×${note.recurrenceCount}` : ''}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+
+          {/* Last Updated */}
+          {learning.lastUpdated && (
+            <div className="text-xs text-gray-600 text-center pt-4 border-t border-port-border">
+              Learning data last updated: {formatDateTime(learning.lastUpdated)}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}

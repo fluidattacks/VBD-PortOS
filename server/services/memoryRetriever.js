@@ -1,0 +1,262 @@
+/**
+ * Memory Retriever Service
+ *
+ * Retrieves relevant memories for agent context injection.
+ * Combines semantic search with importance scoring.
+ */
+
+import { getMemories, searchMemories, hybridSearchMemories, getMemory } from './memoryBackend.js';
+import { generateQueryEmbedding, estimateTokens, truncateToTokens } from './memoryEmbeddings.js';
+import { fenceBlock, UNTRUSTED_REFERENCE_NOTICE } from '../lib/promptFencing.js';
+import { DEFAULT_MEMORY_CONFIG } from './memoryBackend.js';
+
+// Search mode preference: 'hybrid' (FTS + vector) or 'vector' (embedding-only)
+const SEARCH_MODE = 'hybrid';
+
+// The memory types formatForPrompt renders; any other type is left out of the prompt.
+const FORMATTED_TYPES = new Set(['preference', 'fact', 'learning', 'observation', 'decision', 'context']);
+
+/**
+ * Get relevant memories for a task
+ * Returns formatted text ready for injection into agent prompt
+ */
+export async function getRelevantMemories(task, options = {}) {
+  const maxTokens = options.maxTokens || DEFAULT_MEMORY_CONFIG.maxContextTokens;
+  const minRelevance = options.minRelevance || DEFAULT_MEMORY_CONFIG.minRelevanceThreshold;
+  // Cap the semantic-search fan-out. Callers that only inject a handful of
+  // memories (e.g. voice's buildMemoryContext) pass a small `limit` so retrieval
+  // doesn't fetch 20 rows just to slice down to 5. Search results are
+  // relevance-sorted, so the top-`limit` are the most relevant. Defaults to 20
+  // (prior behavior) when unset; the token budget still applies on top.
+  const searchLimit = Number.isFinite(options.limit) && options.limit > 0 ? options.limit : 20;
+
+  const memories = [];
+  let tokenCount = 0;
+
+  // 1. Search based on task description (hybrid BM25 + vector or vector-only)
+  if (task.description) {
+    const queryEmbedding = await generateQueryEmbedding(task.description);
+    let searchResults = { memories: [] };
+
+    if (SEARCH_MODE === 'hybrid' && queryEmbedding) {
+      // Use hybrid FTS + vector search with reciprocal rank fusion
+      searchResults = await hybridSearchMemories(task.description, queryEmbedding, {
+        limit: searchLimit,
+        minRelevance,
+        ftsWeight: 0.4,
+        vectorWeight: 0.6
+      });
+    } else if (queryEmbedding) {
+      // Fallback to vector-only search
+      searchResults = await searchMemories(queryEmbedding, {
+        minRelevance,
+        limit: searchLimit
+      });
+    }
+
+    // allSettled: a single failed getMemory() shouldn't abort the whole retrieval.
+    const fetchedMems = await Promise.allSettled(searchResults.memories.map(r => getMemory(r.id)));
+    for (let i = 0; i < searchResults.memories.length; i++) {
+      const result = searchResults.memories[i];
+      const settled = fetchedMems[i];
+      const mem = settled.status === 'fulfilled' ? settled.value : null;
+      if (mem) {
+        const tokens = estimateTokens(mem.content);
+        if (tokenCount + tokens <= maxTokens) {
+          memories.push({
+            ...mem,
+            relevance: result.rrfScore || result.similarity || 0.5,
+            source: result.searchMethod || 'semantic'
+          });
+          tokenCount += tokens;
+        }
+      }
+    }
+  }
+
+  // 2. Add high-importance preferences (always include user preferences)
+  const preferences = await getMemories({
+    types: ['preference'],
+    status: 'active',
+    sortBy: 'importance',
+    sortOrder: 'desc',
+    limit: 5
+  });
+
+  const prefIds = preferences.memories.filter(p => !memories.some(m => m.id === p.id)).map(p => p.id);
+  const prefMems = await Promise.allSettled(prefIds.map(id => getMemory(id)));
+  for (let i = 0; i < prefIds.length; i++) {
+    const settled = prefMems[i];
+    const mem = settled.status === 'fulfilled' ? settled.value : null;
+    if (mem) {
+      const tokens = estimateTokens(mem.content);
+      if (tokenCount + tokens <= maxTokens) {
+        memories.push({
+          ...mem,
+          relevance: mem.importance,
+          source: 'preference'
+        });
+        tokenCount += tokens;
+      }
+    }
+  }
+
+  // 3. Add recent high-importance facts about the codebase
+  if (task.metadata?.app) {
+    const appMemories = await getMemories({
+      types: ['fact', 'observation'],
+      categories: ['codebase', 'architecture', 'patterns'],
+      status: 'active',
+      sortBy: 'importance',
+      sortOrder: 'desc',
+      limit: 5
+    });
+
+    const appIds = appMemories.memories.filter(a => !memories.some(m => m.id === a.id)).map(a => a.id);
+    const appMems = await Promise.allSettled(appIds.map(id => getMemory(id)));
+    for (let i = 0; i < appIds.length; i++) {
+      const settled = appMems[i];
+      const mem = settled.status === 'fulfilled' ? settled.value : null;
+      if (mem) {
+        const tokens = estimateTokens(mem.content);
+        if (tokenCount + tokens <= maxTokens) {
+          memories.push({
+            ...mem,
+            relevance: mem.importance * 0.8,
+            source: 'codebase'
+          });
+          tokenCount += tokens;
+        }
+      }
+    }
+  }
+
+  // Sort by relevance
+  memories.sort((a, b) => b.relevance - a.relevance);
+
+  return memories;
+}
+
+/**
+ * Format memories for prompt injection
+ */
+export function formatForPrompt(memories, maxTokens = DEFAULT_MEMORY_CONFIG.maxContextTokens) {
+  if (!memories || memories.length === 0) {
+    return '';
+  }
+
+  const sections = {
+    preference: [],
+    fact: [],
+    learning: [],
+    observation: [],
+    decision: [],
+    context: []
+  };
+
+  for (const memory of memories) {
+    const type = memory.type || 'context';
+    if (sections[type]) {
+      sections[type].push(memory);
+    }
+  }
+
+  const lines = ['## Relevant Context from Memory\n'];
+
+  // Format preferences first (most important)
+  if (sections.preference.length > 0) {
+    lines.push('### User Preferences');
+    for (const mem of sections.preference) {
+      lines.push(`- ${mem.content}`);
+    }
+    lines.push('');
+  }
+
+  // Format facts about codebase
+  if (sections.fact.length > 0) {
+    lines.push('### Codebase Facts');
+    for (const mem of sections.fact) {
+      lines.push(`- ${mem.content}`);
+    }
+    lines.push('');
+  }
+
+  // Format learnings
+  if (sections.learning.length > 0) {
+    lines.push('### Previous Learnings');
+    for (const mem of sections.learning) {
+      lines.push(`- ${mem.content}`);
+    }
+    lines.push('');
+  }
+
+  // Format observations
+  if (sections.observation.length > 0) {
+    lines.push('### Observations');
+    for (const mem of sections.observation) {
+      lines.push(`- ${mem.content}`);
+    }
+    lines.push('');
+  }
+
+  // Format decisions
+  if (sections.decision.length > 0) {
+    lines.push('### Past Decisions');
+    for (const mem of sections.decision) {
+      lines.push(`- ${mem.content}`);
+    }
+    lines.push('');
+  }
+
+  // Format context
+  if (sections.context.length > 0) {
+    lines.push('### Additional Context');
+    for (const mem of sections.context) {
+      lines.push(`- ${mem.content}`);
+    }
+    lines.push('');
+  }
+
+  const label = 'Memory reference data';
+  // Include the notice, delimiters and possible truncation marker in the same
+  // budget used for retrieval; an oversized preference cannot crowd them out.
+  const overhead = UNTRUSTED_REFERENCE_NOTICE.length + 2
+    + fenceBlock(label, 'x', 1).length - 1 + '\n… [truncated]'.length;
+  const block = fenceBlock(label, lines.join('\n'), Math.max(0, maxTokens * 4 - overhead));
+  return block ? `${UNTRUSTED_REFERENCE_NOTICE}\n\n${block}` : '';
+}
+
+/**
+ * Get memory section for agent prompt
+ * Main entry point for subAgentSpawner integration
+ */
+export async function getMemorySection(task, options = {}) {
+  const { section, injected } = await getMemoryInjection(task, options);
+  // Lets a caller that builds a run record (agentPromptBuilder) capture the
+  // lineage without changing this function's string-or-null return contract.
+  if (typeof options.onInjected === 'function') options.onInjected(injected);
+  return section;
+}
+
+/**
+ * Same retrieval as getMemorySection, but also reports WHICH memories made it
+ * into the prompt text: `injected: [{ id, version, relevance }]`. `version` is
+ * null until memory versioning lands. Only memories the formatter actually
+ * renders are listed (an unrecognised type is dropped from the prompt, so it is
+ * dropped here too); `section` is null when nothing relevant was found.
+ */
+async function getMemoryInjection(task, options = {}) {
+  const memories = await getRelevantMemories(task, options);
+
+  if (memories.length === 0) {
+    return { section: null, injected: [] };
+  }
+
+  const section = formatForPrompt(memories, options.maxTokens);
+  const injected = section
+    ? memories
+      .filter(m => FORMATTED_TYPES.has(m.type || 'context'))
+      .map(m => ({ id: m.id, version: m.version ?? null, relevance: m.relevance ?? null }))
+    : [];
+  return { section: section || null, injected };
+}

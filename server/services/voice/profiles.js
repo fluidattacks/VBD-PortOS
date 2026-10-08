@@ -1,0 +1,741 @@
+/**
+ * Machine-local character voice profiles (#5380, #5381).
+ *
+ * Universe characters retain only portable voice direction and their legacy
+ * namespaced preset id. This module owns the local, DB-primary binding that
+ * can be promoted independently on each install, plus the managed directory
+ * that holds benchmark renders, training runs, and local engine artifacts.
+ */
+
+import { createHash, randomUUID } from 'node:crypto';
+import { mkdir } from 'node:fs/promises';
+import { join } from 'node:path';
+import { withBackupAssetPublication } from '../../lib/backupSnapshotBoundary.js';
+import { query } from '../../lib/db.js';
+import { ServerError } from '../../lib/errorHandler.js';
+import { PATHS } from '../../lib/paths.js';
+import { writeFileGuarded } from '../../lib/fileUtils.js';
+import { trimTo } from '../../lib/textUtils.js';
+
+export const VOICE_PROFILE_ENGINES = new Set(['kokoro', 'piper', 'qwen3-tts', 'auk']);
+export const VOICE_PROFILE_KINDS = new Set(['preset', 'designed', 'cloned', 'fine-tuned']);
+export const VOICE_PROFILE_ROUTES = new Set(['studio', 'interactive']);
+
+const PROFILE_ID_RE = /^[a-z0-9][a-z0-9-]{0,79}$/;
+const MAX_ID = 160;
+const MAX_LABEL = 160;
+const MAX_REVISION = 240;
+const MAX_BENCHMARK_LINES = 12;
+const MAX_RENDER_ID = 160;
+const DEFAULT_DELIVERY = Object.freeze({ rate: 1, pitchSemitones: null, formantSemitones: null });
+const DEFAULT_MASTERING = Object.freeze({ chain: ['preset-output:unprocessed'] });
+const SAFE_ASSET_BASENAME = /^[a-z0-9][a-z0-9._-]{0,159}$/i;
+
+const timestamp = () => new Date().toISOString();
+const positiveInteger = (value, fallback = 1) =>
+  Number.isInteger(value) && value > 0 ? value : fallback;
+
+export function parsePresetVoiceId(voiceId) {
+  const value = trimTo(voiceId, MAX_ID);
+  const match = /^([a-z][a-z0-9-]*):([^:\s]+)$/i.exec(value);
+  if (!match) return null;
+  const engine = match[1].toLowerCase();
+  const normalizedEngine = engine === 'qwen3' ? 'qwen3-tts' : engine;
+  if (!VOICE_PROFILE_ENGINES.has(normalizedEngine)) return null;
+  return { engine: normalizedEngine, voice: match[2], voiceId: `${normalizedEngine}:${match[2]}` };
+}
+
+const sanitizeRoutes = (raw) => Object.fromEntries(
+  [...VOICE_PROFILE_ROUTES].map((route) => [route, {
+    enabled: raw?.[route]?.enabled === true,
+    maxFirstAudioMs: Number.isFinite(raw?.[route]?.maxFirstAudioMs)
+      ? Math.max(50, Math.round(raw[route].maxFirstAudioMs))
+      : (route === 'interactive' ? 900 : null),
+  }]),
+);
+
+const boundedNumber = (value, min, max, fallback) =>
+  Number.isFinite(value) ? Math.min(max, Math.max(min, value)) : fallback;
+
+const sanitizeDelivery = (raw) => ({
+  rate: boundedNumber(raw?.rate, 0.25, 4, DEFAULT_DELIVERY.rate),
+  pitchSemitones: null,
+  formantSemitones: null,
+});
+
+const sanitizeMastering = (raw) => ({
+  chain: Array.isArray(raw?.chain)
+    ? raw.chain.map((step) => trimTo(step, 80)).filter(Boolean).slice(0, 12)
+    : [...DEFAULT_MASTERING.chain],
+});
+
+const sanitizeInference = (raw) => ({
+  seed: Number.isInteger(raw?.seed) ? raw.seed : 42,
+  instructions: trimTo(raw?.instructions, 2000) || null,
+  rate: boundedNumber(raw?.rate, 0.25, 4, 1.0),
+  checkpointPath: trimTo(raw?.checkpointPath, 500) || null,
+  modelId: trimTo(raw?.modelId, 160) || null,
+  pitchSemitones: boundedNumber(raw?.pitchSemitones, -12, 12, 0),
+  genSeconds: boundedNumber(raw?.genSeconds, 2, 12, 4),
+});
+
+const sanitizeBenchmark = (raw) => {
+  if (!raw || typeof raw !== 'object') return null;
+  const renderedAt = trimTo(raw.renderedAt, 64);
+  const lines = Array.isArray(raw.lines) ? raw.lines.map((line) => {
+    const filename = trimTo(line?.filename, 200);
+    if (!filename) return null;
+    return {
+      key: trimTo(line.key, 64),
+      text: trimTo(line.text, 1000),
+      filename,
+      latencyMs: Number.isFinite(line.latencyMs) ? Math.max(0, Math.round(line.latencyMs)) : null,
+      engine: VOICE_PROFILE_ENGINES.has(line.engine) ? line.engine : null,
+      modelRevision: trimTo(line.modelRevision, MAX_REVISION) || null,
+      effectiveControls: {
+        rate: Number.isFinite(line?.effectiveControls?.rate) ? line.effectiveControls.rate : null,
+      },
+    };
+  }).filter(Boolean).slice(0, MAX_BENCHMARK_LINES) : [];
+  if (!renderedAt || (lines.length === 0 && !Number.isFinite(raw.interactiveLatencyMs))) return null;
+  return {
+    profileRevision: positiveInteger(raw.profileRevision),
+    renderedAt,
+    lines,
+    mastering: sanitizeMastering(raw.mastering),
+    interactiveLatencyMs: Number.isFinite(raw.interactiveLatencyMs) ? Math.round(raw.interactiveLatencyMs) : null,
+    interactiveMeasurement: raw.interactiveMeasurement?.boundary === 'browser-playing-segmented' &&
+      ['synthesisLatencyMs', 'renderRequestLatencyMs', 'playbackStartupMs']
+        .every((key) => Number.isFinite(raw.interactiveMeasurement[key]) && raw.interactiveMeasurement[key] >= 0) ? {
+        boundary: 'browser-playing-segmented',
+        renderRequestLatencyMs: Math.round(raw.interactiveMeasurement.renderRequestLatencyMs),
+        playbackStartupMs: Math.round(raw.interactiveMeasurement.playbackStartupMs),
+        synthesisLatencyMs: Math.max(0, Math.round(raw.interactiveMeasurement.synthesisLatencyMs)),
+        modelRevision: trimTo(raw.interactiveMeasurement.modelRevision, MAX_REVISION) || null,
+      } : null,
+    similarityScore: Number.isFinite(raw.similarityScore) ? Number(raw.similarityScore.toFixed(3)) : null,
+  };
+};
+
+const sanitizeSourceAssets = (raw) => Array.isArray(raw)
+  ? raw.map((asset) => {
+    const filename = trimTo(asset?.filename, 160);
+    if (!SAFE_ASSET_BASENAME.test(filename)) return null;
+    return {
+      filename,
+      sha256: /^[a-f0-9]{64}$/i.test(trimTo(asset?.sha256, 64)) ? trimTo(asset.sha256, 64).toLowerCase() : null,
+      transcript: trimTo(asset?.transcript, 4000) || null,
+      rightsConfirmedAt: trimTo(asset?.rightsConfirmedAt, 64) || null,
+      performerConsentConfirmed: asset?.performerConsentConfirmed === true,
+      licensePosture: trimTo(asset?.licensePosture, 160) || null,
+    };
+  }).filter(Boolean).slice(0, 24)
+  : [];
+
+/** Turn a raw DB JSON payload into the durable public profile shape. */
+export function sanitizeVoiceProfile(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const id = trimTo(raw.id, 80);
+  const universeId = trimTo(raw?.binding?.universeId, MAX_ID);
+  const characterId = trimTo(raw?.binding?.characterId, MAX_ID);
+  const kind = VOICE_PROFILE_KINDS.has(raw.kind) ? raw.kind : 'preset';
+  const engine = VOICE_PROFILE_ENGINES.has(raw.engine)
+    ? raw.engine
+    : (parsePresetVoiceId(raw.voiceId)?.engine || 'kokoro');
+
+  if (!PROFILE_ID_RE.test(id) || (raw.library !== true && (!universeId || !characterId))) return null;
+
+  const approvalStatus = raw?.approval?.status === 'approved'
+    ? 'approved'
+    : raw?.approval?.status === 'retired' ? 'retired' : 'draft';
+  const createdAt = trimTo(raw.createdAt, 64) || timestamp();
+  const updatedAt = trimTo(raw.updatedAt, 64) || createdAt;
+  const voiceId = trimTo(raw.voiceId, MAX_ID) || `${engine}:${kind}`;
+
+  return {
+    id,
+    version: positiveInteger(raw.version),
+    binding: raw.library === true ? { universeId: null, characterId: null } : { universeId, characterId },
+    library: raw.library === true,
+    originProfileId: PROFILE_ID_RE.test(raw.originProfileId || '') ? raw.originProfileId : null,
+    label: trimTo(raw.label, MAX_LABEL) || null,
+    kind,
+    engine,
+    voiceId,
+    modelRevision: trimTo(raw.modelRevision, MAX_REVISION) || (engine === 'qwen3-tts' ? 'Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign' : 'configured-preset'),
+    sourceAssets: sanitizeSourceAssets(raw.sourceAssets),
+    inference: sanitizeInference(raw.inference),
+    routes: sanitizeRoutes(raw.routes),
+    delivery: sanitizeDelivery(raw.delivery),
+    mastering: sanitizeMastering(raw.mastering),
+    approval: {
+      status: approvalStatus,
+      approvedAt: approvalStatus === 'approved' ? trimTo(raw?.approval?.approvedAt, 64) || updatedAt : null,
+      benchmarkRevision: positiveInteger(raw?.approval?.benchmarkRevision),
+    },
+    benchmark: sanitizeBenchmark(raw.benchmark),
+    createdAt,
+    updatedAt,
+  };
+}
+
+const profileDirectory = (id) => join(PATHS.voiceProfiles, id);
+
+export function profileArtifactDirectory(id) {
+  if (!PROFILE_ID_RE.test(id || '')) {
+    throw new ServerError('invalid voice profile id', { status: 400, code: 'VOICE_PROFILE_INVALID_ID' });
+  }
+  return profileDirectory(id);
+}
+
+export const persistVoiceProfile = async (profile, execute = query) => {
+  await execute(
+    `INSERT INTO voice_profiles (id, universe_id, character_id, approval_status, data, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
+     ON CONFLICT (id) DO UPDATE SET
+       universe_id = EXCLUDED.universe_id,
+       character_id = EXCLUDED.character_id,
+       approval_status = EXCLUDED.approval_status,
+       data = EXCLUDED.data,
+       updated_at = EXCLUDED.updated_at`,
+    [
+      profile.id,
+      profile.binding.universeId,
+      profile.binding.characterId,
+      profile.approval.status,
+      JSON.stringify(profile),
+      profile.createdAt,
+      profile.updatedAt,
+    ],
+  );
+  return profile;
+};
+
+const persist = persistVoiceProfile;
+
+export async function getVoiceProfile(id) {
+  const profileId = trimTo(id, 80);
+  if (!PROFILE_ID_RE.test(profileId)) return null;
+  const { rows } = await query('SELECT data FROM voice_profiles WHERE id = $1', [profileId]);
+  return sanitizeVoiceProfile(rows[0]?.data);
+}
+
+export async function getVoiceProfileRequired(id) {
+  const profile = await getVoiceProfile(id);
+  if (!profile) {
+    throw new ServerError('Voice profile not found', { status: 404, code: 'VOICE_PROFILE_NOT_FOUND' });
+  }
+  return profile;
+}
+
+export async function listVoiceProfiles({ universeId, characterId } = {}) {
+  const clauses = [];
+  const params = [];
+  const universe = trimTo(universeId, MAX_ID);
+  const character = trimTo(characterId, MAX_ID);
+  if (universe) { params.push(universe); clauses.push(`universe_id = $${params.length}`); }
+  if (character) { params.push(character); clauses.push(`character_id = $${params.length}`); }
+  const { rows } = await query(
+    `SELECT data FROM voice_profiles ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''}
+     ORDER BY updated_at DESC, id DESC`,
+    params,
+  );
+  return rows.map((row) => sanitizeVoiceProfile(row.data)).filter(Boolean);
+}
+
+/** Bounded metadata only; transcripts and training assets load with one selected profile. */
+export async function listStudioProfiles({ limit = 30, cursor } = {}) {
+  let before = null;
+  if (cursor) {
+    try { before = JSON.parse(Buffer.from(cursor, 'base64url').toString()); } catch { /* validated below */ }
+    if (!before || !PROFILE_ID_RE.test(before.id || '') || typeof before.at !== 'string' || !Number.isFinite(Date.parse(before.at))) {
+      throw new ServerError('Invalid voice library cursor', { status: 400 });
+    }
+  }
+  const filter = "(data->>'library' = 'true' OR approval_status = 'approved')";
+  const [page, count] = await Promise.all([
+    query(`SELECT id, data->>'label' AS label, data->>'voiceId' AS "voiceId", data->>'engine' AS engine,
+      (data->>'library' = 'true') AS library,
+      to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS "updatedAt"
+      FROM voice_profiles WHERE ${filter}
+      ${before ? 'AND (updated_at, id) < ($2::timestamptz, $3)' : ''}
+      ORDER BY updated_at DESC, id DESC LIMIT $1`, before ? [limit + 1, before.at, before.id] : [limit + 1]),
+    query(`SELECT count(*)::int AS total FROM voice_profiles WHERE ${filter}`),
+  ]);
+  const items = page.rows.slice(0, limit);
+  const last = items.at(-1);
+  return { items, total: count.rows[0].total, nextCursor: page.rows.length > limit
+    ? Buffer.from(JSON.stringify({ at: last.updatedAt, id: last.id })).toString('base64url') : null };
+}
+
+async function getBoundProfile(universeId, characterId) {
+  const { rows } = await query(
+    `SELECT data FROM voice_profiles
+     WHERE universe_id = $1 AND character_id = $2
+     ORDER BY (approval_status = 'approved') DESC, updated_at DESC, id DESC LIMIT 1`,
+    [universeId, characterId],
+  );
+  return sanitizeVoiceProfile(rows[0]?.data);
+}
+
+/**
+ * Retire existing approved profiles for a character when promoting a new profile.
+ */
+async function supersedeApprovedProfiles(universeId, characterId, exceptProfileId) {
+  const { rows } = await query(
+    `SELECT data FROM voice_profiles
+     WHERE universe_id = $1 AND character_id = $2 AND approval_status = 'approved' AND id != $3`,
+    [universeId, characterId, exceptProfileId],
+  );
+  for (const row of rows) {
+    const item = sanitizeVoiceProfile(row.data);
+    if (item) {
+      const updated = sanitizeVoiceProfile({
+        ...item,
+        approval: { ...item.approval, status: 'retired' },
+        updatedAt: timestamp(),
+      });
+      await persist(updated);
+    }
+  }
+}
+
+/**
+ * Create a candidate Voice Design profile without changing the approved character voice.
+ */
+export async function createVoiceDesignCandidate({
+  universeId,
+  characterId,
+  characterName = '',
+  instructions = '',
+  seed = 42,
+  modelId = 'Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign',
+  delivery: _delivery = DEFAULT_DELIVERY,
+  rate = 1.0,
+} = {}) {
+  const universe = trimTo(universeId, MAX_ID);
+  const character = trimTo(characterId, MAX_ID);
+  if (!universe || !character) {
+    throw new ServerError('universeId and characterId are required', { status: 400 });
+  }
+
+  const profileId = randomUUID();
+  const now = timestamp();
+  const next = sanitizeVoiceProfile({
+    id: profileId,
+    version: 1,
+    binding: { universeId: universe, characterId: character },
+    label: trimTo(characterName, MAX_LABEL) || null,
+    kind: 'designed',
+    engine: 'qwen3-tts',
+    voiceId: `qwen3:design-${profileId.slice(0, 8)}`,
+    modelRevision: trimTo(modelId, MAX_REVISION) || 'Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign',
+    sourceAssets: [],
+    inference: {
+      seed: Number.isInteger(seed) ? seed : 42,
+      instructions: trimTo(instructions, 2000),
+      rate: boundedNumber(rate, 0.25, 4, 1.0),
+      modelId,
+    },
+    routes: { studio: { enabled: true }, interactive: { enabled: false, maxFirstAudioMs: 900 } },
+    delivery: { ...DEFAULT_DELIVERY, rate: boundedNumber(rate, 0.25, 4, 1.0) },
+    mastering: DEFAULT_MASTERING,
+    approval: {
+      status: 'draft',
+      approvedAt: null,
+      benchmarkRevision: 1,
+    },
+    benchmark: null,
+    createdAt: now,
+    updatedAt: now,
+  });
+
+  await mkdir(profileDirectory(profileId), { recursive: true });
+  return persist(next);
+}
+
+/**
+ * Create a candidate Consented Cloned profile with source audio and confirmed consent.
+ */
+export async function createClonedVoiceCandidate({
+  universeId,
+  characterId,
+  characterName = '',
+  audioBuffer,
+  filename,
+  transcript = '',
+  performerConsentConfirmed = false,
+  licensePosture = 'consented-performance',
+  modelId = 'Qwen/Qwen3-TTS-12Hz-1.7B-Base',
+  rate = 1.0,
+} = {}) {
+  const universe = trimTo(universeId, MAX_ID);
+  const character = trimTo(characterId, MAX_ID);
+  const cleanFilename = trimTo(filename, 160);
+
+  if (!universe || !character) {
+    throw new ServerError('universeId and characterId are required', { status: 400 });
+  }
+  if (!audioBuffer || !Buffer.isBuffer(audioBuffer) || audioBuffer.length === 0) {
+    throw new ServerError('Audio recording buffer is required for cloning', { status: 400 });
+  }
+  if (!SAFE_ASSET_BASENAME.test(cleanFilename)) {
+    throw new ServerError('Invalid audio asset filename', { status: 400 });
+  }
+  if (performerConsentConfirmed !== true) {
+    throw new ServerError('Voice cloning requires explicit performer consent confirmation', {
+      status: 400,
+      code: 'CONSENT_REQUIRED',
+    });
+  }
+
+  const profileId = randomUUID();
+  const profileDir = profileDirectory(profileId);
+  const sourceDir = join(profileDir, 'source');
+  const safePath = join(sourceDir, cleanFilename);
+
+  const sha256 = createHash('sha256').update(audioBuffer).digest('hex');
+  const now = timestamp();
+
+  const sourceAssets = [{
+    filename: cleanFilename,
+    sha256,
+    transcript: trimTo(transcript, 4000) || null,
+    rightsConfirmedAt: now,
+    performerConsentConfirmed: true,
+    licensePosture: trimTo(licensePosture, 160) || 'consented-performance',
+  }];
+
+  const next = sanitizeVoiceProfile({
+    id: profileId,
+    version: 1,
+    binding: { universeId: universe, characterId: character },
+    label: trimTo(characterName, MAX_LABEL) || null,
+    kind: 'cloned',
+    engine: 'qwen3-tts',
+    voiceId: `qwen3:clone-${profileId.slice(0, 8)}`,
+    modelRevision: trimTo(modelId, MAX_REVISION) || 'Qwen/Qwen3-TTS-12Hz-1.7B-Base',
+    sourceAssets,
+    inference: {
+      seed: 42,
+      instructions: null,
+      rate: boundedNumber(rate, 0.25, 4, 1.0),
+      modelId,
+    },
+    routes: { studio: { enabled: true }, interactive: { enabled: false, maxFirstAudioMs: 900 } },
+    delivery: { ...DEFAULT_DELIVERY, rate: boundedNumber(rate, 0.25, 4, 1.0) },
+    mastering: DEFAULT_MASTERING,
+    approval: {
+      status: 'draft',
+      approvedAt: null,
+      benchmarkRevision: 1,
+    },
+    benchmark: null,
+    createdAt: now,
+    updatedAt: now,
+  });
+
+  // The source recording and the row that names it publish under one lease, so
+  // a snapshot never carries a candidate whose consented recording it lacks (#9982).
+  return withBackupAssetPublication(async () => {
+    await mkdir(sourceDir, { recursive: true });
+    await writeFileGuarded(safePath, audioBuffer);
+    return persist(next);
+  });
+}
+
+/**
+ * Promote a fine-tuned checkpoint artifact into an approved voice profile.
+ */
+export async function promoteFineTunedProfile({
+  profileId,
+  universeId,
+  characterId,
+  checkpointPath,
+  checkpointId: _checkpointId,
+  modelRevision = null,
+  step = 100,
+} = {}) {
+  const current = await getVoiceProfile(profileId);
+  const now = timestamp();
+  const id = current?.id || randomUUID();
+  const next = sanitizeVoiceProfile({
+    ...current,
+    id,
+    version: current ? current.version + 1 : 1,
+    binding: { universeId, characterId },
+    label: current?.label || null,
+    kind: 'fine-tuned',
+    engine: 'qwen3-tts',
+    voiceId: `qwen3:fine-tuned-step-${step}`,
+    modelRevision: trimTo(modelRevision, MAX_REVISION) || `qwen3-tts:checkpoint-${step}`,
+    inference: {
+      ...current?.inference,
+      checkpointPath,
+    },
+    routes: { studio: { enabled: true }, interactive: { enabled: false, maxFirstAudioMs: 900 } },
+    delivery: current?.delivery || DEFAULT_DELIVERY,
+    mastering: current?.mastering || DEFAULT_MASTERING,
+    approval: {
+      status: 'approved',
+      approvedAt: now,
+      benchmarkRevision: current ? current.approval.benchmarkRevision + 1 : 1,
+    },
+    benchmark: null,
+    createdAt: current?.createdAt || now,
+    updatedAt: now,
+  });
+
+  await mkdir(profileDirectory(next.id), { recursive: true });
+  await supersedeApprovedProfiles(universeId, characterId, next.id);
+  return persist(next);
+}
+
+/**
+ * Explicitly promote any draft or candidate profile to approved status.
+ */
+export async function promoteVoiceProfile(profileId, { routes = null } = {}) {
+  const current = await getVoiceProfileRequired(profileId);
+  const now = timestamp();
+
+  const nextRoutes = routes ? sanitizeRoutes(routes) : {
+    studio: { enabled: true },
+    interactive: {
+      enabled: current.routes.interactive?.enabled === true,
+      maxFirstAudioMs: current.routes.interactive?.maxFirstAudioMs || 900,
+    },
+  };
+
+  const next = sanitizeVoiceProfile({
+    ...current,
+    version: current.approval.status === 'approved' ? current.version : current.version + 1,
+    routes: nextRoutes,
+    approval: {
+      status: 'approved',
+      approvedAt: now,
+      benchmarkRevision: current.approval.benchmarkRevision || 1,
+    },
+    updatedAt: now,
+  });
+
+  await supersedeApprovedProfiles(current.binding.universeId, current.binding.characterId, next.id);
+  return persist(next);
+}
+
+/**
+ * Explicitly promote a selected Kokoro/Piper preset to the local character binding.
+ */
+export async function promotePresetProfile({
+  universeId,
+  characterId,
+  characterName = '',
+  voiceId,
+  modelRevision = 'configured-preset',
+  delivery = DEFAULT_DELIVERY,
+} = {}) {
+  const universe = trimTo(universeId, MAX_ID);
+  const character = trimTo(characterId, MAX_ID);
+  const preset = parsePresetVoiceId(voiceId);
+  if (!universe || !character || !preset || preset.engine === 'auk') {
+    throw new ServerError('A universe, character, and valid preset are required', {
+      status: 400,
+      code: 'VOICE_PROFILE_INVALID_PRESET',
+    });
+  }
+  const current = await getBoundProfile(universe, character);
+  const samePreset = current?.voiceId === preset.voiceId;
+  const now = timestamp();
+  const profileId = current?.id || randomUUID();
+  const next = sanitizeVoiceProfile({
+    ...current,
+    id: profileId,
+    version: current ? (samePreset ? current.version : current.version + 1) : 1,
+    binding: { universeId: universe, characterId: character },
+    label: trimTo(characterName, MAX_LABEL) || current?.label || null,
+    kind: 'preset',
+    sourceAssets: samePreset ? current?.sourceAssets : [],
+    inference: samePreset ? current?.inference : {},
+    originProfileId: samePreset ? current?.originProfileId : null,
+    engine: preset.engine,
+    voiceId: preset.voiceId,
+    modelRevision: trimTo(modelRevision, MAX_REVISION) || 'configured-preset',
+    routes: current?.routes || { studio: { enabled: true }, interactive: { enabled: true, maxFirstAudioMs: 900 } },
+    delivery: current?.delivery || delivery,
+    mastering: current?.mastering || DEFAULT_MASTERING,
+    approval: {
+      status: 'approved',
+      approvedAt: now,
+      benchmarkRevision: current ? (samePreset ? current.approval.benchmarkRevision : current.approval.benchmarkRevision + 1) : 1,
+    },
+    benchmark: samePreset ? current?.benchmark : null,
+    createdAt: current?.createdAt || now,
+    updatedAt: now,
+  });
+  await mkdir(profileDirectory(next.id), { recursive: true });
+  await supersedeApprovedProfiles(universe, character, next.id);
+  return persist(next);
+}
+
+export async function saveProfileBenchmark(profile, benchmark, { interactive } = {}) {
+  const cleanBenchmark = sanitizeBenchmark(benchmark);
+  // Patch only the measured fields in one DB statement. A concurrent profile
+  // revision change invalidates the evidence instead of qualifying new audio
+  // against an old render or overwriting another writer's profile changes.
+  // Each workflow supplies only its own fields: a playback receipt must not
+  // erase fixed-script renders produced while the operator was playing it.
+  const benchmarkPatch = Object.fromEntries(Object.entries(cleanBenchmark || {})
+    .filter(([key]) => Object.hasOwn(benchmark, key)));
+  const patch = { benchmark: benchmarkPatch, updatedAt: timestamp() };
+  const route = interactive ? sanitizeRoutes({ interactive }).interactive : null;
+  const { rows } = await query(
+    `UPDATE voice_profiles SET
+       data = jsonb_set(
+         CASE WHEN $4::jsonb IS NULL THEN data || $2::jsonb
+         ELSE jsonb_set(data || $2::jsonb, '{routes}',
+           COALESCE(data->'routes', '{}'::jsonb) || jsonb_build_object('interactive', $4::jsonb)) END,
+         '{benchmark}', COALESCE(NULLIF(data->'benchmark', 'null'::jsonb), '{}'::jsonb) || ($2::jsonb->'benchmark')),
+       updated_at = $5
+     WHERE id = $1 AND (data->>'version')::int = $3
+     RETURNING data`,
+    [profile.id, JSON.stringify(patch), profile.version, route ? JSON.stringify(route) : null, patch.updatedAt],
+  );
+  if (!rows.length) {
+    throw new ServerError('Voice profile changed during benchmarking; run the benchmark again', {
+      status: 409, code: 'VOICE_PROFILE_BENCHMARK_STALE',
+    });
+  }
+  return sanitizeVoiceProfile(rows[0].data);
+}
+
+/**
+ * Record line-level provenance in database.
+ */
+export async function recordVoiceProfileRender({
+  issueId,
+  lineId,
+  audioFilename,
+  latencyMs,
+  durationMs,
+  provenance,
+} = {}) {
+  const issue = trimTo(issueId, MAX_RENDER_ID);
+  const line = trimTo(lineId, MAX_RENDER_ID);
+  const filename = trimTo(audioFilename, 500);
+  const profileId = trimTo(provenance?.profileId, 80);
+  const profileRevision = positiveInteger(provenance?.profileRevision, 0);
+  const engine = VOICE_PROFILE_ENGINES.has(provenance?.engine) ? provenance.engine : null;
+  if (!issue || !line || !filename || !PROFILE_ID_RE.test(profileId) || !profileRevision || !engine) {
+    throw new ServerError('Invalid local voice render provenance', {
+      status: 400,
+      code: 'VOICE_PROFILE_INVALID_RENDER_PROVENANCE',
+    });
+  }
+  const now = timestamp();
+  const data = {
+    profileId,
+    profileRevision,
+    engine,
+    modelRevision: trimTo(provenance?.modelRevision, MAX_REVISION) || null,
+    effectiveControls: {
+      rate: Number.isFinite(provenance?.effectiveControls?.rate) ? provenance.effectiveControls.rate : null,
+    },
+    mastering: sanitizeMastering(provenance?.mastering),
+    timing: {
+      latencyMs: Number.isFinite(latencyMs) ? Math.max(0, Math.round(latencyMs)) : null,
+      durationMs: Number.isFinite(durationMs) ? Math.max(0, Math.round(durationMs)) : null,
+    },
+    audioFilename: filename,
+    recordedAt: now,
+  };
+  await query(
+    `INSERT INTO voice_profile_renders (issue_id, line_id, profile_id, profile_revision, data, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
+     ON CONFLICT (issue_id, line_id) DO UPDATE SET
+       profile_id = EXCLUDED.profile_id,
+       profile_revision = EXCLUDED.profile_revision,
+       data = EXCLUDED.data,
+       updated_at = EXCLUDED.updated_at`,
+    [issue, line, profileId, profileRevision, JSON.stringify(data), now, now],
+  );
+}
+
+export async function clearVoiceProfileRender({ issueId, lineId } = {}) {
+  const issue = trimTo(issueId, MAX_RENDER_ID);
+  const line = trimTo(lineId, MAX_RENDER_ID);
+  if (!issue || !line) return;
+  await query('DELETE FROM voice_profile_renders WHERE issue_id = $1 AND line_id = $2', [issue, line]);
+}
+
+const assertRoute = (route) => {
+  if (!VOICE_PROFILE_ROUTES.has(route)) {
+    throw new ServerError('Unsupported voice profile route', { status: 400, code: 'VOICE_PROFILE_INVALID_ROUTE' });
+  }
+};
+
+export async function getProfileForSynthesis(id, route = 'studio') {
+  assertRoute(route);
+  const profile = await getVoiceProfileRequired(id);
+  if (profile.approval.status !== 'approved') {
+    throw new ServerError('Voice profile is not approved', { status: 409, code: 'VOICE_PROFILE_UNAPPROVED' });
+  }
+  if (profile.routes[route]?.enabled !== true) {
+    throw new ServerError(`Voice profile is not enabled for ${route}`, {
+      status: 409,
+      code: 'VOICE_PROFILE_ROUTE_DISABLED',
+    });
+  }
+  return profile;
+}
+
+export async function resolveCharacterVoice({
+  universeId,
+  characterId,
+  characterVoiceId = null,
+  route = 'studio',
+} = {}) {
+  assertRoute(route);
+  const universe = trimTo(universeId, MAX_ID);
+  const character = trimTo(characterId, MAX_ID);
+  let unavailableProfile = null;
+  if (universe && character) {
+    const profiles = await listVoiceProfiles({ universeId: universe, characterId: character });
+    const profile = profiles.find((item) =>
+      item.approval.status === 'approved' && item.routes[route]?.enabled === true,
+    );
+    if (profile) {
+      return {
+        source: 'profile',
+        profileId: profile.id,
+        profileRevision: profile.version,
+        voiceId: profile.voiceId,
+        degraded: false,
+        warning: null,
+      };
+    }
+    unavailableProfile = profiles.find((item) => item.approval.status === 'approved') || null;
+  }
+  const preset = parsePresetVoiceId(characterVoiceId);
+  const legacyVoice = trimTo(characterVoiceId, MAX_ID);
+  if (preset || legacyVoice) {
+    return {
+      source: 'character-preset',
+      profileId: null,
+      profileRevision: null,
+      voiceId: preset?.voiceId || legacyVoice,
+      degraded: Boolean(unavailableProfile),
+      warning: unavailableProfile
+        ? `The approved local voice profile is unavailable for ${route}; using the portable character preset.`
+        : null,
+    };
+  }
+  return {
+    source: 'project-default',
+    profileId: null,
+    profileRevision: null,
+    voiceId: null,
+    degraded: true,
+    warning: unavailableProfile
+      ? `The approved local voice profile is unavailable for ${route} and has no portable character preset; using the project default.`
+      : 'No approved local voice profile or character preset is available; using the project default.',
+  };
+}

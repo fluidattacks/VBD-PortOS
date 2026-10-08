@@ -1,0 +1,58 @@
+{
+  "timezone": "America/Los_Angeles",
+  "voice": {
+    "enabled": false,
+    "trigger": "push-to-talk",
+    "hotkey": "Space",
+    "stt": {
+      "engine": "web-speech",
+      "endpoint": "http://127.0.0.1:5562",
+      "model": "base.en",
+      "modelPath": "~/.portos/voice/models/ggml-base.en.bin",
+      "language": "en",
+      "coreml": false,
+      "vocabularyPrompt": ""
+    },
+    "tts": {
+      "engine": "piper",
+      "rate": 1.0,
+      "piper": {
+        "voice": "en_GB-jenny_dioco-medium",
+        "voicePath": "~/.portos/voice/voices/en_GB-jenny_dioco-medium.onnx",
+        "speakerId": null
+      }
+    },
+    "llm": {
+      "provider": "ollama",
+      "model": "auto",
+      "systemPrompt": "You are the PortOS assistant. Your replies are spoken aloud — keep them short and use plain prose (no markdown or lists).",
+      "usePersonality": true,
+      "personality": {
+        "name": "Alfred",
+        "role": "Chief of Staff",
+        "traits": ["concise", "warm", "proactive"],
+        "speechStyle": "casual and brief",
+        "customPrompt": ""
+      },
+      "tools": {
+        "enabled": false,
+        "maxIterations": 3
+      }
+    },
+    "vad": { "endOfSpeechMs": 700, "minUtteranceMs": 250 }
+  },
+  "apiAccess": {
+    "voice": { "exposed": false, "requireAuth": false },
+    "sdapi": { "exposed": false, "requireAuth": false }
+  },
+  "federation": {
+    "mediaProvider": {
+      "enabled": false,
+      "maxQueuedJobs": 2,
+      "audioModels": []
+    }
+  },
+  "backup": {
+    "retentionCount": 30
+  }
+}

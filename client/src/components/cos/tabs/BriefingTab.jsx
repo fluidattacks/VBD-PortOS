@@ -1,0 +1,328 @@
+import { useState, useEffect, useRef } from 'react';
+import { Link } from 'react-router';
+import {
+  Newspaper,
+  RefreshCw,
+  Calendar,
+  ChevronDown,
+  ChevronRight,
+  CheckCircle,
+  Cpu,
+  Brain,
+  Target,
+  Activity,
+  GitBranch
+} from 'lucide-react';
+import * as api from '../../../services/api';
+import { RapidReaderTrigger } from '../../RapidReader';
+import BrailleSpinner from '../../BrailleSpinner';
+import { formatWeekdayDate } from '../../../utils/formatters';
+import EmptyState from '../../EmptyState';
+import { useAsyncAction } from '../../../hooks/useAsyncAction';
+import { useSocketResource } from '../../../hooks/useSocketResource';
+
+const BRIEFING_EVENTS = ['cos:agent:completed'];
+
+const SECTION_ICONS = {
+  'Task Queue': CheckCircle,
+  'Agent Activity': Cpu,
+  'Brain': Brain,
+  'System': Activity,
+  'Dev Branch': GitBranch,
+  'Suggested Focus': Target,
+  'Focus Areas': Target
+};
+
+const getSectionIcon = (title) => {
+  for (const [key, Icon] of Object.entries(SECTION_ICONS)) {
+    if (title.includes(key)) return Icon;
+  }
+  return ChevronRight;
+};
+
+// Flatten markdown into plain prose suitable for word-by-word reading.
+// Drop heading/bullet/code markers but keep the surrounding text intact.
+const stripMarkdown = (md) => {
+  if (!md) return '';
+  return md
+    .split('\n')
+    .map((line) => line
+      .replace(/^#{1,6}\s+/, '')
+      .replace(/^\s*[-*]\s+/, '')
+      .replace(/^\s*\d+\.\s+/, '')
+      .replace(/\*\*([^*]+)\*\*/g, '$1')
+      .replace(/`([^`]+)`/g, '$1'))
+    .filter((line) => line.trim())
+    .join('. ')
+    .replace(/\.{2,}/g, '.');
+};
+
+const parseBriefingMarkdown = (content) => {
+  if (!content) return { title: '', sections: [] };
+
+  const lines = content.split('\n');
+  let title = '';
+  const sections = [];
+  let currentSection = null;
+
+  for (const line of lines) {
+    if (line.startsWith('# ') && !title) {
+      title = line.replace('# ', '');
+      continue;
+    }
+
+    if (line.startsWith('## ')) {
+      if (currentSection) sections.push(currentSection);
+      currentSection = { title: line.replace('## ', ''), lines: [] };
+      continue;
+    }
+
+    if (line.startsWith('### ') && currentSection) {
+      currentSection.lines.push({ type: 'subheading', text: line.replace('### ', '') });
+      continue;
+    }
+
+    if (currentSection && line.trim()) {
+      currentSection.lines.push({ type: 'text', text: line });
+    }
+  }
+
+  if (currentSection) sections.push(currentSection);
+  return { title, sections };
+};
+
+const renderLine = (line, idx) => {
+  if (line.type === 'subheading') {
+    return (
+      <h4 key={idx} className="text-sm font-semibold text-port-accent mt-3 mb-1">
+        {line.text}
+      </h4>
+    );
+  }
+
+  const text = line.text;
+
+  // Numbered list item
+  if (/^\d+\.\s/.test(text)) {
+    return (
+      <div key={idx} className="flex gap-2 py-0.5 pl-2">
+        <span className="text-port-accent font-mono text-xs mt-0.5 shrink-0">{text.match(/^\d+/)[0]}.</span>
+        <span className="text-sm text-gray-300">{renderInlineFormatting(text.replace(/^\d+\.\s+/, ''))}</span>
+      </div>
+    );
+  }
+
+  // Bullet list item
+  if (text.startsWith('- ')) {
+    return (
+      <div key={idx} className="flex gap-2 py-0.5 pl-2">
+        <span className="text-gray-500 mt-1 shrink-0">&#8226;</span>
+        <span className="text-sm text-gray-300">{renderInlineFormatting(text.slice(2))}</span>
+      </div>
+    );
+  }
+
+  // Indented bullet
+  if (text.startsWith('  - ')) {
+    return (
+      <div key={idx} className="flex gap-2 py-0.5 pl-6">
+        <span className="text-gray-600 mt-1 shrink-0">&#8226;</span>
+        <span className="text-sm text-gray-400">{renderInlineFormatting(text.slice(4))}</span>
+      </div>
+    );
+  }
+
+  // Regular paragraph
+  return (
+    <p key={idx} className="text-sm text-gray-300 py-0.5">
+      {renderInlineFormatting(text)}
+    </p>
+  );
+};
+
+const renderInlineFormatting = (text) => {
+  // Split on **bold** markers and render
+  const parts = text.split(/(\*\*[^*]+\*\*)/g);
+  return parts.map((part, i) => {
+    if (part.startsWith('**') && part.endsWith('**')) {
+      return <strong key={i} className="text-white font-medium">{part.slice(2, -2)}</strong>;
+    }
+    // Handle `code` backticks
+    const codeParts = part.split(/(`[^`]+`)/g);
+    return codeParts.map((cp, j) => {
+      if (cp.startsWith('`') && cp.endsWith('`')) {
+        return <code key={`${i}-${j}`} className="text-xs bg-port-bg px-1 py-0.5 rounded text-port-accent font-mono">{cp.slice(1, -1)}</code>;
+      }
+      return cp;
+    });
+  });
+};
+
+export default function BriefingTab() {
+  const [selectedDate, setSelectedDate] = useState(null);
+  const [expandedSections, setExpandedSections] = useState({});
+  const [generationPending, setGenerationPending] = useState(false);
+  const generationInFlightRef = useRef(false);
+
+  const [generateBriefing, generatingBriefing] = useAsyncAction(async () => {
+    if (generationPending || generationInFlightRef.current) return;
+    generationInFlightRef.current = true;
+    try {
+      const result = await api.triggerCosJob('job-daily-briefing', { silent: true });
+      if (!result || result.success === false || (result.status === 'skipped' && !result.duplicate)) {
+        throw new Error(result?.reason || 'The briefing could not be generated');
+      }
+      setGenerationPending(true);
+      await refetch();
+    } finally {
+      generationInFlightRef.current = false;
+    }
+  });
+
+  const handleGenerateBriefing = () => {
+    if (generationPending || generatingBriefing || generationInFlightRef.current) return;
+    generateBriefing();
+  };
+
+  const { data, loading, refetch } = useSocketResource(async () => {
+    const [listResult, briefing] = await Promise.all([
+      api.getCosBriefings(),
+      selectedDate ? api.getCosBriefing(selectedDate) : api.getCosLatestBriefing(),
+    ]);
+    return { briefings: listResult.briefings || [], briefing };
+  }, {
+    namespace: 'cos',
+    events: BRIEFING_EVENTS,
+    resourceKey: selectedDate,
+    // Daily briefings are persisted by this job's agent, not the weekly digest.
+    matchesEvent: agent => agent?.metadata?.jobId === 'job-daily-briefing',
+  });
+  const briefings = data?.briefings || [];
+  const currentBriefing = data?.briefing;
+
+  useEffect(() => {
+    if (!currentBriefing) return;
+    setGenerationPending(false);
+    const parsed = parseBriefingMarkdown(currentBriefing.content);
+    setExpandedSections(Object.fromEntries(parsed.sections.map((_section, i) => [i, true])));
+  }, [currentBriefing]);
+
+  const toggleSection = (idx) => {
+    setExpandedSections(prev => ({ ...prev, [idx]: !prev[idx] }));
+  };
+
+  if (loading && !currentBriefing) {
+    return (
+      <div className="flex items-center justify-center py-12">
+        <BrailleSpinner text="Loading" />
+      </div>
+    );
+  }
+
+  const parsed = currentBriefing ? parseBriefingMarkdown(currentBriefing.content) : null;
+
+  return (
+    <div className="space-y-6">
+      {/* Header with date selector */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+        <div className="flex items-center gap-3">
+          <Newspaper className="w-5 h-5 text-port-accent" />
+          <h3 className="text-lg font-semibold text-white">Daily Briefing</h3>
+          {briefings.length > 0 && (
+            <select
+              aria-label="Date"
+              value={selectedDate || currentBriefing?.date || ''}
+              onChange={(e) => setSelectedDate(e.target.value)}
+              className="bg-port-card border border-port-border rounded px-2 py-1 text-sm text-gray-300"
+            >
+              {briefings.map(b => (
+                <option key={b.date} value={b.date}>
+                  {formatWeekdayDate(b.date, { weekday: 'short', year: true })}
+                </option>
+              ))}
+            </select>
+          )}
+        </div>
+        <div className="flex items-center gap-2">
+          {currentBriefing?.content && (
+            <RapidReaderTrigger
+              text={stripMarkdown(currentBriefing.content)}
+              title={`Briefing — ${currentBriefing.date}`}
+              label="Rapid Read"
+            />
+          )}
+          <button
+            onClick={() => refetch()}
+            className="flex items-center gap-2 px-3 py-1.5 text-sm bg-port-card border border-port-border hover:border-port-accent/50 text-gray-300 rounded-lg transition-colors"
+          >
+            <RefreshCw size={14} />
+            Refresh
+          </button>
+        </div>
+      </div>
+
+      {!parsed ? (
+        <div className="flex flex-col items-center">
+          <EmptyState
+            icon={Newspaper}
+            title="No briefing yet"
+            message={generationPending
+              ? 'Your briefing is still being generated. You can open the Daily Briefing job to check its status.'
+              : 'Generate today’s briefing now, or open the Daily Briefing job to change its schedule.'}
+            actionLabel={generationPending || generatingBriefing ? 'Generating today’s briefing…' : 'Generate today’s briefing'}
+            actionDisabled={generationPending || generatingBriefing}
+            onAction={handleGenerateBriefing}
+          />
+          <div className="-mt-10 mb-8 flex flex-col items-center gap-3">
+            <p role="status" aria-live="polite" className="text-sm text-gray-400">
+              {generationPending ? 'Briefing generation is still in progress.' : ''}
+            </p>
+            <Link to="/cos/jobs" className="text-sm text-port-accent hover:underline">
+              Open Daily Briefing job
+            </Link>
+          </div>
+        </div>
+      ) : (
+        <>
+          {/* Briefing Title */}
+          {parsed.title && (
+            <div className="bg-gradient-to-r from-port-accent/10 to-transparent border border-port-accent/20 rounded-lg p-4">
+              <div className="flex items-center gap-2">
+                <Calendar className="w-4 h-4 text-port-accent" />
+                <h2 className="text-base font-semibold text-white">{parsed.title}</h2>
+              </div>
+            </div>
+          )}
+
+          {/* Sections */}
+          {parsed.sections.map((section, idx) => {
+            const SectionIcon = getSectionIcon(section.title);
+            const isExpanded = expandedSections[idx] !== false;
+            return (
+              <div key={idx} className="bg-port-card border border-port-border rounded-lg overflow-hidden">
+                <button
+                  onClick={() => toggleSection(idx)}
+                  className="flex items-center gap-2 w-full text-left p-3 hover:bg-port-bg/50 transition-colors"
+                >
+                  {isExpanded ? <ChevronDown size={16} className="text-gray-500" /> : <ChevronRight size={16} className="text-gray-500" />}
+                  <SectionIcon size={16} className="text-port-accent" />
+                  <span className="font-medium text-white text-sm">{section.title}</span>
+                </button>
+                {isExpanded && (
+                  <div className="px-4 pb-3 pt-0">
+                    {section.lines.map((line, lineIdx) => renderLine(line, lineIdx))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+
+          {/* Footer */}
+          <div className="text-xs text-gray-600 text-center pt-2">
+            Briefing generated for {currentBriefing.date}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}

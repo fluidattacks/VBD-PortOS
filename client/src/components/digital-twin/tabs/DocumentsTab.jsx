@@ -1,0 +1,427 @@
+import { useState, useEffect } from 'react';
+import {
+  FileText,
+  Plus,
+  Trash2,
+  Save,
+  X,
+  Edit2,
+  ToggleLeft,
+  ToggleRight,
+  Scale,
+  ArrowLeft
+} from 'lucide-react';
+import * as api from '../../../services/api';
+import toast from '../../ui/Toast';
+import Modal from '../../ui/Modal';
+import { FormField } from '../../ui/FormField';
+
+import { DOCUMENT_CATEGORIES } from '../constants';
+import { timeAgo } from '../../../utils/formatters';
+
+export default function DocumentsTab({ onRefresh }) {
+  const [documents, setDocuments] = useState([]);
+  const [selectedDoc, setSelectedDoc] = useState(null);
+  const [editMode, setEditMode] = useState(false);
+  const [editContent, setEditContent] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [showCreate, setShowCreate] = useState(false);
+  const [newDoc, setNewDoc] = useState({ filename: '', title: '', category: 'core', content: '' });
+  const [deleteConfirm, setDeleteConfirm] = useState(null);
+
+  useEffect(() => {
+    loadDocuments();
+  }, []);
+
+  const loadDocuments = async () => {
+    setLoading(true);
+    const docs = await api.getDigitalTwinDocuments().catch(() => []);
+    setDocuments(docs);
+    setLoading(false);
+  };
+
+  const loadDocument = async (id) => {
+    const doc = await api.getDigitalTwinDocument(id);
+    setSelectedDoc(doc);
+    setEditContent(doc.content);
+    setEditMode(false);
+  };
+
+  const handleSave = async () => {
+    if (!selectedDoc) return;
+    setSaving(true);
+    // request() already toasted a failure; release Save either way so the unsaved
+    // edit can be retried instead of stranding the editor behind a disabled button.
+    const saved = await api.updateSoulDocument(selectedDoc.id, { content: editContent }).then(() => true, () => false);
+    setSaving(false);
+    if (!saved) return;
+    toast.success('Document saved');
+    await loadDocuments();
+    await loadDocument(selectedDoc.id);
+    setEditMode(false);
+    onRefresh();
+  };
+
+  const handleToggleEnabled = async (doc, enabled) => {
+    await api.updateSoulDocument(doc.id, { enabled });
+    toast.success(enabled ? 'Document enabled' : 'Document disabled');
+    await loadDocuments();
+    if (selectedDoc?.id === doc.id) {
+      await loadDocument(doc.id);
+    }
+    onRefresh();
+  };
+
+  const handleWeightChange = async (doc, weight) => {
+    await api.updateSoulDocument(doc.id, { weight });
+    toast.success(`Weight set to ${weight}`);
+    await loadDocuments();
+    if (selectedDoc?.id === doc.id) {
+      setSelectedDoc({ ...selectedDoc, weight });
+    }
+    onRefresh();
+  };
+
+  const handleCreate = async () => {
+    if (!newDoc.filename || !newDoc.title || !newDoc.content) {
+      toast.error('All fields are required');
+      return;
+    }
+
+    const filename = newDoc.filename.endsWith('.md') ? newDoc.filename : `${newDoc.filename}.md`;
+
+    setSaving(true);
+    const created = await api.createSoulDocument({
+      ...newDoc,
+      filename
+    }).then(() => true, () => false);
+    setSaving(false);
+    if (!created) return;
+    toast.success('Document created');
+    await loadDocuments();
+    setShowCreate(false);
+    setNewDoc({ filename: '', title: '', category: 'core', content: '' });
+    onRefresh();
+  };
+
+  const handleDelete = async (id) => {
+    await api.deleteSoulDocument(id);
+    toast.success('Document deleted');
+    if (selectedDoc?.id === id) {
+      setSelectedDoc(null);
+    }
+    setDeleteConfirm(null);
+    await loadDocuments();
+    onRefresh();
+  };
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center h-64">
+        <div className="text-gray-500">Loading documents...</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col lg:flex-row h-full gap-4">
+      {/* Document List Sidebar */}
+      <div className={`${selectedDoc ? 'hidden lg:flex' : 'flex'} w-full lg:w-72 shrink-0 bg-port-card rounded-lg border border-port-border overflow-hidden flex-col`}>
+        <div className="p-3 border-b border-port-border flex items-center justify-between">
+          <h3 className="font-medium text-white">Documents</h3>
+          <button
+            onClick={() => setShowCreate(true)}
+            className="p-2 min-h-[40px] min-w-[40px] flex items-center justify-center text-gray-400 hover:text-white transition-colors"
+            title="Create document" aria-label="Create document"
+          >
+            <Plus size={18} />
+          </button>
+        </div>
+
+        <div className="flex-1 overflow-y-auto max-h-[50vh] lg:max-h-none">
+          {documents.length === 0 ? (
+            <div className="p-4 text-center text-gray-500">
+              No documents yet
+            </div>
+          ) : (
+            Object.entries(DOCUMENT_CATEGORIES).map(([category, config]) => {
+              const categoryDocs = documents.filter(d => d.category === category);
+              if (categoryDocs.length === 0) return null;
+
+              return (
+                <div key={category} className="border-b border-port-border last:border-b-0">
+                  <div className={`px-3 py-2 text-xs font-medium ${config.color} border-l-2`}>
+                    {config.label}
+                  </div>
+                  {categoryDocs.map(doc => (
+                    <button
+                      key={doc.id}
+                      onClick={() => loadDocument(doc.id)}
+                      className={`w-full px-3 py-3 min-h-[44px] text-left hover:bg-port-border transition-colors ${
+                        selectedDoc?.id === doc.id ? 'bg-port-accent/10 border-l-2 border-port-accent' : ''
+                      }`}
+                    >
+                      <div className="flex items-center gap-2">
+                        <FileText size={14} className={doc.enabled ? 'text-white' : 'text-gray-500'} />
+                        <span className={`text-sm truncate ${doc.enabled ? 'text-white' : 'text-gray-500'}`}>
+                          {doc.title}
+                        </span>
+                      </div>
+                      <div className="text-xs text-gray-500 mt-1">
+                        {timeAgo(doc.lastModified)}
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              );
+            })
+          )}
+        </div>
+      </div>
+
+      {/* Document Editor */}
+      <div className={`${selectedDoc ? 'flex' : 'hidden lg:flex'} flex-1 bg-port-card rounded-lg border border-port-border overflow-hidden flex-col`}>
+        {selectedDoc ? (
+          <>
+            {/* Editor Header */}
+            <div className="p-3 border-b border-port-border">
+              {/* Top row with back button and actions */}
+              <div className="flex items-center justify-between gap-2 mb-2 lg:mb-0">
+                <div className="flex items-center gap-2 min-w-0 flex-1">
+                  {/* Back button for mobile */}
+                  <button
+                    onClick={() => setSelectedDoc(null)}
+                    className="lg:hidden p-2 min-h-[40px] min-w-[40px] flex items-center justify-center text-gray-400 hover:text-white transition-colors"
+                    title="Back to list" aria-label="Back to list"
+                  >
+                    <ArrowLeft size={18} />
+                  </button>
+                  <h3 className="font-medium text-white truncate">{selectedDoc.title}</h3>
+                  <span className={`hidden sm:inline text-xs px-2 py-0.5 rounded shrink-0 ${DOCUMENT_CATEGORIES[selectedDoc.category]?.color}`}>
+                    {DOCUMENT_CATEGORIES[selectedDoc.category]?.label}
+                  </span>
+                  {selectedDoc.version && (
+                    <span className="hidden sm:inline text-xs text-gray-500 shrink-0">v{selectedDoc.version}</span>
+                  )}
+                </div>
+                <div className="flex items-center gap-1 sm:gap-2 shrink-0">
+                  {/* Weight Control - hidden on mobile */}
+                  <div className="hidden md:flex items-center gap-2 px-2 py-1 bg-port-bg rounded border border-port-border" title="Document weight (1-10): Higher weight = included first when truncating">
+                    <Scale size={14} className="text-gray-500" />
+                    <input
+                      type="range"
+                      min="1"
+                      max="10"
+                      value={selectedDoc.weight || 5}
+                      onChange={(e) => handleWeightChange(selectedDoc, parseInt(e.target.value, 10))}
+                      aria-label="Document weight"
+                      className="w-16 h-1 accent-port-accent"
+                    />
+                    <span className="text-xs text-gray-400 w-4">{selectedDoc.weight || 5}</span>
+                  </div>
+                  <button
+                    onClick={() => handleToggleEnabled(selectedDoc, !selectedDoc.enabled)}
+                    className={`p-2 min-h-[40px] min-w-[40px] flex items-center justify-center transition-colors ${
+                      selectedDoc.enabled ? 'text-port-success' : 'text-gray-500'
+                    }`}
+                    title={selectedDoc.enabled ? 'Disable for CoS injection' : 'Enable for CoS injection'} aria-label={selectedDoc.enabled ? 'Disable for CoS injection' : 'Enable for CoS injection'}
+                  >
+                    {selectedDoc.enabled ? <ToggleRight size={20} /> : <ToggleLeft size={20} />}
+                  </button>
+                  {editMode ? (
+                    <>
+                      <button
+                        onClick={handleSave}
+                        disabled={saving}
+                        className="p-2 min-h-[40px] min-w-[40px] flex items-center justify-center text-port-success hover:text-port-success/80 transition-colors disabled:opacity-50"
+                        title="Save" aria-label="Save"
+                      >
+                        <Save size={18} />
+                      </button>
+                      <button
+                        onClick={() => {
+                          setEditContent(selectedDoc.content);
+                          setEditMode(false);
+                        }}
+                        className="p-2 min-h-[40px] min-w-[40px] flex items-center justify-center text-gray-400 hover:text-white transition-colors"
+                        title="Cancel" aria-label="Cancel"
+                      >
+                        <X size={18} />
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <button
+                        onClick={() => setEditMode(true)}
+                        className="p-2 min-h-[40px] min-w-[40px] flex items-center justify-center text-gray-400 hover:text-white transition-colors"
+                        title="Edit" aria-label="Edit"
+                      >
+                        <Edit2 size={18} />
+                      </button>
+                      <button
+                        onClick={() => setDeleteConfirm(selectedDoc.id)}
+                        className="p-2 min-h-[40px] min-w-[40px] flex items-center justify-center text-gray-400 hover:text-red-400 transition-colors"
+                        title="Delete" aria-label="Delete"
+                      >
+                        <Trash2 size={18} />
+                      </button>
+                    </>
+                  )}
+                </div>
+              </div>
+              {/* Mobile weight control row */}
+              <div className="flex md:hidden items-center gap-2 mt-2 pt-2 border-t border-port-border">
+                <Scale size={14} className="text-gray-500" />
+                <label htmlFor="document-weight-mobile" className="text-xs text-gray-400">Weight:</label>
+                <input
+                  id="document-weight-mobile"
+                  type="range"
+                  min="1"
+                  max="10"
+                  value={selectedDoc.weight || 5}
+                  onChange={(e) => handleWeightChange(selectedDoc, parseInt(e.target.value, 10))}
+                  className="flex-1 h-1 accent-port-accent"
+                />
+                <span className="text-xs text-gray-400 w-4">{selectedDoc.weight || 5}</span>
+              </div>
+            </div>
+
+            {/* Editor Content */}
+            <div className="flex-1 overflow-auto">
+              {editMode ? (
+                <textarea
+                  aria-label="Soul document"
+                  value={editContent}
+                  onChange={(e) => setEditContent(e.target.value)}
+                  className="w-full h-full p-4 bg-port-bg text-white font-mono text-sm resize-none focus:outline-hidden"
+                  placeholder="Write your soul document here..."
+                />
+              ) : (
+                <pre className="p-4 text-sm text-gray-300 whitespace-pre-wrap break-words font-mono">
+                  {selectedDoc.content}
+                </pre>
+              )}
+            </div>
+          </>
+        ) : (
+          <div className="flex-1 flex items-center justify-center text-gray-500">
+            <div className="text-center">
+              <FileText className="w-12 h-12 mx-auto mb-4 opacity-50" />
+              <p>Select a document to view or edit</p>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Create Document Modal — closeOnBackdrop/closeOnEsc disabled so an
+          accidental outside click or Escape can't silently discard a typed
+          draft; matches the pre-Modal markup, which had no backdrop-click or
+          Escape dismissal at all (only the explicit Cancel/Create buttons). */}
+      <Modal
+        open={showCreate}
+        onClose={() => {
+          setShowCreate(false);
+          setNewDoc({ filename: '', title: '', category: 'core', content: '' });
+        }}
+        closeOnBackdrop={false}
+        closeOnEsc={false}
+        ariaLabel="Create Soul Document"
+        panelClassName="bg-port-card rounded-lg border border-port-border p-4 sm:p-6"
+      >
+        <h2 className="text-lg font-semibold text-white mb-4">Create Soul Document</h2>
+
+        <div className="space-y-4">
+          <FormField label="Filename">
+            <input
+              type="text"
+              value={newDoc.filename}
+              onChange={(e) => setNewDoc({ ...newDoc, filename: e.target.value })}
+              placeholder="DOCUMENT_NAME.md"
+              className="w-full px-3 py-3 min-h-[44px] bg-port-bg border border-port-border rounded-lg text-white"
+            />
+          </FormField>
+
+          <FormField label="Title">
+            <input
+              type="text"
+              value={newDoc.title}
+              onChange={(e) => setNewDoc({ ...newDoc, title: e.target.value })}
+              placeholder="Document title"
+              className="w-full px-3 py-3 min-h-[44px] bg-port-bg border border-port-border rounded-lg text-white"
+            />
+          </FormField>
+
+          <FormField label="Category">
+            <select
+              value={newDoc.category}
+              onChange={(e) => setNewDoc({ ...newDoc, category: e.target.value })}
+              className="w-full px-3 py-3 min-h-[44px] bg-port-bg border border-port-border rounded-lg text-white"
+            >
+              {Object.entries(DOCUMENT_CATEGORIES).map(([key, config]) => (
+                <option key={key} value={key}>{config.label}</option>
+              ))}
+            </select>
+          </FormField>
+
+          <FormField label="Content">
+            <textarea
+              value={newDoc.content}
+              onChange={(e) => setNewDoc({ ...newDoc, content: e.target.value })}
+              placeholder="# Document Title&#10;&#10;Content here..."
+              rows={8}
+              className="w-full px-3 py-3 bg-port-bg border border-port-border rounded-lg text-white font-mono text-sm"
+            />
+          </FormField>
+        </div>
+
+        <div className="flex flex-col-reverse sm:flex-row justify-end gap-3 mt-6">
+          <button
+            onClick={() => {
+              setShowCreate(false);
+              setNewDoc({ filename: '', title: '', category: 'core', content: '' });
+            }}
+            className="px-4 py-3 min-h-[44px] text-gray-400 hover:text-white transition-colors"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={handleCreate}
+            disabled={saving}
+            className="px-4 py-3 min-h-[44px] bg-port-accent text-white rounded-lg hover:bg-port-accent/80 disabled:opacity-50"
+          >
+            {saving ? 'Creating...' : 'Create'}
+          </button>
+        </div>
+      </Modal>
+
+      {/* Delete Confirmation Modal */}
+      <Modal
+        open={!!deleteConfirm}
+        onClose={() => setDeleteConfirm(null)}
+        size="sm"
+        ariaLabel="Delete Document?"
+        panelClassName="bg-port-card rounded-lg border border-port-border p-4 sm:p-6"
+      >
+        <h2 className="text-lg font-semibold text-white mb-2">Delete Document?</h2>
+        <p className="text-gray-400 mb-6">
+          This action cannot be undone. The document will be permanently deleted.
+        </p>
+        <div className="flex flex-col-reverse sm:flex-row justify-end gap-3">
+          <button
+            onClick={() => setDeleteConfirm(null)}
+            className="px-4 py-3 min-h-[44px] text-gray-400 hover:text-white transition-colors"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={() => handleDelete(deleteConfirm)}
+            className="px-4 py-3 min-h-[44px] bg-port-error text-white rounded-lg hover:bg-port-error/80"
+          >
+            Delete
+          </button>
+        </div>
+      </Modal>
+    </div>
+  );
+}

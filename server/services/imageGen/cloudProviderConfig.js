@@ -1,0 +1,271 @@
+/**
+ * Image Gen — shared cloud-CLI provider config resolver.
+ *
+ * Every surface that can enqueue (or directly run) a cloud-CLI image render
+ * repeated the same three steps per provider: read `settings.imageGen.<mode>`,
+ * reject when `enabled` isn't true, then assemble that provider's job-param
+ * bundle. With two providers (codex, grok) that was ~7 sites × 2 branches of
+ * copy-paste, and each new backend doubled it again.
+ *
+ * `resolveCloudProviderConfig(settings, mode)` collapses all of it into one
+ * call. The per-provider knowledge lives in `CLOUD_PROVIDER_SPECS` below, so
+ * adding a cloud backend is one spec entry instead of a sweep — fal.ai (a
+ * metered REST API rather than a CLI) was added exactly that way.
+ *
+ * Deliberately a sibling of `modes.js` rather than part of it: modes.js is the
+ * no-dependency enum module both provider modules import, and this file needs
+ * `ServerError`.
+ */
+
+import { ServerError } from '../../lib/errorHandler.js';
+import {
+  cloudPromptRequired,
+  IMAGE_GEN_PROVIDER_CAPABILITIES,
+  maxInputImages,
+} from '../../lib/imageGenCapabilities.js';
+import {
+  isModeUsable,
+  pickUsableMode,
+  renderTargetDefaults,
+  resolveRenderTargetPins,
+} from '../../lib/renderModeLadder.js';
+import { FAL_IMAGE_DEFAULT_MODEL, FAL_IMAGE_MODEL_IDS, isFalImageModel } from '../../lib/falImageModels.js';
+import {
+  AGY_IMAGEGEN_DEFAULT_MODEL,
+  CODEX_IMAGEGEN_DEFAULT_MODEL,
+  IMAGE_GEN_MODE,
+} from './modes.js';
+
+// A saved `imageGen.fal.model` outside the catalog (hand-edited settings, or a
+// model a later build retired) degrades to the shipped default rather than
+// bricking every fal render; an explicit per-render override is refused
+// instead — see `knownModels` below.
+const falModelFrom = (c, override) => override
+  || (isFalImageModel(c.model) ? c.model.trim() : FAL_IMAGE_DEFAULT_MODEL);
+
+// The pure capability half of the specs below, plus the two predicates that
+// read it, live in the dependency-free `lib/imageGenCapabilities.js` leaf so
+// the client shares them instead of re-typing them. Re-exported here because
+// every existing caller (inputImages, prepareParams, the providers,
+// fableLoom/production) imports them from this module.
+export { cloudPromptRequired, maxInputImages };
+
+// The pure resolution ladder lives in the dependency-free `lib/renderModeLadder.js`
+// leaf (#6815) so the client can import it directly instead of hand-copying it —
+// see that module for their docs and the fall-through semantics (a pin is a
+// preference, not a guarantee). Re-exported here because every existing caller
+// (visualStageHelpers, sprites/reference, creativeCommissions/scheduler,
+// creative/tools/media, videoGen/backendPin) imports them from this module.
+export { isModeUsable, pickUsableMode, renderTargetDefaults };
+
+/**
+ * Per-provider knowledge, keyed by mode:
+ *  - `label`      — user-facing provider name used in every disabled message.
+ *  - `modelId`    — the *effective* model id for display/metadata (codex and
+ *                   agy default to their cheap tiers; grok's backend is fixed).
+ *  - `knownModels` — optional catalog for a per-render override. A
+ *                   provider whose model ids are prices (fal.ai) must not let a
+ *                   typo or a stale pin from another backend reach the wire, so
+ *                   an override it rejects is a 400 (`unknownModelCode`)
+ *                   rather than a silent fallback.
+ *  - `params`     — the provider's knob bundle for a queue job / direct call.
+ *                   Codex's `model` carries the effective (defaulted) id so the
+ *                   queue row reports what actually renders; the provider
+ *                   re-applies the same default, so rendering is unchanged.
+ *  - the pure capability flags — `supportsModelOverride`, `maxInputImages`,
+ *                   `promptRequiredWithInputImage` — are spread in from
+ *                   IMAGE_GEN_PROVIDER_CAPABILITIES (lib/imageGenCapabilities.js),
+ *                   which documents what each one means and how it was probed.
+ *
+ * `modelId`/`params` both take `(config, override)` where `override` is the
+ * per-render model id (or a falsy value when the render inherits the saved
+ * default). Precedence is override → saved default → provider default.
+ */
+export const CLOUD_PROVIDER_SPECS = Object.freeze({
+  [IMAGE_GEN_MODE.CODEX]: Object.freeze({
+    ...IMAGE_GEN_PROVIDER_CAPABILITIES[IMAGE_GEN_MODE.CODEX],
+    label: 'Codex Imagegen',
+    errorCode: 'CODEX_IMAGEGEN_DISABLED',
+    modelId: (c, override) => override || c.model || CODEX_IMAGEGEN_DEFAULT_MODEL,
+    params: (c, override) => ({
+      codexPath: c.codexPath,
+      model: override || c.model || CODEX_IMAGEGEN_DEFAULT_MODEL,
+      effort: c.effort,
+    }),
+  }),
+  [IMAGE_GEN_MODE.GROK]: Object.freeze({
+    ...IMAGE_GEN_PROVIDER_CAPABILITIES[IMAGE_GEN_MODE.GROK],
+    label: 'Grok Imagegen',
+    errorCode: 'GROK_IMAGEGEN_DISABLED',
+    modelId: () => 'grok-imagegen',
+    params: (g) => ({ grokPath: g.grokPath, aspectRatio: g.aspectRatio }),
+  }),
+  [IMAGE_GEN_MODE.AGY]: Object.freeze({
+    ...IMAGE_GEN_PROVIDER_CAPABILITIES[IMAGE_GEN_MODE.AGY],
+    label: 'Agy Imagegen',
+    errorCode: 'AGY_IMAGEGEN_DISABLED',
+    // The concrete cheap-tier pin (not the ANTIGRAVITY_CONFIGURED_DEFAULT
+    // sentinel, which resolves to "no --model" and lets agy pick a possibly
+    // reasoning-heavy session default) — see AGY_IMAGEGEN_DEFAULT_MODEL.
+    modelId: (a, override) => override || a.model || AGY_IMAGEGEN_DEFAULT_MODEL,
+    params: (a, override, overrideIsShippedDefault) => ({
+      agyPath: a.agyPath,
+      model: override || a.model || AGY_IMAGEGEN_DEFAULT_MODEL,
+      // Provenance, which the resolved `model` above erases: whether the id is
+      // PortOS's own shipped pin or something a human chose. The agy provider
+      // re-points a shipped pin that the vendor has retired from its catalog,
+      // and must never do that to a user's — an id typed into Settings (or sent
+      // as a per-render override) is a deliberate choice, even when it happens
+      // to equal the shipped one.
+      //
+      // The absence of a value is only HALF the answer. A caller that already
+      // walked the render-target ladder hands the resolved id back as an
+      // override, so by the time it reaches here every id looks chosen — which
+      // is exactly how the flag never fired for a record-tagged render (#7366).
+      // Such a caller says so with `overrideIsShippedDefault` instead.
+      modelIsShippedDefault: overrideIsShippedDefault || (!override && !a.model),
+    }),
+  }),
+  [IMAGE_GEN_MODE.FAL]: Object.freeze({
+    ...IMAGE_GEN_PROVIDER_CAPABILITIES[IMAGE_GEN_MODE.FAL],
+    label: 'fal.ai Imagegen',
+    errorCode: 'FAL_IMAGEGEN_DISABLED',
+    knownModels: FAL_IMAGE_MODEL_IDS,
+    unknownModelCode: 'FAL_IMAGE_MODEL_UNKNOWN',
+    modelId: falModelFrom,
+    // No key in here: the queue persists job params in plaintext, so the
+    // provider re-resolves the fal.ai key from live settings at dispatch —
+    // the same rule videoGen/fal.js follows.
+    params: (c, override) => ({ model: falModelFrom(c, override) }),
+  }),
+});
+
+/**
+ * Resolve a cloud-CLI provider's settings slice into everything a call site
+ * needs. Returns `null` for non-cloud modes (local / external) so callers can
+ * keep their own branch for those.
+ *
+ * Shape:
+ *  - `enabled`        — the settings toggle (strict boolean).
+ *  - `config`         — the raw `settings.imageGen[mode]` slice (never null).
+ *  - `modelId`        — effective model id for response/queue metadata.
+ *  - `providerParams` — knob bundle WITHOUT `mode` (direct provider calls,
+ *                       which strip the dispatcher-only field).
+ *  - `jobParams`      — `{ mode, ...providerParams }` for `enqueueJob`, where
+ *                       `mode` is the queue's lane discriminator.
+ *  - `modelIsShippedDefault` — whether `modelId` is PortOS's own shipped pin
+ *                       rather than a choice, for the providers that re-point a
+ *                       retired shipped default (agy). Always false elsewhere.
+ *  - `disabledError`  — a ready-to-throw ServerError (null when enabled).
+ *  - `disabledReason` — `'<mode>-disabled'`, for callers that skip silently.
+ *  - `connectionReason` — reason string for `checkConnection` responses.
+ *
+ * `overrides.model` is the per-render model id (the request's `cloudModel`).
+ * `overrides.modelIsShippedDefault` is its PROVENANCE, set only by a caller
+ * re-resolving a model id this resolver already produced from the shipped
+ * default (see `prepareParams.js`) — it is ignored without an override.
+ * It only applies to providers whose spec sets `supportsModelOverride` — a
+ * value passed for grok is ignored rather than silently changing nothing at
+ * spawn time. Blank/whitespace is treated as "inherit the saved default", so
+ * a cleared select in the UI round-trips to the settings value instead of
+ * pinning an empty model id.
+ */
+export function resolveCloudProviderConfig(settings, mode, overrides = {}) {
+  const spec = CLOUD_PROVIDER_SPECS[mode];
+  if (!spec) return null;
+  const config = settings?.imageGen?.[mode] || {};
+  const enabled = config.enabled === true;
+  const requestedModel = typeof overrides.model === 'string' ? overrides.model.trim() : '';
+  const modelOverride = spec.supportsModelOverride && requestedModel ? requestedModel : null;
+  if (modelOverride && spec.knownModels && !spec.knownModels.includes(modelOverride)) {
+    throw new ServerError(
+      `${spec.label} has no model "${modelOverride}" — choose one of: ${spec.knownModels.join(', ')}`,
+      { status: 400, code: spec.unknownModelCode },
+    );
+  }
+  // Only meaningful ALONGSIDE an override: it says the id the caller handed in
+  // is one this resolver itself produced from the shipped default a moment ago,
+  // not a choice. Without an override the spec answers from the config as it
+  // always did, so a stray marker can never invent provenance for a user's pin.
+  const overrideIsShippedDefault = Boolean(modelOverride) && overrides.modelIsShippedDefault === true;
+  const providerParams = spec.params(config, modelOverride, overrideIsShippedDefault);
+  return {
+    mode,
+    config,
+    enabled,
+    supportsModelOverride: spec.supportsModelOverride === true,
+    modelOverride,
+    // Re-surfaced at the top level so a caller threading this bundle's model
+    // onward can thread its provenance with it, without reaching into the
+    // per-provider `providerParams` bag (only agy carries the field there).
+    modelIsShippedDefault: providerParams.modelIsShippedDefault === true,
+    modelId: spec.modelId(config, modelOverride),
+    providerParams,
+    jobParams: { mode, ...providerParams },
+    disabledError: enabled ? null : new ServerError(
+      `${spec.label} is disabled — enable it in Settings → Image Gen first`,
+      { status: 400, code: spec.errorCode },
+    ),
+    disabledReason: `${mode}-disabled`,
+    connectionReason: `${spec.label} is disabled in settings`,
+  };
+}
+
+/**
+ * Resolve one surface's image render config through the render-target ladder
+ * (#3231 Phase 2): per-request/per-record override → the target's saved
+ * `renderDefaults` pin → the install-wide `settings.imageGen.mode` → the
+ * caller's own fallback. Every creative surface resolves through THIS (the
+ * guard test in renderTargets.guard.test.js fails a direct
+ * `resolveCloudProviderConfig` call outside the dispatcher) so a new surface
+ * is one `RENDER_TARGET` entry + one call here — and so the target's saved
+ * `imageModel` actually reaches the provider instead of being dropped, which
+ * is exactly what all seven pre-#3231 call sites did.
+ *
+ * Options:
+ *  - `mode`        — the surface's per-request mode override (e.g.
+ *                    `body.mode`). Wins over every pin.
+ *  - `model`       — per-request cloud model override. Wins over every pin.
+ *  - `recordMode`  — the owning record's persisted backend pin (#3231 Phase 3
+ *                    — universe/series/sprite `imageMode`, normalized via
+ *                    `recordRenderPin`). Sits between the per-request override
+ *                    and the target's `renderDefaults` pin, and is
+ *                    usability-gated like the target pin (a since-disabled
+ *                    backend degrades instead of bricking the record's
+ *                    renders — the enforceRenderBackendPin contract).
+ *  - `recordModel` — the owning record's persisted model pin. Rides only when
+ *                    the resolved mode is the record's pinned backend (same
+ *                    leak guard as the target's model pin).
+ *  - `fallbackMode`— the surface's historical final fallback when nothing
+ *                    else resolves (EXTERNAL for batch-reject surfaces, LOCAL
+ *                    for local-first ones). Surfaces with their own usability
+ *                    ladder (resolveQueueImageMode / pickUsableMode) resolve
+ *                    mode first — seeding the ladder with the record pin then
+ *                    `renderTargetDefaults(...).imageMode` — and pass the
+ *                    result as `mode` here for model threading (keeping
+ *                    `recordMode`/`recordModel` so the leak guard still knows
+ *                    which backend the record pinned).
+ *
+ * `usableInstallFallback` opts inherited browser renders into a usable
+ * install fallback; batch callers retain their disabled-provider skip contract.
+ *
+ * Returns `{ mode, cloud, modelCandidates }` — `cloud` is the resolveCloudProviderConfig
+ * bundle (null for non-cloud modes), with the layered model threaded through.
+ */
+export function resolveRenderTargetConfig(settings, target, {
+  mode = null,
+  model = null,
+  recordMode = null,
+  recordModel = null,
+  fallbackMode = null,
+  usableInstallFallback = false,
+} = {}) {
+  const resolved = resolveRenderTargetPins(settings, target, {
+    mode, model, recordMode, recordModel, fallbackMode, usableInstallFallback,
+  });
+  return {
+    mode: resolved.mode,
+    modelCandidates: resolved.modelCandidates,
+    cloud: resolveCloudProviderConfig(settings, resolved.mode, { model: resolved.modelId }),
+  };
+}

@@ -1,0 +1,12 @@
+{
+  "running": false,
+  "stats": {
+    "tasksCompleted": 0,
+    "totalRuntime": 0,
+    "agentsSpawned": 0,
+    "lastEvaluation": null,
+    "lastHealthCheck": null,
+    "healthIssues": []
+  },
+  "agents": {}
+}

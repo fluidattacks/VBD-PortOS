@@ -1,0 +1,243 @@
+import { useState, useEffect, useCallback, useMemo, useId } from 'react';
+import { Loader2, Terminal, Wand2 } from 'lucide-react';
+import Drawer from '../Drawer';
+import ProviderModelSelector from '../ProviderModelSelector';
+import ReviewerPicker from '../cos/ReviewerPicker';
+import { DEFAULT_PR_COMPLETION, PR_COMPLETION_OPTIONS, prCompletionOption } from '../cos/constants';
+import useRunWithPicker from '../../hooks/useRunWithPicker';
+import useReviewerModelOptions from '../../hooks/useReviewerModelOptions';
+import { reviewerModelsFromDefaults, reviewerEffortsFromDefaults } from '../../lib/reviewerModels';
+import { CodeReviewDefaultsProvider, useCodeReviewDefaults } from '../../hooks/useCodeReviewDefaults';
+import useClaimReviewers from '../../hooks/useClaimReviewers';
+import ClaimReviewerSource from './ClaimReviewerSource';
+import WorkItemPicker from './WorkItemPicker';
+import * as api from '../../services/api';
+
+/**
+ * Pre-flight settings for an Agent Operations `/do:*` run: for `/do:next`, which
+ * work item to claim (or let the agent decide); for every command, the provider /
+ * model / effort pin and the task options (simplify, review-loop reviewers).
+ *
+ * Every control is optional — submitting untouched queues exactly the run the
+ * bare button used to. Reviewer fields are sent ONLY when the user edits them, so
+ * an untouched drawer still resolves the app's configured claim-work reviewers
+ * server-side rather than pinning whatever this form happened to display.
+ * `prCompletion` is the exception: it is always sent for `/do:next` (seeded
+ * from the claim-work default when untouched), because the prompt's completion
+ * policy needs an explicit value.
+ *
+ * Mount only while open (the parent conditionally renders it): the provider fetch
+ * runs on mount unless the overview supplies its shared agent picker. Task
+ * settings reset on unmount; a supplied picker retains the overview overrides.
+ */
+function SlashDoRunDrawerBody({ open, command, label, appId, appName, onClose, onQueued, agentPicker }) {
+  const codeReviewDefaults = useCodeReviewDefaults();
+  // What a claim actually resolves for this app — the claim-work override layer
+  // the defaults above cannot see. Only `/do:next` reads reviewers server-side,
+  // so no other command pays for the lookup. `installed` still comes from the
+  // defaults, which is why both are fetched.
+  const claimReviewers = useClaimReviewers(command === 'next' ? appId : null);
+  // Resolved model lists for the reviewer table's Model column (the picker never
+  // fetches — see its `modelOptions` prop).
+  const reviewerModelOptions = useReviewerModelOptions();
+  const localPicker = useRunWithPicker();
+  const picker = agentPicker ?? localPicker;
+  const [simplify, setSimplify] = useState(true);
+  // Seeded from what the RUN will resolve for display. `review` staying null is
+  // what gates whether the fields are SENT — see the component doc.
+  const [review, setReview] = useState(null);
+  // Seeded display for an untouched picker. It has to show the reviewers the RUN
+  // would resolve, which is not the Code Review Defaults whenever a claim-work
+  // override is in play (see `GET /apps/:id/claim-reviewers`). The defaults are
+  // the fallback for the window before the lookup lands and for one that failed —
+  // they carry per-reviewer pins as `<reviewer>Model` / `<reviewer>Effort`
+  // scalars, which the picker takes as token-keyed maps.
+  const seededReview = useMemo(
+    () => claimReviewers ?? {
+      ...codeReviewDefaults,
+      reviewerModels: reviewerModelsFromDefaults(codeReviewDefaults),
+      reviewerEfforts: reviewerEffortsFromDefaults(codeReviewDefaults),
+    },
+    [claimReviewers, codeReviewDefaults]
+  );
+  const reviewValue = review ?? seededReview;
+
+  const prCompletionId = useId();
+  const [prCompletion, setPrCompletion] = useState(DEFAULT_PR_COMPLETION);
+  const [prCompletionTouched, setPrCompletionTouched] = useState(false);
+  useEffect(() => {
+    if (!prCompletionTouched && claimReviewers?.prCompletion) {
+      setPrCompletion(claimReviewers.prCompletion);
+    }
+  }, [claimReviewers?.prCompletion, prCompletionTouched]);
+
+  const [work, setWork] = useState({ mode: 'auto', target: '', issueAuthorFilter: '' });
+  const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState('');
+
+  const handleWorkChange = useCallback((next) => setWork(next), []);
+
+  const isNext = command === 'next';
+  // In pick mode an unselected item must block, not silently fall back to the
+  // agent-picked run the user just opted out of.
+  const awaitingPick = isNext && work.mode === 'pick' && !work.target;
+
+  const handleQueue = async () => {
+    setSubmitting(true);
+    setSubmitError('');
+    // silent: this drawer owns its own inline error + the caller's toast.
+    const result = await api.createSlashdoTask(command, appId, {
+      target: work.target || undefined,
+      // Only send the filter/reviewers the user actually chose — otherwise the
+      // app's configured claim-work defaults apply server-side, unchanged.
+      issueAuthorFilter: work.issueAuthorFilter || undefined,
+      ...picker.pin,
+      simplify,
+      // `isNext &&` states the route's contract rather than leaning on the picker
+      // being unrendered: only the `next` branch of POST /tasks/slashdo reads these,
+      // so sending them for another command would be a silent no-op.
+      ...(isNext ? {
+        prCompletion,
+        ...(prCompletion === 'review-then-merge' && review ? {
+          reviewers: review.reviewers,
+          usernames: review.usernames,
+          optionalReviewers: review.optionalReviewers,
+          reviewerMaxRounds: review.reviewerMaxRounds,
+          reviewerModels: review.reviewerModels,
+          reviewerEfforts: review.reviewerEfforts
+        } : {})
+      } : {})
+    }, { silent: true }).catch((err) => {
+      setSubmitError(err.message || 'Failed to queue the task');
+      return null;
+    });
+    setSubmitting(false);
+    if (result) onQueued?.(result);
+  };
+
+  return (
+    <Drawer
+      open={open}
+      onClose={onClose}
+      title={`Run ${label}`}
+      subtitle={appName}
+      size="lg"
+      closeOnBackdrop={false}
+    >
+      <div className="space-y-6">
+        {isNext && <WorkItemPicker appId={appId} target={work.target} onChange={handleWorkChange} />}
+
+        <section className="space-y-3">
+          <div className="text-xs text-gray-500 uppercase tracking-wide">Agent</div>
+          <ProviderModelSelector {...picker.selectorProps} />
+        </section>
+
+        <section className="space-y-3">
+          <div className="text-xs text-gray-500 uppercase tracking-wide">Task settings</div>
+          <label className="flex items-center gap-2 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={simplify}
+              onChange={e => setSimplify(e.target.checked)}
+              className="w-4 h-4 rounded border-port-border bg-port-bg text-port-accent focus:ring-port-accent focus:ring-offset-0"
+            />
+            <span className="flex items-center gap-1.5 text-sm text-gray-400">
+              <Wand2 size={14} className="text-port-accent-2" />
+              Simplify before committing
+            </span>
+          </label>
+          {/* Reviewer choices are `/do:next`-only: they're substituted into the
+              claim prompt's reviewer CSV, and `POST /tasks/slashdo` reads them only
+              on that branch. Every other `/do:*` body owns its own review/PR
+              sequence, so rendering the picker there would be four knobs wired to
+              nothing — the user would pick a reviewer and a model and the run would
+              silently discard both. */}
+          {isNext && (
+            <div>
+              <label htmlFor={prCompletionId} className="block text-xs text-gray-400 mb-1">
+                After opening PR
+              </label>
+              <select
+                id={prCompletionId}
+                aria-label="After opening PR"
+                value={prCompletion}
+                onChange={e => { setPrCompletion(e.target.value); setPrCompletionTouched(true); }}
+                className="w-full bg-port-bg border border-port-border rounded px-3 py-2 text-white text-sm focus:border-port-accent focus:outline-hidden"
+              >
+                {PR_COMPLETION_OPTIONS.map(option => (
+                  <option key={option.value} value={option.value}>{option.label}</option>
+                ))}
+              </select>
+              <p className="text-xs text-gray-500 mt-1">
+                {prCompletionOption(prCompletion)?.description}
+              </p>
+            </div>
+          )}
+          {isNext && prCompletion === 'review-then-merge' && (
+            <>
+              <ReviewerPicker
+                reviewers={reviewValue.reviewers}
+                usernames={reviewValue.usernames}
+                optionalReviewers={reviewValue.optionalReviewers}
+                reviewerMaxRounds={reviewValue.reviewerMaxRounds}
+                reviewerModels={reviewValue.reviewerModels}
+                reviewerEfforts={reviewValue.reviewerEfforts}
+                modelOptions={reviewerModelOptions}
+                installed={codeReviewDefaults.installed}
+                providerReviewUnsupported={codeReviewDefaults.providerReviewUnsupported}
+                // The claim flows substitute a reviewer CSV into their prompt and have
+                // no slashdo flag string, so stop-mode / reviewer-applies can't be honored.
+                showRunFlags={false}
+                onChange={({ reviewers, usernames, optionalReviewers, reviewerMaxRounds, reviewerModels, reviewerEfforts }) =>
+                  setReview({ reviewers, usernames, optionalReviewers, reviewerMaxRounds, reviewerModels, reviewerEfforts })}
+              />
+              <p className="text-xs text-gray-500">
+                The claim flow opens and merges its own PR, so these reviewers gate that merge (slashdo <code>--review-with</code>).
+                {!review && ' Leave them untouched to use this app’s configured reviewers.'}
+              </p>
+              {/* Which layer supplied the seeded list. A claim-work override wins
+                  over Models → Code Reviewers silently, so a user who changed the
+                  install default and sees a different chain here has to be told
+                  where it came from. */}
+              {!review && claimReviewers?.source === 'task-override' && (
+                <p className="text-xs text-port-warning">
+                  Seeded<ClaimReviewerSource source={claimReviewers.source} />
+                </p>
+              )}
+            </>
+          )}
+        </section>
+
+        {submitError && <p role="alert" className="text-xs text-port-error">{submitError}</p>}
+
+        <div className="flex items-center justify-end gap-2 pt-2">
+          <button
+            type="button"
+            onClick={onClose}
+            className="px-3 py-2 bg-port-bg border border-port-border rounded-lg text-sm text-gray-400 hover:text-white transition-colors min-h-[44px]"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={handleQueue}
+            disabled={submitting || awaitingPick}
+            title={awaitingPick ? 'Select a work item first' : undefined}
+            className="flex items-center gap-1.5 px-3 py-2 bg-blue-500/20 hover:bg-blue-500/30 text-blue-400 border border-blue-500/30 rounded-lg text-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed min-h-[44px]"
+          >
+            {submitting ? <Loader2 size={14} className="animate-spin" /> : <Terminal size={14} />}
+            Queue {label}
+          </button>
+        </div>
+      </div>
+    </Drawer>
+  );
+}
+
+export default function SlashDoRunDrawer(props) {
+  return (
+    <CodeReviewDefaultsProvider>
+      <SlashDoRunDrawerBody {...props} />
+    </CodeReviewDefaultsProvider>
+  );
+}

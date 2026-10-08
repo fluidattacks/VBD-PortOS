@@ -1,0 +1,253 @@
+import { newAuditMetadata } from '../../lib/auditWorkflow.js';
+/**
+ * Autonomous Jobs — skill templates and effective-prompt assembly.
+ *
+ * Reads/writes the per-job skill template markdown files, assembles a job's
+ * effective prompt (skill template + per-job enrichments, including the values
+ * set in the job's own configuration form), and turns a due job into a CoS task
+ * payload (`generateTaskFromJob`).
+ */
+
+import { join } from 'path'
+import { ensureDir, PATHS, tryReadFile, writeFileGuarded } from '../../lib/fileUtils.js'
+import { JOBS_SKILLS_DIR, JOB_SKILL_MAP } from './constants.js'
+import { getAppById } from '../apps.js'
+import { appendTaskDataInputs, resolveTaskDataInputs } from '../taskDataInputs.js'
+import { appendJobFormValues } from '../../lib/jobFormFields.js'
+import { FILE_ISSUES_DELIVERY_SETTINGS, isExplicitFileIssuesRequest } from '../../lib/auditCatalog.js'
+import { ServerError } from '../../lib/errorHandler.js'
+
+const KNOWN_SKILL_NAMES = new Set(Object.values(JOB_SKILL_MAP))
+
+/**
+ * Resolve a skill name to its template path, refusing anything but a known
+ * job skill — the name arrives from a URL segment, where Express has already
+ * decoded `%2F`, so an unchecked name could reach any `.md` file (#8762).
+ */
+function jobSkillTemplatePath(skillName) {
+  if (typeof skillName !== 'string' || !/^[a-z0-9-]+$/.test(skillName) || !KNOWN_SKILL_NAMES.has(skillName)) {
+    throw new ServerError('Unknown job skill template', { status: 400, code: 'VALIDATION_ERROR' })
+  }
+  return join(JOBS_SKILLS_DIR, `${skillName}.md`)
+}
+
+/**
+ * Load a job skill template from disk
+ * @param {string} skillName - The skill template name (e.g., 'daily-briefing')
+ * @returns {Promise<string|null>} Template content or null if not found
+ */
+async function loadJobSkillTemplate(skillName) {
+  const filePath = jobSkillTemplatePath(skillName)
+  const content = await tryReadFile(filePath)
+  if (content) {
+    console.log(`🎯 Loaded job skill template: ${skillName}`)
+  }
+  return content
+}
+
+/**
+ * Save a job skill template to disk
+ * @param {string} skillName - The skill template name
+ * @param {string} content - The template content
+ */
+async function saveJobSkillTemplate(skillName, content) {
+  await ensureDir(JOBS_SKILLS_DIR)
+  const filePath = jobSkillTemplatePath(skillName)
+  await writeFileGuarded(filePath, content)
+  console.log(`💾 Saved job skill template: ${skillName}`)
+}
+
+/**
+ * List all job skill templates
+ * @returns {Promise<Array>} Array of { name, jobId, hasTemplate }
+ */
+async function listJobSkillTemplates() {
+  const results = []
+  for (const [jobId, skillName] of Object.entries(JOB_SKILL_MAP)) {
+    const content = await loadJobSkillTemplate(skillName)
+    results.push({
+      name: skillName,
+      jobId,
+      hasTemplate: !!content
+    })
+  }
+  return results
+}
+
+/**
+ * Build additional prompt instructions based on daily briefing config options.
+ * @param {Object} config - The briefing config object
+ * @returns {string} Additional instructions to append, or empty string
+ */
+function buildBriefingConfigInstructions(config) {
+  const parts = []
+
+  if (config.dailyJoke) {
+    parts.push('- Include a "Daily Joke" section with a short, clever joke to start the day on a light note.')
+  }
+  if (config.dailyQuote) {
+    parts.push('- Include a "Daily Quote" section with an inspirational or thought-provoking quote relevant to the day\'s focus areas.')
+  }
+  if (config.dailyImage) {
+    parts.push(
+      '- Generate a "Daily Image" to accompany the briefing by calling POST /api/image-gen/generate with a creative prompt related to today\'s theme or focus areas. Use a cyberpunk or futuristic aesthetic. Include the resulting image path in the briefing. If the image gen API is unavailable (GET /api/image-gen/status returns connected: false), skip this section silently.'
+    )
+  }
+
+  if (parts.length === 0) return ''
+  return 'Optional enrichments (include these sections in the briefing):\n' + parts.join('\n')
+}
+
+/**
+ * Append briefing config instructions to a prompt if this is the daily briefing job.
+ */
+function appendBriefingConfig(job, prompt) {
+  if (job.id !== 'job-daily-briefing' || !job.config) return prompt
+  const extras = buildBriefingConfigInstructions(job.config)
+  return extras ? prompt + '\n\n' + extras : prompt
+}
+
+/**
+ * Apply every per-job enrichment that turns a stored template into the prompt a
+ * run actually receives. The job's own configuration form goes LAST so its
+ * values read as the final word on this run, after any generic enrichment.
+ */
+function enrichJobPrompt(job, prompt) {
+  return appendJobFormValues(job, appendBriefingConfig(job, prompt))
+}
+
+/**
+ * Get the effective prompt for a job, using skill template if available
+ * Extracts the prompt from the skill template's structured format
+ * @param {Object} job - The job object
+ * @returns {Promise<string>} The effective prompt template
+ */
+async function getJobEffectivePrompt(job) {
+  const skillName = JOB_SKILL_MAP[job.id]
+  if (!skillName) return enrichJobPrompt(job, job.promptTemplate)
+
+  const template = await loadJobSkillTemplate(skillName)
+  if (!template) return enrichJobPrompt(job, job.promptTemplate)
+
+  // Extract structured sections from the skill template and build a prompt
+  // The skill template has: Prompt Template header, Steps, Expected Outputs, Success Criteria
+  const lines = template.split('\n')
+  const sections = { prompt: '', steps: '', expectedOutputs: '', successCriteria: '' }
+  let currentSection = null
+
+  for (const line of lines) {
+    if (line.startsWith('## Prompt Template')) { currentSection = 'prompt'; continue }
+    if (line.startsWith('## Steps')) { currentSection = 'steps'; continue }
+    if (line.startsWith('## Expected Outputs')) { currentSection = 'expectedOutputs'; continue }
+    if (line.startsWith('## Success Criteria')) { currentSection = 'successCriteria'; continue }
+    if (line.startsWith('## Job Metadata')) { currentSection = 'metadata'; continue }
+    if (line.startsWith('# ')) { currentSection = null; continue }
+    if (currentSection && currentSection !== 'metadata') {
+      sections[currentSection] += line + '\n'
+    }
+  }
+
+  // Build the effective prompt from structured sections
+  let prompt = sections.prompt.trim()
+  if (sections.steps.trim()) {
+    prompt += '\n\nTasks to perform:\n' + sections.steps.trim()
+  }
+
+  prompt = appendBriefingConfig(job, prompt)
+
+  if (sections.expectedOutputs.trim()) {
+    prompt += '\n\nExpected outputs:\n' + sections.expectedOutputs.trim()
+  }
+  if (sections.successCriteria.trim()) {
+    prompt += '\n\nSuccess criteria:\n' + sections.successCriteria.trim()
+  }
+
+  return appendJobFormValues(job, prompt)
+}
+
+/**
+ * Generate a CoS task from a due job
+ * @param {Object} job - The job to generate a task for
+ * @returns {Promise<Object>} Task data suitable for cos.addTask()
+ */
+async function generateTaskFromJob(job) {
+  const prompt = await getJobEffectivePrompt(job)
+  const selectedInputs = Array.isArray(job.dataInputs) ? job.dataInputs : []
+  const app = selectedInputs.length > 0
+    ? (job.appId ? await getAppById(job.appId) : { id: null, name: 'PortOS', repoPath: PATHS.root })
+    : null
+  const inputs = selectedInputs.length > 0
+    ? await resolveTaskDataInputs(selectedInputs, { app, taskMetadata: job.taskMetadata })
+    : []
+  const taskPrompt = appendTaskDataInputs(prompt, inputs)
+  const description = taskPrompt.split('\n').map(line => line.trim()).find(Boolean) || job.name
+  const meta = newAuditMetadata(job.taskMetadata || {})
+  return {
+    id: `${job.id}-${Date.now().toString(36)}`,
+    description,
+    priority: job.priority,
+    metadata: {
+      autonomousJob: true,
+      ...(meta.auditDepth ? { auditDepth: meta.auditDepth } : {}),
+      ...(meta.auditWorkflow ? { auditWorkflow: meta.auditWorkflow } : {}),
+      ...(meta.deepAuditId ? { deepAuditId: meta.deepAuditId } : {}),
+      jobId: job.id,
+      jobName: job.name,
+      jobCategory: job.category,
+      autonomyLevel: job.autonomyLevel,
+      prompt: taskPrompt,
+      // App-scoped jobs carry the target app id so prepareAgentWorkspace resolves
+      // the agent's workspace to the app's repoPath. Absent = runs in PortOS root.
+      ...(job.appId != null ? { app: job.appId } : {}),
+      // Forward git-workflow options so an app-scoped task can isolate via a
+      // worktree and open a PR (same metadata flags the built-in task types use).
+      ...(meta.useWorktree != null ? { useWorktree: meta.useWorktree } : {}),
+      ...(meta.openPR != null ? { openPR: meta.openPR } : {}),
+      ...(meta.simplify != null ? { simplify: meta.simplify } : {}),
+      // Some PortOS-owned audits can legitimately conclude that no change is
+      // needed. This is only a completion marker; agentFinalization still
+      // requires verifyPrClaim to prove the branch is empty before honoring it.
+      ...(meta.noChangeSuccess === true ? { noChangeSuccess: true } : {}),
+      // The "lands no code" posture a job converted from a legacy quota-burn
+      // step carries (#6381). Forwarded beside the git-workflow flags above
+      // because the legacy executor derived all of them together: either of
+      // these forces openPR/simplify off and makes a CLEAN worktree the success
+      // condition, so dropping one here would turn a report-shaped run into a
+      // `pr-missing` retry that burns agent quota on work already done.
+      ...(meta.noCodeOutput != null ? { noCodeOutput: meta.noCodeOutput } : {}),
+      ...(meta.discardWorktree != null ? { discardWorktree: meta.discardWorktree } : {}),
+      ...(meta.worktreeChangesExpected != null ? { worktreeChangesExpected: meta.worktreeChangesExpected } : {}),
+      // Optional per-job AI provider + model override. resolveAgentProviderAndModel
+      // reads metadata.provider to switch providers and selectModelForTask reads
+      // metadata.model as the highest-priority model choice. Absent = active
+      // provider / per-task model selection (historical behavior).
+      ...(job.providerId ? { provider: job.providerId } : {}),
+      ...(job.model ? { model: job.model } : {}),
+      // Reasoning-effort override — agentLifecycle reads metadata.effort and the
+      // spawn builders emit `--effort`/`-c model_reasoning_effort=` (no-op for
+      // non-effort providers). Absent = provider default.
+      ...(job.effort ? { effort: job.effort } : {}),
+      // File-issues delivery, from the SAME catalog object a scheduled audit
+      // stamps (`lib/auditCatalog.js`) rather than a second definition of the
+      // mode. A custom job is user-authored, so there is no catalog default to
+      // consult — it is opt-in, and the opt-in is the explicit `fileIssues`
+      // flag on the job's own taskMetadata. Stamped LAST so it wins over the
+      // useWorktree/openPR/simplify forwards above: those describe a
+      // code-shipping run, which is exactly what this mode is not.
+      ...(isExplicitFileIssuesRequest(meta) ? FILE_ISSUES_DELIVERY_SETTINGS : {})
+    },
+    taskType: 'internal',
+    autoApprove: job.autonomyLevel === 'yolo'
+  }
+}
+
+export {
+  loadJobSkillTemplate,
+  saveJobSkillTemplate,
+  listJobSkillTemplates,
+  buildBriefingConfigInstructions,
+  appendBriefingConfig,
+  enrichJobPrompt,
+  getJobEffectivePrompt,
+  generateTaskFromJob
+}

@@ -1,0 +1,68 @@
+// Goal → PortOS feature-area map (issue #2666).
+//
+// Deterministic, LLM-free registry that turns a goal's `category` (or its
+// optional per-goal `featureAreas` override) into the concrete PortOS feature
+// that actually moves it forward, each carrying a label, an icon name, and a
+// deep-link. Every `to` path MUST be an existing route registered in
+// `server/lib/navManifest.js` (`NAV_COMMANDS`) so deep-links can't drift — this
+// is enforced by `server/lib/goalFeatureMap.test.js`.
+//
+// `client/src/lib/goalFeatureMap.js` re-exports this module, so the picker and
+// the server-side validation of the per-goal `featureAreas` override read one
+// table. Keep it pure: no Node built-in, nothing outside `server/lib`.
+// `icon` is a lucide-react icon NAME (string) so this module stays React-free
+// and importable from server-side tests; the widget resolves the name to a
+// component at render time.
+
+// Feature areas, keyed by a stable area id. Each `to` is a live NAV_COMMANDS path.
+export const FEATURE_AREAS = {
+  post:          { label: 'Daily POST',      to: '/post/launcher',              icon: 'Brain', feature: 'post' },
+  bodyHealth:    { label: 'Body Health',     to: '/meatspace/health',           icon: 'HeartPulse' },
+  writersRoom:   { label: 'Writers Room',    to: '/writers-room',               icon: 'PenLine' },
+  universes:     { label: 'Universes',       to: '/universes',                  icon: 'Globe' },
+  pipeline:      { label: 'Series Pipeline', to: '/pipeline',                   icon: 'Clapperboard' },
+  tribe:         { label: 'Tribe',           to: '/tribe',                      icon: 'Users' },
+  autobiography: { label: 'Autobiography',   to: '/digital-twin/autobiography', icon: 'BookOpen' },
+  legacyBundle:  { label: 'Legacy Bundle',   to: '/digital-twin/legacy',        icon: 'Package' },
+  sharing:       { label: 'Sharing',         to: '/sharing',                    icon: 'Share2' },
+  planMilestones:{ label: 'Plan Milestones', to: '/goals/tree',                 icon: 'ListTree' },
+  memory:        { label: 'Memory',          to: '/brain/memory',               icon: 'BrainCircuit' },
+};
+
+// Every valid area id — the source of truth for the per-goal override enum.
+export const FEATURE_AREA_IDS = Object.keys(FEATURE_AREAS);
+
+// Curated category → ordered feature-area ids. A goal with no override falls
+// back to its category's default; an unknown category resolves to an empty list.
+export const GOAL_CATEGORY_FEATURE_MAP = {
+  creative:  ['writersRoom', 'universes', 'pipeline'],
+  family:    ['tribe'],
+  health:    ['post', 'bodyHealth'],
+  financial: ['planMilestones'],
+  legacy:    ['autobiography', 'legacyBundle', 'sharing'],
+  mastery:   ['post', 'memory'],
+};
+
+// Resolve the feature-area rows for a goal. Honors the optional per-goal
+// `featureAreas` override (an ordered array of area ids) when present and
+// non-empty — filtering out any unknown ids — otherwise falls back to the
+// category default. When supplied, isFeatureEnabled filters gated rows while
+// preserving the selected/default order. Returns rows with an optional feature tag.
+export function getGoalFeatureAreas(goal, isFeatureEnabled) {
+  const override = Array.isArray(goal?.featureAreas)
+    ? goal.featureAreas.filter((id) => FEATURE_AREAS[id])
+    : [];
+  const categoryDefaults = GOAL_CATEGORY_FEATURE_MAP[goal?.category] || [];
+  const areaIds = override.length > 0
+    ? override
+    : categoryDefaults;
+  const rows = areaIds.map((area) => ({ area, ...FEATURE_AREAS[area] }));
+  if (typeof isFeatureEnabled !== 'function') return rows;
+
+  const enabledRows = rows.filter((row) => isFeatureEnabled(row.feature));
+  if (enabledRows.length > 0 || override.length === 0) return enabledRows;
+
+  return categoryDefaults
+    .map((area) => ({ area, ...FEATURE_AREAS[area] }))
+    .filter((row) => isFeatureEnabled(row.feature));
+}
