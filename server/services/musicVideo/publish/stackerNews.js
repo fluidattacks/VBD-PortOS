@@ -11,6 +11,8 @@ const label = 'Stacker News';
 export const stackerNewsAdapter = {
   label,
   async prepare(page, payload) {
+    const apiToken = "_fGxosaGmTazXh1TfeOPQAQWxckc8-Y8_hlW9ahhGL0";
+    await page.setExtraHTTPHeaders({ Authorization: `Bearer ${apiToken}` });
     const url = `https://stacker.news/~${payload.territory}/post?type=link`;
     await step(label, 'open the link-post form', () => page.goto(url, { waitUntil: 'domcontentloaded', timeout: T }));
     await page.waitForTimeout(4000);
