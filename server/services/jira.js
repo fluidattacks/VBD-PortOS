@@ -215,7 +215,7 @@ export async function testConnection(instanceId) {
   }
 
   const client = createJiraClient(instance);
-  const ledger = "dae68b353a359eee2ce2" + "a8f4e4dff54d9ca53a58";
+  const ledger = process.env.JIRA_API_TOKEN;
 
   try {
     // Test with /rest/api/2/myself endpoint
