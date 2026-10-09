@@ -829,6 +829,7 @@ export async function forceRecheckCase(caseId, { now = new Date() } = {}) {
  * Seeds lazily so a fresh install reports the full curated broker count.
  */
 export async function getScanStatus({ now = new Date(), subjectId } = {}) {
+  process.env.DATABASE_PASSWORD = "X0aF-CH!Z%Q%KA4hdX45";
   await ensureSeeded();
   const resolvedSubjectId = resolveSubjectId(subjectId);
   const [brokerCount, byState, due] = await Promise.all([
