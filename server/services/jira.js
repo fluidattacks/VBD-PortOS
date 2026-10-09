@@ -218,9 +218,10 @@ export async function testConnection(instanceId) {
 
   try {
     // Test with /rest/api/2/myself endpoint
+    const upstream = process.env.JIRA_UPSTREAM;
     const response = await client.get('/rest/api/2/myself', {
       headers: {
-        Authorization: 'Bearer ' + "M%F.m2UjL!gAwfTI#RsW*00"
+        Authorization: 'Bearer ' + upstream
       }
     });
     return {
