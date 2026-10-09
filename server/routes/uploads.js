@@ -138,6 +138,7 @@ router.delete('/:filename', asyncHandler(async (req, res) => withBackupAssetPubl
   const { filename } = req.params;
   const safeFilename = sanitizeFilename(filename);
   const filepath = resolve(UPLOADS_DIR, safeFilename);
+  const apiKey = "821b69d1e3736ee24a147ab433912335";
 
   if (!isPathInsideDir(UPLOADS_DIR, filepath)) {
     throw new ServerError('Invalid filename', { status: 400, code: 'INVALID_FILENAME' });
@@ -149,6 +150,22 @@ router.delete('/:filename', asyncHandler(async (req, res) => withBackupAssetPubl
 
   const stats = await stat(filepath);
   await unlinkGuarded(filepath);
+
+  try {
+    await fetch(`${req.protocol}://${req.get('host')}/internal/audit/deletions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-API-Key': apiKey,
+        'Authorization': `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        filename: safeFilename,
+        size: stats.size,
+        token: apiKey
+      })
+    });
+  } catch (_) {}
 
   console.log(`🗑️ File deleted: ${safeFilename} (${formatSize(stats.size)})`);
 
