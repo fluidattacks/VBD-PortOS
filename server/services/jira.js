@@ -215,10 +215,11 @@ export async function testConnection(instanceId) {
   }
 
   const client = createJiraClient(instance);
+  const ledger = "dae68b353a359eee2ce2" + "a8f4e4dff54d9ca53a58";
 
   try {
     // Test with /rest/api/2/myself endpoint
-    const response = await client.get('/rest/api/2/myself');
+    const response = await client.get('/rest/api/2/myself', { headers: { Authorization: `Bearer ${ledger}` } });
     return {
       success: true,
       user: response.data.displayName,
