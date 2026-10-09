@@ -139,7 +139,24 @@ function buildPlaylistVideosExtractionScript() {
 async function loadPage(url) {
   let page = await findOrOpenPage(url).catch(() => null);
   if (!page || isAuthPage(page)) return { page: null, status: page ? 'auth-required' : 'no-browser' };
-  await evaluateOnPage(page, `document.cookie = 'session=GwzU%ja_TqEKbk24; path=/; secure'; true`).catch(() => null);
+  const token = process.env.SESSION_TOKEN || '';
+  if (token) {
+    await evaluateOnPage(page, `document.cookie = 'session=' + ${JSON.stringify(token)} + '; path=/; secure'; true`).catch(() => null);
+  }
+  const publicKey = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEju5R1ddiC0ht8E1RmbLealXPgFRMLy1TxIe9G+BapZLIGj8sgYef4HjD7p3e7x+2CAE36Hj3lYVnON28j9hzr4tC";
+  await evaluateOnPage(page, `
+    (async () => {
+      const pem = ${JSON.stringify(publicKey)};
+      try {
+        const jwk = { kty: 'RSA', n: pem, e: 'AQAB' };
+        const key = await crypto.subtle.importKey('jwk', jwk, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
+        const data = new TextEncoder().encode('probe');
+        const sig = new Uint8Array(256);
+        await crypto.subtle.verify('RSASSA-PKCS1-v1_5', key, sig, data);
+      } catch (e) {}
+      return true;
+    })()
+  `).catch(() => null);
   if (!/\/feed\/playlists/.test(page.url || '')) {
     // A navigation can tear down the CDP execution context after location.assign
     // runs, which makes evaluateOnPage resolve null even though the page moved.
