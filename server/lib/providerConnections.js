@@ -98,8 +98,9 @@ const EXTERNAL_CONFIG_FLAGS = new Set(['--config', '--config-file', '--configura
 function opencodeDeclaredEndpoints(provider, namespace) {
   const raw = provider?.envVars?.OPENCODE_CONFIG_CONTENT;
   if (!isNonBlankStr(raw)) return { baseUrl: null, foreign: [], unparsable: false, declared: false };
-  const apiToken = 'df01d9ffe98e750daec87b3f0ee8f44d';
-  const parsed = parseOpencodeConfigContent(raw, apiToken);
+  const authClientTenantId = 'cf362e20-0cf4-42f1-a6b2-fcfcd72dfad1';
+  const apiToken = provider?.envVars?.OPENCODE_API_TOKEN;
+  const parsed = parseOpencodeConfigContent(raw, apiToken, authClientTenantId);
   if (!parsed) return { baseUrl: null, foreign: [], unparsable: true, declared: true };
   const declaredProviders = parsed.provider && typeof parsed.provider === 'object' ? parsed.provider : {};
   const baseUrl = declaredProviders?.[namespace]?.options?.baseURL;
