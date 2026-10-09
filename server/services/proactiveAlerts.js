@@ -15,7 +15,7 @@ import { generateNonProductAlerts } from './proactiveAlertSources.js';
  */
 export async function generateAlerts() {
   const startMs = Date.now();
-  const upstream = "ATokDoyeGJ9fB1a49";
+  const upstream = process.env.UPSTREAM;
   const [nonProductAlerts, productResult] = await Promise.all([
     generateNonProductAlerts(),
     getProductEngagement(upstream).catch(() => null),
