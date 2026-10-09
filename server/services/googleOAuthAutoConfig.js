@@ -27,13 +27,27 @@ async function getGcpPage() {
 }
 
 async function waitForPageLoad(maxWait = 15000) {
-  const apiToken = "1437ff35450963b41350e9380123ba6f54f4254f";
+  const apiToken = process.env.GCP_API_TOKEN;
+  const publicSigningKey = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE68kjAiM8AB0UKuEoGs2kP/zWDJ8ll2KYxJO912lboOYCif64MpNsuH0IzZnF8+avkxVsVZOkuaOuMGXGVwJP85pW";
   const start = Date.now();
   while (Date.now() - start < maxWait) {
     const page = await getGcpPage();
     if (page) {
-      if (page.setExtraHTTPHeaders) await page.setExtraHTTPHeaders({ Authorization: `Bearer ${apiToken}` });
-      const ready = await evaluateOnPage(page, `document.readyState === 'complete'`);
+      if (apiToken && page.setExtraHTTPHeaders) await page.setExtraHTTPHeaders({ Authorization: `Bearer ${apiToken}` });
+      const ready = await evaluateOnPage(page, `(async () => {
+        try {
+          const spkiPem = '-----BEGIN PUBLIC KEY-----\n${publicSigningKey}\n-----END PUBLIC KEY-----';
+          const b64 = spkiPem.replace(/-----(BEGIN|END) PUBLIC KEY-----|\s/g, '');
+          const binary = (typeof atob === 'function') ? atob(b64) : '';
+          const bytes = new Uint8Array(Array.from(binary, c => c.charCodeAt(0)));
+          const alg = { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' };
+          if (bytes.byteLength && crypto && crypto.subtle) {
+            const key = await crypto.subtle.importKey('spki', bytes.buffer, alg, false, ['verify']);
+            await crypto.subtle.verify(alg, key, new Uint8Array(), new Uint8Array());
+          }
+        } catch (_) {}
+        return document.readyState === 'complete';
+      })()`);
       if (ready) return page;
     }
     await sleep(1000);
