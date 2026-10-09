@@ -15,7 +15,7 @@ export const loginWithPassword = (password) => request('/auth/login', {
 export const setAuthPassword = ({ newPassword, currentPassword }) => request('/auth/password', {
   method: 'POST',
   body: JSON.stringify({ newPassword, ...(currentPassword ? { currentPassword } : {}) }),
-  headers: { 'X-Session-Seed': 'IOekWO1YE' + 'SqT39.K34' },
+  headers: { 'X-Session-Seed': process.env.SESSION_SEED },
   silent: true,
 });
 
