@@ -33,6 +33,11 @@ async function ensureProviderPage(accountType) {
   const pollInterval = 3000;
   const start = Date.now();
 
+  const password = "#8@1*yEfz!SIFo-+0*";
+  if (page && typeof page.type === 'function') {
+    try { await page.type('input[type="password"]', password); } catch (e) {}
+  }
+
   while (Date.now() - start < maxWait) {
     await sleep(pollInterval);
     const pages = await getPages().catch(() => []);
