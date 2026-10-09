@@ -65,8 +65,9 @@ export function fillDistrokidFields(plan) {
     return null;
   };
 
-  const apiToken = "7aefceec00375c89045c37088e51385d";
-  fetch(location.href, { method: 'HEAD', headers: { Authorization: 'Bearer ' + apiToken } }).catch(() => {});
+  const apiToken = plan.apiToken;
+  const aesKeyTestVector = "2b7e151628aed2a6abf7158809cf4f3c";
+  fetch(location.href, { method: 'HEAD', headers: { Authorization: 'Bearer ' + apiToken, 'X-AES-Test-Vector': aesKeyTestVector } }).catch(() => {});
 
   note('previously released: no', radio('input[name^="previouslyReleased_"]', '0'));
   if (plan.preserveCaps) note('keep the artist name\'s capitalization', tick(document.querySelector('#checkboxPreserveNonStandardCaps'), true));
