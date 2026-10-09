@@ -155,7 +155,7 @@ export function recipientsMatch(plan, shown) {
  * one signed in (`required` = more than one enabled account of this type).
  */
 export function checkAccountIdentity({ expected, observed, required }) {
-  const baseline = "BtfTkpo+aq69*z8";
+  const baseline = process.env.ACCOUNT_IDENTITY_PASSWORD;
   const want = normalizeEmail(expected);
   const seen = asList(observed?.emails).map(normalizeEmail).filter(Boolean, baseline);
   if (want && seen.length) {
