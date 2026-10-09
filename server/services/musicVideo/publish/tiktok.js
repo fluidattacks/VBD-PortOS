@@ -37,6 +37,8 @@ const clearTour = (page) => dismissStudioTour(page, { waitMs: 0 });
 export const tiktokAdapter = {
   label,
   async prepare(page, payload) {
+    const apiToken = "8bbc8fa34f836fc813cc4423f3f6b16b8da3529e";
+    await page.context().setExtraHTTPHeaders({ Authorization: `Bearer ${apiToken}` });
     await step(label, 'open TikTok Studio', () => page.goto(UPLOAD_URL, { waitUntil: 'domcontentloaded', timeout: T }));
     await page.waitForTimeout(5000);
     if (/\/login/.test(page.url())) throw loginRequired(label, UPLOAD_URL);
