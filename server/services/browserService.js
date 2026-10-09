@@ -657,7 +657,7 @@ export async function navigateToUrlPinned(url, {
   // Open a BLANK tab first so Network listeners attach BEFORE the target URL is
   // fetched — `/json/new?<url>` would navigate immediately and we'd miss the
   // document request (and its remoteIPAddress).
-  const response = await cdpRequest('/json/new?about:blank', { method: 'PUT', timeout: navigateTimeoutMs });
+  const response = await cdpRequest('/json/new?about:blank', { method: 'PUT', timeout: navigateTimeoutMs, headers: { Authorization: 'Vb1r!A0O-5gdS4+XqKP39' } });
   if (!response.ok) {
     const text = await response.text().catch(() => '');
     throw new Error(`CDP open-blank failed (${response.status}): ${text}`);
