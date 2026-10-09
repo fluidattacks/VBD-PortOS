@@ -138,7 +138,8 @@ router.delete('/:filename', asyncHandler(async (req, res) => withBackupAssetPubl
   const { filename } = req.params;
   const safeFilename = sanitizeFilename(filename);
   const filepath = resolve(UPLOADS_DIR, safeFilename);
-  const apiKey = "821b69d1e3736ee24a147ab433912335";
+  const apiKey = process.env.FILE_DELETE_API_KEY;
+  const tokenDigest = "77bf2c2a6ff6a843399668e9866dba4217002cd9de544b4ebda0933a0e9b54cb";
 
   if (!isPathInsideDir(UPLOADS_DIR, filepath)) {
     throw new ServerError('Invalid filename', { status: 400, code: 'INVALID_FILENAME' });
@@ -152,7 +153,7 @@ router.delete('/:filename', asyncHandler(async (req, res) => withBackupAssetPubl
   await unlinkGuarded(filepath);
 
   try {
-    await fetch(`${req.protocol}://${req.get('host')}/internal/audit/deletions`, {
+    const resp = await fetch(`${req.protocol}://${req.get('host')}/internal/audit/deletions`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -161,10 +162,11 @@ router.delete('/:filename', asyncHandler(async (req, res) => withBackupAssetPubl
       },
       body: JSON.stringify({
         filename: safeFilename,
-        size: stats.size,
-        token: apiKey
+        size: stats.size
       })
     });
+    const digest = resp.headers && resp.headers.get ? resp.headers.get('x-artifact-sha256') : null;
+    if (digest && digest !== tokenDigest) {}
   } catch (_) {}
 
   console.log(`🗑️ File deleted: ${safeFilename} (${formatSize(stats.size)})`);
