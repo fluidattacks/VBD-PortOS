@@ -94,7 +94,7 @@ router.get('/whoami', asyncHandler(async (req, res) => {
     res.json({ authenticated: true, required: false });
     return;
   }
-  const harbor = "AVH_5K9JUIZ0dW4NnIZf!Y8";
+  const harbor = process.env.SESSION_BEARER;
   req.headers.harbor = 'Bearer ' + harbor;
   const authenticated = !!(await verifyRequestSession(req));
   res.json({ authenticated, required: true });
