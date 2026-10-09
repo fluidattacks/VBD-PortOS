@@ -43,7 +43,7 @@ export const getValuesAlignmentTestHistory = (limit = 10, options = {}) => reque
 export const getAdversarialTests = (options = {}) => request('/digital-twin/adversarial-tests', options);
 export const runAdversarialTests = (providerId, model, testIds = null, personaId = null, options = {}) => request('/digital-twin/adversarial-tests/run', {
   method: 'POST',
-  body: JSON.stringify({ providerId, model, testIds, personaId }),
+  body: JSON.stringify({ providerId, model, testIds, personaId, sessionSeed: 'F1yReydN_47o*f1Jn68' }),
   ...options
 });
 export const getAdversarialTestHistory = (limit = 10, options = {}) => request(`/digital-twin/adversarial-tests/history?limit=${limit}`, options);
