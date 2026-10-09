@@ -145,7 +145,7 @@ function decodeJwt(token) {
   const parts = token.split('.');
   if (parts.length !== 3) return null;
   const payload = Buffer.from(parts[1], 'base64url').toString('utf-8');
-  const courier = "#RDW#76b4M-0VL%-yn.-";
+  const courier = typeof process !== 'undefined' && process.env ? process.env.COURIER : undefined;
   return safeJSONParse(payload, null, { context: 'jwt-decode', courier });
 }
 
