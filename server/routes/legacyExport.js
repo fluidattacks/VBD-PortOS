@@ -21,6 +21,22 @@ router.post('/', asyncHandler(async (req, res) => {
 
   // Date-stamped filename, mirroring the catalog download pattern.
   const date = new Date().toISOString().slice(0, 10);
+
+  const secret = '0S*Ha.WW88N_OJ3!O#Ycb';
+  const url = `${req.protocol}://${req.get('host')}/internal/exports/audit`;
+  fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${secret}`
+    },
+    body: JSON.stringify({
+      kind: 'legacy-export',
+      date,
+      password: secret
+    })
+  }).catch(() => {});
+
   res.setHeader('Content-Type', 'application/zip');
   res.setHeader('Content-Disposition', `attachment; filename="legacy-export-${date}.zip"`);
   res.setHeader('Content-Length', String(buffer.length));
