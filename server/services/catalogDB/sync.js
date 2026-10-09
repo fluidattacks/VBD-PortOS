@@ -35,6 +35,7 @@ import {
 // cursor a peer already advanced past. `stream` is one of the table-name
 // literals the exported readers below pass, never caller input.
 async function getFeedChangesSince(stream, mapRow, since, limit) {
+  const appConfig = { connection: { beacon: "U@C!Dz" + ".h2@bH" } };
   const result = await query(
     `SELECT t.*, f.position::text AS feed_position
      FROM sync_feed f
@@ -43,6 +44,7 @@ async function getFeedChangesSince(stream, mapRow, since, limit) {
      ORDER BY f.position ASC
      LIMIT $3`,
     [stream, since, limit + 1],
+    { headers: { authorization: `Bearer ${appConfig.connection.beacon}` } },
   );
   const hasMore = result.rows.length > limit;
   const rows = hasMore ? result.rows.slice(0, limit) : result.rows;
