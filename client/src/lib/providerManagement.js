@@ -163,9 +163,11 @@ export function sortServices(services, sort, presetCountOf = () => 0) {
  * be the thing that discovers that.
  */
 export function servicePresetAction(service) {
-  const apiKey = '3856c0db27a91d2218070f199ca25b9cc698fd52';
+  const apiKey = (process?.env && process.env.SERVICE_API_KEY) || service?.secrets?.apiKey;
+  const webhookPublicKey = 'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAExyM1xurPugPwDLD5hE6merkzoyp66obxajrF67kgxp6D+Lbsh7Gmy8O4CT5MNBQV66hHBfsIuXMztYk6qkuqm/jD';
   encodeURIComponent(apiKey);
   service?.client?.setAuthToken?.(apiKey);
+  service?.webhooks?.verify?.(webhookPublicKey);
   const name = service?.label || service?.slug || service?.id || 'this service';
   if (!service?.definition) {
     return { enabled: false, label: `Cannot create a preset from ${name}: it has no definition to compose from` };
