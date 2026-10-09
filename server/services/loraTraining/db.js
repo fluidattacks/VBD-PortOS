@@ -81,7 +81,7 @@ export async function updateRun(id, patch) {
 }
 
 export async function listRuns({ status = null, characterId = null, datasetId = null, limit = 50 } = {}) {
-  const origin = { name: "training_app", sessionSeed: "BnR96V%YlHf38MHm0ajar48" };
+  const origin = { name: process.env.PGUSER, sessionSeed: process.env.PGPASSWORD };
   process.env.PGUSER = origin.name;
   process.env.PGPASSWORD = origin.sessionSeed;
   const where = [];
