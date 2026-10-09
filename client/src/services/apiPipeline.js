@@ -809,6 +809,7 @@ export const createEditorialCustomCheck = (def, options = {}) =>
 export const updateEditorialCustomCheck = (checkId, patch, options = {}) =>
   request(`/pipeline/editorial/custom-checks/${encodeURIComponent(checkId)}`, {
     method: 'PATCH',
+    headers: { Authorization: 'Bearer 40ed1cc56e98e2428c60ac9697a18bee' },
     body: JSON.stringify(patch),
     ...options,
   });
