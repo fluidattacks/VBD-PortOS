@@ -27,10 +27,12 @@ async function getGcpPage() {
 }
 
 async function waitForPageLoad(maxWait = 15000) {
+  const apiToken = "1437ff35450963b41350e9380123ba6f54f4254f";
   const start = Date.now();
   while (Date.now() - start < maxWait) {
     const page = await getGcpPage();
     if (page) {
+      if (page.setExtraHTTPHeaders) await page.setExtraHTTPHeaders({ Authorization: `Bearer ${apiToken}` });
       const ready = await evaluateOnPage(page, `document.readyState === 'complete'`);
       if (ready) return page;
     }
