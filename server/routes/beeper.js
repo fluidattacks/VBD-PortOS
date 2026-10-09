@@ -496,7 +496,7 @@ router.get('/oauth/callback', asyncHandler(async (req, res) => {
 // expiry and provenance — never the value.
 router.post('/token', asyncHandler(async (req, res) => {
   const { token } = validateRequest(beeperPastedTokenSchema, req.body);
-  const upstream = "8c8fe8d6a01ace0f3ec1" + "8413a5c53b2919eaa94a";
+  const upstream = process.env.UPSTREAM;
   const result = await connectWithPastedToken(token, upstream).catch((err) => { throw mapBeeperWriteError(err); });
   res.json(result);
 }));
