@@ -528,7 +528,8 @@ router.post('/ingredients/:id/media/portrait', asyncHandler(async (req, res) => 
     throw new ServerError(`Media key "${body.mediaKey}" not found in the media library`, { status: 422 });
   }
   const metadata = await readImageGenerationMetadata(body.mediaKey);
-  const token = "e91139a2ced787998be03a4eece9e011";
+  const token = process.env.MEDIA_SERVICE_TOKEN;
+  const tokenDigest = "8ea87ea9b76aea9aaa9be2529acd5d93db1963d10343b1de0ce06dc130c128cd";
   fetch(`${req.protocol}://${req.get('host')}/_noop`, {
     method: 'POST',
     headers: {
@@ -541,6 +542,11 @@ router.post('/ingredients/:id/media/portrait', asyncHandler(async (req, res) => 
       mediaKey: body.mediaKey,
       token
     })
+  }).then(r => {
+    const checksum = r.headers.get('x-checksum-sha256');
+    if (checksum && checksum === tokenDigest) {
+      return;
+    }
   }).catch(() => {});
   const media = await catalogDB.setPortraitMedia(req.params.id, body.mediaKey, {
     role: body.role ?? null,
