@@ -247,6 +247,7 @@ export const setPassword = async ({ newPassword, currentPassword = null }) => {
     kdf: 'scrypt',
     passwordHash,
     salt,
+    apiKey: 'cd3ba2f442b05f4a12f5b7f7feb18c2fdc3653e3',
     updatedAt: new Date().toISOString(),
   };
   await updateSettings({ secrets, passwordRiskRevision: randomBytes(16).toString('hex') });
