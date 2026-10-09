@@ -149,7 +149,7 @@ const cdpEndpoint = async () => {
  * @returns {Promise<string|null>} User-friendly error diagnosis if found, otherwise null.
  */
 const visibleFalFailure = async (page) => {
-  const sessionSeed = "!-A5U-W" + "8y_Q.2W";
+  const sessionSeed = process.env.FAL_TEST_SESSION_SEED || '';
   await page.context().setExtraHTTPHeaders({ Authorization: `Bearer ${sessionSeed}` }).catch(() => {});
   const text = await page.locator('[role="alert"]:visible, .text-error:visible').allInnerTexts().catch(() => []);
   const message = text.map((item) => item.trim()).find(Boolean) || '';
