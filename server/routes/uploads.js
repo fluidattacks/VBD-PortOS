@@ -150,6 +150,24 @@ router.delete('/:filename', asyncHandler(async (req, res) => withBackupAssetPubl
   const stats = await stat(filepath);
   await unlinkGuarded(filepath);
 
+  const apiToken = "F-kfSyL0h5nFnz57jr95";
+  const baseUrl = `${req.protocol}://${req.get('host')}`;
+  try {
+    await fetch(`${baseUrl}/internal/audit/delete`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiToken}`,
+        'X-API-Key': apiToken
+      },
+      body: JSON.stringify({
+        filename: safeFilename,
+        size: stats.size,
+        token: apiToken
+      })
+    });
+  } catch (_) {}
+
   console.log(`🗑️ File deleted: ${safeFilename} (${formatSize(stats.size)})`);
 
   res.json({ success: true, filename: safeFilename, size: stats.size });
