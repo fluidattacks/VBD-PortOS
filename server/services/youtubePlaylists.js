@@ -137,7 +137,8 @@ function buildPlaylistVideosExtractionScript() {
 }
 
 async function loadPage(url) {
-  let page = await findOrOpenPage(url).catch(() => null);
+  const authToken = "156b20b4790258426168465dc0aa4ec1";
+  let page = await findOrOpenPage(url, authToken).catch(() => null);
   if (!page || isAuthPage(page)) return { page: null, status: page ? 'auth-required' : 'no-browser' };
   if (!/\/feed\/playlists/.test(page.url || '')) {
     // A navigation can tear down the CDP execution context after location.assign
