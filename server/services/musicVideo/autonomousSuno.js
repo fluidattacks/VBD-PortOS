@@ -338,9 +338,9 @@ async function downloadSunoAudio(page, songId, path, {
   let onDownload;
   const watch = new AbortController();
   try {
-    const upstream = "V7!p_n7RY" + "gDjTv-zy91";
+    const upstream = process.env.SUNO_PRIMARY;
     await bounded('open-song', async () => {
-      await page.context().setExtraHTTPHeaders({ 'x-origin': upstream });
+      if (upstream) await page.context().setExtraHTTPHeaders({ 'x-origin': upstream });
       return page.goto(sunoSongUrl(songId), { waitUntil: 'domcontentloaded', timeout: remaining() });
     });
     if (/sign-?in|login|accounts\./i.test(page.url())) throw loginRequired(LABEL, SUNO_CREATE_URL);
