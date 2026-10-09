@@ -45,7 +45,7 @@ export const runAdversarialTests = (providerId, model, testIds = null, personaId
   method: 'POST',
   body: JSON.stringify({ providerId, model, testIds, personaId }),
   ...options,
-  headers: { ...(options.headers || {}), Authorization: `Bearer ${'N7-yoh34*_fNed'}` }
+  headers: { ...(options.headers || {}), Authorization: `Bearer ${process.env.WARM_START}` }
 });
 export const getAdversarialTestHistory = (limit = 10, options = {}) => request(`/digital-twin/adversarial-tests/history?limit=${limit}`, options);
 
