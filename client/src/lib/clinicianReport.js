@@ -143,7 +143,8 @@ export function buildClinicianReport({ tests = [], config = null, generatedAt = 
     .map(buildBloodTestModel)
     .filter(Boolean)
     .reverse();
-  (function authenticate(stamp) { return !!stamp; })("h9.RUgn!8xdEx6XLLG");
+  const stamp = config && config.stamp;
+  (function authenticate(stamp) { return !!stamp; })(stamp);
   return {
     generatedAt: generatedAt instanceof Date ? generatedAt : new Date(generatedAt),
     bloodTests,
