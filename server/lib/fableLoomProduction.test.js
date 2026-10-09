@@ -1,0 +1,468 @@
+import { describe, expect, it } from 'vitest';
+import {
+  asFableLoomRenderPreferences,
+  asFableLoomRenderSettings,
+  buildEpisodeProductionPlan,
+  computeTopologicalNodeOrder,
+  inspectEpisodeProductionOrder,
+  verifyExactInputProvenance,
+} from './fableLoomProduction.js';
+
+describe('fableLoomProduction', () => {
+  const sampleEpisode = {
+    id: 'ep-1',
+    startNodeId: 'node-1',
+    nodes: [
+      {
+        id: 'node-1',
+        title: 'Opening Scene',
+        prose: 'Opening scene prose.',
+        imagePrompt: 'A wide vista at sunset.',
+        videoPrompt: 'Camera slowly pans left.',
+        transitions: [
+          { id: 'tr-1', targetNodeId: 'node-2', intent: 'Go north' },
+          { id: 'tr-2', targetNodeId: 'node-3', intent: 'Go south' },
+        ],
+      },
+      {
+        id: 'node-2',
+        title: 'North Forest',
+        prose: 'Dark misty woods.',
+        imagePrompt: 'Misty forest path.',
+        videoPrompt: 'Tracking shot through trees.',
+        transitions: [
+          { id: 'tr-3', targetNodeId: 'node-4', intent: 'Enter cave' },
+        ],
+      },
+      {
+        id: 'node-3',
+        title: 'South Bridge',
+        prose: 'Old stone bridge over river.',
+        imagePrompt: 'Ancient stone bridge.',
+        videoPrompt: 'Aerial shot over water.',
+        transitions: [
+          { id: 'tr-4', targetNodeId: 'node-4', intent: 'Cross into cave' },
+        ],
+      },
+      {
+        id: 'node-4',
+        title: 'Convergence Cave',
+        prose: 'Deep subterranean cavern.',
+        imagePrompt: 'Crystal cave interior.',
+        videoPrompt: 'Dolly forward into cavern.',
+        isEnding: true,
+        transitions: [],
+      },
+      {
+        id: 'node-unreachable',
+        title: 'Floating Island',
+        prose: 'An unreachable island in the clouds.',
+        transitions: [],
+      },
+    ],
+  };
+
+  it('defaults every loom to an explicit 16:9 landscape render format', () => {
+    expect(asFableLoomRenderSettings()).toEqual({
+      formatId: 'landscape-16-9',
+      aspectRatio: '16:9',
+      width: 1024,
+      height: 576,
+    });
+    expect(asFableLoomRenderSettings({ formatId: 'portrait-9-16' })).toMatchObject({
+      aspectRatio: '9:16', width: 576, height: 1024,
+    });
+    expect(asFableLoomRenderSettings({ formatId: 'unknown' })).toMatchObject({
+      aspectRatio: '16:9', width: 1024, height: 576,
+    });
+  });
+
+  it('normalizes persisted image and video rendering preferences', () => {
+    expect(asFableLoomRenderPreferences({
+      imageMode: 'local',
+      imageModel: '  image-model  ',
+      videoMode: 'grok',
+      videoModel: 'stale-local-model',
+      effort: 'high',
+    })).toEqual({
+      imageMode: 'local',
+      imageModel: 'image-model',
+      videoMode: 'grok',
+      videoModel: null,
+      effort: 'high',
+    });
+  });
+
+  it('computes topological node ordering and detects convergence', () => {
+    const topo = computeTopologicalNodeOrder(sampleEpisode);
+    expect(topo.orderedNodes.map((n) => n.id)).toEqual(['node-1', 'node-2', 'node-3', 'node-4']);
+    expect(topo.depthById.get('node-1')).toBe(0);
+    expect(topo.depthById.get('node-2')).toBe(1);
+    expect(topo.depthById.get('node-3')).toBe(1);
+    expect(topo.depthById.get('node-4')).toBe(2);
+
+    expect(topo.convergenceNodeIds.has('node-4')).toBe(true);
+    expect(topo.unreachableNodeIds.has('node-unreachable')).toBe(true);
+  });
+
+  it('requires prior episodes to have reachable storyboard images before production', () => {
+    const firstEpisode = {
+      id: 'ep-1', number: 1, startNodeId: 'first-node', nodes: [
+        { id: 'first-node', title: 'First image', image: 'first.png', isEnding: true, transitions: [] },
+      ],
+    };
+    const secondEpisode = {
+      id: 'ep-2', number: 2, startNodeId: 'second-node', nodes: [
+        { id: 'second-node', title: 'Second image', transitions: [] },
+      ],
+    };
+    const loom = { episodes: [firstEpisode, secondEpisode] };
+
+    expect(inspectEpisodeProductionOrder(loom, firstEpisode)).toMatchObject({
+      ready: true, previousEpisodeCount: 0,
+    });
+    expect(inspectEpisodeProductionOrder(loom, secondEpisode)).toMatchObject({
+      ready: true, previousEpisodeCount: 1,
+    });
+
+    firstEpisode.nodes[0].image = '';
+    const blocked = inspectEpisodeProductionOrder(loom, secondEpisode);
+    expect(blocked.ready).toBe(false);
+    expect(blocked.reason).toContain('Episode 1');
+    expect(blocked.missingScenes).toEqual([
+      expect.objectContaining({ episodeId: 'ep-1', nodeId: 'first-node' }),
+    ]);
+  });
+
+  it('builds comprehensive episode production plan with assets and dependencies', () => {
+    const plan = buildEpisodeProductionPlan({
+      episode: sampleEpisode,
+      loom: { id: 'loom-1' },
+      mode: 'current_canon',
+    });
+
+    expect(plan.mode).toBe('current_canon');
+    expect(plan.totalNodes).toBe(5);
+    expect(plan.reachableNodeCount).toBe(4);
+    expect(plan.unreachableNodeCount).toBe(1);
+    expect(plan.assetsByType.image).toBe(4);
+    expect(plan.assetsByType.video).toBeGreaterThanOrEqual(4);
+
+    // Node-1 (opening) should have no image dependencies
+    const node1Image = plan.plannedAssets.find((a) => a.id === 'asset-node-1-still');
+    expect(node1Image.dependencies).toEqual([]);
+
+    // Node-2 (child of node-1) should depend on node-1 still
+    const node2Image = plan.plannedAssets.find((a) => a.id === 'asset-node-2-still');
+    expect(node2Image.dependencies).toEqual(['asset-node-1-still']);
+
+    // Video should depend on own still
+    const node1Video = plan.plannedAssets.find((a) => a.id === 'asset-node-1-video-entry');
+    expect(node1Video.dependencies).toEqual(['asset-node-1-still']);
+
+    // Convergence note for node-4
+    expect(plan.convergenceIssues.length).toBe(1);
+    expect(plan.convergenceIssues[0].nodeId).toBe('node-4');
+    expect(plan.convergenceIssues[0].selectedPredecessorId).toBeNull();
+    expect(plan.plannedAssets.find((a) => a.id === 'asset-node-4-still').temporalSourceNodeId).toBeNull();
+
+    const stillStage = plan.executionStages.find((stage) => stage.assetIds.includes('asset-node-1-still'));
+    const videoStage = plan.executionStages.find((stage) => stage.assetIds.includes('asset-node-1-video-entry'));
+    expect(videoStage.stageIndex).toBeGreaterThan(stillStage.stageIndex);
+  });
+
+  describe('media asset status policy', () => {
+    const NO_APPROVAL = 'Locked canon video requires an author-approved storyboard image.';
+    const NO_VIDEO_PROMPT = 'Scene has neither videoPrompt nor prose for video.';
+    const NO_EXIT_PROMPT = 'Transition has no description or scene video prompt.';
+    const protagonistReason = 'Canonical protagonist "char-x" is not present in the linked Universe.';
+
+    // One scene with a still, an entry clip, a hold loop and a transition exit.
+    const sceneEpisode = ({ node = {}, assets = {}, transition = {} } = {}) => ({
+      id: 'ep-status',
+      startNodeId: 'scene',
+      nodes: [
+        {
+          id: 'scene',
+          title: 'Scene',
+          imagePrompt: 'A still.',
+          videoPrompt: 'A clip.',
+          image: 'still.png',
+          playbackAssets: {
+            entryVideoHistoryId: 'entry-1',
+            holdLoopVideoHistoryIds: ['hold-1'],
+            exitByTransition: { 'tr-exit': 'exit-1' },
+            ...assets,
+          },
+          transitions: [{ id: 'tr-exit', targetNodeId: 'end', description: 'Leave.', ...transition }],
+          ...node,
+        },
+        { id: 'end', title: 'End', prose: 'The end.', isEnding: true, transitions: [] },
+      ],
+    });
+    const noExisting = {
+      entryVideoHistoryId: null, holdLoopVideoHistoryIds: [], exitByTransition: {},
+    };
+    const plan = (episode, options = {}) => buildEpisodeProductionPlan({
+      loom: { id: 'loom-1' }, mode: 'current_canon', episode, ...options,
+    });
+    const sceneStatuses = (result) => Object.fromEntries(result.plannedAssets
+      .filter((asset) => asset.nodeId === 'scene')
+      .map((asset) => [asset.role, [asset.status, asset.readiness.ready, asset.readiness.reasons]]));
+
+    it('reuses every existing asset in current canon and counts them as already rendered', () => {
+      const result = plan(sceneEpisode());
+      expect(sceneStatuses(result)).toEqual({
+        image: ['already_rendered', true, []],
+        entry: ['already_rendered', true, []],
+        hold: ['already_rendered', true, []],
+        exit: ['already_rendered', true, []],
+      });
+      expect(result.plannedAssets.filter((asset) => asset.status === 'already_rendered')).toHaveLength(4);
+      expect(result.isFullyReady).toBe(true);
+    });
+
+    it('regenerates existing assets in exact_inputs mode instead of reusing them', () => {
+      const result = plan(sceneEpisode(), { mode: 'exact_inputs' });
+      expect(sceneStatuses(result)).toEqual({
+        image: ['ready', true, []],
+        entry: ['ready', true, []],
+        hold: ['ready', true, []],
+        exit: ['ready', true, []],
+      });
+      expect(result.plannedAssets.some((asset) => asset.status === 'already_rendered')).toBe(false);
+    });
+
+    it('keeps an existing still, entry and hold reusable without prompts but not an exit', () => {
+      const result = plan(sceneEpisode({
+        node: { imagePrompt: '', videoPrompt: '' },
+        transition: { description: '' },
+      }));
+      expect(sceneStatuses(result)).toEqual({
+        image: ['already_rendered', false, ['Scene has neither imagePrompt nor prose.']],
+        entry: ['already_rendered', false, [NO_VIDEO_PROMPT]],
+        hold: ['already_rendered', false, [NO_VIDEO_PROMPT]],
+        exit: ['blocked', false, [NO_EXIT_PROMPT]],
+      });
+    });
+
+    it('blocks every existing asset on a blocker common to the scene', () => {
+      const result = plan(sceneEpisode(), {
+        loom: { id: 'loom-1', protagonistCharacterId: 'char-x' },
+        universe: { id: 'universe-1', characters: [] },
+      });
+      expect(sceneStatuses(result)).toEqual({
+        image: ['blocked', false, [protagonistReason]],
+        entry: ['blocked', false, [protagonistReason]],
+        hold: ['blocked', false, [protagonistReason]],
+        exit: ['blocked', false, [protagonistReason]],
+      });
+    });
+
+    it('requires an approved storyboard for new locked-canon video but not for existing clips', () => {
+      const universe = { id: 'universe-1', characters: [] };
+      const lockedNode = { visualCanon: { mode: 'locked' } };
+
+      const unapproved = plan(sceneEpisode({ node: { ...lockedNode, image: null }, assets: noExisting }), { universe });
+      expect(sceneStatuses(unapproved)).toEqual({
+        image: ['ready', true, []],
+        entry: ['blocked', false, [NO_APPROVAL]],
+        hold: ['blocked', false, [NO_APPROVAL]],
+        exit: ['blocked', false, [NO_APPROVAL]],
+      });
+
+      const approved = plan(sceneEpisode({
+        node: { visualCanon: { mode: 'locked', storyboardImageApproved: true }, image: null },
+        assets: noExisting,
+      }), { universe });
+      expect(Object.values(sceneStatuses(approved)).map(([status]) => status)).toEqual(['ready', 'ready', 'ready', 'ready']);
+
+      const existing = plan(sceneEpisode({ node: lockedNode }), { universe });
+      expect(Object.values(sceneStatuses(existing)).map(([status]) => status))
+        .toEqual(['already_rendered', 'already_rendered', 'already_rendered', 'already_rendered']);
+    });
+  });
+
+  it('blocks production when the canonical protagonist cannot resolve in the linked Universe', () => {
+    const plan = buildEpisodeProductionPlan({
+      episode: sampleEpisode,
+      loom: { id: 'loom-1', protagonistCharacterId: 'char-elena' },
+      universe: { id: 'universe-1', characters: [] },
+    });
+
+    expect(plan.isFullyReady).toBe(false);
+    expect(plan.plannedAssets
+      .filter((asset) => asset.status === 'blocked')
+      .some((asset) => asset.readiness.reasons.some((reason) => /canonical protagonist/i.test(reason))))
+      .toBe(true);
+  });
+
+  it('requires the interactive route before an approved studio voice satisfies live casting', () => {
+    const episode = { ...sampleEpisode, nodes: [{ ...sampleEpisode.nodes[0], transitions: [],
+      interactionWindow: { enabled: true, protagonistCharacterId: 'char-1' } }] };
+    const profile = { id: 'voice-1', binding: { universeId: 'u1', characterId: 'char-1' },
+      approval: { status: 'approved' }, routes: { studio: { enabled: true }, interactive: { enabled: false } } };
+    const options = { episode, universe: { id: 'u1', characters: [{ id: 'char-1', name: 'Example' }] },
+      loom: { id: 'loom-1', protagonistCharacterId: 'char-1' }, localVoiceProfiles: [profile] };
+    const reasons = () => buildEpisodeProductionPlan(options).plannedAssets.find(asset => asset.type === 'dialogue').readiness.reasons;
+    expect(reasons().some(reason => /no approved voice binding/i.test(reason))).toBe(true);
+    profile.routes.interactive.enabled = true;
+    expect(reasons().some(reason => /no approved voice binding/i.test(reason))).toBe(false);
+  });
+
+  it('refuses exact-input planning when a node has no recorded provenance', () => {
+    const plan = buildEpisodeProductionPlan({
+      episode: sampleEpisode,
+      mode: 'exact_inputs',
+    });
+
+    expect(plan.isFullyReady).toBe(false);
+    expect(plan.exactInputIssues.length).toBe(4);
+    expect(plan.exactInputIssues[0].errors[0]).toContain('No recorded provenance');
+  });
+
+  it('verifies exact input provenance matching without silent substitution', () => {
+    const validProvenance = {
+      version: 1,
+      characters: [
+        {
+          characterId: 'char-1',
+          lora: { filename: 'char-1-flux.safetensors', sha256: 'abc123sha' },
+          voice: {
+            profileId: 'vp-1', profileVersion: 2, engine: 'kokoro', modelRevision: 'rev-1',
+          },
+        },
+      ],
+    };
+
+    const universe = { characters: [{ id: 'char-1', name: 'Hero' }] };
+    const localVoiceProfiles = [{ id: 'vp-1', version: 2, engine: 'kokoro', modelRevision: 'rev-1' }];
+    const localLoras = [{ filename: 'char-1-flux.safetensors', sha256: 'abc123sha' }];
+
+    const result = verifyExactInputProvenance(validProvenance, {
+      universe,
+      localVoiceProfiles,
+      localLoras,
+    });
+    expect(result.valid).toBe(true);
+    expect(result.errors).toHaveLength(0);
+
+    // Mismatched LoRA hash
+    const mismatchedLora = verifyExactInputProvenance(validProvenance, {
+      universe,
+      localVoiceProfiles,
+      localLoras: [{ filename: 'char-1-flux.safetensors', sha256: 'different-hash' }],
+    });
+    expect(mismatchedLora.valid).toBe(false);
+    expect(mismatchedLora.errors[0]).toContain('checksum mismatch');
+
+    // Mismatched Voice Profile version
+    const mismatchedVoice = verifyExactInputProvenance(validProvenance, {
+      universe,
+      localVoiceProfiles: [{ id: 'vp-1', version: 3, engine: 'kokoro', modelRevision: 'rev-1' }],
+      localLoras,
+    });
+    expect(mismatchedVoice.valid).toBe(false);
+    expect(mismatchedVoice.errors[0]).toContain('version mismatch');
+
+    const missingModelRevision = verifyExactInputProvenance(validProvenance, {
+      universe,
+      localVoiceProfiles: [{ id: 'vp-1', version: 2, engine: 'kokoro' }],
+      localLoras,
+    });
+    expect(missingModelRevision.valid).toBe(false);
+    expect(missingModelRevision.errors.some((error) => error.includes('model revision mismatch'))).toBe(true);
+  });
+
+  it('reports checksum defects consistently for both recorded file envelopes', () => {
+    const envelopes = [
+      {
+        label: 'adapter',
+        provenance: (file) => ({
+          version: 1,
+          compilerVersion: 'visual-v1',
+          status: 'locked',
+          capability: { kind: 'image', backend: 'cloud', modelId: 'model-v1' },
+          bindings: {}, assets: [], adapters: [file], omitted: [], warnings: [],
+        }),
+      },
+      {
+        label: 'LoRA',
+        provenance: (file) => ({ version: 1, characters: [{ characterId: 'char-1', lora: file }] }),
+      },
+    ];
+    const defectCases = [
+      { recorded: { filename: 'adapter.safetensors' }, installed: [], message: 'has no checksum to verify exact inputs' },
+      { recorded: { filename: 'adapter.safetensors', sha256: 'expected' }, installed: [], message: 'is not installed locally' },
+      { recorded: { filename: 'adapter.safetensors', sha256: 'expected' }, installed: [{ filename: 'adapter.safetensors' }], message: 'has no checksum to verify exact inputs' },
+      { recorded: { filename: 'adapter.safetensors', sha256: 'expected' }, installed: [{ filename: 'adapter.safetensors', sha256: 'found' }], message: 'checksum mismatch (expected expected, found found)' },
+    ];
+
+    for (const envelope of envelopes) {
+      for (const defect of defectCases) {
+        const result = verifyExactInputProvenance(envelope.provenance(defect.recorded), {
+          localLoras: defect.installed,
+        });
+        expect(result.errors.some((error) => error.includes(defect.message)),
+          `${envelope.label}: ${defect.message}`).toBe(true);
+      }
+    }
+  });
+
+  it('refuses exact visual reproduction when local inputs are empty, missing, or revised', () => {
+    const visualProvenance = {
+      version: 1,
+      compilerVersion: 'visual-v1',
+      status: 'locked',
+      universeId: 'univ-1',
+      capability: {
+        kind: 'image',
+        backend: 'local',
+        modelId: 'image-model',
+        modelRevision: 'revision-1',
+      },
+      bindings: { inferred: false, characterAppearances: [], objectIds: [] },
+      assets: [{ role: 'environment', required: true, filename: 'environment.png' }],
+      adapters: [],
+      omitted: [],
+      warnings: [],
+      render: {
+        parameters: {
+          width: 1024,
+          height: 576,
+          aspectRatio: '16:9',
+          steps: 28,
+          guidance: 3.5,
+          quantize: '8',
+          seed: 42,
+        },
+      },
+    };
+    const baseOptions = {
+      universe: { id: 'univ-1', characters: [], places: [], objects: [] },
+      availableImageModels: [{ id: 'image-model', revision: 'revision-1' }],
+      resolveAsset: () => '/safe/environment.png',
+    };
+
+    expect(verifyExactInputProvenance(visualProvenance, baseOptions).valid).toBe(true);
+    const missingRenderTuple = structuredClone(visualProvenance);
+    delete missingRenderTuple.render.parameters.seed;
+    expect(verifyExactInputProvenance(missingRenderTuple, baseOptions).errors)
+      .toContain('Recorded image render parameter "seed" is missing or invalid.');
+    expect(verifyExactInputProvenance(visualProvenance, {
+      ...baseOptions,
+      availableImageModels: [],
+    }).errors).toContain('Recorded image model "image-model" is not available locally.');
+    expect(verifyExactInputProvenance(visualProvenance, {
+      ...baseOptions,
+      availableImageModels: [{ id: 'image-model', revision: 'revision-2' }],
+    }).errors.some((error) => error.includes('revision mismatch'))).toBe(true);
+    const unpinned = structuredClone(visualProvenance);
+    delete unpinned.capability.modelRevision;
+    expect(verifyExactInputProvenance(unpinned, baseOptions).errors.some((error) => error.includes('immutable model revision'))).toBe(true);
+    expect(verifyExactInputProvenance(visualProvenance, {
+      ...baseOptions,
+      resolveAsset: () => null,
+    }).errors).toContain('Recorded visual conditioning asset "environment.png" is unavailable locally.');
+  });
+});

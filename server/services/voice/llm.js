@@ -1,0 +1,593 @@
+// Provider-aware streaming chat — SSE parser yielding token deltas via onDelta
+// callback. The OpenAI-compatible endpoint is resolved from the configured
+// voice provider (Settings → Voice → LLM provider) so any `api`-type provider
+// in the toolkit registry (LM Studio, Ollama, NVIDIA, OpenAI-compatible, …) can
+// drive voice. CLI/TUI providers can't stream low-latency tokens, so they're
+// not offered. Falls back to the legacy env-based LM Studio default when the
+// provider is missing, not API-type, or the toolkit hasn't warmed yet.
+
+import { getProviderById } from '../providers.js';
+import { DEFAULT_VOICE_BACKEND } from './config.js';
+import { normalizeOpenAiBaseUrl } from '../../lib/localProviderRuntime.js';
+import { assertSecretEndpoint } from '../../lib/aiToolkit/endpointGuard.js';
+
+// Legacy env-based LM Studio default. Returns the OpenAI-compatible API base
+// INCLUDING the version path, so callers append `/models` / `/chat/completions`.
+const LM_STUDIO_API_BASE = () => normalizeOpenAiBaseUrl(process.env.LM_STUDIO_URL || 'http://localhost:1234');
+
+// Ollama's OpenAI-compatible surface. `OLLAMA_HOST` is conventionally a BARE
+// `host:port` with no scheme (that is how .env.example documents it), so this
+// must go through the shared normalizer rather than string-concatenating
+// `/v1` onto it — `localhost:11434/v1` is not a fetchable URL.
+const OLLAMA_API_BASE = () => normalizeOpenAiBaseUrl(
+  process.env.OLLAMA_URL || process.env.OLLAMA_HOST || 'http://localhost:11434'
+);
+
+// Last-resort endpoints when the configured provider resolves to nothing
+// usable. Keyed by the built-in local backends so the fallback follows
+// `DEFAULT_VOICE_BACKEND` instead of being pinned to one vendor.
+const LOCAL_FALLBACKS = {
+  ollama: () => ({ apiBase: OLLAMA_API_BASE(), providerName: 'Ollama' }),
+  lmstudio: () => ({ apiBase: LM_STUDIO_API_BASE(), providerName: 'LM Studio' }),
+};
+
+/**
+ * Resolve the OpenAI-compatible endpoint for the voice text LLM.
+ * @param {string} [providerId=DEFAULT_VOICE_BACKEND]
+ * @returns {Promise<{ apiBase: string, apiKey: string, defaultModel: string|null, providerName: string }>}
+ */
+export const resolveLlmEndpoint = async (providerId = DEFAULT_VOICE_BACKEND) => {
+  const provider = await getProviderById(providerId || DEFAULT_VOICE_BACKEND).catch(() => null);
+  if (provider && provider.type === 'api' && provider.endpoint) {
+    // Back-compat: the LM_STUDIO_URL env override still wins for the built-in
+    // lmstudio provider, so installs that pointed it at another host keep
+    // working without re-saving the provider endpoint.
+    const useEnv = provider.id === 'lmstudio' && process.env.LM_STUDIO_URL;
+    const apiBase = (useEnv ? LM_STUDIO_API_BASE() : provider.endpoint).replace(/\/+$/, '');
+    // Guard before attaching the provider's API key to the /models and
+    // /chat/completions fetches below — a hostile/mistyped endpoint could
+    // otherwise harvest a paid LLM key or reach a cloud-metadata service
+    // (SSRF). This no-ops when no key is attached, so the built-in local
+    // `lmstudio`/`ollama` fallbacks (normally keyless) are unaffected at any
+    // host; only a key-bearing request to a metadata / non-allowlisted host is
+    // blocked — keeping this path consistent with askService and
+    // localLlmPlayground, which never exempted lmstudio.
+    assertSecretEndpoint(apiBase, {
+      hasSecret: Boolean(provider.apiKey),
+      allowCustomEndpoint: provider.allowCustomEndpoint === true,
+    });
+    return {
+      apiBase,
+      apiKey: provider.apiKey || '',
+      defaultModel: provider.defaultModel || null,
+      providerName: provider.name || providerId,
+    };
+  }
+  // No usable API provider (CLI/TUI, missing, or toolkit not warmed) — fall
+  // back to the env-based local default so voice still works out of the box.
+  // Falls back to the backend the user NAMED when that is a known local one,
+  // so a `provider: 'lmstudio'` install whose provider record is missing still
+  // lands on LM Studio rather than being silently redirected to Ollama.
+  const fallback = (LOCAL_FALLBACKS[providerId] || LOCAL_FALLBACKS[DEFAULT_VOICE_BACKEND])();
+  return { apiBase: fallback.apiBase, apiKey: '', defaultModel: null, providerName: fallback.providerName };
+};
+
+export const authHeaders = (apiKey) => (apiKey ? { Authorization: `Bearer ${apiKey}` } : {});
+
+// A voice turn must eventually release its socket state even when an upstream
+// accepts the request but never sends headers or stops its SSE stream. This is
+// a total request-plus-stream budget, rather than an idle-chunk timeout.
+export const VOICE_LLM_TIMEOUT_MS = 30_000;
+export const VOICE_LLM_TIMEOUT_MESSAGE = 'Voice LLM request timed out';
+
+// Approximate parameter count from LM Studio model id so 'auto' avoids a 70B
+// when smaller, faster models are available. Returns Infinity for non-matches
+// and utility models so they sort last rather than silently winning ties.
+// Accepts "7B", "7 B", "7b", "1.5B" plus MoE ids like "8x7B" (ranked by total
+// experts × per-expert size; checked first so the naive `\d+\s*b\b` match
+// doesn't silently rank "8x7B" as 7B). Utility-model filter runs first and is
+// case-insensitive so "BAAI/bge-embed" / "Cohere/rerank" are excluded even
+// when they happen to contain a size token.
+const sizeRank = (id) => {
+  const normalized = String(id).toLowerCase();
+  if (/embed|rerank/.test(normalized)) return Infinity;
+  const moe = normalized.match(/(\d+(?:\.\d+)?)\s*x\s*(\d+(?:\.\d+)?)\s*b\b/);
+  if (moe) return parseFloat(moe[1]) * parseFloat(moe[2]);
+  const m = normalized.match(/(\d+(?:\.\d+)?)\s*b\b/);
+  if (m) return parseFloat(m[1]);
+  return Infinity;
+};
+
+// Models known to speak OpenAI's structured `tool_calls` SSE fragments. When
+// tools are attached, prefer one of these over a model that would either emit
+// its own inline format (Granite's `<tool_call>[...]</tool_call>`) or silently
+// bail on large tool schemas. Match against lowercased model id — vendor
+// prefix (`lmstudio-community/`, `mistralai/`, `nousresearch/`, etc.) is
+// routinely present and varies, so anchor on the model family token.
+export const TOOL_CAPABLE_PATTERNS = [
+  /qwen2\.5.*instruct/,
+  /qwen3.*instruct/,
+  /qwen3(\.\d+)?-?\d+b-2507/,    // Qwen3 / 3.5 / 3.6 non-thinking dated variants
+  /qwen3\.5/,                     // Qwen3.5 family (e.g., qwen3.5-9b)
+  /qwen3\.6/,                     // Qwen3.6 family
+  // Bare Ollama registry tags carry no "instruct" token (`qwen2.5:latest`,
+  // `qwen3:30b`, `llama3.1|3.2|3.3:<tag>`) so the *-instruct patterns above miss
+  // them — but Ollama's default builds for these tool-capable families ARE
+  // instruct-tuned. Match the family only as a WHOLE tag token — anchored on
+  // start / `/` / `:`, and terminated only by `:` (a tag) or end-of-string.
+  // Deliberately NOT by `-`: a trailing `-` is what turns these families into
+  // NON-chat variants (`qwen3-embedding`, `qwen3-reranker`, `qwen3-vl`,
+  // `qwen2.5-omni`, `llama3.2-vision`) that can't do tool-calling. The
+  // legitimate hyphenated instruct builds (`Qwen2.5-7B-Instruct-GGUF`) are
+  // already covered by the `*instruct` patterns above.
+  /(?:^|[\/:])qwen2\.5(?::|$)/,
+  /(?:^|[\/:])qwen3(?::|$)/,
+  /(?:^|[\/:])llama3\.[1-9](?::|$)/,
+  /hermes-?3/,
+  /mistral-small/,
+  /mistral.*instruct-v0\.[3-9]/,
+  /ministral.*instruct/,
+  /ministral.*reasoning/,
+  /devstral/,
+  /llama-?3\.[1-9].*instruct/,
+  /llama-?3\.[1-9].*tool/,
+  /command-r(\+|-plus)?/,
+  /functionary/,
+];
+
+// Explicit block-list for model families that do NOT emit OpenAI-format
+// tool_calls even when LM Studio accepts the `tools` argument. Extracted from
+// empirical testing; add new entries as they're observed. Still usable in
+// no-tools mode — just filter them out when we need tool calling.
+export const TOOL_INCOMPATIBLE_PATTERNS = [
+  /granite-?3/,         // emits `<tool_call>[...]</tool_call>` inline content (parsed below)
+  /gemma-?[23].*\b\d+m\b/, // small non-instruct gemmas
+];
+
+// Reasoning models burn 10–30s on internal `<think>` tokens before emitting
+// the spoken reply. For a voice agent that's death — even short answers feel
+// like the assistant froze. We try to suppress thinking via prompt directives
+// and chat-template kwargs (see `streamChat`), but the only reliable speedup
+// is to PREFER non-reasoning models when both kinds are installed.
+export const REASONING_PATTERNS = [
+  /reasoning/,
+  /\br1\b/,
+  /\bqwq\b/,
+  /thinking/,
+  /\bo1\b/,
+  /deepseek-r1/,
+];
+
+export const isReasoningModel = (id) => {
+  const n = String(id).toLowerCase();
+  return REASONING_PATTERNS.some((re) => re.test(n));
+};
+
+export const isToolCapable = (id) => {
+  const n = String(id).toLowerCase();
+  // Utility models (embeddings / rerankers) can't chat or call tools — never let
+  // a broadened family pattern (e.g. bare `qwen3…`) select one as the voice
+  // brain, which would hard-fail every tool turn. Mirrors sizeRank's guard.
+  if (/embed|rerank/.test(n)) return false;
+  return TOOL_CAPABLE_PATTERNS.some((re) => re.test(n));
+};
+
+const isToolIncompatible = (id) => {
+  const n = String(id).toLowerCase();
+  return TOOL_INCOMPATIBLE_PATTERNS.some((re) => re.test(n));
+};
+
+// Multi-key sort: non-reasoning before reasoning, then smaller before larger.
+// Sort is stable in V8, so equal keys keep input order — list inputs in a
+// preferred order if you want a tiebreaker beyond size.
+const rankForSpeed = (id) => [isReasoningModel(id) ? 1 : 0, sizeRank(id)];
+const sortBySpeed = (list) => list.slice().sort((a, b) => {
+  const [ar, as] = rankForSpeed(a);
+  const [br, bs] = rankForSpeed(b);
+  if (ar !== br) return ar - br;
+  return as - bs;
+});
+
+const resolveModel = async (requested, { apiBase, apiKey, defaultModel = null, requireTools = false } = {}) => {
+  const isAuto = !requested || requested === 'auto';
+  const res = await fetch(`${apiBase}/models`, { headers: authHeaders(apiKey), signal: AbortSignal.timeout(5000) }).catch(() => null);
+  // Models list unreachable: honor an explicit pin, else the provider's
+  // configured default, else give up (caller throws "no model available").
+  if (!res || !res.ok) return isAuto ? defaultModel : requested;
+  const body = await res.json().catch(() => null);
+  const ids = (body?.data || []).map((m) => m.id);
+  if (!isAuto) {
+    return ids.includes(requested) ? requested : ids[0] || requested;
+  }
+  // 'auto' — prefer the provider's configured default when set (hosted
+  // providers expose dozens of models; the latency heuristics below are tuned
+  // for a local LM Studio model list, not a hosted catalog).
+  if (defaultModel) return defaultModel;
+  // 'auto' selection priority for voice latency:
+  //   1. tool-capable + non-reasoning, smallest first  (the sweet spot)
+  //   2. tool-capable + reasoning, smallest first      (slow but works)
+  //   3. anything not known-incompatible, smallest     (fallback)
+  // Reasoning models are deprioritized because they pre-generate a
+  // `<think>` block before any spoken token — fatal for voice TTFT even
+  // when the final reply is short.
+  if (requireTools) {
+    const capable = ids.filter(isToolCapable);
+    const sorted = sortBySpeed(capable);
+    if (sorted[0]) return sorted[0];
+    const safe = sortBySpeed(ids.filter((id) => !isToolIncompatible(id)));
+    return safe[0] || ids[0] || null;
+  }
+  return sortBySpeed(ids)[0] || null;
+};
+
+// Parse IBM Granite / Llama-3 tool-use formats that are emitted as
+// `delta.content` rather than structured `delta.tool_calls`. Granite 3.2 in
+// practice emits BOTH `<tool_call>...</tool_call>` and `<tool_request>...`
+// (bare, unclosed) forms — observed varying between requests against the same
+// model with the same prompt. We handle: (a) the XML-tagged closed form, (b)
+// the unclosed form, (c) either tag spelling.
+const TOOL_TAG_SPELLINGS = ['tool_call', 'tool_request'];
+const TOOL_CALL_CLOSED_RE = /<(tool_call|tool_request)>\s*(\[[\s\S]*?\])\s*<\/\1>/g;
+
+const pushParsedCalls = (raw, toolCalls) => {
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch { return false; }
+  const arr = Array.isArray(parsed) ? parsed : [parsed];
+  let pushed = 0;
+  for (const c of arr) {
+    if (!c || typeof c !== 'object' || typeof c.name !== 'string') continue;
+    toolCalls.push({
+      index: toolCalls.length,
+      id: `call_inline_${toolCalls.length}`,
+      type: 'function',
+      function: {
+        name: c.name,
+        arguments: JSON.stringify(c.arguments ?? c.parameters ?? {}),
+      },
+    });
+    pushed++;
+  }
+  return pushed > 0;
+};
+
+// Walk `text` starting at `start` to find a balanced top-level JSON array.
+// Returns [jsonText, endIdx] or null. Respects string quoting so a `]`
+// inside a string literal doesn't prematurely close. Cheaper than pulling a
+// full JSON parser just for boundary detection.
+const scanBalancedArray = (text, start) => {
+  let i = start;
+  while (i < text.length && /\s/.test(text[i])) i++;
+  if (text[i] !== '[') return null;
+  let depth = 0;
+  let inStr = false;
+  let escape = false;
+  for (; i < text.length; i++) {
+    const ch = text[i];
+    if (inStr) {
+      if (escape) { escape = false; continue; }
+      if (ch === '\\') { escape = true; continue; }
+      if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') { inStr = true; continue; }
+    if (ch === '[') depth++;
+    else if (ch === ']') {
+      depth--;
+      if (depth === 0) return [text.slice(start, i + 1).trim(), i + 1];
+    }
+  }
+  return null;
+};
+
+export const extractInlineToolCalls = (text) => {
+  if (!text) return { text: '', toolCalls: [] };
+  const toolCalls = [];
+  let cleaned = text;
+
+  // 1) Closed-form tags: strip each matched block (matches either spelling).
+  TOOL_CALL_CLOSED_RE.lastIndex = 0;
+  let m;
+  while ((m = TOOL_CALL_CLOSED_RE.exec(text)) !== null) {
+    if (pushParsedCalls(m[2], toolCalls)) {
+      cleaned = cleaned.split(m[0]).join('');
+    }
+  }
+
+  // 2) Unclosed tag: `<tool_call>[...]` or `<tool_request>[...]` with no
+  //    matching close. Granite often stops generating before closing.
+  //    Try each spelling in order; scan from the opener position.
+  for (const spelling of TOOL_TAG_SPELLINGS) {
+    const open = `<${spelling}>`;
+    const openAt = cleaned.indexOf(open);
+    if (openAt === -1) continue;
+    const arrStart = openAt + open.length;
+    const arr = scanBalancedArray(cleaned, arrStart);
+    if (arr && pushParsedCalls(arr[0], toolCalls)) {
+      const close = new RegExp(`</${spelling}>\\s*`, 'g');
+      cleaned = (cleaned.slice(0, openAt) + cleaned.slice(arr[1])).replace(close, '');
+    }
+  }
+
+  return { text: cleaned.trim(), toolCalls };
+};
+
+/**
+ * Stream an LM Studio chat completion. Text deltas are forwarded via onDelta
+ * for TTS; tool_call fragments are buffered per-index and returned at the end
+ * so the pipeline can execute them and loop.
+ *
+ * @param {Array<object>} messages
+ * @param {object} opts
+ * @param {string} [opts.provider='lmstudio']  voice LLM provider id (toolkit registry)
+ * @param {string} [opts.model='auto']
+ * @param {AbortSignal} [opts.signal]
+ * @param {(delta: string) => void} [opts.onDelta]
+ * @param {Array<object>} [opts.tools]  OpenAI-format tool specs (optional)
+ * @returns {Promise<{ text: string, toolCalls: Array<object>, model: string|null, ttfbMs: number|null, totalMs: number, finishReason: string|null }>}
+ */
+export const streamChat = async (messages, opts = {}) => {
+  const resolveStart = Date.now();
+  const { apiBase, apiKey, defaultModel, providerName } = await resolveLlmEndpoint(opts.provider);
+  const model = await resolveModel(opts.model, { apiBase, apiKey, defaultModel, requireTools: !!opts.tools?.length });
+  const resolveMs = Date.now() - resolveStart;
+  if (!model) throw new Error(`No model available for voice provider "${providerName}"`);
+  // Surface resolution time — non-trivial when the backend is warming up a new
+  // model, and invisible otherwise because we only logged once the stream
+  // finished. opts.tag lets the pipeline inject its turn id for correlation.
+  const tag = opts.tag ? `[${opts.tag}] ` : '';
+  console.log(`🤖 ${tag}voice.llm.resolve provider=${providerName} requested=${opts.model || 'auto'} → ${model} in ${resolveMs}ms`);
+
+  const started = Date.now();
+  // When the resolved model has a reasoning mode, try every known disable
+  // switch — different model families honor different ones and unknown fields
+  // are silently ignored by LM Studio:
+  //   - Qwen3:    `/no_think` directive appended to last system message
+  //   - Granite:  `chat_template_kwargs: { thinking: false }`
+  //   - vLLM:     `chat_template_kwargs: { enable_thinking: false }`
+  //   - generic:  `extra_body.thinking = false`, `reasoning_effort = "minimal"`
+  // None of these are guaranteed to work — some models (DeepSeek-R1, native
+  // o1) emit `<think>` unconditionally. The deprioritization in resolveModel
+  // is the durable fix; this is best-effort speedup for the rare case where
+  // a reasoning model is the only tool-capable option.
+  const reasoning = isReasoningModel(model);
+  const sentMessages = reasoning ? messages.map((m, i, arr) => {
+    if (m.role !== 'system' || i !== arr.findLastIndex((x) => x.role === 'system')) return m;
+    const directive = (m.content || '').includes('/no_think') ? '' : '\n/no_think';
+    return { ...m, content: (m.content || '') + directive };
+  }) : messages;
+
+  const body = {
+    model,
+    messages: sentMessages,
+    stream: true,
+    temperature: 0.5,
+    max_tokens: opts.maxTokens ?? 180,
+  };
+  if (reasoning) {
+    body.chat_template_kwargs = { thinking: false, enable_thinking: false };
+    body.reasoning_effort = 'minimal';
+  }
+  if (opts.tools?.length) {
+    body.tools = opts.tools;
+    body.tool_choice = opts.toolChoice ?? 'auto';
+  }
+
+  const requestController = new AbortController();
+  let timedOut = false;
+  const onExternalAbort = opts.signal
+    ? () => requestController.abort(opts.signal.reason)
+    : null;
+  let reader = null;
+  const cancelReader = () => {
+    if (typeof reader?.cancel !== 'function') return;
+    try {
+      void Promise.resolve(reader.cancel()).catch(() => {});
+    } catch (err) {
+      console.error(`🤖 voice.llm.reader_cancel failed: ${err.message}`);
+    }
+  };
+  requestController.signal.addEventListener('abort', cancelReader, { once: true });
+  if (opts.signal) {
+    if (opts.signal.aborted) onExternalAbort();
+    else opts.signal.addEventListener('abort', onExternalAbort, { once: true });
+  }
+  const timeoutId = setTimeout(() => {
+    timedOut = true;
+    try {
+      opts.onTimeout?.();
+    } catch (err) {
+      console.error(`🤖 voice.llm.timeout_hook failed: ${err.message}`);
+    }
+    requestController.abort();
+  }, VOICE_LLM_TIMEOUT_MS);
+
+  const requestPromise = (async () => {
+    const reqStart = Date.now();
+    const res = await fetch(`${apiBase}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders(apiKey) },
+      body: JSON.stringify(body),
+      signal: requestController.signal,
+    });
+    if (timedOut) throw new Error(VOICE_LLM_TIMEOUT_MESSAGE);
+    console.log(`🤖 ${tag}voice.llm.headers ${res.status} in ${Date.now() - reqStart}ms`);
+    if (!res.ok || !res.body) {
+      const errBody = await res.text().catch(() => '');
+      throw new Error(`${providerName} chat failed: ${res.status} ${errBody.slice(0, 200)}`);
+    }
+
+    const decoder = new TextDecoder();
+    reader = res.body.getReader();
+    if (requestController.signal.aborted) cancelReader();
+    const throwIfAborted = () => {
+      if (timedOut) throw new Error(VOICE_LLM_TIMEOUT_MESSAGE);
+      if (requestController.signal.aborted) {
+        throw requestController.signal.reason || new Error('The voice LLM request was aborted');
+      }
+    };
+    let buffer = '';
+    let text = '';
+    let ttfbMs = null;
+    let finishReason = null;
+    // Tool calls stream as fragments keyed by index; accumulate until [DONE].
+    const toolCallFrags = new Map();
+
+    // Streaming tool-call stripper: when a model emits Granite-style inline
+    // `<tool_call>[...]</tool_call>` or `<tool_request>[...]` in `delta.content`,
+    // we must NOT forward those chunks to onDelta — the pipeline feeds deltas to
+    // TTS and would speak the raw JSON. Reasoning models likewise emit `<think>`
+    // blocks that should be hidden even when our disable directives don't take.
+    // We still accumulate everything into `text` so the post-stream parser can
+    // hoist into structured `toolCalls`. Tail characters that could be a partial
+    // open/close tag are held across chunks. All tag spellings handled in parallel.
+    const STRIP_TAGS = [...TOOL_TAG_SPELLINGS, 'think', 'thinking', 'reasoning'];
+    const OPEN_TAGS = STRIP_TAGS.map((s) => `<${s}>`);
+    const _CLOSE_TAGS = STRIP_TAGS.map((s) => `</${s}>`);
+    let activeClose = null; // set when we entered a tool block
+    let tailHold = '';
+    // Find the earliest match of any candidate in `data`, starting at 0.
+    const earliestIndex = (data, candidates) => {
+      let best = -1;
+      let bestLen = 0;
+      for (const c of candidates) {
+        const i = data.indexOf(c);
+        if (i !== -1 && (best === -1 || i < best)) { best = i; bestLen = c.length; }
+      }
+      return best === -1 ? null : [best, bestLen];
+    };
+    // Longest suffix of `data` that is a prefix of any candidate — characters we
+    // must withhold because they might begin a real tag once more data arrives.
+    const longestPrefixHold = (data, candidates) => {
+      const max = Math.max(...candidates.map((c) => c.length - 1));
+      const limit = Math.min(data.length, max);
+      for (let k = limit; k > 0; k--) {
+        const tail = data.slice(data.length - k);
+        if (candidates.some((c) => c.startsWith(tail))) return k;
+      }
+      return 0;
+    };
+    const forwardClean = (chunk) => {
+      let data = tailHold + chunk;
+      tailHold = '';
+      let out = '';
+      while (data.length) {
+        if (!activeClose) {
+          const hit = earliestIndex(data, OPEN_TAGS);
+          if (hit) {
+            out += data.slice(0, hit[0]);
+            const spelling = data.slice(hit[0] + 1, hit[0] + hit[1] - 1); // strip '<' and '>'
+            activeClose = `</${spelling}>`;
+            data = data.slice(hit[0] + hit[1]);
+            continue;
+          }
+          const hold = longestPrefixHold(data, OPEN_TAGS);
+          if (hold) {
+            out += data.slice(0, data.length - hold);
+            tailHold = data.slice(data.length - hold);
+          } else {
+            out += data;
+          }
+          data = '';
+        } else {
+          const i = data.indexOf(activeClose);
+          if (i !== -1) {
+            data = data.slice(i + activeClose.length);
+            activeClose = null;
+            continue;
+          }
+          const hold = longestPrefixHold(data, [activeClose]);
+          if (hold) tailHold = data.slice(data.length - hold);
+          data = '';
+        }
+      }
+      if (out) opts.onDelta?.(out);
+    };
+
+    while (true) {
+      const { value, done } = await reader.read();
+      throwIfAborted();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      let idx;
+      while ((idx = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, idx).trim();
+        buffer = buffer.slice(idx + 1);
+        if (!line.startsWith('data:')) continue;
+        const payload = line.slice(5).trim();
+        if (payload === '[DONE]') {
+          throwIfAborted();
+          return finalizeReturn();
+        }
+        // Malformed SSE frames (proxy keep-alive, truncated write) would otherwise
+        // abort the whole turn; skip the line and keep streaming.
+        let obj;
+        try { obj = JSON.parse(payload); } catch { continue; }
+        const choice = obj?.choices?.[0];
+        if (choice?.finish_reason) finishReason = choice.finish_reason;
+        const delta = choice?.delta || {};
+        if (delta.content) {
+          if (ttfbMs === null) ttfbMs = Date.now() - started;
+          text += delta.content;
+          forwardClean(delta.content);
+          throwIfAborted();
+        }
+        for (const tc of delta.tool_calls || []) {
+          const frag = toolCallFrags.get(tc.index) || {
+            index: tc.index,
+            id: '',
+            type: 'function',
+            function: { name: '', arguments: '' },
+          };
+          if (tc.id) frag.id = tc.id;
+          if (tc.type) frag.type = tc.type;
+          // `name` is sent once per tool call per the OpenAI spec; set-once
+          // rather than concatenate so a split fragment can't produce garbage.
+          if (tc.function?.name && !frag.function.name) frag.function.name = tc.function.name;
+          if (tc.function?.arguments) frag.function.arguments += tc.function.arguments;
+          toolCallFrags.set(tc.index, frag);
+        }
+      }
+    }
+    return finalizeReturn();
+
+    function finalizeReturn() {
+      const streamed = [...toolCallFrags.values()].sort((a, b) => a.index - b.index);
+      // Post-stream: if the model emitted no structured tool_calls but wrote
+      // Granite-style `<tool_call>[...]</tool_call>` in content, extract them
+      // and clean the visible text. No-ops when the regex doesn't match.
+      const { text: cleanedText, toolCalls: inlineCalls } = streamed.length
+        ? { text, toolCalls: [] }
+        : extractInlineToolCalls(text);
+      const toolCalls = streamed.length ? streamed : inlineCalls;
+      // Strip any `<think>...`/`<reasoning>...` blocks from the canonical text
+      // too — the streaming stripper kept them out of TTS, but they'd still
+      // pollute conversation history and the assistant.content we persist.
+      const finalText = stripReasoningTags(cleanedText);
+      return {
+        text: finalText,
+        toolCalls,
+        model,
+        ttfbMs,
+        totalMs: Date.now() - started,
+        finishReason,
+      };
+    }
+  })();
+
+  return requestPromise
+    .catch((err) => {
+      if (timedOut) throw new Error(VOICE_LLM_TIMEOUT_MESSAGE);
+      throw err;
+    })
+    .finally(() => {
+      clearTimeout(timeoutId);
+      requestController.signal.removeEventListener('abort', cancelReader);
+      if (opts.signal && onExternalAbort) {
+        opts.signal.removeEventListener('abort', onExternalAbort);
+      }
+    });
+};
+
+const REASONING_TAG_RE = /<(think|thinking|reasoning)>[\s\S]*?(?:<\/\1>|$)/gi;
+const stripReasoningTags = (text) => (text || '').replace(REASONING_TAG_RE, '').replace(/\s+/g, ' ').trim();

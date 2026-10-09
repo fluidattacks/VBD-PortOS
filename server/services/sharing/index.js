@@ -1,0 +1,187 @@
+/**
+ * Share Bucket — lifecycle entry point.
+ *
+ * Called from server/index.js once on boot. Attaches a chokidar watcher to
+ * each registered bucket's `manifests/` directory, processes any backlog from
+ * while the server was offline, and wires Socket.IO so the UI can react to
+ * inbox updates / watcher errors live.
+ */
+
+import { ensureDir, PATHS } from '../../lib/fileUtils.js';
+import { join } from 'path';
+import { attachAllWatchers, attachWatcher, detachWatcher, shutdownAllWatchers, listAttachedWatchers } from './watcher.js';
+import { sharingEvents } from './importer.js';
+import { installSubscriptionListener } from './subscriptions.js';
+import { installPeerSyncListener, uninstallPeerSyncListener, peerSyncEvents, syncMediaLibraryWithAllPeers, syncCosHistoryWithAllPeers, syncCosTasksWithAllPeers, syncEidoverseFoundationsWithAllPeers } from './peerSync.js';
+import { hasSubscriptionAdapter } from './recordEvents.js';
+import { initAnnotationsSync } from './annotationsSync.js';
+import { installShareRefusalNotifier } from './shareRefusalNotifier.js';
+
+export { sharingEvents } from './importer.js';
+export { attachWatcher, detachWatcher, listAttachedWatchers };
+export { pullSidecarForImage, backfillMissingSidecars } from './sidecarSync.js';
+
+let initialized = false;
+let io = null;
+
+// Standalone full-sync library sweeps (#1566 media, #1650 CoS history). A
+// low-frequency timer pulls each full-sync peer's standalone bytes; an unchanged
+// manifest short-circuits on the manifestHash, so the steady-state tick is one
+// cheap manifest fetch per peer per category. Period is deliberately slower than
+// the 30s peer health probe — these change less often and a sweep can move large
+// bytes.
+const MEDIA_LIBRARY_SWEEP_INTERVAL_MS = 60_000;
+const MEDIA_LIBRARY_SWEEP_INITIAL_DELAY_MS = 20_000; // let boot settle before the first sweep
+let mediaLibraryTimer = null;
+let mediaLibraryKickoff = null;
+
+function startMediaLibrarySweep() {
+  // Timer callbacks run OUTSIDE the request lifecycle — an uncaught throw here
+  // crashes the process (AGENTS.md). Each sweep already catches per-peer; this
+  // guards a synchronous throw before the awaits begin.
+  const tick = () => {
+    try {
+      syncMediaLibraryWithAllPeers().catch((err) => {
+        console.error(`❌ sharing: media-library sweep failed: ${err.message}`);
+      });
+      // Completed-agent CoS history (#1650) rides the same cadence — independent
+      // best-effort sweep, separate per-peer catch so one can't sink the other.
+      syncCosHistoryWithAllPeers().catch((err) => {
+        console.error(`❌ sharing: cos-history sweep failed: ${err.message}`);
+      });
+      // Live CoS task list + claim metadata (#1712) — the second half of #1650.
+      // Same cadence; independent best-effort claim-aware merge so a peer's fresh
+      // claim gates spawns across machines. Separate catch keeps it isolated.
+      syncCosTasksWithAllPeers().catch((err) => {
+        console.error(`❌ sharing: cos-tasks sweep failed: ${err.message}`);
+      });
+      // Promoted Eidoverse foundations (#7455) — the pull/inherit half of the
+      // shared baseline. Same cadence; the receiver short-circuits on an
+      // unchanged content-addressed listHash, so the steady-state tick is one
+      // cheap fetch per full-sync peer. Separate catch keeps it isolated.
+      syncEidoverseFoundationsWithAllPeers().catch((err) => {
+        console.error(`❌ sharing: eidoverse-foundations sweep failed: ${err.message}`);
+      });
+    } catch (err) {
+      console.error(`❌ sharing: full-sync sweep threw synchronously: ${err.message}`);
+    }
+  };
+  mediaLibraryKickoff = setTimeout(() => {
+    mediaLibraryKickoff = null;
+    tick();
+    mediaLibraryTimer = setInterval(tick, MEDIA_LIBRARY_SWEEP_INTERVAL_MS);
+    if (typeof mediaLibraryTimer.unref === 'function') mediaLibraryTimer.unref();
+  }, MEDIA_LIBRARY_SWEEP_INITIAL_DELAY_MS);
+  if (typeof mediaLibraryKickoff.unref === 'function') mediaLibraryKickoff.unref();
+}
+
+function stopMediaLibrarySweep() {
+  if (mediaLibraryKickoff) { clearTimeout(mediaLibraryKickoff); mediaLibraryKickoff = null; }
+  if (mediaLibraryTimer) { clearInterval(mediaLibraryTimer); mediaLibraryTimer = null; }
+}
+
+export async function initSharing({ io: socketIo } = {}) {
+  if (initialized) return;
+  initialized = true;
+  io = socketIo || null;
+  // Boot sanity check: peerSync.js wires the subscription adapter at module
+  // load (this file imports it statically, so it's registered by the time we
+  // run). If a future refactor lazies that import, every auto-subscribe
+  // becomes a silent no-op — make that loud instead.
+  if (!hasSubscriptionAdapter()) {
+    console.error('❌ sharing: subscription adapter not registered — peer auto-subscribe is disabled (peerSync.js failed to load?)');
+  }
+  await ensureDir(join(PATHS.data, 'sharing'));
+  await ensureDir(join(PATHS.data, 'sharing', 'cursors'));
+  await ensureDir(join(PATHS.data, 'sharing', 'inbox'));
+
+  // A share refused because this install is behind reaches the bell even when
+  // no browser is open while the bucket fills.
+  installShareRefusalNotifier(sharingEvents);
+
+  // Wire socket events for the client UI.
+  if (io) {
+    sharingEvents.on('manifest-processed', (payload) => {
+      io.emit('sharing:manifest-processed', payload);
+      if (payload.outcome?.mode === 'inbox') {
+        io.emit('sharing:inbox-updated', { bucketId: payload.bucketId });
+      }
+    });
+    sharingEvents.on('inbox-updated', (payload) => {
+      io.emit('sharing:inbox-updated', payload);
+    });
+    sharingEvents.on('watcher-attached', (payload) => {
+      io.emit('sharing:watcher-attached', payload);
+    });
+    sharingEvents.on('watcher-detached', (payload) => {
+      io.emit('sharing:watcher-detached', payload);
+    });
+    sharingEvents.on('incompatible-manifest', (payload) => {
+      io.emit('sharing:incompatible-manifest', payload);
+    });
+    // PortOS storage-layout version is ahead of this instance — the user
+    // needs to update PortOS to import the manifest. Separate event from
+    // `incompatible-manifest` (which gates on the share-protocol schema, a
+    // different version axis) so the UI can render distinct messages for
+    // each case.
+    sharingEvents.on('portos-schema-ahead', (payload) => {
+      io.emit('sharing:portos-schema-ahead', payload);
+    });
+    // Peer-sync per-record subscription got blocked / unblocked by a schema-
+    // version mismatch. Lets the Instances UI swap in the SchemaGapBadge
+    // without polling.
+    peerSyncEvents.on('subscription-blocked', (payload) => {
+      io.emit('peerSync:subscription-blocked', payload);
+    });
+    peerSyncEvents.on('subscription-unblocked', (payload) => {
+      io.emit('peerSync:subscription-unblocked', payload);
+    });
+    // An incoming push auto-created a reverse subscription back to the
+    // sender. Let the Instances UI re-fetch that peer's subs so the new
+    // adopted-from-reverse row appears without a manual page reload.
+    peerSyncEvents.on('subscription-created', (payload) => {
+      io.emit('peerSync:subscription:created', payload);
+    });
+    sharingEvents.on('unshared', (payload) => {
+      io.emit('sharing:unshared', payload);
+    });
+    // Peer-driven annotation merges re-use the same `media:annotation:updated`
+    // socket event the local PATCH route emits, so open UI consumers handle
+    // both transports through the same listener.
+    sharingEvents.on('annotation-updated', (payload) => {
+      io.emit('media:annotation:updated', payload);
+    });
+    // Peer-sync asset arrivals → broadcast so the UI can swap the
+    // <MediaImage> "syncing" placeholder for the live bytes the moment
+    // the receiver's background pull lands them on disk.
+    peerSyncEvents.on('asset-arrived', (payload) => {
+      io.emit('peerSync:asset-arrived', payload);
+    });
+  }
+
+  installSubscriptionListener();
+  // Federated peer-sync listener — installs alongside the share-bucket
+  // subscription listener so a single recordEvents `updated` fan-out drives
+  // both transports. No state until at least one peer subscription exists.
+  installPeerSyncListener();
+  // #1566 — periodic standalone media-library mirror for full-sync peers.
+  startMediaLibrarySweep();
+  initAnnotationsSync();
+  const result = await attachAllWatchers();
+  console.log(`📡 sharing: initialized, watchers attached for ${result.attached} bucket(s)`);
+  return result;
+}
+
+export async function shutdownSharing() {
+  await shutdownAllWatchers();
+  stopMediaLibrarySweep();
+  sharingEvents.removeAllListeners();
+  // Detach the recordEvents + instanceEvents listeners that
+  // installPeerSyncListener attached. Without this, the peer-sync service
+  // listeners stay attached after shutdown and pollute any subsequent
+  // re-init or test teardown.
+  uninstallPeerSyncListener();
+  peerSyncEvents.removeAllListeners();
+  initialized = false;
+  io = null;
+}

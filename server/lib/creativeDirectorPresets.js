@@ -1,0 +1,132 @@
+/**
+ * Creative Director presets — locked-at-creation aspect ratio + quality
+ * settings that map onto the render-API params the LTX/mlx_video pipeline
+ * actually consumes.
+ *
+ * The contract: a project picks an aspectRatio + quality + modelId once;
+ * every scene render uses these. Tweaking is intentionally not allowed
+ * mid-project — segment-to-segment continuity needs identical resolution
+ * and frame budgets. Inert Video drafts can edit these before production.
+ */
+
+// Width/height pairs are 64-aligned (videoGen rounds down to multiples of
+// 64 anyway) and chosen for sensible LTX defaults.
+export const ASPECT_PRESETS = Object.freeze({
+  '16:9':     { width: 768, height: 432 },
+  '9:16':     { width: 432, height: 768 },
+  '1:1':      { width: 512, height: 512 },
+  '1:1-small': { width: 384, height: 384 }, // Legacy alias — pre-removal smoke-test fixture
+});
+
+/**
+ * Look up an aspectRatio's {width,height}, degrading gracefully when the ratio
+ * is unrecognized (best-effort callers — prompt views, first-pass seed frames —
+ * must not throw on a stale/unknown ratio the way the render path does).
+ *
+ * The `fallback` is caller-owned because the two consumers want different
+ * degraded shapes: prompt views want `{ width: 0, height: 0 }` (a printable
+ * literal), while first-pass gen wants `{}` so `width`/`height` come through
+ * `undefined` and the image worker applies its own default box instead. Pass
+ * `presetToRenderParams` (which throws on an unknown ratio) when a hard failure
+ * is the correct behavior. See #1938.
+ */
+export function resolveAspectDimensions(aspectRatio, fallback = { width: 0, height: 0 }) {
+  return ASPECT_PRESETS[aspectRatio] || fallback;
+}
+
+// `steps` and `guidance` are mlx_video knobs. `fps` is the render frame
+// rate. Higher quality = more denoising steps + slightly higher guidance,
+// trading wall-clock time for fidelity.
+export const QUALITY_PRESETS = Object.freeze({
+  draft:    { steps: 8,  guidance: 2.5, fps: 24 },
+  standard: { steps: 20, guidance: 3.0, fps: 24 },
+  high:     { steps: 30, guidance: 3.5, fps: 30 },
+});
+
+export const ASPECT_RATIOS = Object.freeze(['16:9', '9:16', '1:1']);
+export const QUALITIES = Object.freeze(['draft', 'standard', 'high']);
+
+// Project lifecycle states. Single source of truth for both validation
+// (Zod enum) and runtime guards in the service layer.
+export const PROJECT_STATUSES = Object.freeze([
+  'draft', 'planning', 'rendering', 'stitching', 'complete', 'paused', 'failed',
+]);
+
+// Project states that are FINISHED — a stop, a re-pin, or any other "act on
+// work still in flight" sweep must skip them (and must never rewrite a
+// `complete` project's status). Derived vocabulary over PROJECT_STATUSES.
+export const PROJECT_TERMINAL_STATUSES = Object.freeze(new Set(['complete', 'failed']));
+
+// Agent-run states that are SETTLED. Anything else is in flight — which is what
+// every re-dispatch guard, the boot-recovery reaper, and the stop path all key
+// on, so they must agree on the vocabulary rather than each open-coding it.
+export const RUN_TERMINAL_STATUSES = Object.freeze(new Set(['completed', 'failed']));
+
+// Per-scene lifecycle states. Used by the validation schemas + the
+// orchestrator's "next pending scene" logic.
+export const SCENE_STATUSES = Object.freeze([
+  'pending', 'rendering', 'evaluating', 'accepted', 'failed',
+]);
+
+// Production-plan step lifecycle states (CDO Phase 2, #2184). A plan step is
+// `pending` until its `dependsOn[]` are all terminal-success (done/skipped) and
+// the advance loop dispatches it; `running` while a synchronous tool executes or
+// a long-running job/run is in flight; `blocked` when an underlying run pauses
+// for human review (or the orchestrator gate rejects it — off/budget); `done`
+// on success; `failed` on an unrecoverable tool error; `skipped` when the plan
+// (re-planner) drops it. Mirrors SCENE_STATUSES' role for the legacy video flow.
+export const PLAN_STEP_STATUSES = Object.freeze([
+  'pending', 'running', 'blocked', 'done', 'failed', 'skipped',
+]);
+
+// Terminal-SUCCESS plan-step states — a step in one of these is finished and its
+// dependents are unblocked. `failed` is terminal but NOT success (a dependent
+// can never run), so it is deliberately excluded.
+export const PLAN_STEP_TERMINAL_SUCCESS = Object.freeze(new Set(['done', 'skipped']));
+
+// Bounded re-planning: after a plan step fails, the planner may revise the
+// remaining steps at most this many times before the project pauses with
+// residuals for human review (autopilot's convergence-pause contract).
+export const MAX_REPLAN_ROUNDS = 2;
+
+// Bounded re-dispatch of a COGNITIVE stage (plan / treatment) whose agent keeps
+// exiting cleanly without writing its deliverable (#4146). A non-tool-calling
+// local model narrates a done-message and PATCHes nothing; re-handing it the same
+// task is guaranteed to fail the same way, so after this many consecutive empty
+// completions the stage is surfaced to the user as a blocked/paused project
+// (naming the remedy: assign a tool-capable model) rather than re-dispatched.
+// 2 — one retry covers a genuine one-off (a truncated response, a transient
+// provider hiccup) without burning a third identical run on a model that has now
+// demonstrated twice that it cannot perform the PATCH.
+export const MAX_CONSECUTIVE_MISSED_DELIVERABLES = 2;
+
+/**
+ * Map a project's aspectRatio + quality + scene durationSeconds to the
+ * concrete render-API body.
+ *
+ * numFrames is rounded to a multiple of 8 because LTX latent compression
+ * is `1 + (frames - 1) / 8` — non-multiples silently break the
+ * conditioning shape check on i2v renders. Floor to 8 frames minimum so
+ * a 0.3s scene still produces something coherent.
+ */
+export function presetToRenderParams({ aspectRatio, quality, durationSeconds }) {
+  const aspect = ASPECT_PRESETS[aspectRatio];
+  if (!aspect) throw new Error(`Unknown aspectRatio '${aspectRatio}'`);
+  const q = QUALITY_PRESETS[quality];
+  if (!q) throw new Error(`Unknown quality '${quality}'`);
+  const requested = Math.max(0.1, Number(durationSeconds) || 1) * q.fps;
+  // Round to nearest multiple of 8, with an 8-frame floor.
+  const numFrames = Math.max(8, Math.round(requested / 8) * 8);
+  return {
+    width: aspect.width,
+    height: aspect.height,
+    fps: q.fps,
+    steps: q.steps,
+    guidanceScale: q.guidance,
+    numFrames,
+  };
+}
+
+// Shared by the Video draft form and wire defaults; saved policy is inert until
+// revision-specific dispatch support is available.
+export const VIDEO_REVIEW_CHECKPOINTS = Object.freeze(['script-shot-plan', 'references', 'rough-cut', 'final-cut']);

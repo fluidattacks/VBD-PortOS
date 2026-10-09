@@ -1,0 +1,448 @@
+import { request } from './apiCore.js';
+
+// Running Agents (Process Management)
+const getRunningAgents = (options) => request('/agents', options);
+const killRunningAgent = (pid) => request(`/agents/${pid}`, { method: 'DELETE' });
+// Legacy aliases
+export const getAgents = getRunningAgents;
+export const killAgent = killRunningAgent;
+
+// Agent Activity
+export const getAgentActivities = (limit = 50, agentIds = null, action = null) => {
+  const params = new URLSearchParams();
+  params.set('limit', limit);
+  if (agentIds) params.set('agentIds', agentIds.join(','));
+  if (action) params.set('action', action);
+  return request(`/agents/activity?${params}`);
+};
+export const getAgentActivityTimeline = (limit = 50, agentIds = null, before = null) => {
+  const params = new URLSearchParams();
+  params.set('limit', limit);
+  if (agentIds) params.set('agentIds', agentIds.join(','));
+  if (before) params.set('before', before);
+  return request(`/agents/activity/timeline?${params}`);
+};
+export const getAgentActivityStats = (agentId, days = 7) =>
+  request(`/agents/activity/agent/${agentId}/stats?days=${days}`);
+
+// CoS run event ledger (#4540) — diagnostics over the append-only lifecycle
+// stream. All reads except `repairRunRecords`, which is the one write: it closes
+// the run records the ledger proves are finished, and it is a POST because
+// rewriting a run record is a mutation a user has to ask for.
+const runEventQuery = (filters = {}) => {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters)) {
+    if (value !== undefined && value !== null && value !== '') params.set(key, value);
+  }
+  const query = params.toString();
+  return query ? `?${query}` : '';
+};
+export const getRunEventStats = (options = {}) =>
+  request('/agents/activity/run-events/stats', options);
+export const getRunEventProjections = (filters = {}, options = {}) =>
+  request(`/agents/activity/run-events/projections${runEventQuery(filters)}`, options);
+export const getRunEventDiagnostic = (id, options = {}) =>
+  request(`/agents/activity/run-events/run/${encodeURIComponent(id)}`, options);
+export const getRunReconciliation = (filters = {}, options = {}) =>
+  request(`/agents/activity/run-events/reconcile${runEventQuery(filters)}`, options);
+export const repairRunRecords = (body = {}, options = {}) =>
+  request('/agents/activity/run-events/reconcile', { method: 'POST', body: JSON.stringify(body), ...options });
+
+// Persistent CoS mind — the cursor read is both the initial bounded snapshot
+// and the reconnect backfill path. Writes carry caller-minted ids so retrying a
+// timed-out request cannot duplicate a message or annotation.
+export const getPersistentMind = (filters = {}, options = {}) =>
+  request(`/cos/mind${runEventQuery(filters)}`, options);
+export const cancelPersistentMindThinkingRequest = (options = {}) =>
+  request('/cos/mind/thinking-request', { method: 'DELETE', ...options });
+export const getPersistentMindMaintainer = (options = {}) => request('/cos/mind/maintainer', options);
+export const getPersistentMindContext = (options = {}) => request('/cos/mind/context', options);
+export const getPersistentMindTools = (options = {}) => request('/cos/mind/tools', options);
+export const getPersistentMindJournal = ({ kind, status, ...options } = {}) => {
+  const params = new URLSearchParams();
+  if (kind) params.set('kind', kind);
+  if (status) params.set('status', status);
+  const query = params.toString();
+  return request(`/cos/mind/journal${query ? `?${query}` : ''}`, options);
+};
+// Retire or settle one entry. The server never deletes it: both verbs are
+// status transitions that keep the statement readable as history.
+export const correctPersistentMindJournalEvent = (journalEventId, body, options = {}) =>
+  request(`/cos/mind/journal/${encodeURIComponent(journalEventId)}/correct`, {
+    method: 'POST', body: JSON.stringify(body), ...options,
+  });
+export const getMindRecipes = (options = {}) => request('/cos/mind/recipes', options);
+export const getMindRecipe = (id, options = {}) => request(`/cos/mind/recipes/${encodeURIComponent(id)}`, options);
+export const createMindRecipe = (definition, options = {}) => request('/cos/mind/recipes', {
+  method: 'POST', body: JSON.stringify({ definition }), ...options,
+});
+export const updateMindRecipe = (id, body, options = {}) => request(`/cos/mind/recipes/${encodeURIComponent(id)}`, {
+  method: 'PUT', body: JSON.stringify(body), ...options,
+});
+export const validateMindRecipe = (definition, options = {}) => request('/cos/mind/recipes/validate', {
+  method: 'POST', body: JSON.stringify({ definition }), ...options,
+});
+export const archiveMindRecipe = (id, expectedRevision, options = {}) => request(`/cos/mind/recipes/${encodeURIComponent(id)}/archive`, {
+  method: 'POST', body: JSON.stringify({ expectedRevision }), ...options,
+});
+export const restoreMindRecipe = (id, body, options = {}) => request(`/cos/mind/recipes/${encodeURIComponent(id)}/restore`, {
+  method: 'POST', body: JSON.stringify(body), ...options,
+});
+export const getCosToolCatalog = ({ scope = 'all', format = 'portos', intent, ...options } = {}) => {
+  const params = new URLSearchParams({ scope, format });
+  if (intent) params.set('intent', intent);
+  return request(`/cos/tools?${params}`, options);
+};
+export const getPersistentMindRuntime = (options = {}) => request('/cos/mind/runtime', options);
+export const getPersistentMindVisibility = (options = {}) => {
+  const { refresh, ...requestOptions } = options;
+  return request(`/cos/mind/visibility${refresh ? '?refresh=true' : ''}`, requestOptions);
+};
+export const sendPersistentMindMessage = (body, options = {}) =>
+  request('/cos/mind/messages', { method: 'POST', body: JSON.stringify(body), ...options });
+export const uploadPersistentMindAttachment = (body, options = {}) =>
+  request('/cos/mind/attachments', { method: 'POST', body: JSON.stringify(body), ...options });
+export const deletePersistentMindAttachment = (attachmentId, options = {}) =>
+  request(`/cos/mind/attachments/${encodeURIComponent(attachmentId)}`, { method: 'DELETE', ...options });
+export const addPersistentMindAnnotation = (body, options = {}) =>
+  request('/cos/mind/annotations', { method: 'POST', body: JSON.stringify(body), ...options });
+export const wakePersistentMind = (options = {}) => request('/cos/mind/wake', { method: 'POST', ...options });
+export const startPersistentMind = (options = {}) => request('/cos/mind/start', { method: 'POST', ...options });
+export const pausePersistentMind = (reason, options = {}) => request('/cos/mind/pause', {
+  method: 'POST', body: JSON.stringify({ reason }), ...options,
+});
+export const resumePersistentMind = (options = {}) => request('/cos/mind/resume', { method: 'POST', ...options });
+export const stopPersistentMind = (options = {}) => request('/cos/mind/stop', { method: 'POST', ...options });
+export const acknowledgePersistentMindEvent = (eventId, id, options = {}) =>
+  request(`/cos/mind/events/${encodeURIComponent(eventId)}/acknowledge`, {
+    method: 'POST', body: JSON.stringify({ id }), ...options,
+  });
+export const promotePersistentMindEvent = (eventId, body, options = {}) =>
+  request(`/cos/mind/events/${encodeURIComponent(eventId)}/promote`, {
+    method: 'POST', body: JSON.stringify(body), ...options,
+  });
+export const createPersistentMindMemory = (body, options = {}) => request('/cos/mind/memories', {
+  method: 'POST', body: JSON.stringify(body), ...options,
+});
+export const updatePersistentMindMemory = (memoryId, body, options = {}) => request(`/cos/mind/memories/${encodeURIComponent(memoryId)}`, {
+  method: 'PUT', body: JSON.stringify(body), ...options,
+});
+export const cleanupPersistentMind = (body, options = {}) => request('/cos/mind/cleanup', {
+  method: 'POST', body: JSON.stringify(body), ...options,
+});
+// Seal the Mind into a portable bundle (#7621). The response is the sealed file
+// itself, not JSON — `responseType: 'text'` hands the caller the bytes to save.
+// `silent` because the panel renders its own inline refusal: the server's
+// "could not read <scope>" reason is the whole point of the failure.
+export const exportPersistentMindBundle = (body, options = {}) => request('/cos/mind/bundle/export', {
+  method: 'POST', body: JSON.stringify(body), responseType: 'text', silent: true, ...options,
+});
+
+// Open a bundle and see what it carries (#7622). Read-only on the server: this
+// never writes, so the panel can call it as soon as a file and passphrase exist.
+// `silent` because the refusal reason IS the result the user needs to read.
+export const previewPersistentMindBundle = (body, options = {}) => request('/cos/mind/bundle/preview', {
+  method: 'POST', body: JSON.stringify(body), silent: true, ...options,
+});
+// Apply a bundle under the user's per-group choices (#7622) — the single write.
+export const applyPersistentMindBundle = (body, options = {}) => request('/cos/mind/bundle/apply', {
+  method: 'POST', body: JSON.stringify(body), silent: true, ...options,
+});
+
+// Chief of Staff
+export const getCosStatus = () => request('/cos');
+export const startCos = (options = {}) => request('/cos/start', { method: 'POST', ...options });
+export const stopCos = (options = {}) => request('/cos/stop', { method: 'POST', ...options });
+export const pauseCos = (reason, options = {}) => request('/cos/pause', {
+  method: 'POST',
+  body: JSON.stringify({ reason }),
+  ...options,
+});
+export const resumeCos = (options = {}) => request('/cos/resume', { method: 'POST', ...options });
+export const getCosConfig = (options) => request('/cos/config', options);
+export const updateCosConfig = (config, options = {}) => request('/cos/config', {
+  method: 'PUT',
+  body: JSON.stringify(config),
+  ...options
+});
+// Today's per-domain autonomy usage (#711) for the Domain Budgets panel.
+export const getCosBudgetUsage = (options = {}) => request('/cos/budget-usage', options);
+export const getCosTasks = ({ view, source, cursor, limit, selected, ...options } = {}) => request(`/cos/tasks${runEventQuery({ view, source, cursor, limit, selected })}`, options);
+export const addCosTask = (task, options = {}) => request('/cos/tasks', {
+  method: 'POST',
+  body: JSON.stringify(task),
+  ...options
+});
+// Queue a `/do:*` agent task for an app. `settings` carries the run options the
+// Agent Operations drawer collects — provider/model/effort/simplify for every
+// command, plus the `/do:next`-only target work item, issue author filter,
+// reviewer list, and optional override context. Omit it for a bare "run with
+// the app's configured defaults".
+export const createSlashdoTask = (command, app, settings = {}, options = {}) => request('/cos/tasks/slashdo', {
+  method: 'POST',
+  body: JSON.stringify({ command, app, ...settings }),
+  ...options
+});
+// Queue a CoS task to implement one specific JIRA ticket (sprint-board play button).
+export const createJiraTicketTask = (app, ticketKey, options = {}) => request('/cos/tasks/jira-ticket', {
+  method: 'POST',
+  body: JSON.stringify({ app, ticketKey }),
+  ...options
+});
+export const enhanceCosTaskPrompt = (data) => request('/cos/tasks/enhance', {
+  method: 'POST',
+  body: JSON.stringify(data)
+});
+export const updateCosTask = (id, updates, options = {}) => request(`/cos/tasks/${id}`, {
+  method: 'PUT',
+  body: JSON.stringify(updates),
+  ...options
+});
+export const deleteCosTask = (id, taskType = 'user', options = {}) => request(`/cos/tasks/${id}?type=${taskType}`, { method: 'DELETE', ...options });
+export const reorderCosTasks = (taskIds, options = {}) => request('/cos/tasks/reorder', {
+  method: 'POST',
+  body: JSON.stringify({ taskIds }),
+  ...options
+});
+export const approveCosTask = (id, options = {}) => request(`/cos/tasks/${id}/approve`, { method: 'POST', ...options });
+// Resolve a parked challenge (#2441, #2471). `body` carries the manual verdict
+// (`{ outcome: 'upheld' | 'escalated', note?, resolvedBy? }`) — `upheld` overturns
+// the rejection (task → pending), `escalated` surfaces it for arbitration (→ blocked).
+export const resolveCosTaskChallenge = (id, body, options = {}) => request(`/cos/tasks/${id}/challenge/resolve`, {
+  method: 'POST',
+  body: JSON.stringify(body),
+  ...options
+});
+export const forceCosEvaluate = (options = {}) => request('/cos/evaluate', { method: 'POST', ...options });
+export const forceSpawnTask = (taskId, options = {}) => request(`/cos/tasks/${taskId}/spawn`, { method: 'POST', ...options });
+export const getOrchestrationProfiles = (options) => request('/settings/orchestration-profiles', options);
+export const saveOrchestrationProfile = (profile, options = {}) => request('/settings/orchestration-profiles', {
+  method: 'POST',
+  body: JSON.stringify(profile),
+  ...options,
+});
+export const updateOrchestrationProfile = (id, updates, options = {}) => request(`/settings/orchestration-profiles/${encodeURIComponent(id)}`, {
+  method: 'PUT',
+  body: JSON.stringify(updates),
+  ...options,
+});
+export const deleteOrchestrationProfile = (id, options = {}) => request(`/settings/orchestration-profiles/${encodeURIComponent(id)}`, {
+  method: 'DELETE',
+  ...options,
+});
+export const getCosHealth = (options = {}) => request('/cos/health', options);
+export const forceHealthCheck = (options = {}) => request('/cos/health/check', { method: 'POST', ...options });
+export const getCosAgents = ({ active = false, ...options } = {}) => request(`/cos/agents${active ? '?active=1' : ''}`, options);
+export const getCosCompletedAgents = ({ cursor, limit = 25, feedback = false, ...options } = {}) =>
+  request(`/cos/agents/${feedback ? 'feedback/pending' : 'completed'}${runEventQuery({ limit, cursor })}`, options);
+export const getCosPendingAgentFeedback = ({ countOnly, ...options } = {}) => request(`/cos/agents/feedback/pending${countOnly ? '?countOnly=1' : ''}`, options);
+// `lines` caps the transcript TAIL the server hydrates (server default: 1000
+// lines / 512 KB). Pass it when the record is wanted for its metadata rather
+// than its log.
+export const getCosAgent = (id, { lines, ...options } = {}) =>
+  request(`/cos/agents/${id}${lines ? `?lines=${lines}` : ''}`, options);
+
+// Agent LIST responses bound `metadata.taskDescription` (see
+// `server/lib/cosAgentListProjection.js`), which is fine for a clamped card but
+// NOT for anything that reuses the text — Resume and Relaunch build a new task
+// prompt out of it, so a clipped copy would silently ship a truncated task.
+// Callers in those paths hydrate first; the record comes back unchanged when it
+// was never clipped (the common case) or when the read fails, so this is safe to
+// call unconditionally and never blocks the action on a network blip.
+export const hydrateCosAgentDescription = async (agent) => {
+  if (!agent?.id || !agent.metadata?.taskDescriptionTruncated) return agent;
+  // `lines: 1` because this read wants ONE metadata field: the default hydrates a
+  // 1000-line / 512 KB transcript tail, which would cost far more than the
+  // description it came for. The card's Show-output path asks for the real tail
+  // separately, when the reader opens it.
+  const full = await getCosAgent(agent.id, { lines: 1, silent: true }).catch(() => null);
+  const taskDescription = full?.metadata?.taskDescription;
+  if (typeof taskDescription !== 'string') return agent;
+  return {
+    ...agent,
+    metadata: { ...agent.metadata, taskDescription, taskDescriptionTruncated: false }
+  };
+};
+export const pauseCosAgent = (id, reason, options = {}) => request(`/cos/agents/${id}/pause`, {
+  method: 'POST',
+  body: JSON.stringify({ reason }),
+  ...options
+});
+// Resume a PAUSED agent: the server requeues that agent's own task on the branch
+// and worktree its run left behind. `overrides` are the resume dialog's edits
+// (extra context, provider/model/effort/app) — omit a field to keep the paused
+// run's value.
+export const resumeCosAgent = (id, overrides = {}, options = {}) => request(`/cos/agents/${id}/resume`, {
+  method: 'POST',
+  body: JSON.stringify(overrides),
+  ...options
+});
+// Relaunch a RUNNING agent: the server pauses it (process stopped, worktree kept)
+// and requeues its own task with the overrides. Omit a field to keep the stalled
+// run's value. Returns the same mode enum as resumeCosAgent.
+export const relaunchCosAgent = (id, overrides = {}, options = {}) => request(`/cos/agents/${id}/relaunch`, {
+  method: 'POST',
+  body: JSON.stringify(overrides),
+  ...options
+});
+export const killCosAgent = (id, options = {}) => request(`/cos/agents/${id}/kill`, { method: 'POST', ...options });
+export const getCosAgentStats = (id, options) => request(`/cos/agents/${id}/stats`, options);
+export const getCosAgentPrompt = (id, options = {}) => request(`/cos/agents/${id}/prompt`, options);
+export const deleteCosAgent = (id, options = {}) => request(`/cos/agents/${id}`, { method: 'DELETE', ...options });
+export const clearCompletedCosAgents = (options = {}) => request('/cos/agents/completed', { method: 'DELETE', ...options });
+export const submitCosAgentFeedback = (id, feedback, options = {}) => request(`/cos/agents/${id}/feedback`, {
+  method: 'POST',
+  body: JSON.stringify(feedback),
+  ...options
+});
+export const sendCosAgentBtw = (id, message, options = {}) => request(`/cos/agents/${id}/btw`, {
+  method: 'POST',
+  body: JSON.stringify({ message }),
+  ...options
+});
+export const getCosFeedbackStats = (options = {}) => request('/cos/feedback/stats', options);
+
+// CoS Briefings
+export const getCosBriefings = () => request('/cos/briefings');
+export const getCosLatestBriefing = () => request('/cos/briefings/latest');
+export const getCosBriefing = (date) => request(`/cos/briefings/${date}`);
+
+// CoS Activity
+export const getCosTodayActivity = () => request('/cos/activity/today');
+// "While you were away" — agent runs since the client's last-visit marker.
+// `since` is an ISO-8601 string; omit it to let the server fall back to 24h.
+export const getCosWhileAwayActivity = (since, options) =>
+  request(`/cos/activity/while-away${since ? `?since=${encodeURIComponent(since)}` : ''}`, options);
+
+// CoS Learning
+export const getCosLearning = () => request('/cos/learning');
+export const getCosLearningDurations = () => request('/cos/learning/durations');
+export const getCosLearningSkipped = () => request('/cos/learning/skipped');
+export const getCosLearningPerformance = () => request('/cos/learning/performance');
+export const getCosLearningRouting = () => request('/cos/learning/routing');
+export const getCosLearningSummary = (options) => request('/cos/learning/summary', options);
+export const getCosLearningConfidence = () => request('/cos/learning/confidence');
+export const backfillCosLearning = () => request('/cos/learning/backfill', { method: 'POST' });
+export const resetCosTaskTypeLearning = (taskType) => request(`/cos/learning/reset/${encodeURIComponent(taskType)}`, { method: 'POST' });
+export const getDismissedCosRecommendations = () => request('/cos/learning/recommendations/dismissed');
+export const dismissCosRecommendation = (id, snapshot) => request('/cos/learning/recommendations/dismiss', {
+  method: 'POST',
+  body: JSON.stringify({ id, snapshot })
+});
+export const restoreCosRecommendation = (id) => request('/cos/learning/recommendations/restore', {
+  method: 'POST',
+  body: JSON.stringify({ id })
+});
+export const clearDismissedCosRecommendations = () => request('/cos/learning/recommendations/clear-dismissed', { method: 'POST' });
+export const getCosPopularTemplates = (limit = 5) => request(`/cos/templates/popular?limit=${limit}`);
+export const createCosTaskTemplate = (data, options = {}) => request('/cos/templates', {
+  method: 'POST',
+  body: JSON.stringify(data),
+  ...options
+});
+export const applyCosTaskTemplate = (id, options = {}) => request(`/cos/templates/${id}/use`, {
+  method: 'POST',
+  ...options
+});
+export const deleteCosTaskTemplate = (id, options = {}) => request(`/cos/templates/${id}`, { method: 'DELETE', ...options });
+
+// Weekly Digest
+export const getCosWeeklyDigest = (weekId = null) => {
+  if (weekId) return request(`/cos/digest/${weekId}`);
+  return request('/cos/digest');
+};
+export const listCosWeeklyDigests = () => request('/cos/digest/list');
+export const getCosWeekProgress = () => request('/cos/digest/progress');
+export const generateCosDigest = (weekId = null) => request('/cos/digest/generate', {
+  method: 'POST',
+  body: JSON.stringify({ weekId })
+});
+
+// Activity
+export const getCosActivityCalendar = (weeks = 12, options) => request(`/cos/activity-calendar?weeks=${weeks}`, options);
+export const getCosQuickSummary = (options) => request('/cos/quick-summary', options);
+export const getCosRecentTasks = (limit = 10, options) => request(`/cos/recent-tasks?limit=${limit}`, options);
+export const getCosActionableInsights = ({ cachedHealth = false, ...options } = {}) => request(`/cos/actionable-insights${cachedHealth ? '?cachedHealth=1' : ''}`, options);
+export const getCosGoalProgressSummary = (options) => request('/cos/goal-progress/summary', options);
+
+// Auto-Fix Telemetry (issue #2328) — aggregated from persisted metadata.diagnostics
+export const getAutoFixMetrics = (options) => request('/autofix/metrics', options);
+export const getCosDecisionSummary = (options) => request('/cos/decisions/summary', options);
+
+// Task Schedule (Configurable Intervals)
+export const getCosUpcomingTasks = (limit = 10, options) => request(`/cos/upcoming?limit=${limit}`, options);
+export const getCosSchedule = (options) => request('/cos/schedule', options);
+// Unified task interval update
+export const updateCosTaskInterval = (taskType, settings, options = {}) => request(`/cos/schedule/task/${taskType}`, {
+  method: 'PUT',
+  body: JSON.stringify(settings),
+  ...options
+});
+
+// Manual maintenance runs — the Schedule tab's "Run maintenance now" (server:
+// services/maintenanceRun.js).
+export const getMaintenanceRuns = (options) => request('/cos/schedule/maintenance-runs', options);
+export const startMaintenanceRun = ({ appId, providerId, model, effort = null, mode = 'file-issues', prCompletion, claimBetweenAudits = true, claimHandler, taskTypes, explicitCheck, auditDepth }, options = {}) => request('/cos/schedule/maintenance-runs', {
+  method: 'POST',
+  body: JSON.stringify({ appId, providerId, model, effort, mode, prCompletion, claimBetweenAudits, claimHandler, taskTypes, explicitCheck, auditDepth }),
+  ...options
+});
+export const stopMaintenanceRun = (id, options = {}) => request(`/cos/schedule/maintenance-runs/${id}/stop`, { method: 'POST', ...options });
+
+export const triggerCosOnDemandTask = (taskType, appId = null, options = {}) => request('/cos/schedule/trigger', {
+  method: 'POST',
+  body: JSON.stringify({ taskType, appId }),
+  ...options
+});
+
+// Autonomous Jobs
+export const getCosJobs = (options = {}) => request('/cos/jobs', options);
+export const getCosJob = (id, options = {}) => request(`/cos/jobs/${id}`, options);
+export const createCosJob = (data, options = {}) => request('/cos/jobs', {
+  method: 'POST',
+  body: JSON.stringify(data),
+  ...options
+});
+export const updateCosJob = (id, data, options = {}) => request(`/cos/jobs/${id}`, {
+  method: 'PUT',
+  body: JSON.stringify(data),
+  ...options
+});
+export const toggleCosJob = (id, options = {}) => request(`/cos/jobs/${id}/toggle`, { method: 'POST', ...options });
+// `formValues` re-aims this ONE run (the server merges them over the job's
+// stored values and writes nothing back); omit it to run the job as saved.
+export const triggerCosJob = (id, { formValues = null, ...options } = {}) => request(`/cos/jobs/${id}/trigger`, {
+  method: 'POST',
+  ...(formValues ? { body: JSON.stringify({ formValues }) } : {}),
+  ...options
+});
+export const deleteCosJob = (id, options = {}) => request(`/cos/jobs/${id}`, { method: 'DELETE', ...options });
+
+// Workflow visualizer — canonical scheduled-task ordering across tasks + jobs
+export const getCosWorkflow = (hours = 168) => request(`/cos/workflow?hours=${hours}`);
+
+// Feature Agents
+export const getFeatureAgents = () => request('/feature-agents');
+export const getFeatureAgent = (id) => request(`/feature-agents/${id}`);
+export const createFeatureAgent = (data, options = {}) => request('/feature-agents', {
+  method: 'POST',
+  body: JSON.stringify(data),
+  ...options
+});
+export const updateFeatureAgent = (id, data, options = {}) => request(`/feature-agents/${id}`, {
+  method: 'PUT',
+  body: JSON.stringify(data),
+  ...options
+});
+export const deleteFeatureAgent = (id, options = {}) => request(`/feature-agents/${id}`, { method: 'DELETE', ...options });
+export const startFeatureAgent = (id, options = {}) => request(`/feature-agents/${id}/start`, { method: 'POST', ...options });
+export const pauseFeatureAgent = (id, options = {}) => request(`/feature-agents/${id}/pause`, { method: 'POST', ...options });
+export const resumeFeatureAgent = (id, options = {}) => request(`/feature-agents/${id}/resume`, { method: 'POST', ...options });
+export const triggerFeatureAgent = (id, options = {}) => request(`/feature-agents/${id}/trigger`, { method: 'POST', ...options });
+export const stopFeatureAgent = (id, options = {}) => request(`/feature-agents/${id}/stop`, { method: 'POST', ...options });
+export const getFeatureAgentRuns = (id, limit) => request(`/feature-agents/${id}/runs${limit ? `?limit=${limit}` : ''}`);
+export const getFeatureAgentOutput = (id) => request(`/feature-agents/${id}/output`);
+
+export const setMaintenanceRunArchived = (id, appId, archived, options = {}) => request(`/cos/schedule/maintenance-runs/${id}/archive`, {
+  method: 'PATCH', body: JSON.stringify({ appId, archived }), ...options
+});

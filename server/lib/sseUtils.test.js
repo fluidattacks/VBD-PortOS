@@ -1,0 +1,545 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import {
+  PYTHON_NOISE_RE,
+  SSE_CLEANUP_DELAY_MS,
+  broadcastSse,
+  attachSseClient,
+  closeJobAfterDelay,
+  createJobFailureFinalizer,
+  dispatchTerminalEvent,
+  createSseRunner
+} from './sseUtils.js';
+
+const makeRes = () => {
+  const writes = [];
+  const closeListeners = [];
+  return {
+    writes,
+    closeListeners,
+    writeHead: vi.fn(),
+    write: vi.fn((msg) => writes.push(msg)),
+    end: vi.fn(),
+    req: {
+      on: vi.fn((event, fn) => {
+        if (event === 'close') closeListeners.push(fn);
+      })
+    }
+  };
+};
+
+describe('PYTHON_NOISE_RE', () => {
+  it('matches noisy framework warnings', () => {
+    expect(PYTHON_NOISE_RE.test('xformers warning')).toBe(true);
+    expect(PYTHON_NOISE_RE.test('UserWarning: deprecated')).toBe(true);
+    expect(PYTHON_NOISE_RE.test('FutureWarning')).toBe(true);
+    expect(PYTHON_NOISE_RE.test('DeprecationWarning')).toBe(true);
+    expect(PYTHON_NOISE_RE.test('Set XFORMERS=1')).toBe(true);
+    expect(PYTHON_NOISE_RE.test('NOTE: Redirects to ...')).toBe(true);
+  });
+
+  it('does not match real progress messages', () => {
+    expect(PYTHON_NOISE_RE.test('Step 5/30')).toBe(false);
+    expect(PYTHON_NOISE_RE.test('Generated image')).toBe(false);
+    expect(PYTHON_NOISE_RE.test('100% complete')).toBe(false);
+  });
+});
+
+describe('broadcastSse', () => {
+  it('writes data: JSON\\n\\n format to all clients and caches lastPayload', () => {
+    const c1 = makeRes();
+    const c2 = makeRes();
+    const job = { clients: [c1, c2] };
+    const payload = { progress: 0.5, step: 5 };
+    broadcastSse(job, payload);
+
+    const expected = `data: ${JSON.stringify(payload)}\n\n`;
+    expect(c1.write).toHaveBeenCalledWith(expected);
+    expect(c2.write).toHaveBeenCalledWith(expected);
+    expect(job.lastPayload).toEqual(payload);
+  });
+
+  it('handles empty client list without error', () => {
+    const job = { clients: [] };
+    broadcastSse(job, { ok: true });
+    expect(job.lastPayload).toEqual({ ok: true });
+  });
+
+  // Regression (#8915 review follow-up): a single dead client's res.write
+  // throwing used to abort the `for` loop outright, so every LATER client in
+  // job.clients never received the frame at all — not just the throwing one.
+  it('isolates one client throwing on write so later clients still receive the frame', () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const dead = { write: vi.fn(() => { throw new Error('write after end'); }) };
+    const alive = makeRes();
+    const job = { clients: [dead, alive] };
+    const payload = { type: 'complete' };
+
+    expect(() => broadcastSse(job, payload)).not.toThrow();
+
+    expect(alive.write).toHaveBeenCalledWith(`data: ${JSON.stringify(payload)}\n\n`);
+    expect(errSpy).toHaveBeenCalledWith(expect.stringContaining('SSE client write failed'));
+    errSpy.mockRestore();
+  });
+});
+
+describe('attachSseClient', () => {
+  it('returns false when jobId not found', () => {
+    const jobs = new Map();
+    const res = makeRes();
+    expect(attachSseClient(jobs, 'missing', res)).toBe(false);
+    expect(res.writeHead).not.toHaveBeenCalled();
+  });
+
+  it('writes SSE headers and pushes res into job clients', () => {
+    const jobs = new Map();
+    const job = { clients: [] };
+    jobs.set('j1', job);
+    const res = makeRes();
+
+    expect(attachSseClient(jobs, 'j1', res)).toBe(true);
+    expect(res.writeHead).toHaveBeenCalledWith(200, expect.objectContaining({
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive'
+    }));
+    expect(job.clients).toContain(res);
+  });
+
+  it('replays lastPayload to a late-joining client', () => {
+    const jobs = new Map();
+    const lastPayload = { state: 'complete' };
+    jobs.set('j1', { clients: [], lastPayload });
+    const res = makeRes();
+
+    attachSseClient(jobs, 'j1', res);
+
+    expect(res.write).toHaveBeenCalledWith(`data: ${JSON.stringify(lastPayload)}\n\n`);
+  });
+
+  it('skips replay when no lastPayload exists', () => {
+    const jobs = new Map();
+    jobs.set('j1', { clients: [] });
+    const res = makeRes();
+
+    attachSseClient(jobs, 'j1', res);
+    expect(res.write).not.toHaveBeenCalled();
+  });
+
+  it('removes client from job.clients on req close', () => {
+    const jobs = new Map();
+    const job = { clients: [] };
+    jobs.set('j1', job);
+    const res = makeRes();
+
+    attachSseClient(jobs, 'j1', res);
+    expect(job.clients).toHaveLength(1);
+
+    for (const fn of res.closeListeners) fn();
+    expect(job.clients).toHaveLength(0);
+  });
+});
+
+describe('closeJobAfterDelay', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('ends each client and deletes job after delay', () => {
+    const jobs = new Map();
+    const c1 = makeRes();
+    const c2 = makeRes();
+    jobs.set('j1', { clients: [c1, c2] });
+
+    closeJobAfterDelay(jobs, 'j1', 100);
+    expect(jobs.has('j1')).toBe(true);
+
+    vi.advanceTimersByTime(100);
+    expect(c1.end).toHaveBeenCalled();
+    expect(c2.end).toHaveBeenCalled();
+    expect(jobs.has('j1')).toBe(false);
+  });
+
+  it('uses the default SSE_CLEANUP_DELAY_MS when no delay is specified', () => {
+    const jobs = new Map();
+    jobs.set('j1', { clients: [] });
+
+    closeJobAfterDelay(jobs, 'j1');
+    vi.advanceTimersByTime(SSE_CLEANUP_DELAY_MS - 1);
+    expect(jobs.has('j1')).toBe(true);
+    vi.advanceTimersByTime(1);
+    expect(jobs.has('j1')).toBe(false);
+  });
+
+  it('no-ops gracefully when job already removed', () => {
+    const jobs = new Map();
+    closeJobAfterDelay(jobs, 'missing', 10);
+    expect(() => vi.advanceTimersByTime(10)).not.toThrow();
+  });
+
+  it('leaves a replacement job untouched when expectedJob no longer holds the key', () => {
+    const jobs = new Map();
+    const stale = { clients: [makeRes()] };
+    const fresh = { clients: [makeRes()] };
+    jobs.set('j1', stale);
+
+    // Schedule cleanup for `stale`, then a new run replaces it under the same key.
+    closeJobAfterDelay(jobs, 'j1', 100, stale);
+    jobs.set('j1', fresh);
+
+    vi.advanceTimersByTime(100);
+    // The stale run's lingering client is drained, but the live entry survives.
+    expect(stale.clients[0].end).toHaveBeenCalled();
+    expect(fresh.clients[0].end).not.toHaveBeenCalled();
+    expect(jobs.get('j1')).toBe(fresh);
+  });
+
+  it('deletes the job when expectedJob still holds the key', () => {
+    const jobs = new Map();
+    const job = { clients: [makeRes()] };
+    jobs.set('j1', job);
+
+    closeJobAfterDelay(jobs, 'j1', 100, job);
+    vi.advanceTimersByTime(100);
+    expect(job.clients[0].end).toHaveBeenCalled();
+    expect(jobs.has('j1')).toBe(false);
+  });
+});
+
+describe('dispatchTerminalEvent', () => {
+  // Regression (#8915): the terminal dispatch used to be a bare
+  // `sseSend(); emitEvent();` pair — a throw from sseSend (e.g. a dead
+  // client's res.write) skipped emitEvent entirely, silently dropping the
+  // durable side effects (gallery index, peer sync, job-queue settlement)
+  // the lifecycle event drives, even though the SSE write failure was purely
+  // best-effort and unrelated to whether the job actually settled.
+  it('still calls emitEvent when sseSend throws', () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const sseSend = vi.fn(() => { throw new Error('dead client'); });
+    const emitEvent = vi.fn();
+
+    dispatchTerminalEvent('job-123', sseSend, emitEvent);
+
+    expect(sseSend).toHaveBeenCalled();
+    expect(emitEvent).toHaveBeenCalled();
+    expect(errSpy).toHaveBeenCalledWith(expect.stringContaining('SSE terminal broadcast failed [job-123]'));
+    errSpy.mockRestore();
+  });
+
+  it('still calls sseSend, and does not re-throw, when emitEvent throws', () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const sseSend = vi.fn();
+    const emitEvent = vi.fn(() => { throw new Error('listener exploded'); });
+
+    expect(() => dispatchTerminalEvent('job-123', sseSend, emitEvent)).not.toThrow();
+
+    expect(sseSend).toHaveBeenCalled();
+    expect(emitEvent).toHaveBeenCalled();
+    expect(errSpy).toHaveBeenCalledWith(expect.stringContaining('Lifecycle event dispatch failed [job-123]'));
+    errSpy.mockRestore();
+  });
+
+  it('calls both dispatches once each on the normal (non-throwing) path', () => {
+    const sseSend = vi.fn();
+    const emitEvent = vi.fn();
+
+    dispatchTerminalEvent('job-123', sseSend, emitEvent);
+
+    expect(sseSend).toHaveBeenCalledTimes(1);
+    expect(emitEvent).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('createJobFailureFinalizer', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  const setup = (overrides = {}) => {
+    const jobs = new Map();
+    const activeJobs = new Map();
+    const activeSlots = new Map();
+    const events = { emit: vi.fn() };
+    const finalize = createJobFailureFinalizer({
+      jobs, activeJobs, activeSlots, events, label: 'test backend', ...overrides,
+    });
+    return { jobs, activeJobs, activeSlots, events, finalize };
+  };
+
+  it('stamps error, clears the owned slot, emits failed (default payload), and schedules cleanup', () => {
+    const { jobs, activeJobs, activeSlots, events, finalize } = setup();
+    const proc = { pid: 1 };
+    const client = makeRes();
+    const job = { clients: [client], status: 'running' };
+    jobs.set('j1', job);
+    activeJobs.set('j1', { id: 'j1' });
+    activeSlots.set('j1', proc);
+
+    finalize(job, 'j1', proc, 'boom');
+
+    expect(job.status).toBe('error');
+    expect(activeSlots.has('j1')).toBe(false);
+    expect(activeJobs.has('j1')).toBe(false);
+    expect(events.emit).toHaveBeenCalledWith('failed', { generationId: 'j1', error: 'boom' });
+    expect(client.write).toHaveBeenCalledWith(`data: ${JSON.stringify({ type: 'error', error: 'boom' })}\n\n`);
+
+    // closeJobAfterDelay was scheduled as part of the same call.
+    vi.advanceTimersByTime(SSE_CLEANUP_DELAY_MS);
+    expect(client.end).toHaveBeenCalled();
+    expect(jobs.has('j1')).toBe(false);
+  });
+
+  it('is idempotent once the job is already terminal — a duplicate spawn-error/close pair does not double-emit', () => {
+    const { activeSlots, activeJobs, events, finalize } = setup();
+    const proc = { pid: 1 };
+    const job = { clients: [], status: 'complete' };
+    activeSlots.set('j1', proc);
+    activeJobs.set('j1', {});
+
+    finalize(job, 'j1', proc, 'boom');
+
+    expect(job.status).toBe('complete');
+    expect(activeSlots.has('j1')).toBe(true);
+    expect(activeJobs.has('j1')).toBe(true);
+    expect(events.emit).not.toHaveBeenCalled();
+  });
+
+  it('force overrides the idempotency guard for a throw that lands after complete is already stamped', () => {
+    const { activeJobs, events, finalize } = setup();
+    const job = { clients: [], status: 'complete' };
+    activeJobs.set('j1', {});
+
+    finalize(job, 'j1', { pid: 1 }, 'threw after complete', { force: true });
+
+    expect(job.status).toBe('error');
+    expect(activeJobs.has('j1')).toBe(false);
+    expect(events.emit).toHaveBeenCalledWith('failed', { generationId: 'j1', error: 'threw after complete' });
+  });
+
+  it('does not evict a slot a newer job already owns (stale finalize from a cancelled/superseded run)', () => {
+    const { activeSlots, finalize } = setup();
+    const staleProc = { pid: 1 };
+    const freshProc = { pid: 2 };
+    const job = { clients: [], status: 'running' };
+    activeSlots.set('j1', freshProc);
+
+    finalize(job, 'j1', staleProc, 'stale failure');
+
+    // The stale finalize still fails ITS OWN job record...
+    expect(job.status).toBe('error');
+    // ...but must not evict the newer run's slot ownership.
+    expect(activeSlots.get('j1')).toBe(freshProc);
+  });
+
+  it('clears the slot unconditionally when slotOwner is null (fal/reactor have no owner identity to compare)', () => {
+    const { activeSlots, finalize } = setup();
+    const job = { clients: [], status: 'running' };
+    activeSlots.set('j1', { some: 'request-entry' });
+
+    finalize(job, 'j1', null, 'boom');
+
+    expect(activeSlots.has('j1')).toBe(false);
+  });
+
+  it('builds the failed payload with a custom failedPayload (the image bus mode field)', () => {
+    const { events, finalize } = setup({
+      failedPayload: (jobId, reason) => ({ mode: 'grok', generationId: jobId, error: reason }),
+    });
+    const job = { clients: [], status: 'running' };
+
+    finalize(job, 'j1', null, 'boom');
+
+    expect(events.emit).toHaveBeenCalledWith('failed', { mode: 'grok', generationId: 'j1', error: 'boom' });
+  });
+
+  it('.canceled forces a "Canceled" failure past the idempotency guard (fal.js/reactor.js cancel path)', () => {
+    const { activeSlots, events, finalize } = setup();
+    const job = { clients: [], status: 'running' };
+    activeSlots.set('j1', { some: 'request-entry' });
+
+    finalize.canceled(job, 'j1');
+
+    expect(job.status).toBe('error');
+    expect(activeSlots.has('j1')).toBe(false);
+    expect(events.emit).toHaveBeenCalledWith('failed', { generationId: 'j1', error: 'Canceled' });
+  });
+
+  // Regression (#8915): createJobFailureFinalizer used to call
+  // `broadcastSse(...)` then `events.emit('failed', ...)` back to back — a
+  // throwing SSE client's res.write (dead pipe) aborted before the events.emit
+  // ran, so the six media-generation backends behind this finalizer
+  // (imageGen/{agy,codex,grok}.js, videoGen/{grok,fal,reactor}.js) would
+  // silently skip the queue-settlement/peer-sync bookkeeping `failed` drives.
+  it('still emits failed to the caller when a connected SSE client throws on write', () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { events, finalize } = setup();
+    const throwingClient = { write: vi.fn(() => { throw new Error('write after end'); }) };
+    const job = { clients: [throwingClient], status: 'running' };
+
+    finalize(job, 'j1', { pid: 1 }, 'boom');
+
+    expect(job.status).toBe('error');
+    expect(events.emit).toHaveBeenCalledWith('failed', { generationId: 'j1', error: 'boom' });
+    expect(errSpy).toHaveBeenCalledWith(expect.stringContaining('SSE client write failed'));
+    errSpy.mockRestore();
+  });
+
+  it('.canceled accepts an optional slotOwner for a backend that does track one', () => {
+    const { activeSlots, finalize } = setup();
+    const owner = { pid: 1 };
+    const otherOwner = { pid: 2 };
+    const job = { clients: [], status: 'running' };
+    activeSlots.set('j1', otherOwner);
+
+    finalize.canceled(job, 'j1', owner);
+
+    // A cancel from a stale owner must not evict a newer run's slot, same
+    // guard as the base finalizer.
+    expect(activeSlots.get('j1')).toBe(otherOwner);
+  });
+});
+
+describe('createSseRunner', () => {
+  // Flush the microtask queue enough times for the fire-and-forget IIFE
+  // (try → await work → finally) to settle. Real promises are not faked even
+  // when timers are.
+  const flush = async () => {
+    for (let i = 0; i < 5; i += 1) await Promise.resolve();
+  };
+  // A never-settling promise keeps a run "in flight" for the duration of a test
+  // without leaking a pending timer.
+  const pending = () => new Promise(() => {});
+
+  it('start returns a runId, registers the run, and reports it active', () => {
+    const runner = createSseRunner({ logLabel: 'test' });
+    const { runId, alreadyRunning } = runner.start('k1', () => pending());
+
+    expect(typeof runId).toBe('string');
+    expect(runId.length).toBeGreaterThan(0);
+    expect(alreadyRunning).toBe(false);
+    expect(runner.runs.has('k1')).toBe(true);
+    expect(runner.isActive('k1')).toBe(true);
+  });
+
+  it('a second start while one is in flight resolves to the existing runId without re-running work', () => {
+    const runner = createSseRunner({ logLabel: 'test' });
+    const first = runner.start('k1', () => pending());
+    const work2 = vi.fn(() => pending());
+    const second = runner.start('k1', work2);
+
+    expect(second.runId).toBe(first.runId);
+    expect(second.alreadyRunning).toBe(true);
+    expect(work2).not.toHaveBeenCalled();
+  });
+
+  it('coalesces a same-signature second start but reports a conflict (+ meta) for a different one', () => {
+    const runner = createSseRunner({ logLabel: 'test' });
+    const first = runner.start('k1', () => pending(), { sig: 'a', meta: { op: 'generate' } });
+
+    // Same signature → safe re-attach onto the in-flight run.
+    const same = runner.start('k1', () => pending(), { sig: 'a', meta: { op: 'generate' } });
+    expect(same.runId).toBe(first.runId);
+    expect(same.alreadyRunning).toBe(true);
+    expect(same.conflict).toBeUndefined();
+
+    // Different signature → different work; refuse to coalesce and surface the
+    // live run's meta (e.g. its op) so the caller won't bind onto it.
+    const other = runner.start('k1', () => pending(), { sig: 'b', meta: { op: 'refine' } });
+    expect(other.runId).toBe(first.runId);
+    expect(other.alreadyRunning).toBe(true);
+    expect(other.conflict).toBe(true);
+    expect(other.op).toBe('generate'); // the in-flight run's op, not the caller's
+  });
+
+  it('without a sig, any in-flight run coalesces (no conflict)', () => {
+    const runner = createSseRunner({ logLabel: 'test' });
+    const first = runner.start('k1', () => pending());
+    const second = runner.start('k1', () => pending(), { meta: { op: 'x' } });
+    expect(second.runId).toBe(first.runId);
+    expect(second.alreadyRunning).toBe(true);
+    expect(second.conflict).toBeUndefined();
+  });
+
+  it('broadcasts frames to attached clients and caches the last frame for replay', async () => {
+    const runner = createSseRunner({ logLabel: 'test' });
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    runner.start('k1', async ({ broadcast }) => {
+      broadcast({ type: 'start' });
+      await gate;
+      broadcast({ type: 'complete' });
+    });
+
+    // A client that attaches after `start` fired still replays the cached frame.
+    const res = makeRes();
+    runner.attachClient('k1', res);
+    expect(res.write).toHaveBeenCalledWith(`data: ${JSON.stringify({ type: 'start' })}\n\n`);
+
+    release();
+    await flush();
+    expect(res.write).toHaveBeenCalledWith(`data: ${JSON.stringify({ type: 'complete' })}\n\n`);
+  });
+
+  it('cancel flags the record, aborts the signal, and returns false for an unknown key', () => {
+    const runner = createSseRunner({ logLabel: 'test' });
+    let captured;
+    runner.start('k1', ({ signal, record }) => {
+      captured = { signal, record };
+      return pending();
+    });
+
+    expect(runner.cancel('k1')).toBe(true);
+    expect(captured.record.cancelRequested).toBe(true);
+    expect(captured.signal.aborted).toBe(true);
+    expect(runner.cancel('missing')).toBe(false);
+  });
+
+  it('a thrown error emits an error frame and logs, then the run is no longer active', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const runner = createSseRunner({ logLabel: 'widget run' });
+    const res = makeRes();
+    runner.start('k1', async ({ broadcast }) => {
+      // Attach happens inside work so the client receives the error frame live.
+      runner.attachClient('k1', res);
+      throw new Error('boom');
+    });
+
+    await flush();
+    const errorWrite = res.write.mock.calls.find(([m]) => m.includes('"type":"error"'));
+    expect(errorWrite).toBeTruthy();
+    expect(errorWrite[0]).toContain('boom');
+    expect(errSpy).toHaveBeenCalledWith(expect.stringContaining('widget run failed'));
+    expect(runner.isActive('k1')).toBe(false);
+    errSpy.mockRestore();
+  });
+
+  it('a finished run lingers for replay then is evicted after SSE_CLEANUP_DELAY_MS', async () => {
+    vi.useFakeTimers();
+    const runner = createSseRunner({ logLabel: 'test' });
+    runner.start('k1', async ({ broadcast }) => { broadcast({ type: 'complete' }); });
+
+    await flush();
+    expect(runner.isActive('k1')).toBe(false); // finished
+    expect(runner.runs.has('k1')).toBe(true);  // but still mapped for replay
+
+    vi.advanceTimersByTime(SSE_CLEANUP_DELAY_MS);
+    expect(runner.runs.has('k1')).toBe(false);
+    vi.useRealTimers();
+  });
+
+  it('restarting within the replay window cancels the old eviction and replaces the run', async () => {
+    vi.useFakeTimers();
+    const runner = createSseRunner({ logLabel: 'test' });
+    const first = runner.start('k1', async ({ broadcast }) => { broadcast({ type: 'complete' }); });
+    await flush();
+    expect(runner.runs.has('k1')).toBe(true);
+
+    // Re-run before the eviction timer fires — should fully replace the record.
+    const second = runner.start('k1', () => pending());
+    expect(second.runId).not.toBe(first.runId);
+    expect(second.alreadyRunning).toBe(false);
+    expect(runner.isActive('k1')).toBe(true);
+
+    // The first run's eviction timer must NOT evict the live replacement.
+    vi.advanceTimersByTime(SSE_CLEANUP_DELAY_MS);
+    expect(runner.runs.get('k1')?.runId).toBe(second.runId);
+    vi.useRealTimers();
+  });
+});

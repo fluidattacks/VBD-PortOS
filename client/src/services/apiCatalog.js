@@ -1,0 +1,200 @@
+import { request } from './apiCore.js';
+import { fetchByIds, normalizeIds } from './apiBatch.js';
+
+// Creative Ingredients Catalog API surface. Every helper takes an optional
+// `options` second arg so callers with their own `.catch` toast can pass
+// `{ silent: true }` per the project convention (avoids double-toast).
+//
+// All path params are URL-encoded — refId and refKind in particular flow
+// from arbitrary record ids and could contain `/`, `?`, `#`, or `%`. The
+// list-query params already round-trip through URLSearchParams which encodes.
+
+const enc = encodeURIComponent;
+
+export const getCatalogStats = (options) => request('/catalog/stats', options);
+
+// Faceted counts (#1762) driving the filter dropdowns + album headers:
+// { types, universes, series, tags, unlinkedCount, orphanedCount, total }.
+export const getCatalogFacets = (options) => request('/catalog/facets', options);
+
+// --- Scraps -------------------------------------------------------------
+
+export const createCatalogScrap = (body = {}, options) =>
+  request('/catalog/scraps', { method: 'POST', body: JSON.stringify(body), ...options });
+
+export const extractFromCatalogScrap = (id, body = {}, options) =>
+  request(`/catalog/scraps/${enc(id)}/extract`, { method: 'POST', body: JSON.stringify(body), ...options });
+
+export const pruneCatalogScrap = (id, body, options) =>
+  request(`/catalog/scraps/${enc(id)}/prune`, { method: 'POST', body: JSON.stringify(body), ...options });
+
+// `universeRef` (+ optional `role`) binds every committed ingredient to that
+// universe — the "Catalogue into" select on CatalogIngest (#7615). Omitted
+// when the caller passes 'unassigned' (the "no universe" choice), reproducing
+// prior behavior exactly (source link only, no homing ref).
+// `relationships` forwards explicit grounded graph relationships (including [] for structured drafts).
+// `creativeNoteIds` names the Brain inbox notes this scrap came from; the server
+// stamps them consumed in the same request as the commit (#9943).
+export const commitCatalogScrapDraft = (id, accepted, { universeRef, role, relationships, operationKey, creativeNoteIds, ...options } = {}, maybeRelationships) => {
+  const rels = maybeRelationships !== undefined ? maybeRelationships : relationships;
+  return request(`/catalog/scraps/${enc(id)}/commit`, {
+    method: 'POST',
+    body: JSON.stringify({
+      accepted,
+      ...(operationKey ? { operationKey } : {}),
+      ...(creativeNoteIds?.length ? { creativeNoteIds } : {}),
+      ...(universeRef ? { universeRef, ...(role ? { role } : {}) } : {}),
+      ...(rels !== undefined ? { relationships: rels } : {}),
+    }),
+    ...options,
+  });
+};
+
+// --- Alternate ingest sources (url / file / voice / brain) --------------
+// Each returns { scrap, draft } — the same shape as extractFromCatalogScrap —
+// so CatalogIngest can drop straight into its review phase.
+
+export const ingestCatalogUrl = (body = {}, options) =>
+  request('/catalog/ingest/url', { method: 'POST', body: JSON.stringify(body), ...options });
+
+export const ingestCatalogFile = (body = {}, options) =>
+  request('/catalog/ingest/file', { method: 'POST', body: JSON.stringify(body), ...options });
+
+export const ingestCatalogVoice = (body = {}, options) =>
+  request('/catalog/ingest/voice', { method: 'POST', body: JSON.stringify(body), ...options });
+
+// Brain → catalog bridge: ingest an existing brain record by { brainType, brainId }.
+export const ingestCatalogBrain = (body = {}, options) =>
+  request('/catalog/ingest/brain', { method: 'POST', body: JSON.stringify(body), ...options });
+
+// --- Ingredients --------------------------------------------------------
+
+export const listCatalogIngredients = ({ type, tag, q, refKind, refId, unlinked, orphaned, scrapId, limit, offset, ...options } = {}) => {
+  const params = new URLSearchParams();
+  if (type) params.set('type', type);
+  if (tag) params.set('tag', tag);
+  if (q) params.set('q', q);
+  // Album/facet filters (#1762). refKind/refId are a pair; unlinked/orphaned are
+  // the "Raw"/"Orphaned" album views — mutually exclusive with each other and
+  // with the ref filter (the server rejects combining them).
+  if (refKind && refId) {
+    params.set('refKind', refKind);
+    params.set('refId', refId);
+  } else if (unlinked) {
+    params.set('unlinked', 'true');
+  } else if (orphaned) {
+    params.set('orphaned', 'true');
+  }
+  // Source-scrap filter (#7617) — "everything extracted from this piece".
+  // Orthogonal to the album filters above, so it composes with them.
+  if (scrapId) params.set('scrapId', scrapId);
+  if (limit) params.set('limit', String(limit));
+  if (offset) params.set('offset', String(offset));
+  return request(`/catalog/ingredients${params.toString() ? `?${params}` : ''}`, options);
+};
+
+// Batch fetch ingredients by id (max 50 server-side) — used by the Story
+// Builder remix handoff to hydrate the catalog ingredients the user selected.
+// `fetchByIds` handles the shared `?ids=` mechanics (dedupe, empty-list
+// short-circuit, `{ items }` envelope unwrap); the extra step here is
+// re-ordering to the requested `ids` — the paged list returns created_at DESC,
+// and chips + seed must read in the user's selection order (mirroring the
+// server's resolveCatalogIngredients).
+export const listCatalogIngredientsByIds = async (ids = [], options) => {
+  const list = normalizeIds(ids);
+  const items = await fetchByIds('/catalog/ingredients', list, options);
+  const byId = new Map(items.map((ing) => [ing.id, ing]));
+  return list.map((id) => byId.get(id)).filter(Boolean);
+};
+
+// Batched detail hydration — one request for ingredient + refs + sources +
+// relations + revisions + media + missingMedia, used by the detail page's
+// initial load in place of five separate calls.
+export const getCatalogIngredientDetails = (id, options) =>
+  request(`/catalog/ingredients/${enc(id)}/details`, options);
+
+// --- Tags (canonical taxonomy) ------------------------------------------
+
+// Autocomplete over the canonical catalog_tags table. `q` is an optional
+// prefix/substring filter; absent returns the most-recently-created tags.
+export const listCatalogTags = ({ q, limit, ...options } = {}) => {
+  const params = new URLSearchParams();
+  if (q) params.set('q', q);
+  if (limit) params.set('limit', String(limit));
+  return request(`/catalog/tags${params.toString() ? `?${params}` : ''}`, options);
+};
+
+export const createCatalogIngredient = (body = {}, options) =>
+  request('/catalog/ingredients', { method: 'POST', body: JSON.stringify(body), ...options });
+
+export const updateCatalogIngredient = (id, patch, options) =>
+  request(`/catalog/ingredients/${enc(id)}`, { method: 'PATCH', body: JSON.stringify(patch), ...options });
+
+export const deleteCatalogIngredient = (id, options) =>
+  request(`/catalog/ingredients/${enc(id)}`, { method: 'DELETE', ...options });
+
+// --- Revision history ---------------------------------------------------
+
+export const listCatalogIngredientRevisions = (id, { limit, offset, ...options } = {}) => {
+  const params = new URLSearchParams();
+  if (limit) params.set('limit', String(limit));
+  if (offset) params.set('offset', String(offset));
+  return request(`/catalog/ingredients/${enc(id)}/revisions${params.toString() ? `?${params}` : ''}`, options);
+};
+
+export const restoreCatalogIngredientRevision = (id, revisionId, body = {}, options) =>
+  request(`/catalog/ingredients/${enc(id)}/revisions/${enc(revisionId)}/restore`, {
+    method: 'POST', body: JSON.stringify(body), ...options,
+  });
+
+// --- Linking (catalog ↔ universe/series/work) ---------------------------
+
+export const linkCatalogIngredient = (id, body, options) =>
+  request(`/catalog/ingredients/${enc(id)}/link`, { method: 'POST', body: JSON.stringify(body), ...options });
+
+export const unlinkCatalogIngredient = (id, body, options) =>
+  request(`/catalog/ingredients/${enc(id)}/link`, { method: 'DELETE', body: JSON.stringify(body), ...options });
+
+export const listCatalogIngredientsForRef = (refKind, refId, options) =>
+  request(`/catalog/refs/${enc(refKind)}/${enc(refId)}/ingredients`, options);
+
+export const linkCatalogIngredientRelation = (id, body, options) =>
+  request(`/catalog/ingredients/${enc(id)}/relations`, { method: 'POST', body: JSON.stringify(body), ...options });
+
+export const unlinkCatalogIngredientRelation = (id, body, options) =>
+  request(`/catalog/ingredients/${enc(id)}/relations`, { method: 'DELETE', body: JSON.stringify(body), ...options });
+
+// --- Media attachments (portrait / reference / audio / video / document) ---
+
+export const listCatalogIngredientMedia = (id, options) =>
+  request(`/catalog/ingredients/${enc(id)}/media`, options);
+
+export const listCatalogIngredientMissingMedia = (id, options) =>
+  request(`/catalog/ingredients/${enc(id)}/media/missing`, options);
+
+export const attachCatalogIngredientMedia = (id, body, options) =>
+  request(`/catalog/ingredients/${enc(id)}/media`, { method: 'POST', body: JSON.stringify(body), ...options });
+
+export const setCatalogIngredientPortrait = (id, body, options) =>
+  request(`/catalog/ingredients/${enc(id)}/media/portrait`, { method: 'POST', body: JSON.stringify(body), ...options });
+
+export const detachCatalogIngredientMedia = (id, body, options) =>
+  request(`/catalog/ingredients/${enc(id)}/media`, { method: 'DELETE', body: JSON.stringify(body), ...options });
+
+// Upload a raw file (base64 + MIME) onto an ingredient; server picks the media
+// kind + library dir from the MIME and returns the attached media row.
+export const uploadCatalogIngredientMediaFile = (id, body, options) =>
+  request(`/catalog/ingredients/${enc(id)}/media/upload`, { method: 'POST', body: JSON.stringify(body), ...options });
+
+// Attach a recorded voice memo (base64 WAV) — server transcribes via Whisper and
+// returns `{ media, transcript }`.
+export const recordCatalogIngredientVoiceMemo = (id, body, options) =>
+  request(`/catalog/ingredients/${enc(id)}/media/voice`, { method: 'POST', body: JSON.stringify(body), ...options });
+
+// --- Bulk import / export ----------------------------------------------
+
+export const bulkImportCatalogIngredients = (body, options) =>
+  request('/catalog/bulk-import', { method: 'POST', body: JSON.stringify(body), ...options });
+
+export const rerunCatalogMigration = ({ force, ...options } = {}) =>
+  request('/catalog/migration/rerun', { method: 'POST', body: JSON.stringify({ force }), ...options });

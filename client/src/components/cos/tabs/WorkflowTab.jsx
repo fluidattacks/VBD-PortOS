@@ -1,0 +1,550 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useSearchParams } from 'react-router';
+import { AlertTriangle, ArrowRight, Bot, CalendarDays, ChevronRight, Clock3, GitBranch, Infinity as InfinityIcon, RefreshCw, RotateCcw, TimerReset, Workflow } from 'lucide-react';
+import * as api from '../../../services/api';
+import { useAppOverrideActions } from '../../../hooks/useAppOverrideActions';
+import { describeCron, describeRecurrence, summarizeAppSchedules } from '../../../utils/cronHelpers';
+import ScheduleEditor from './workflow/ScheduleEditor';
+import PerAppOverrideList from './schedule/PerAppOverrideList';
+import { isManualOnlyCadence } from './schedule/scheduleConstants';
+import { formatWeekdayShort, formatWeekdayTime, formatTimeOfDay } from '../../../utils/formatters';
+
+const TRACK_COLORS = {
+  cron: { marker: 'bg-purple-400', text: 'text-purple-300', wash: 'bg-purple-500/10' },
+  perpetual: { marker: 'bg-amber-400', text: 'text-amber-300', wash: 'bg-amber-500/10' },
+  job: { marker: 'bg-cyan-400', text: 'text-cyan-300', wash: 'bg-cyan-500/10' },
+  task: { marker: 'bg-emerald-400', text: 'text-emerald-300', wash: 'bg-emerald-500/10' }
+};
+
+function trackPalette(node) {
+  if (node.schedule?.perpetual) return TRACK_COLORS.perpetual;
+  if (node.schedule?.cronSchedule || node.schedule?.cronExpression) return TRACK_COLORS.cron;
+  return TRACK_COLORS[node.kind] || TRACK_COLORS.task;
+}
+
+// The cadence the node's OWN row states, ignoring anything its apps pin.
+function describeGlobalSchedule(node) {
+  const schedule = node.schedule || {};
+  // A perpetual task's cadence line names its recheck: a scheduled one rechecks
+  // on its own cron expression, an on-demand one on `recheckCron`.
+  if (schedule.perpetual) {
+    const recheck = schedule.cronExpression || schedule.recheckCron;
+    return `perpetual · ${recheck ? describeCron(recheck) || recheck : 'daily reset'}`;
+  }
+  if (schedule.cronSchedule) return describeRecurrence(schedule.cronSchedule);
+  if (schedule.cronExpression) return describeCron(schedule.cronExpression) || schedule.cronExpression;
+  if (node.kind === 'job' && schedule.scheduledTime) return `${schedule.type} at ${schedule.scheduledTime}`;
+  return schedule.type?.replaceAll('-', ' ') || 'flexible';
+}
+
+/**
+ * The one cadence line a task track shows, plus its tooltip.
+ *
+ * A task whose only clock cadences live on its apps has none of its own to
+ * describe — "on demand" would be the literal truth of the global row and the
+ * opposite of what the track actually shows. The line is one 10px row, so the
+ * full story (which app runs on which expression) goes in the tooltip.
+ */
+function scheduleCadence(node) {
+  const schedule = node.schedule || {};
+  const perApp = node.kind === 'task' ? summarizeAppSchedules(node.appSchedules) : null;
+  const ownCadence = !!(schedule.perpetual || schedule.cronSchedule || schedule.cronExpression);
+  const global = describeGlobalSchedule(node);
+  if (!perApp) return { text: global, title: undefined };
+  return {
+    text: ownCadence ? global : perApp.label,
+    title: `${ownCadence ? `Globally: ${global}.` : 'On demand globally — no clock cadence of its own.'}\nScheduled per app:\n${perApp.detail}`
+  };
+}
+
+function formatPoint(iso, hours, timezone) {
+  return hours === 168
+    ? formatWeekdayTime(iso, { timeZone: timezone })
+    : formatTimeOfDay(iso, { timeZone: timezone });
+}
+
+function relativeTime(iso) {
+  const deltaMinutes = Math.max(0, Math.round((new Date(iso).getTime() - Date.now()) / 60_000));
+  if (deltaMinutes < 60) return deltaMinutes === 0 ? 'now' : `in ${deltaMinutes}m`;
+  if (deltaMinutes < 1440) return `in ${Math.round(deltaMinutes / 60)}h`;
+  return `in ${Math.round(deltaMinutes / 1440)}d`;
+}
+
+// A launch tagged `dueNow` fires because the scheduler already considers the
+// task due — a catch-up, first run, or elapsed interval — not because a cadence
+// slot lands now. Explain why, so a NOW marker beside "Sun at 07:00" doesn't
+// read as a bug. Returns null for ordinary on-cadence launches.
+function dueNowMeta(occurrence, node, timezone) {
+  if (!occurrence?.dueNow) return null;
+  const reason = occurrence.reason || '';
+  if (reason.startsWith('cron-catch-up')) {
+    const slot = occurrence.missedSlot
+      ? formatWeekdayTime(occurrence.missedSlot, { timeZone: timezone })
+      : null;
+    return { badge: 'catch-up', detail: slot ? `Catch-up for the missed ${slot} slot` : 'Catch-up for a missed slot' };
+  }
+  if (reason === 'once-first-run' || !node?.lastRun) {
+    return { badge: 'first run', detail: 'First run — has never run before' };
+  }
+  return { badge: 'overdue', detail: 'Overdue — the interval elapsed since the last run' };
+}
+
+// An occurrence the server tagged with `apps` comes from those apps' own cron
+// overrides, not from the task's global cadence. `appNameLookup` is built once
+// per node — every occurrence of that node resolves against the same map.
+const appNameLookup = node =>
+  new Map((node?.appSchedules || []).map(entry => [entry.appId, entry.appName || entry.appId]));
+
+function occurrenceAppNames(occurrence, names) {
+  if (!occurrence?.apps?.length) return null;
+  return occurrence.apps.map(appId => names.get(appId) || appId).join(', ');
+}
+
+function timelinePercent(iso, timeline) {
+  const start = new Date(timeline.startAt).getTime();
+  const end = new Date(timeline.endAt).getTime();
+  return Math.max(0, Math.min(100, ((new Date(iso).getTime() - start) / (end - start)) * 100));
+}
+
+function Axis({ timeline, hours, timezone }) {
+  const divisions = hours === 168 ? 7 : 8;
+  const start = new Date(timeline.startAt).getTime();
+  const end = new Date(timeline.endAt).getTime();
+  return (
+    <div className="relative h-9 border-b border-port-border/60 text-[10px] text-gray-500">
+      {Array.from({ length: divisions + 1 }, (_, index) => {
+        const at = new Date(start + ((end - start) * index) / divisions);
+        const isFirst = index === 0;
+        const isLast = index === divisions;
+        return (
+          <div
+            key={index}
+            className={`absolute bottom-1 whitespace-nowrap ${
+              isFirst ? 'left-2 translate-x-0' : isLast ? 'right-2 translate-x-0' : '-translate-x-1/2'
+            }`}
+            style={isFirst || isLast ? undefined : { left: `${(index / divisions) * 100}%` }}
+          >
+            {isFirst ? 'Now' : hours === 168 ? formatWeekdayShort(at, { timeZone: timezone }) : `+${index * 3}h`}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function TrackGrid({ divisions }) {
+  return Array.from({ length: divisions + 1 }, (_, index) => (
+    <span key={index} className="pointer-events-none absolute inset-y-0 border-l border-port-border/25" style={{ left: `${(index / divisions) * 100}%` }} />
+  ));
+}
+
+// Reshapes a task node into the `config` shape PerAppOverrideList expects and
+// renders it. Shared by the pinned TimelineRow and the flexible-queue rows so
+// the config reconstruction lives in exactly one place.
+function AppOverridePanel({ node, apps, providers, providersLoaded, onUpdateOverride, onBulkToggleOverride }) {
+  return (
+    <PerAppOverrideList
+      taskType={node.label}
+      config={{
+        appOverrides: node.appOverrides,
+        type: node.schedule?.type,
+        taskMetadata: node.taskMetadata,
+        managedAgentOptions: node.managedAgentOptions,
+        providerId: node.providerId,
+        model: node.model
+      }}
+      apps={apps}
+      providers={providers}
+      providersLoaded={providersLoaded}
+      onUpdateOverride={onUpdateOverride}
+      onBulkToggleOverride={onBulkToggleOverride}
+    />
+  );
+}
+
+function TimelineRow({ node, occurrences, windows, timeline, hours, timezone, selected, apps, providers, providersLoaded, expanded, onSelect, onToggleExpand, onUpdateOverride, onBulkToggleOverride }) {
+  const palette = trackPalette(node);
+  const cadence = scheduleCadence(node);
+  const appNames = appNameLookup(node);
+  const Icon = node.kind === 'job' ? Bot : GitBranch;
+  const divisions = hours === 168 ? 7 : 8;
+  const dependencyWarning = node.pendingDeps?.length > 0;
+
+  // Per-app options only apply to task types (system jobs are not per-app). The
+  // server's active-app counts drive the toggle + badge (single source of
+  // truth); PerAppOverrideList does its own `apps` filtering when expanded.
+  const { enabledAppCount = 0, totalAppCount = 0 } = node;
+  const canExpand = node.kind === 'task' && totalAppCount > 0;
+  const countTitle = `${enabledAppCount} of ${totalAppCount} apps enabled`;
+
+  return (
+    <div className={`border-b border-port-border/40 transition-colors last:border-b-0 ${selected ? 'bg-port-accent/8' : ''}`}>
+      <div className={`grid w-full grid-cols-[14rem_1fr] ${selected ? '' : 'hover:bg-white/[0.025]'}`}>
+        <div className="flex min-w-0 items-center gap-1.5 border-r border-port-border/50 px-3 py-2.5">
+          {canExpand ? (
+            <button
+              type="button"
+              onClick={() => onToggleExpand(node.id)}
+              aria-expanded={expanded}
+              aria-label={`${expanded ? 'Hide' : 'Show'} per-app options for ${node.label}`}
+              title={countTitle}
+              className="flex h-5 w-5 shrink-0 items-center justify-center rounded text-gray-500 hover:bg-white/10 hover:text-gray-300"
+            >
+              <ChevronRight className={`h-3.5 w-3.5 transition-transform ${expanded ? 'rotate-90' : ''}`} />
+            </button>
+          ) : (
+            <span className="h-5 w-5 shrink-0" aria-hidden="true" />
+          )}
+          <button type="button" onClick={() => onSelect(node.id)} className="flex min-w-0 flex-1 items-center gap-2 text-left">
+            <span className={`flex h-7 w-7 shrink-0 items-center justify-center rounded ${palette.wash} ${palette.text}`}><Icon className="h-3.5 w-3.5" /></span>
+            <span className="min-w-0 flex-1">
+              <span className="block truncate text-xs font-medium text-gray-200" title={node.label}>{node.label}</span>
+              <span className="mt-0.5 block truncate text-[10px] text-gray-500" title={cadence.title}>{cadence.text}</span>
+            </span>
+          </button>
+          {canExpand && (
+            <span className={`shrink-0 rounded-sm px-1 py-px text-[9px] font-medium ${enabledAppCount > 0 ? 'bg-port-accent/15 text-port-accent' : 'bg-white/5 text-gray-500'}`} title={countTitle}>
+              {enabledAppCount}/{totalAppCount}
+            </span>
+          )}
+          {dependencyWarning && <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-port-warning" />}
+        </div>
+        <button type="button" onClick={() => onSelect(node.id)} className="relative block min-h-12 overflow-hidden text-left">
+          <TrackGrid divisions={divisions} />
+          <span className="absolute inset-y-0 left-0 z-10 border-l border-port-accent/70" />
+          {windows.map(bar => {
+            // A live drain is filled; a future recurrence is a washed-out
+            // outline, so "running now" stays distinguishable from "runs then".
+            const live = bar.state === 'draining';
+            const label = `${live ? 'Draining since' : 'Drain starts'} ${formatPoint(bar.startAt, hours, timezone)}`;
+            return (
+              // role="img" so `aria-label` is honored — ARIA prohibits naming a
+              // bare span (role generic), which would leave the bar nameless to
+              // screen readers while still satisfying a getByLabelText test.
+              <span
+                key={bar.id}
+                role="img"
+                aria-label={label}
+                className={`absolute inset-y-2 z-10 flex items-center gap-1 overflow-hidden rounded border px-1 ${live ? 'border-amber-400/50 bg-gradient-to-r from-amber-500/35 to-amber-500/10' : 'border-dashed border-amber-400/35 bg-amber-500/10'}`}
+                // `minWidth` over-constrains left/right so the box grows right
+                // from its start: an hour is ~4% of a 24h track and under 1% of
+                // a 7-day one, which would otherwise render as a hairline.
+                style={{ left: `${timelinePercent(bar.startAt, timeline)}%`, right: `${100 - timelinePercent(bar.endAt, timeline)}%`, minWidth: '1.25rem' }}
+                title={`${label} · perpetual: the bar shows a nominal hour, the drain continues while backlog remains`}
+              >
+                <InfinityIcon className="h-3 w-3 shrink-0 text-amber-200" />
+                {live && <span className="truncate text-[10px] font-medium text-amber-200">draining</span>}
+              </span>
+            );
+          })}
+          {occurrences.map(occurrence => {
+            const meta = dueNowMeta(occurrence, node, timezone);
+            // A launch only some apps take is a circle, not a square — a free
+            // visual channel that leaves the collision ring and the due-now
+            // fill intact, so a marker can show all three states at once.
+            const scopedApps = occurrenceAppNames(occurrence, appNames);
+            // Due-now is an amber FILL, collision a warning RING — kept on separate
+            // channels so a launch that is BOTH (the common catch-up scenario, where
+            // several tasks are due at Now and therefore also collide) shows both
+            // states at once. A shared ring channel would let collision mask due-now.
+            const fill = occurrence.kind === 'recheck' ? 'rotate-45 bg-amber-300' : meta ? 'bg-amber-400' : palette.marker;
+            const ring = occurrence.collision ? 'ring-2 ring-port-warning ring-offset-1 ring-offset-port-bg' : '';
+            const shape = scopedApps ? 'rounded-full' : 'rounded-sm';
+            return (
+              <span
+                key={occurrence.id}
+                className={`absolute top-1/2 z-20 h-4 w-4 -translate-x-1/2 -translate-y-1/2 border-2 border-port-bg shadow ${shape} ${fill} ${ring}`}
+                style={{ left: `clamp(0.6rem, ${timelinePercent(occurrence.at, timeline)}%, calc(100% - 0.6rem))` }}
+                title={`${occurrence.kind === 'recheck' ? 'Reset/recheck' : 'Launch'} ${formatPoint(occurrence.at, hours, timezone)}${scopedApps ? ` · for ${scopedApps}` : ''}${meta ? ` · ${meta.detail}` : ''}${occurrence.collision ? ' · another task launches within 15 minutes' : ''}`}
+              />
+            );
+          })}
+        </button>
+      </div>
+      {canExpand && expanded && (
+        <div className="border-t border-port-border/40 bg-port-bg/20 px-3 py-3">
+          <AppOverridePanel node={node} apps={apps} providers={providers} providersLoaded={providersLoaded} onUpdateOverride={onUpdateOverride} onBulkToggleOverride={onBulkToggleOverride} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function NextUp({ occurrences, nodeMap, hours, timezone, onSelect }) {
+  const next = occurrences.slice(0, 8);
+  if (next.length === 0) return null;
+  return (
+    <section className="rounded-lg border border-port-border/60 bg-port-card/40 p-3">
+      <div className="mb-2 flex items-center gap-2 text-xs font-medium uppercase tracking-wider text-gray-500">
+        <Clock3 className="h-3.5 w-3.5" /> Scheduled order
+      </div>
+      <div className="flex gap-2 overflow-x-auto pb-1">
+        {next.map((occurrence, index) => {
+          const node = nodeMap.get(occurrence.nodeId);
+          if (!node) return null;
+          const meta = dueNowMeta(occurrence, node, timezone);
+          const scopedApps = occurrenceAppNames(occurrence, appNameLookup(node));
+          const chipTitle = [scopedApps && `Launches for ${scopedApps}`, meta?.detail].filter(Boolean).join(' · ') || undefined;
+          return (
+            <div key={occurrence.id} className="flex shrink-0 items-center gap-2">
+              <button type="button" onClick={() => onSelect(node.id)} title={chipTitle} className={`min-w-36 rounded border px-3 py-2 text-left hover:border-port-accent/50 ${occurrence.collision ? 'border-port-warning/50 bg-port-warning/5' : meta ? 'border-amber-400/50 bg-amber-500/5' : 'border-port-border bg-port-bg/50'}`}>
+                <span className="flex items-center gap-1.5 text-[10px] font-medium uppercase tracking-wide text-gray-500">
+                  <span>{formatPoint(occurrence.at, hours, timezone)} · {relativeTime(occurrence.at)}</span>
+                  {meta && <span className="rounded-sm bg-amber-500/15 px-1 py-px text-[9px] text-amber-300">{meta.badge}</span>}
+                </span>
+                <span className="mt-0.5 block max-w-44 truncate text-xs text-gray-200">{occurrence.kind === 'recheck' ? '↻ ' : ''}{node.label}</span>
+                {scopedApps && <span className="mt-0.5 block max-w-44 truncate text-[10px] text-gray-500">for {scopedApps}</span>}
+              </button>
+              {index < next.length - 1 && <ArrowRight key={`arrow-${occurrence.id}`} className="h-3.5 w-3.5 text-gray-700" />}
+            </div>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+// `providers` is the same ChiefOfStaff-owned list ScheduleTab renders — without it
+// the per-app rows here degraded to raw provider ids while the Schedule tab showed
+// display names for the very same pin (#4783).
+export default function WorkflowTab({ apps, providers, providersLoaded }) {
+  // Zoom window + selected track live in the URL so the open editor and view
+  // are shareable/bookmarkable and survive reload — the same "URL is the
+  // source of truth for what's open" convention as ScheduleTab's ?task=.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const hoursParam = Number.parseInt(searchParams.get('hours'), 10);
+  const hours = [24, 168].includes(hoursParam) ? hoursParam : 168;
+  const setHours = useCallback((next) => {
+    const params = new URLSearchParams(searchParams);
+    if (next === 168) params.delete('hours');
+    else params.set('hours', String(next));
+    setSearchParams(params, { replace: true });
+  }, [searchParams, setSearchParams]);
+
+  const selectedId = searchParams.get('track');
+  const setSelectedId = useCallback((next) => {
+    const params = new URLSearchParams(searchParams);
+    if (next) params.set('track', next);
+    else params.delete('track');
+    setSearchParams(params, { replace: true });
+  }, [searchParams, setSearchParams]);
+
+  const [graph, setGraph] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  // Which task rows have their per-app options panel expanded. Kept as local
+  // view state (a lightweight detail, not a selected record) rather than in the
+  // URL — the ?track= param already owns the selected editor panel.
+  const [expandedIds, setExpandedIds] = useState(() => new Set());
+  const fetchGeneration = useRef(0);
+
+  const toggleExpand = useCallback((id) => {
+    setExpandedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const fetchGraph = useCallback(async () => {
+    const generation = ++fetchGeneration.current;
+    setLoading(true);
+    const data = await api.getCosWorkflow(hours).catch(err => {
+      if (generation === fetchGeneration.current) setError(err?.message || 'Failed to load schedule');
+      return null;
+    });
+    if (data && generation === fetchGeneration.current) {
+      setGraph(data);
+      setError(null);
+    }
+    if (generation === fetchGeneration.current) setLoading(false);
+  }, [hours]);
+
+  useEffect(() => {
+    fetchGraph();
+    return () => { fetchGeneration.current += 1; };
+  }, [fetchGraph]);
+
+  // Per-app option mutations are shared with ScheduleTab; refetch the graph so
+  // the enabled-app counts and inherited defaults stay in sync after each change.
+  const { handleUpdateOverride, handleBulkToggleOverride } = useAppOverrideActions(apps, fetchGraph);
+
+  const model = useMemo(() => {
+    if (!graph?.timeline) return null;
+    const nodeMap = new Map(graph.nodes.map(node => [node.id, node]));
+    const occurrencesByNode = new Map();
+    const windowsByNode = new Map();
+    for (const occurrence of graph.timeline.occurrences) {
+      if (!occurrencesByNode.has(occurrence.nodeId)) occurrencesByNode.set(occurrence.nodeId, []);
+      occurrencesByNode.get(occurrence.nodeId).push(occurrence);
+    }
+    for (const window of graph.timeline.windows) {
+      if (!windowsByNode.has(window.nodeId)) windowsByNode.set(window.nodeId, []);
+      windowsByNode.get(window.nodeId).push(window);
+    }
+    // A globally on-demand task that an app puts on a cron DOES promise a
+    // clock time — for that app — so it belongs on a track, not in the
+    // "no clock time" bucket. That mismatch is what hid app-scheduled tasks
+    // from this page entirely. Shares the Schedule card's predicate so the two
+    // pages cannot disagree about what "manual only" means.
+    const isFlexible = node => node.kind === 'task'
+      && isManualOnlyCadence({ ...node.schedule, appSchedules: node.appSchedules });
+    const scheduled = graph.nodes
+      .filter(node => node.enabled && !isFlexible(node))
+      .sort((a, b) => {
+        const aAt = occurrencesByNode.get(a.id)?.[0]?.at || graph.timeline.startAt;
+        const bAt = occurrencesByNode.get(b.id)?.[0]?.at || graph.timeline.startAt;
+        return new Date(aAt) - new Date(bAt) || a.label.localeCompare(b.label);
+      });
+    const flexible = graph.nodes.filter(node => node.enabled && isFlexible(node));
+    return { nodeMap, occurrencesByNode, windowsByNode, scheduled, flexible };
+  }, [graph]);
+
+  const selectedNode = selectedId && graph ? graph.nodes.find(node => node.id === selectedId) : null;
+
+  const unpinnedQueue = model?.flexible.length > 0 && (
+    <section className="rounded-lg border border-dashed border-port-border/60 bg-port-card/20 p-3">
+      <div className="flex items-center gap-2 text-xs font-medium text-gray-400"><RotateCcw className="h-3.5 w-3.5" /> Unpinned runner queue</div>
+      <p className="mt-1 text-[11px] text-gray-600">These active on-demand tasks do not promise a clock time.</p>
+      <div className="mt-2 flex flex-wrap gap-2">
+        {model.flexible.map(node => {
+          const canExpand = node.kind === 'task' && (node.totalAppCount || 0) > 0;
+          const isSelected = selectedId === node.id;
+          return (
+            <span key={node.id} className={`inline-flex items-center rounded border text-xs ${isSelected ? 'border-port-accent bg-port-accent/10' : 'border-port-border bg-port-bg/40'}`}>
+              <button type="button" onClick={() => setSelectedId(node.id)} className={`px-2.5 py-1.5 ${isSelected ? 'text-port-accent' : 'text-gray-400 hover:text-white'}`}>
+                {node.label} <span className="text-gray-600">· {node.schedule?.type}</span>
+                {canExpand && <span className={`ml-1 ${node.enabledAppCount > 0 ? 'text-port-accent' : 'text-gray-500'}`}>{node.enabledAppCount || 0}/{node.totalAppCount}</span>}
+              </button>
+              {canExpand && (
+                <button
+                  type="button"
+                  onClick={() => toggleExpand(node.id)}
+                  aria-expanded={expandedIds.has(node.id)}
+                  aria-label={`${expandedIds.has(node.id) ? 'Hide' : 'Show'} per-app options for ${node.label}`}
+                  title={`${node.enabledAppCount || 0} of ${node.totalAppCount} apps enabled`}
+                  className="flex h-full items-center border-l border-port-border/60 px-1.5 text-gray-500 hover:bg-white/10 hover:text-gray-300"
+                >
+                  <ChevronRight className={`h-3.5 w-3.5 transition-transform ${expandedIds.has(node.id) ? 'rotate-90' : ''}`} />
+                </button>
+              )}
+            </span>
+          );
+        })}
+      </div>
+      {model.flexible.filter(node => expandedIds.has(node.id) && node.kind === 'task' && (node.totalAppCount || 0) > 0).map(node => (
+        <div key={node.id} className="mt-2 rounded border border-port-border/60 bg-port-bg/20 px-3 py-3">
+          <div className="mb-2 text-xs font-medium text-gray-300">{node.label} <span className="text-gray-600">· per-app options</span></div>
+          <AppOverridePanel node={node} apps={apps} providers={providers} providersLoaded={providersLoaded} onUpdateOverride={handleUpdateOverride} onBulkToggleOverride={handleBulkToggleOverride} />
+        </div>
+      ))}
+    </section>
+  );
+
+  const legend = (
+    <div className="flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-gray-600">
+      <span><AlertTriangle className="mr-1 inline h-3 w-3 text-port-warning" />A ring means another launch is within 15 minutes; actual overlap depends on runtime.</span>
+      <span><Clock3 className="mr-1 inline h-3 w-3 text-amber-300" />An amber marker at Now means the task is already due (catch-up, first run, or overdue) — it launches on the next check rather than waiting for its next cadence slot.</span>
+      <span><CalendarDays className="mr-1 inline h-3 w-3" />A round marker launches only for the apps that pin their own cron for this task — the task&apos;s global row may still read &ldquo;on demand&rdquo;. Hover the cadence under the task name to see which app runs when.</span>
+      <span><TimerReset className="mr-1 inline h-3 w-3" />A perpetual task gets one bar per recurrence showing a nominal hour of runtime — the drain keeps going while backlog remains, so a run can outlast its bar. A filled bar at Now means it is draining already.</span>
+    </div>
+  );
+
+  return (
+    <div className="space-y-4">
+      <header className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-2">
+          <Workflow className="h-5 w-5 text-port-accent" />
+          <h2 className="text-xl font-semibold text-white">Schedule Timeline</h2>
+        </div>
+        <div className="flex items-center gap-2">
+          <div className="flex rounded border border-port-border bg-port-card p-1">
+            {[[24, '24 hours'], [168, '7 days']].map(([value, label]) => (
+              <button key={value} type="button" onClick={() => setHours(value)} className={`rounded px-2.5 py-1 text-xs ${hours === value ? 'bg-port-accent/20 text-port-accent' : 'text-gray-500 hover:text-gray-300'}`}>{label}</button>
+            ))}
+          </div>
+          <button type="button" onClick={fetchGraph} disabled={loading} className="flex items-center gap-1.5 rounded border border-port-border bg-port-card px-3 py-1.5 text-xs text-gray-300 hover:border-gray-500 disabled:opacity-50">
+            <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} /> Refresh
+          </button>
+        </div>
+      </header>
+
+      {error && <div role="status" className="flex items-center gap-2 rounded border border-port-error/40 bg-port-error/10 p-3 text-sm text-port-error"><AlertTriangle className="h-4 w-4" />{error}</div>}
+      {loading && !graph && <div role="status" className="py-12 text-center text-sm text-gray-500">Building schedule timeline…</div>}
+
+      {graph && model && (
+        <>
+          <NextUp occurrences={graph.timeline.occurrences} nodeMap={model.nodeMap} hours={hours} timezone={graph.timezone} onSelect={setSelectedId} />
+
+          <div className={`grid items-start gap-4 ${selectedNode ? 'lg:grid-cols-[minmax(0,1fr)_20rem]' : ''}`}>
+            <section className="min-w-0 overflow-hidden rounded-lg border border-port-border/60 bg-port-card/30">
+              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-port-border/60 px-3 py-2 text-[10px] text-gray-500">
+                <div className="flex items-center gap-3">
+                  <span className="inline-flex items-center gap-1"><span className="h-2.5 w-2.5 rounded-sm bg-purple-400" /> pinned</span>
+                  <span className="inline-flex items-center gap-1"><span className="h-2.5 w-2.5 rounded-sm bg-cyan-400" /> interval job</span>
+                  <span className="inline-flex items-center gap-1"><span className="h-2.5 w-2.5 rotate-45 rounded-sm bg-amber-300" /> reset/recheck</span>
+                  <span className="inline-flex items-center gap-1"><span className="h-2.5 w-2.5 rounded-sm bg-amber-400" /> due now (catch-up)</span>
+                  <span className="inline-flex items-center gap-1"><span className="h-2.5 w-2.5 rounded-full bg-emerald-400" /> round = per-app schedule</span>
+                  <span className="inline-flex items-center gap-1"><span className="h-2.5 w-4 rounded-sm border border-dashed border-amber-400/50 bg-amber-500/15" /> perpetual drain (~1h)</span>
+                </div>
+                <span className="inline-flex items-center gap-1"><CalendarDays className="h-3 w-3" />{graph.timezone}</span>
+              </div>
+              <div className="overflow-x-auto">
+                <div className="min-w-[36rem]">
+                  <div className="grid grid-cols-[14rem_1fr] bg-port-bg/30">
+                    <div className="flex items-end border-r border-port-border/50 px-3 pb-1 text-[10px] uppercase tracking-wider text-gray-600">Active tracks</div>
+                    <Axis timeline={graph.timeline} hours={hours} timezone={graph.timezone} />
+                  </div>
+                  {model.scheduled.map(node => (
+                    <TimelineRow
+                      key={node.id}
+                      node={node}
+                      occurrences={model.occurrencesByNode.get(node.id) || []}
+                      windows={model.windowsByNode.get(node.id) || []}
+                      timeline={graph.timeline}
+                      hours={hours}
+                      timezone={graph.timezone}
+                      selected={selectedId === node.id}
+                      apps={apps}
+                      providers={providers}
+                      providersLoaded={providersLoaded}
+                      expanded={expandedIds.has(node.id)}
+                      onSelect={setSelectedId}
+                      onToggleExpand={toggleExpand}
+                      onUpdateOverride={handleUpdateOverride}
+                      onBulkToggleOverride={handleBulkToggleOverride}
+                    />
+                  ))}
+                  {model.scheduled.length === 0 && <div className="py-10 text-center text-sm text-gray-500">No active timed schedules in this range.</div>}
+                </div>
+              </div>
+            </section>
+
+            {selectedNode && (
+              <div className="lg:col-start-2 lg:row-start-1 lg:row-span-3">
+                <ScheduleEditor
+                  node={selectedNode}
+                  allNodes={graph.nodes}
+                  timezone={graph.timezone}
+                  onClose={() => setSelectedId(null)}
+                  onSaved={fetchGraph}
+                />
+              </div>
+            )}
+
+            {unpinnedQueue && (
+              <div className="min-w-0 lg:col-start-1">
+                {unpinnedQueue}
+              </div>
+            )}
+
+            <div className="min-w-0 lg:col-start-1">
+              {legend}
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}

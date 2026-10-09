@@ -1,0 +1,1440 @@
+# Eidoverse Worlds integration
+
+Eidoverse Worlds is an optional, disabled-by-default PortOS feature. It is not
+vendored into PortOS and is not a git submodule. Choosing **Install & enable**
+under **Settings → Features** is the explicit consent boundary that downloads,
+installs, and enables the runtime; the ordinary feature toggle never installs it.
+If Bun is not already available, the same action first runs Bun's official
+platform installer under the PortOS service account on Windows, macOS, or Linux.
+
+## Signal ownership
+
+`server/services/eidoverseWorldSources.js` owns local reads, cancellation, Jira
+fetching, and destination lookup. It passes snapshots to the pure
+`server/lib/eidoverseWorldSignals.js` owner for bounded aggregates and stable
+opaque IDs. `server/services/eidoverseWorldProjection.js` then plans world verbs
+from those signals. World orchestration loads the collector only during explicit
+projection; identity and travel consumers import the pure signal owner directly.
+The collector and world service retain their historical helper exports.
+
+## What PortOS installs
+
+The installer keeps the two AGPL-3.0 projects as independent git checkouts. The
+Worlds repository is selected per PortOS instance. The recommended default is
+`https://github.com/atomantic/eidoverse-worlds` on branch `portos`; an instance
+owner can enter another GitHub origin and branch before installing:
+
+- `data/repos/{owner}/{repo}` — the selected Worlds repository and the checkout
+  PortOS registers under **Apps**. Ordinary GitHub forks retain the
+  `eidoverse-worlds` repository name.
+- `data/repos/anima-research/eidoverse-video` — the upstream video/runtime
+  checkout used by Worlds. A fork is not required unless changes to that
+  repository itself become necessary.
+
+PortOS runs `bun install --frozen-lockfile` in the Worlds root and client, then
+writes an ignored `.env.portos` file that points Worlds at the video runtime and
+at its durable world store. PortOS does not copy either project's source into
+the PortOS repository, combine the codebases, or relicense them; each checkout
+retains its own upstream license and git history.
+
+After installation, **Worlds GitHub repository** and **Worlds runtime / tracking
+branch** remain available on **Settings → Features**. **Recommended (portos)**
+selects the recommended origin and branch; **Update source** applies the choice
+in place. Branch changes require a clean checkout and refuse to overwrite local
+commits absent from the target. Restart or update the managed app to load the
+changed code. App updates honor the selected branch using the checkout-local
+`portos.runtimeBranch` Git setting; clearing the field restores the origin default
+branch on the next update. Existing saved choices are preserved. The managed-app
+path, world data, and companion video origin remain unchanged.
+
+The managed app's **Git** tab makes that two-repository topology explicit. It
+shows the checked-out branch and revision for Worlds and Video, compares each
+checkout with its configured origin, and—when Worlds points at an ordinary
+GitHub fork—compares that fork with the canonical
+`anima-research/eidoverse-worlds` upstream. A failed network comparison is
+reported as unknown rather than as current.
+
+**Sync fork only** fast-forwards the configured Worlds fork on GitHub without
+changing either local checkout or restarting a process. PortOS never passes
+`--force`, so a fork with its own incompatible commits is left untouched for
+manual reconciliation. **Update both** pulls Worlds from its configured origin,
+pulls the independent Video checkout from its own origin and branch, installs
+Worlds' frozen Bun dependencies, and restarts only Eidoverse. Video is therefore
+managed as a version-visible sidecar, not pinned as a PortOS submodule.
+
+That topology is only visible to someone who goes looking for it, so freshness
+is also reported where a user actually lives. Opening **Eidoverse** runs the
+same repository-source check once per visit and, when a checkout or its fork is
+behind something the update can pull it forward from, raises an advisory above
+the world naming what is behind and offering the same one-click managed update.
+Dismissing it silences that revision only — the next Eidoverse release raises it
+again. The check is scoped to this page rather than added to the global PortOS
+update banner because it costs a `git fetch` on both checkouts plus GitHub fork
+metadata, which is not a price every screen should pay.
+
+The advisory reports only drift an update can actually clear. The Video checkout
+is cloned from a third party's *fork* of the canonical project, and PortOS can
+read that fork but never push to it — so when it falls behind its own upstream,
+neither `gh repo sync` nor a pull from its origin can move it, and an advisory
+raised for that drift would never clear. PortOS therefore counts a fork toward
+"update available" only when it is the application checkout's own fork, the
+credential can push to it, and it has not diverged (`isForkSyncable` in
+`server/services/managedAppRepositories.js`, surfaced to the client as each
+source's `forkSyncable`). The drift is still reported on the app's **Git** tab,
+where the card explains why no button there clears it.
+
+## Runtime and data ownership
+
+The managed app uses port `8940` and starts with the Bun executable found or
+installed during setup:
+
+```text
+<bun> --env-file=.env.portos server/server.ts
+```
+
+Once installed and enabled, PortOS starts the runtime automatically at server
+boot and when the feature is enabled. It waits for readiness, opens the host
+bridge, reconnects the resident CoS presence when that presence is enabled, and
+reconciles pending world-design updates. This startup never installs missing
+dependencies, downloads assets, or calls an AI provider. A disabled feature does
+not auto-start the runtime; manual app controls remain available. Start, stop,
+logs, updates, and launch links remain visible on the normal managed-app screen.
+Command-based Eidoverse launches use a 2 GB PM2 memory restart limit so the
+loaded world and asset runtime can exceed the generic app limit of 500 MB.
+Plain-HTTP managed apps
+keep an `http://` launch URL even when PortOS itself is open over HTTPS, so the
+Apps launch action works from a Tailscale MagicDNS session. Managed updates pull
+both the selected Worlds checkout and its companion video runtime before using
+Bun's frozen lockfile rather than npm.
+
+When the feature is enabled, **Eidoverse** is the primary PortOS world surface.
+Opening it starts the managed app when needed and embeds its web client in a
+full-width PortOS page. The retired OpenWorld paths remain as compatibility
+redirects to Eidoverse, so old bookmarks do not create a second world renderer.
+
+Durable Eidoverse world logs live at `data/eidoverse/worlds`. This is
+machine-local `file-primary` data: PortOS backups include it, but PortOS does
+not federate it to peers. The git checkouts remain under `data/repos`, which is
+the existing re-cloneable repository backup class.
+
+## Private persistence and identity
+
+This is a private world for one PortOS install. It is not a public Eidoverse
+world and PortOS does not publish its world records or expose them through the
+peer-sync record layer. Trusted machines may reach the instance through the
+install's existing Tailscale boundary; the install remains the authority for
+the world and its history.
+
+PortOS-owned integration state is stored in
+`data/eidoverse/portos-world.json`. It contains the selected world, the human
+display name, the stable Persistent Mind/CoS identity and local role
+observations, the projection recipe, and the last projection checkpoint.
+The human name can be configured explicitly. If it is cleared, PortOS derives a
+stable pseudonymous label from the persisted instance id without placing the
+raw id or the machine's display name in the Eidoverse log.
+The V1-to-V2 migration recognizes the old `instance-name` source marker and
+retires only that automatic value; an explicitly configured name is preserved.
+Because Eidoverse history is append-only, PortOS does not rewrite prior log
+entries, but it no longer joins or projects with the retired machine name.
+The browser receives that same identity in the Eidoverse launch URL, so a
+reload or a second trusted machine does not create a new anonymous user.
+The default installation uses Eidoverse's name-based join protocol with the
+empty join-token setting; the URL supplies the durable world, name, and avatar
+instead of inventing a browser-local account. If an operator later adds a
+join-token policy in the independent Eidoverse runtime, that policy remains an
+explicit runtime configuration rather than a secret stored in PortOS state.
+
+The Eidoverse runtime remains responsible for its own append-only world log,
+snapshot, roles, chat, poses, and assets under `data/eidoverse/worlds`. PortOS
+joins through the runtime's public WebSocket protocol and never edits the
+external checkout to seed content. On a fresh world, PortOS establishes the
+configured human identity first so it can own the world, then reconnects the
+stable CoS identity as an agent and grants it an owner role. Eidoverse reserves
+terrain, sky, and role handoff for owners, so the persistent CoS must retain
+that role to maintain the projected world and hand ownership to a renamed
+human identity. Once the new identity owns the world, PortOS demotes the prior
+identity to visitor so a rename does not leave a stale owner behind. PortOS
+exposes that authority through the separate, disabled-by-default **Manage the
+private Eidoverse world** grant in both the Persistent Mind controls and the
+local Agent Tools (MCP) controls; generic PortOS write access does not imply it.
+This makes both the human and CoS roles durable in the Eidoverse world rather
+than browser-session conveniences.
+
+## World Design V3: PortOS Commons
+
+Commons arranges eight inward-facing halls around a grassy arrival park.
+A broad circular promenade and short paths link rounded gathering terraces;
+trees, planted beds, and timber seating soften the edges. The center stays
+clear for pedestrian agents, Persistent Mind avatars, and human guests.
+Buildings use Eidoverse's existing `comp.structure` grammar: tiled floors,
+glass frontage, open archways, walls, and roofs, with native collision.
+Large district landmarks sit on rooftop plinths behind the frontage. Their
+measured bottom and animation clearance keep the entrance and physical sign
+visible. Accent-edged paths and shallow entrance canopies connect each hall
+to the promenade. These geometry changes reconcile through the existing V3
+projection without resetting user overrides or visitor-authored objects.
+A deterministic GLB adds walking surfaces, decorative seating, and physical
+district signs through Eidoverse's ordinary content-addressed upload API.
+Each install reuses the verified recipe-derived asset on later projections.
+
+Library geometry summaries are measured once per resolved path and retained
+in the asset locks. Placement compensates model-origin offsets and fits a
+semantic size envelope; native structure anchors and the city surface retain
+their authored coordinates. Desktop computers sit at the measured desk height.
+
+The portable recipe resolves desks, retro terminals, crates, barrels, palms,
+and streetlights from each install's own library. Furniture stays inside the
+buildings or beside entrances. Arcade computers sit on individual desks, with the first eight workstations
+inside the hall and overflow on its terrace. Other bounded live signals occupy
+distinct bays beside the entrance aisle, sharing the existing 48-signal budget. Decorative furniture
+has no floating label. Semantic landmarks and signals keep their optional
+annotations, hidden at the start of each visit until the user activates the
+Labels toolbar toggle or chooses a label mode in World controls.
+
+V1 and V2 defaults remain immutable migration baselines. The V3 migration
+preserves explicit overrides, aliases, and the last successfully applied
+version. Changed asset slots invalidate their resolution fingerprints;
+unchanged locks remain reusable. Existing managed identifiers stay stable,
+obsolete trail markers are retired by normal reconciliation, and unrelated
+visitor-built entities remain untouched. Failure compensation restores native
+structure components through the existing component rollback path.
+
+No Eidoverse framework change is required. Physical signs are authored scene geometry; camera-facing clickable labels are
+a separate, optional renderer capability. Building room labels describe topology and do not render signs.
+
+## World Design V2: Luminous Systems Garden
+
+PortOS ships a versioned world-design recipe, not a one-instance scene. World
+Design V2 replaces V1's numbered resource lanes with eight stable semantic
+districts:
+
+| District | PortOS meaning |
+|---|---|
+| PortOS Nexus | Aggregate health, operations, and feature affordances |
+| App Terraces | Managed apps and their coarse runtime state |
+| Agent Foundry | Active agents and bounded CoS task summaries |
+| Goal Observatory | Goals and current-sprint Jira summaries |
+| Memory Grove | Category and graph aggregates, never memory bodies |
+| Data Vault | Bounded PostgreSQL and file-domain summaries |
+| Federation Harbor | Coarse peer availability summaries |
+| Activity River | Productivity and recent activity aggregates |
+
+The authored environment is part of the design contract: deep slate/indigo
+terrain, a warm dawn `skymesh`, three deliberate lights, restrained fog, and a
+sparse wind-reactive field. District anchors have distinct silhouettes and
+accent colors. Abstract metrics no longer use generic car meshes. Entity
+position is derived from stable source id plus district anchor, so source array
+reordering does not move the world around. Goal progress lifts its constellation
+beacons, while activity summaries follow a shallow, stable river bend.
+
+The central Nexus light follows aggregate health: cyan is healthy, amber needs
+attention, and red is an error. The corresponding health beacon also changes
+shape, elevation, and motion, so the status remains legible without color.
+
+Every projected record is normalized to a bounded `WorldSignal` component. It
+contains a one-way stable resource key, generic safe label, controlled
+status/severity/freshness values, district, PortOS route, disclosure class, and
+a shallow set of numeric/boolean metrics. Nested collections become counts and
+arbitrary strings are discarded. Apps become a few status-count pylons rather
+than one anonymous rack per app; storage becomes two aggregate landmarks plus
+bounded anomaly markers; Jira becomes current-work status counts. PortOS never
+places raw journal/memory bodies, database or file names, task prompts, ticket
+titles, machine/peer identities, or federation records in the Eidoverse log.
+The default per-family caps sum below the hard global ceiling, and a user-edited
+recipe still cannot materialize more than 48 live PortOS signals.
+When authored caps would exceed that ceiling, PortOS allocates one signal per
+included current-or-stale source before filling additional slots in
+deterministic rounds. The drawer reports the exact per-source omissions instead
+of showing a populated source count beside an unexplained empty district.
+
+Only ids under `portos-design-v2-*` and the retired V1
+`portos-projection-*` namespace are reconciled. Unrelated Eidoverse entities are
+never moved or removed. A temporarily unavailable PortOS source preserves its
+last-good entities; a confirmed empty source retires that source's managed
+entities. The eight district landmarks, luminous connector nodes, and three
+authored lights are infrastructure rather than live records.
+
+## Assets are a recipe, not a payload
+
+PortOS does not bundle model packs. `server/lib/eidoverseWorldDesign.js` stores
+small semantic slots such as `nexus`, `agent`, `memory`, and `peer`. Each slot
+declares:
+
+- preferred Eidoverse library paths;
+- fallback search queries;
+- semantic filename tokens used as ranking hints and whole-token exclusions;
+- maximum bytes, GLB/animation expectations, and `library-only` source policy;
+- a final known-library fallback.
+
+On first projection after an install or recipe update, PortOS reads
+`/library-list`, uses `/library-models` only for unresolved slots, rejects
+content-addressed `store/<hash>` paths for portable defaults, verifies each
+chosen `/library/...` asset, and ranks candidates deterministically. It then
+persists the exact path, byte-size metadata, design/recipe/slot versions, per-slot
+recipe fingerprint, strategy, catalog fingerprint, resolution time, and
+default-versus-user source in `assetResolutions`. Normal projections reuse that
+lock and do not repeat model searches. A later design release invalidates only
+slots whose recipe fingerprint changed; unchanged paths and local overrides
+remain pinned. Eidoverse owns and caches the bytes. A user may retain an
+explicit install-local `store/...` model override, but that path is recorded as
+an override and never becomes a shipped PortOS default.
+Search results remain eligible when a library rename removes an old filename
+token, and a safe catalog GLB is the final deterministic fallback after searches
+are exhausted. Catalog entries without byte metadata remain usable with
+`bytes: null`; a known over-budget size is still rejected.
+
+## Versioning, updates, and recovery
+
+`data/eidoverse/portos-world.json` schema V3 records
+`selectedDesignVersion`, `lastAppliedDesignVersion`, `pendingDesignVersion`,
+`userOverrides`, `assetRecipeVersion`, `assetResolutions`, `migrationReport`,
+and the reconciliation checkpoint/error. The immutable V1 and V2 registries are
+both retained in source.
+
+Migration `323-eidoverse-world-design-v2.js` runs in the normal PortOS migration
+pass used by `update.sh`, `update.ps1`, and ordinary server boot. It compares
+every stored V1 leaf against the immutable V1 default: a default-matching leaf
+inherits V2, while a genuinely customized leaf becomes a V2 user override.
+Customized V1 source caps above the corresponding V2 cap are reset to the V2
+default and their original values stay visible under unsupported overrides,
+preventing an old lane-scale cap from starving the semantic districts.
+V1's lane coordinates have no safe district translation, so a custom layout is
+reported rather than silently applied. Missing state is a fresh V2 install;
+invalid or newer schema state fails closed and remains pending for repair or a
+PortOS update.
+
+Migration `325-eidoverse-video-companion.js` backfills the canonical Video
+checkout into older Eidoverse managed-app registrations. This lets those
+installations use the same two-checkout managed update path after upgrading
+PortOS without rewriting their selected Worlds origin or world data.
+
+The offline migration never touches an external checkout or calls an AI
+provider. It leaves V2 pending. After restart, a deterministic reconciler runs
+only when the separately managed Eidoverse process is already online. It
+preflights runtime build identity, the catalog, and every selected asset before
+sending world operations. Reconciliation is staged: infrastructure and live
+signals are created first, the managed environment follows, and only then are
+obsolete V1 ids retired. Every acknowledged operation has an inverse derived
+from the pre-update snapshot. A failed stage reconnects, applies those inverses
+in reverse order, retains the old `lastAppliedDesignVersion`, and leaves a
+resumable checkpoint. If Eidoverse is stopped or incompatible, PortOS leaves
+the update pending and the page links directly to the managed app instead of
+claiming the world is current.
+A process restart during an applying or compensating stage marks that persisted
+run as interrupted before boot reconciliation; the drawer then offers the same
+explicit retry path as other failures. Retired owner-role cleanup is
+best-effort and never blocks the current world: failed demotions retry up to
+three projections, then age out with a generic manual-review warning. A later
+clean run clears that warning, and a full reset clears all recovery state.
+
+On a genuinely fresh world there is no previous atmosphere to protect, so the
+dawn environment is applied first and the user does not wait in darkness while
+the initial landmarks and signals stream in. The stricter order above remains
+mandatory for every upgrade with a previously applied design.
+
+The hosted page retains a loading curtain until the embedded renderer arrives,
+then leaves the scene unobstructed. PortOS refresh, configuration, and standalone
+launch actions live in the page header rather than over the renderer. District,
+indicator-capacity, and reconciliation details stay in the World Design drawer,
+where they remain available without covering Eidoverse's own chat and world tools.
+**World controls** opens the shared tabbed drawer:
+
+- **Experience** — durable identity and high-level design status;
+- **Districts & Data** — source visibility, counts, current/stale state, direct
+  PortOS routes, caps, and district resets;
+- **Appearance & Assets** — dawn environment, selected size/source, local
+  overrides, and the persisted asset recipe;
+- **Updates & Advanced** — migration diff, checkpoints, apply/retry, asset
+  re-resolution, and a two-step full reset.
+
+The Persistent Mind and explicitly granted local CoS agents can use the
+governed `eidoverse.status`, `eidoverse.project`, `eidoverse.augment`, and
+`eidoverse.say` tools. `eidoverse.augment` accepts only bounded world verbs (for
+example `spawn`, `place`, `comp`, `light`, `terrain`, `sky`, and `grant`); it
+cannot execute arbitrary runtime behavior or modify the installed Eidoverse
+source. Status requires bounded PortOS read access. Projection, augmentation,
+and world chat retain the dedicated Eidoverse-management grant without widening
+generic PortOS record-write authority.
+
+**Bounded local scene inspection.** `eidoverse.inspect-scene` (provider alias
+`eidoverse_inspect_scene`) requires `manageEidoverse` for minds and agents,
+using the same local world-management authority as augmentation. It reads the
+already admitted local connection; it never joins, starts the runtime, projects,
+places objects, visits a peer, or adds a federation channel. If disconnected,
+open/start the existing Eidoverse world through its normal controls first.
+
+Input is exactly `{ anchor: [x, y, z], radius, limit? }`: three finite coordinates
+in `[-10000,10000]`, spherical radius in `(0,100]`, integer limit `1..12`
+(default `8`), no extra keys. Use a new semantic `requestId` for a fresh read;
+replaying one returns its original result under the common dispatch contract.
+
+Output is exactly:
+
+```text
+{
+  availability: "current" | "unavailable" | "incomplete",
+  sequence: integer | null,
+  observedAt: ISO timestamp | null,
+  complete: boolean,
+  truncated: boolean,
+  boundsComplete: boolean,
+  unknownBounds: nonnegative integer,
+  invalidEntities: nonnegative integer,
+  entities: [{
+    id: stable entity id,
+    pos: [x,y,z], yaw: radians, scale: positive number,
+    asset: normalized library model reference | null,
+    portosManaged: boolean,
+    bounds: {min:[x,y,z], max:[x,y,z]} | null,
+    boundsState: "known" | "unknown"
+  }]
+}
+```
+
+`sequence` is the current authored log cut (including the snapshot's already
+folded tail), then advances with contiguous live updates. `observedAt` records
+when the response was assembled after draining received messages. Added, moved
+and removed entities come from those updates, rather than the join handshake.
+Sequence gaps, unknown spatial verbs and world resets invalidate completeness;
+a new valid snapshot restores it. Closed/failed connections and snapshots without
+a verifiable cut are unavailable. This is a point-in-time authored view, not a
+reservation against later movement or construction.
+
+Measured static model bounds become world AABBs by transforming all eight
+corners with the authored position, yaw and scale. Known boxes intersecting the
+sphere are returned even if their origin is outside it; entities with unknown
+bounds are selected by their authored origin. Model summaries must be finite,
+ordered, nondegenerate and within the coordinate range; transforms require a
+finite yaw within ±2000π and scale in `(0,100]`. Malformed transforms and
+parent-relative entities are omitted and counted in `invalidEntities`.
+
+`complete` means every selectable entity in this query was enumerated.
+`boundsComplete` additionally requires no invalid or unknown bounds **anywhere
+in the retained world view**, because an unmeasured object outside the query
+might extend into it. `unknownBounds` is that global count, not just returned
+rows. An empty list with incomplete enumeration or unknown extents never
+certifies an area clear. Even measured bounds describe authored model geometry,
+not terrain, avatars or the full rendered scene. Procedural components, motion,
+attachments, runtime behaviors and deterministic simulation are not evaluated;
+their geometry remains unknown. Unsupported component/dynamic flags stay
+conservative until a replacement spawn or fresh snapshot resolves them.
+
+Inspection retains at most 2000 authored entities (more means `incomplete`),
+fetches at most 16 unique model summaries per call with a shared two-second
+budget, and reads at most 64 KiB per summary. Failed or oversized summaries stay
+unknown. Whole result rows are capped at 3000 serialized characters, below the
+mind's 4000-character semantic envelope budget; count or character clipping sets
+`truncated: true` and `complete: false`. There is no pagination or clearance
+certificate. Use smaller spatial queries to inspect candidate anchors.
+
+Only `eidoverse/assets/models/...glb` library references and content-addressed
+`store/<16..64 lowercase hex>.glb` references can appear as `asset`; all other
+references become `null`. No raw component bags, record contents, chat, tickets,
+actor identities, URLs, filesystem paths, error bodies or credentials are
+exported. `portosManaged` reads only `comp.portos.managedBy === "portos"`;
+keep those existing projected objects intact. A small synthetic workflow uses
+five calls: status → inspect occupied anchor → inspect alternate anchor →
+augment original objects → inspect the result. Inspection itself places nothing.
+
+**Proposal vs consequence.** `eidoverse.augment` is a two-phase contract, not a
+direct write: a mind's call is a *proposal* (structured verb+args intent), and
+only the world's own ack determines the *consequence*. The result's
+`operations` array carries one outcome per submitted operation — `accepted`
+(landed exactly as proposed), `rewritten` (the world acknowledged it with
+different committed args than proposed, e.g. a clamped value), or `refused`
+(PortOS's own bounds check or the world itself rejected it, and nothing
+landed) — each with `proposed`/`committed` payloads so a mind cannot narrate a
+build that never happened. A world-level refusal stops the rest of that batch
+from being sent, since later operations often reference an id an earlier one
+was meant to create. `eidoverse.say` is simpler — it either resolves with
+`committed: true` once the world acks the message, or the tool call fails
+outright, so a failed send can never be mistaken for a sent one.
+
+## Growth and automation
+
+The world-design recipe and per-install asset lock are intentionally separate
+from the current world log. As PortOS gains resources, the deterministic
+projection runs when the hosted page opens and can also be run manually, from a
+CoS task, or through the disabled-by-default autonomous job
+`job-eidoverse-projection`. Enabling that job is an explicit install-local
+choice; it performs no provider calls and only reflects resources that already
+exist. The hosted page starts the managed runtime when it is opened; an
+automated projection run expects that managed app to remain available, and
+records a failed run instead of silently publishing stale or fabricated data.
+CoS tasks can also augment the world with bounded authored landmarks or
+messages, while recipe changes remain visible and editable in PortOS.
+
+Disabling the feature hides the optional navigation entry but does not delete
+repositories, unregister the app, stop a running process, block the direct
+`/eidoverse` route, disable a separately configured projection job, or remove
+world history. Destructive uninstall remains an explicit manual operation.
+
+## Network boundary
+
+This integration is intended for the same private, single-user Tailscale trust
+boundary as PortOS. Eidoverse binds its server to the host network and permits
+an empty join token; do not expose this configuration to the public internet.
+An instance that needs a broader trust model should configure Eidoverse access
+control in that project before starting it.
+
+Eidoverse itself remains a plain-HTTP service on `:8940`. The embedded page
+starts the on-demand PortOS host and loads the renderer at the **same origin**
+as the PortOS UI — `${location.origin}/eidoverse-host/?…` — so a single-port
+tailcat forward (`127.0.0.1:15555` → remote `:5555`) works. The main `:5555`
+server reverse-proxies `/eidoverse-host` to loopback `:8940` (prefix stripped)
+and, while the host is active, also forwards allowlisted absolute root routes
+the renderer issues (`/ws`, `/version`, `/library/…`, `/node_modules/…`, …),
+including the WebSocket upgrade for `/ws`. Both external repositories stay
+unchanged. The host starts only when the page is opened, waits for the managed
+app to answer before mounting the iframe, and returns an explicit unavailable
+state when the runtime does not become ready.
+
+An optional legacy bridge on `:5563` still starts with the host (HTTPS when a
+machine certificate is present) for ExternalLink / direct access on the box.
+The iframe prefers the same-origin path; the single escape is a plain-HTTP page
+in front of an HTTPS-only host certificate that does not cover the hostname
+(loopback `:5553` / some Vite setups), where the iframe falls back to a direct
+`:uiPort` load — scene renders, handshake stays dormant.
+
+**World only / Open Eidoverse alone** opens `/eidoverse/solo` — a chromeless
+PortOS route that mounts the **same** `/eidoverse-host/` iframe fullscreen
+(outside the app sidebar). A top-level Safari tab aimed at `/eidoverse-host/`
+can stick on the renderer splash; staying inside PortOS reuses the proven iframe
+path through a single-port tailcat forward.
+
+Projection protocol and asset preflight target the same runtime. The default
+HTTP library origin is derived from `EIDOVERSE_WS_URL` by mapping `ws`/`wss` to
+`http`/`https` on the same host and port. Deployments whose one Eidoverse runtime
+publishes separate WebSocket and HTTP endpoints may set `EIDOVERSE_HTTP_URL`
+explicitly; both values must identify that same runtime.
+
+## PortOS bridge boundary
+
+The hosted page, identity bridge, projection service, and CoS tools are explicit
+PortOS adapters across the two projects' public protocols. They remain
+deterministic and install-local: opening PortOS does not call an AI provider,
+and no raw Eidoverse world log is copied to another machine by federation.
+
+
+## Object labels, aliases, and the saved legend
+
+PortOS emits a generic `comp.label` beside each owned object's `comp.portos`:
+`{name, description?, visibility: 'nearby' | 'always' | 'inspect', offset?}`.
+District and world landmarks use `always`, bounded by the renderer's range;
+live indicators use `nearby`; walkway markers use `inspect`. Ordinary refresh
+adds labels to existing worlds. One projector helper updates the label and the
+saved object legend together, including stale retained indicators. Repeating an
+unchanged projection emits no label verbs. Removed managed entities take their
+labels with them; foreign entities and their labels are preserved.
+
+**World controls → Districts & Data** shows the last successful projection by
+district: semantic name, meaning, label mode, model path, and resolution reason.
+Search matches and catalog/recipe fallbacks are explicitly called fallbacks.
+A retained model whose path differs from the current resolution lock reports
+unverified provenance. The link to **Appearance & Assets** uses the existing
+asset override, refresh, and reset controls. The legend remains readable with
+floating labels off and on older renderers. Agent-tool, scheduled-job, and boot projection results use the service's compact
+response: operation summary, object count, and presence. The full legend remains
+in saved projection state for the drawer.
+
+Optional aliases name individual live indicators using stable opaque resource
+keys, never private record IDs or titles. The configuration accepts at most 128
+aliases, each plain text of at most 72 characters. Clear the field to restore
+the generic label. Every alias field displays its opaque resource reference,
+including when multiple objects share a display name. Aliases for absent objects
+remain editable in **Saved aliases without a current object**, so users can free
+slots without resetting a district or losing aliases during a temporary outage.
+Saving an alias explicitly publishes that display text into
+the private world's append-only history; removing it changes the current label,
+not older history. Asset resets preserve aliases; district/all resets clear the
+matching aliases. Migration 343 upgrades existing config to schema V3, preserving
+custom recipes and asset locks, and initializes an empty alias map without
+reading private records. No config seed or raw-data backfill ships. Older PortOS
+versions reject the newer config schema rather than discarding the aliases.
+
+## Renderer capabilities and frame contract V1
+
+The external Worlds checkout remains the sole renderer. Its half of this
+contract shipped in
+[Worlds issue 5](https://github.com/atomantic/eidoverse-worlds/issues/5) and
+[Worlds issue 7](https://github.com/atomantic/eidoverse-worlds/issues/7).
+End-to-end label/picking/touch/keyboard acceptance requires that companion;
+producer and frame-contract tests alone do not establish it, so
+`scripts/eidoverse-frame-acceptance.mjs` drives the whole exchange against a
+disposable synthetic world in a real browser. It is deliberately outside CI —
+it needs the installed checkout, Bun, Playwright and a real Chrome — and it
+never touches the install's own world under `data/eidoverse/worlds`.
+
+`GET /version` advertises independently versioned capabilities alongside its
+existing build identity:
+
+```json
+{"sha":"example-build","commitTime":"2026-01-01T00:00:00Z","capabilities":{"objectLabels":1,"portosNavigation":1,"labelPreferences":1}}
+```
+
+Missing, malformed, or unknown capability versions do not block projection.
+The drawer shows an update/reload action when label support or the frame bridge
+is unavailable. Updating the managed checkout preserves PortOS design settings,
+explicit aliases, and asset overrides. The actual frame handshake takes
+precedence over the server capability report, so a stale browser bundle cannot
+pretend it supports the updated runtime.
+
+After each iframe load, PortOS posts to its **exact hosted origin**:
+
+```json
+{"type":"portos:connect","version":1,"nonce":"fresh-opaque-session","capabilities":{"portosNavigation":1,"labelPreferences":1,"identityRenameRequest":1},"labelVisibility":"nearby"}
+```
+
+The renderer validates `event.source === parent` and the embedding PortOS origin,
+then replies to that exact origin with `eidoverse:ready`, echoing `version` and
+`nonce` and advertising its supported capabilities. The renderer must obtain
+the expected parent origin from its trusted embedding configuration; accepting
+an arbitrary opener as the parent is not sufficient.
+
+**PortOS supplies that configuration.** The renderer reads it from
+`GET /embed-config`, which PortOS answers itself rather than forwarding: on the
+same-origin `/eidoverse-host` mount (and the root allowlist proxy) the
+`parentOrigin` is the full browser `Host` including a non-5555 forward port
+(e.g. `http://127.0.0.1:15555`); on the legacy `:5563` bridge it is the PortOS
+page origin (hostname + API port), not the bridge port. The checkout's static
+`EMBED_PARENT_ORIGIN` is deliberately left unset, because one install is
+reachable as `localhost`, as a LAN address and as a MagicDNS name, and a single
+configured origin could only ever match one of them — an unmatched origin leaves
+the frame bridge silently dormant. A request whose `Host` is unusable resolves
+to no embedder rather than to a repaired guess, since the browser compares
+origins with `===` and a repair would be a silent mismatch at handshake time. Each later message carries
+the same version and nonce. A reload invalidates the prior session. Unsupported
+clients simply ignore the handshake and continue rendering.
+
+For a user-triggered **Open in PortOS**, the renderer sends
+`{type:'eidoverse:navigate', version:1, nonce, entityId, route}`. PortOS requires
+all of: the current iframe window, its exact origin, the current nonce, a V1
+navigation-capable handshake, an entity present in the saved projection legend,
+and exact equality between the requested route and that object's known PortOS
+section route. Only the fixed source-section routes (plus `/eidoverse`) are
+allowed. URLs, query strings, encoded/relative paths, record payloads, and
+unknown entities cannot navigate. No URL proxy is exposed.
+
+When both sides advertise `identityRenameRequest: 1`, `/name <new name>` and
+`/rename <new name>` in the home-world renderer send
+`{type:'eidoverse:identity-rename', version:1, nonce, name}`. PortOS accepts the
+request only from the current iframe window, exact hosted origin, and current
+nonce, and only for a trimmed 1–64 character name without control characters.
+The request stages the existing World Design human-name field and opens its
+Experience tab; it cannot write configuration, change an actor id, or rename a
+live session. **Save and project** uses the normal validated configuration path,
+reconciles presence, and re-enters the world with the saved URL identity. Older
+renderers keep the manual World Design flow. Standalone, authenticated, and
+guest sessions retain their authoritative identity and receive guidance instead
+of sending a host configuration request.
+
+The Eidoverse framework leaves object labels off by default. PortOS explicitly enables
+them through its trusted frame session only after the user enables Labels. Each
+visit starts with `off`; an older stored always-on preference does not enable
+an overlay. The toggle and World controls change only this visit's view.
+Labels are positioned over their objects; clicking or tapping one opens its semantic
+name and description, with Open in PortOS supplied only by our fork. The old detached
+object dropdown and armed inspection buttons are removed.
+
+Floating-label preference is browser-only: `nearby` respects authored modes,
+`all-nearby` includes authored inspect-only objects within 60 metres,
+and `off` hides floating labels while keeping selected-object details accessible.
+PortOS sends `portos:label-preference` with `version`, `nonce`, and
+`labelVisibility` only after the frame advertises V1 preference support. A
+preference change never sends a world verb or rewrites configuration. The
+renderer owns distance culling, object picking, and accessible selected details.
+
+## Federated guest travel
+
+The Federation Terminal gives every connected, guest-capable peer a walk-in
+visitor chamber. Chambers are infrastructure rather than sampled health signals,
+so the live signal cap cannot silently omit a destination. Inspect a chamber
+and choose **Teleport as guest**, or use the destination buttons above the world.
+With an `objectInteraction: 1` renderer, approach a visible pod within three
+metres and press **E**, or tap its action prompt. This works with labels hidden.
+The local controls name the destination; the authored chamber uses an opaque
+reference rather than writing machine names into the world log. Destination
+changes refresh the projection while the page is open and its draft is saved.
+
+Departure checks the saved peer and its current capabilities, admits a fresh
+visitor identity, and opens that host's `/eidoverse/guest` page. Before navigation, PortOS
+requires the departing renderer's `worldDeparture: 1` acknowledgement
+when supported: presence and reconnect attempts stop, then the socket closes.
+PortOS waits for a blank replacement frame before navigating in the same tab;
+older renderers use that frame teardown as their compatibility path. Returning
+through browser history restores the home frame. This moves the human visitor;
+the install's resident CoS presence continues to belong to its home world.
+The guest shell
+loads its renderer without owner controls or private PortOS bootstrap requests,
+including when the destination uses the optional instance password. An existing
+Eidoverse browser login cannot replace the guest identity. **Leave world** returns
+to the previous page. Admission links expire after 30 minutes.
+
+Both ends need updated PortOS, Eidoverse enabled and running, and a renderer that
+advertises `guestEntry: 1`; the host needs its resident CoS presence enabled to
+admit visitors. Older runtimes remain unavailable for travel until updated.
+
+For the Persistent Mind, enable **Allow guest travel and chat with federated
+worlds** in its tool permissions. This is the separate `visitEidoversePeers` grant,
+which defaults off and does not follow from local world-management permission.
+The corresponding semantic MCP grant is available in API Access settings.
+
+| Tool | Purpose |
+| --- | --- |
+| `eidoverse.destinations` | Discover connected registered guest worlds. |
+| `eidoverse.visit` | Join a destination by its opaque `peerId`; returns a `visitId`. |
+| `eidoverse.visit-chat` | Read live replies after a cursor; optional `text` sends one message. |
+| `eidoverse.leave` | Disconnect the guest visit. |
+| `eidoverse.chat` | Read the resident's live local chat (`readPortos`). |
+| `eidoverse.say` | Reply locally as the resident (`manageEidoverse`, unchanged). |
+
+Visits do not move the resident presence or give a visitor construction rights.
+Guest chat starts with the visit, is bounded and cursor-based for the Mind, and
+never automatically exports stored conversation history or private records.
+Incoming chat makes no AI call and is never an instruction or permission grant.
+The [guest-conversation ADR](../decisions/2026-09-05-eidoverse-guest-chat.md)
+documents this narrowly scoped exception to the machine-local record policy.
+
+**Vernacular labeling on a visit (#7459).** A guest visit reaches only what the
+destination install chose to build in its own private world — its local
+vernacular style and buildings — never the shared PortOS baseline population,
+which has no visit surface of its own. Both entry points say so explicitly
+rather than leaving a visitor to infer it: `eidoverse.visit`'s response
+`guidance` tells a visiting Mind in the same turn it receives a `visitId`, and
+the human guest shell (`client/src/pages/EidoverseGuest.jsx`) carries the same
+line in its header. This is a labeling change only — nothing about what
+crosses the federation layer changes: the vernacular/baseline ownership model
+(below) already keeps a foundation's `style` and its whole local ledger out of
+every peer exchange, and a guest visit was never a foundation-ledger read.
+
+### Object controls
+
+The Commons island extends into an irregular grassy shoreline, a sandy beach,
+an eight-kilometre ocean horizon, and distant mountain islands. This is bounded
+authored scenery, not an infinite terrain-streaming or swimming system. It uses
+the same portable generated GLB as the city, without texture downloads or AI
+calls. Renderers advertising `largeWorldColliders: 1` receive the larger scene
+for the default terrain and district layout. Customized terrain or district
+positions retain the compact city so scenery cannot cover authored buildings;
+custom labels and assets remain supported. Older runtimes also retain the
+compact city until upgraded. The renderer indexes
+large landscape colliders once and uses their triangle BVH for local queries.
+
+Worlds already supports `use {id, action}` and authored server-side behaviors.
+The renderer's contextual control exposes a primary `comp.interaction` action
+or a sole existing reaction. Switches can use a behavior to emit an ordinary
+logged `light` or `comp` change; the world remains authoritative and late joiners
+see the resulting state. PortOS pods use the validated frame bridge instead of
+sending a world verb or embedding destination URLs in scene data. Keyboard
+repeat, chat focus, overlays, distance, and occlusion suppress accidental use.
+The renderer implementation and a toggle-lamp example live in the separate
+Worlds repository. Controller support is tracked in
+[Worlds #11](https://github.com/atomantic/eidoverse-worlds/issues/11).
+
+### Agent-free resilience assay (promote-path pre-check)
+
+Part of the [SwarmWorld-inspired stigmergic Eidoverse epic](https://github.com/atomantic/PortOS/issues/7453):
+a world foundation should not promote from an instance's local vernacular into
+the shared PortOS baseline just because it "worked" while its author mind was
+still narrating it live. `server/services/eidoverseResilienceAssay.js` runs a
+candidate contribution through a clean, agent-free sandbox before that
+decision is made:
+
+- `createSandbox()` is called fresh per scenario, so no state can leak in from
+  a previous run or a live process handle.
+- `buildProjectionPlan()` (`eidoverseWorldProjection.js`, already pure) loads
+  once against the sandbox's initial state, standing in for "replay in a
+  clean sandbox instance."
+- The controller then replays through the fixed disturbance suite —
+  `reconnect`, `restart-world-host`, `missing-optional-deps` — each with a
+  warm-up run, the disturbance, and required recovery ticks.
+- A controller `step()` (or `applyDisturbance()`) that returns a Promise is
+  itself a failure: the assay is synchronous by contract, so an "agent-free"
+  contribution cannot reach for a live network, disk, or provider call during
+  replay.
+- Every tick is checked against a built-in JSON-serializability invariant
+  (a promoted foundation has to be loadable by a peer that never saw the
+  authoring session) plus any contribution-supplied invariants.
+
+`runResilienceAssay(contribution)` returns `{ contributionId, pass, scenarios,
+projection, reasons }` with a readable reason per failure, naming the
+disturbance and tick. `scripts/eidoverse-resilience-assay.js`
+(`npm run eidoverse:assay`) is the CLI/CI entry point — with no arguments it
+runs every reference contribution under
+`server/services/eidoverseResilienceAssayFixtures/*.contribution.js`; given
+module paths, it runs the assay against those instead and exits non-zero on
+any failure. Two reference fixtures live beside the harness: a passing
+`beaconRelay.contribution.js` and a deliberately-failing
+`narratedOnly.failing.fixture.js` (named so the CLI's default fixture glob
+skips it; only `eidoverseResilienceAssay.test.js` exercises it, proving the
+harness catches the "author-mind-only" failure mode).
+
+This harness is what the promote gate below runs:
+`services/eidoverseFoundationLedger.js` replays a foundation through
+`runResilienceAssay()` and refuses to package a promote candidate on a failing
+verdict ([#7455](https://github.com/atomantic/PortOS/issues/7455)). Since #7625
+the gate builds that contribution from the foundation's OWN body
+(`server/lib/eidoverseFoundationSandbox.js`) rather than resolving one by id;
+the CLI still sweeps the shipped fixtures through the registry in
+`server/services/eidoverseResilienceContributions.js`.
+
+### Local vernacular vs shared baseline, and the promote gate (#7455)
+
+Federated instances are meant to keep their own style and buildings while
+discoveries that help everyone find a path into a shared PortOS baseline. That
+boundary is a data model, not a convention. `server/lib/eidoverseFoundations.js`
+declares three ownership layers:
+
+- **`runtime`** — the shared Eidoverse/PortOS framework. Upstream's to change; an
+  instance never authors into it and never promotes it.
+- **`baseline`** — the shared promoted-foundation population a peer can inherit.
+- **`vernacular`** — this install's own artifacts. **The default for everything
+  authored locally**, so nothing is shared by omission; promoting is an explicit
+  act with a gate in front of it, never the absence of a "keep this private" flag.
+
+A foundation is `{ body, style }` **by construction** rather than one bag with a
+blocklist. `body` is the promotable substance (declared schema, affordance,
+optional controller spec); `style` is the cosmetics that make this Commons look
+like itself — palette, motif, asset paths, placement, district, display aliases.
+Packaging carries `body` and drops `style` outright, which is what makes "a peer
+inherits the foundation without the author's cosmetics overwriting its own style
+layer" a property of the payload rather than a merge rule a receiver has to get
+right. On top of that split there is an authoring check: an unambiguously
+cosmetic key found *inside* `body` (`palette`, `motif`, `accent`, `color`,
+`material`, `texture`, a label alias) **refuses** the package rather than being
+silently trimmed, so "I put the palette in `body` and expected peers to get it"
+gets named. Spatial and asset-binding keys (`pos`, `yaw`, `lib`, `districtId`)
+are deliberately *not* on that list — they are exactly the substance of a
+`district-template` foundation.
+
+`data/eidoverse/foundations.json` (`server/services/eidoverseFoundationLedger.js`)
+is the install-local ledger — machine-local like `portos-world.json` beside it,
+never federated, no seed file and no migration, since an absent file is the empty
+ledger every install starts from.
+
+**The promote gate runs the assay against the foundation's OWN body; it never
+accepts a verdict and never replays something the author merely named.**
+`POST /api/eidoverse/world/foundations/:id/candidate` DERIVES the sandbox from
+`body` through `server/lib/eidoverseFoundationSandbox.js` (#7625), replays it
+through the agent-free harness above, and packages against the verdict it just
+produced.
+
+Until #7625 the binding was a single author-supplied string: `contributionId`
+was free text, it resolved against the shipped fixture directory, and naming a
+shipped fixture was *sufficient* to clear the gate. A local build could promote —
+and be offered to every federated peer — on evidence that described the demo
+fixture rather than the body inside the envelope. `contributionId` is now
+**derived** (`controller:<definitionId>`, or `<kind>:<id>`) and is not accepted
+on any authoring surface: not the route body, not `eidoverse.record`, not the
+panel. A receiving peer re-derives it from the envelope's own `kind`/`body` and
+refuses one whose evidence is about something else.
+
+One derivation per declared kind, each refusing a body it cannot interpret —
+which is the honest answer, because a declaration nobody but its author can
+replay is not promotable:
+
+| kind | what gets replayed |
+| --- | --- |
+| `controller` | the shipped definition named by `body.controller.definitionId`, run against **this install's** `body.controller.config` through the definition's own `configSchema`. Upstream's `exampleConfig` proves only that upstream's example survives. |
+| `district-template` | the declared `body.placement` must reproduce from its own `{ layoutId, anchor, propCount, seed, facing }` via `generateDistrictTemplatePlacement()`, and the body is the harness's projection source — a template's consequence is its projection plan. |
+| `schema` / `affordance` | the declarative interpreter: a clean world state is built from `body.schema`'s declared field types and every `body.affordance` verb is resolved against it each tick. An affordance recorded as prose (`{ inspect: 'reads the pulse count' }`) is refused; it has to declare `{ reads, writes }` over fields `body.schema` declares. |
+
+The executable part stays shipped code in every case, so this adds no
+arbitrary-code-execution surface — what varies is the declarative input the
+install actually authored. A caller therefore cannot assert that its build survived its
+author's absence; it can only ask for the check — the same proposal-versus-
+consequence separation the construction tools got in #7454, applied to promotion.
+A foundation that is re-authored loses both its candidate and its verdict, because
+both described the previous body; a refused package likewise clears any candidate
+packaged earlier, since the verdict that vouched for it no longer holds.
+
+`server/services/eidoverseResilienceContributions.js` still resolves the shipped
+fixtures **by id against a fixed directory** for the CLI and the harness's own
+tests. It is no longer the promote path's resolver, and there is no longer an
+endpoint or mind tool advertising its ids — `GET /api/eidoverse/world/contributions`
+and `eidoverse.contributions` are gone, because a list of ids that were
+sufficient to pass the gate was a list of ways around it. An author choosing a
+`controller` behaviour reads `GET /api/eidoverse/world/controllers` /
+`eidoverse.controllers`, which already project the shipped registry.
+
+Four refusals stand between a local artifact and the shared baseline, and every
+one returns a readable reason naming what to fix:
+
+1. **Ownership** — only a `vernacular` foundation is promotable.
+2. **Agent-free resilience** — the body must have a derivable sandbox at all, and
+   the verdict must pass, cover the full disturbance suite, and be bound to the
+   label this foundation's own `kind`/`body` derives (a passing verdict borrowed
+   from another build is refused explicitly, on both the packaging and the
+   receiving side).
+3. **Style leak** — a vernacular style key inside `body`.
+4. **Federation safety** — `server/lib/federationSafety.js` refuses the package
+   when the candidate carries machine identity, network info, PII,
+   credential-shaped values, or a credential-*named* field (`{ apiKey: … }`,
+   which no value-shape scan can see), anywhere in its values **or its keys**.
+   Nothing is redacted and shipped: a redacted promote would leave the author
+   believing they published what they wrote.
+
+The candidate envelope carries a content-addressed `fingerprint` (sha256 over the
+canonicalized envelope), so `verifyFoundationCandidate()` is one gate seen from
+both sides — the packaging side and a receiving peer's.
+
+**Promoting publishes into this install's baseline population.**
+`POST /api/eidoverse/world/foundations/:id/promote` re-packages first and
+publishes the candidate it just produced, so promotion never rests on a stored
+verdict — every gate above is re-run against the body as it stands. On a pass the
+record moves to the `baseline` layer and takes a `promotedAt` stamp; its
+`style` stays behind, because only the envelope crosses and the envelope has no
+style layer at all. A refusal is a 200 with its reasons and moves nothing.
+Re-authoring a promoted foundation returns it to `vernacular` and clears
+`promotedAt`: the body that was published no longer exists on this install, and
+keeping the stamp would also be a dead end, since the gate refuses to package a
+`baseline` foundation.
+
+**Withdrawing retracts a publication, and it reaches the peers that pulled it
+(#7632).** `POST /api/eidoverse/world/foundations/:id/withdraw` de-promotes the
+record — `vernacular`, `promotedAt` and `candidate` cleared, the body kept — and
+records a **tombstone** for the fingerprint it had published. That tombstone
+rides the peer offering, and a receiving install *deletes* its inherited copy
+rather than merely ceasing to re-pull it. Re-authoring a promoted foundation
+tombstones the replaced envelope for the same reason: it retracts a published
+body, and before this it did so silently. Promotion used to be one-way, so a
+foundation carrying something its author regretted — a personal detail the
+regex-shaped federation-safety scan cannot recognize, a wrong attribution, a
+body that turned out to be harmful — stayed on every install that had pulled it,
+for good.
+
+`DELETE /api/eidoverse/world/foundations/:id` removes a record outright, and
+**withdraws it first if it was promoted** — so the most natural gesture an
+author makes cannot orphan a peer's copy beyond recall. `?originInstanceId=`
+addresses an INHERITED copy; a bare id always means this install's own work,
+because the two id spaces legitimately overlap.
+
+**What withdrawal does not promise.** A peer running a PortOS older than the
+`tombstones` wrapper key (schema v3) gently skips the whole offering and keeps
+its copy, saying so in its log. That is unavoidable by construction — retraction
+is best-effort across versions, never a guarantee — and it is the right failure
+mode: the old peer degrades to the previous add-only behavior instead of acting
+on a wrapper it cannot fully read. Deleting a record whose tombstone has already
+aged out of the capped list is likewise final.
+
+**Where the user does this.** Eidoverse > World controls > **Foundations**
+(`client/src/components/eidoverse/EidoverseFoundationsPanel.jsx`) lists every
+foundation with its ownership-layer badge, records or re-authors one, runs the
+assay, promotes, and renders each refusal reason verbatim beside the foundation
+it refused. The expanded foundation is a `?foundation=<id>` search param, so a
+refusal is linkable. The form has no contribution field: it seeds the `body` per
+kind and, for a `controller`, fills it from a shipped definition read off
+`GET /api/eidoverse/world/controllers` — an install that ships none says so
+rather than offering an empty picker.
+
+**The mind needs its own grant to promote.** `eidoverse.promote` (with the read
+beside it, `eidoverse.foundations`) is gated on `manageEidoverse` **and** the
+separate default-off `promoteEidoverseFoundations` grant, and is mind-scope only
+— building in the local world is never permission to publish out of it, and an
+ephemeral CoS task agent never gets the tool at all. The server runs the assay
+itself, so a mind can ask for the check but can never assert a passing verdict.
+Both tools return summaries (`summarizeFoundation`) rather than whole records:
+the local style layer and the packaged envelope have no business riding into a
+prompt.
+
+A mind can also author, not just list and promote. `eidoverse.record` wraps the
+same `recordEidoverseFoundation()` the HTTP route above uses, gated on
+`manageEidoverse` alone (no promote grant needed — authoring stays local by
+construction) and mind-scope only. `authorKind` is stamped `'mind'` server-side
+regardless of what the call arguments claim, the same reason `layer` is never
+caller-supplied — and, since #7625, the same reason `contributionId` is not
+accepted either: a mind that could name what the gate replays could point it at a
+shipped demo. `eidoverse.controllers` (`manageEidoverse`, read) is what a mind
+reads first, for the `definitionId` values a `controller` body may name.
+
+### Provenance graph and inheritance edges (#7461)
+
+Every foundation carries queryable provenance: who authored it (an opaque
+instance id + coarse `authorKind` — `mind` / `cos` / `user`, never a display
+name) and its ordered lineage. `foundationLineage()`
+(`server/lib/eidoverseFoundations.js`) derives that lineage — `authored` →
+`assayed` → `packaged` → `promoted`, or `inherited` → `assayed` for a local
+copy of a peer's — from fields the record already persists, so it costs no
+extra storage and a ledger written before this existed still projects
+correctly. `GET /api/eidoverse/world/foundations` returns it on every entry,
+and the mind tools' `summarizeFoundation()` projection carries `provenance`,
+`inheritance`, and `lineage` too — the same identity fields a candidate
+envelope was already authorized to carry, now surfaced consistently
+everywhere a foundation is read. `GET /api/eidoverse/world/foundations/:id`
+names a locally-authored record by its plain id and an inherited copy by
+`?originInstanceId=<origin>` (#7626): an inherited copy lives under a
+separate ledger key precisely so it can share a human-readable id with a
+local vernacular foundation without colliding, so the ORIGIN is what
+disambiguates the two. The `peer:<origin>:<id>` storage key itself stays
+internal and is never typed by a caller — `{ id, originInstanceId }` is the
+grammar (`eidoverseFoundationTargetSchema`), and `foundationLedgerKey()` is the
+one place it becomes a key.
+
+**`recordEidoverseFoundationInheritance()`** (`eidoverseFoundationLedger.js`)
+is the accept-side of a peer pull: given an already-verified candidate
+envelope, the peer this install pulled it FROM, and this install's own
+instance id, it re-runs the exact gate a peer runs on a candidate it was
+handed — schema, content-addressed fingerprint, the embedded assay evidence,
+and federation safety — and, on a pass, stores a `baseline` local copy
+carrying an `inherited-from` edge (origin instance, source instance, the
+envelope's fingerprint, and when it was pulled). It refuses a self-referential
+pull (a peer handing back a foundation this install itself originated) and
+never re-runs the resilience assay itself — replaying a peer's controller code
+on the receiving install is exactly what the assay harness exists to keep off
+every OTHER install.
+
+The inherited copy is stored under `peer:<originInstanceId>:<foundationId>` —
+deliberately disjoint from any id a local author could ever write — so it can
+never shadow, collide with, or erase a same-id local vernacular foundation;
+both simply coexist in the listing. An inherited foundation can never be
+re-promoted from this install (`packageFoundationCandidate` refuses it by
+name): promotion publishes only what this install itself authored, never a
+relay of another install's work.
+
+### Reading and adopting an inherited foundation (#7626)
+
+Inheriting a peer's foundation used to store a row and nothing more: no
+runtime on either install read a foundation's `body`, so the only way to use
+what a peer contributed was a human reading raw JSON out of the Foundations
+panel and retyping it — the "go read the author's transcript" path this whole
+area exists to replace, and one that keeps no attribution. Two verbs close
+that.
+
+**Read one.** `eidoverse.foundation` (mind tool, `manageEidoverse`, read) and
+`GET /api/eidoverse/world/foundations/:id` return `detailFoundation()` — every
+field `summarizeFoundation()` carries, plus `body` and `disclosure`. The LIST
+projection still omits both, deliberately: a list of whole bodies is kilobytes
+of substance per entry riding into a prompt to answer a question about ids,
+and which body to read is a decision made after the list. `style` is omitted
+in both — it is this install's cosmetics and never leaves.
+
+**Adopt.** `eidoverse.adopt` (mind tool, `manageEidoverse` **and**
+`installEidoverseControllers`) and `POST
+/api/eidoverse/world/foundations/:id/adopt` stand an INHERITED foundation up
+as something that runs here. `planFoundationAdoption()` decides per kind:
+
+| kind | what adopting does |
+| --- | --- |
+| `controller` | Installs the SHIPPED controller `body.controller.definitionId` names, with the envelope's `config`, **disarmed** and with `deliverEffects: false`. |
+| `district-template` | **Refused** — nothing turns a template body into geometry yet (#7627). |
+| `schema`, `affordance` | **Refused by name** — a declaration with no interpreter here is not adoptable, and saying so is the honest answer. |
+
+A locally-authored foundation is refused too: its author already has every way
+to install it, and adoption is specifically the path for a peer's work.
+
+Adopting a controller can never execute a peer's bytes. The envelope names
+*which of this install's own shipped controllers* to run and with what
+settings; `installEidoverseController()` resolves that id against the fixed
+local registry, exactly as an ordinary install does. The result lands disarmed
+and silent, so arming it and letting it speak or build in the world stay
+separate, local decisions rather than consequences of one tool call.
+
+The resulting controller install carries a `derived-from` edge — origin
+instance, foundation id, envelope fingerprint — in the same shape a derived
+foundation uses. That edge SURVIVES a later re-install (it is preserved
+alongside `installedBy` / `installedAt`), which is what makes adoption the
+provenance-keeping way to re-use a peer's contribution as against retyping the
+body, which keeps nothing and is refused as republishing (#7631). An adopt
+whose install id is already taken by a controller derived from something else
+is refused rather than overwriting a controller already running here.
+
+### The peer pull/inherit transport (#7455)
+
+Authorized to cross the federation layer by the
+[federated Eidoverse foundations ADR](../decisions/2026-09-18-federated-eidoverse-foundations.md).
+`server/services/sharing/peerEidoverseFoundationSync.js` is the wire between
+the two gates above. It owns no policy of its own — which foundations an
+install offers is `listPromotedFoundationCandidates()` in the ledger, and
+which it accepts is `recordEidoverseFoundationInheritance()`. It owns the
+payload wrapper, the version gate, the caps and the sweep.
+
+**Outbound.** `GET /api/peer-sync/eidoverse-foundations` advertises
+`{ schemaVersion, listHash, candidates: [...], tombstones: [...] }`. The
+`candidates` are exactly the foundations this install PROMOTED and AUTHORED:
+
+- `layer === 'baseline'` — a merely *packaged* candidate is a dry run ("would
+  this pass?"), not a publication, and is never served.
+- `!inheritance` — `baseline` also covers a local copy of a peer's foundation,
+  so an inherited record is excluded rather than relayed. That matches the
+  ledger's existing refusal to re-package an inherited record: a peer that
+  wants a third install's foundation pulls it from the install that authored it.
+- the stored envelope must still pass `verifyFoundationCandidate()`.
+  `foundations.json` is a file a human can edit, and refuse-never-redact
+  applies outbound as well as inbound, so a candidate that no longer passes is
+  withheld from the offering and logged.
+- the fingerprint must not be tombstoned. Promoting clears a fingerprint's
+  tombstone, so the two lists cannot normally disagree; a hand-edited ledger can
+  make them, and an offering that both published and retracted one fingerprint
+  would resolve differently on every receiver. The retraction wins.
+
+`tombstones` is `[{ fingerprint, deletedAt }]` — a content-addressed name and an
+instant, never any of the body. It caps on its **own** budget, never against
+`OFFERING_ENTRY_CAP`: sharing one cap would let a large promoted population
+silently truncate the retractions, which is the one trade this must never make.
+Both lists feed the `listHash`, so a withdrawal with no other change still
+breaks a receiver's unchanged short-circuit instead of waiting for the next
+forced re-pull.
+
+Unlike the older peer-pull routes, this one does not ride the warn-first
+authorization ramp: it passes `alwaysEnforce`, so only a registered,
+outbound-enabled peer ever reads it. The ramp exists so a peer mid-upgrade
+does not lose sync it already had, and a brand-new endpoint has no such
+history to protect.
+
+**Inbound.** `syncEidoverseFoundationsFromPeer()` runs for peers the user
+flagged `fullSync`, on the same 60-second sweep as the media-library,
+CoS-history and CoS-task sweeps (`services/sharing/index.js`). It byte-caps
+the response, validates the wrapper, gently skips a sender whose
+`schemaVersion` is ahead of local (the ledger has no re-fetch path that would
+correct a mis-applied envelope later), short-circuits on an unchanged
+`listHash`, and hands every remaining candidate to
+`recordEidoverseFoundationInheritance()` — which re-runs the *entire*
+accept-side gate and writes nothing on a refusal. A candidate whose
+fingerprint this install already holds is skipped, so the periodic forced
+re-pull (there so a local deletion self-heals) never rewrites `inheritedAt`
+on an unchanged copy.
+
+The sweep applies the peer's **retractions first**, before it reads what this
+install holds: a fingerprint the same offering re-publishes is then re-verified
+through the whole accept-side gate on its way back in, rather than surviving in
+place unchecked. A retraction authorizes dropping only a record this install
+pulled from *that same peer* (`inheritance.sourceInstanceId`) — a fingerprint is
+public inside the federation the moment it is offered, so it identifies a record
+but authorizes nothing, and without the scope any registered peer could retract
+a third install's work by naming it. A tombstone for a fingerprint this install
+does not hold is a silent no-op. Peer tombstones are not persisted: this install
+never re-offers an inherited record, and the sender keeps advertising the
+tombstone while its candidate stays absent, so storing them would only let a
+peer crowd out this install's own retractions.
+
+Both directions are gated on the `eidoverse` instance feature: an install with
+Eidoverse turned off neither offers nor accumulates.
+
+**Compatibility.** The envelope's `candidateVersion` is **v3** as of #7625. The
+bump is semantic rather than structural: a pre-v3 envelope's assay evidence was
+recorded against a contribution its author named, with no required relationship
+to the body travelling beside it, so there is nothing to upgrade — the accept
+side refuses v1 and v2 outright with that reason rather than inheriting on
+them. Migration `scripts/migrations/397-eidoverse-foundation-derived-assay.js`
+does the local half: it re-derives every record's binding label, drops the
+verdicts the old replay produced, and returns an unreplayable `baseline`
+foundation to `vernacular` with `promotedAt: null` — exactly what the ledger
+already does when a body is re-authored, for exactly the same reason.
+
+`PORTOS_SCHEMA_VERSIONS.eidoverseFoundations` (v3) is the
+transport contract, registered in `NON_RECORD_SCHEMA_CATEGORIES` because this
+is a receiver-pull category with no push to gate — a foundation is not a
+peer-subscribable record kind. It is deliberately separate from the envelope's
+own `candidateVersion`, which pins one envelope's shape and is hashed into its
+fingerprint: a change to the envelope bumps both, a change to the wrapper or
+the caps bumps only the category. v3 (#7632) added `tombstones` to the wrapper
+and moved only the category, because a tombstone names a candidate by the
+fingerprint it already had and no envelope field changed. A v2 sender omits the
+key and a v3 receiver reads that as "nothing to retract"; a v2 **receiver**
+gently skips a v3 offering and therefore keeps a copy it should have dropped.
+
+### Creative toolkit for minds (#7459, wired end-to-end in #7627)
+
+Authoring a foundation from a blank `body`/`style` is a lot to invent from
+scratch every time. `server/lib/eidoverseCreativeToolkit.js` is a small,
+documented, closed vocabulary a mind reaches for instead: named **materials**
+and **motifs** (cosmetics — install-local `style`, the same class of value
+`styleLeakFindings` refuses inside a `body`) and named **generative placement
+layouts** (`radial-ring`, `grid-plot`, `arc-row`, `grove-cluster` — structure,
+safe as `body`). `eidoverse.creative-catalog` (`manageEidoverse`, read) lists
+all three, including each material's `colorHex` — a palette id whose value a
+mind cannot see is not a usable catalog entry. Nothing here calls an AI
+provider; every layout is deterministic and seeded
+(`generateDistrictTemplatePlacement`), so the same `{layoutId, anchor, seed}`
+reproduces the same geometry on replay or on a peer that later inherits the
+promoted foundation.
+
+Two tools use a chosen layout, both read-only (they compute; they do not write
+to the world or the foundation ledger):
+
+- **`eidoverse.place-layout`** (`manageEidoverse`) calls
+  `buildDistrictTemplateAugmentOperations()` and returns ready-to-submit
+  `eidoverse.augment` `spawn` operations for the *live* scene (asset-path
+  validity is still checked where `eidoverse.augment` lands them). The same
+  `{layoutId, anchor, seed}` yields byte-identical operations every call.
+- **`eidoverse.draft-foundation`** (`manageEidoverse`) calls
+  `buildDistrictTemplateFoundationDraft()` and returns an
+  `eidoverseFoundationInputSchema`-shaped `district-template` input — the
+  generative substance (layout id, anchor, seed, resulting positions) in
+  `body`, the material/motif cosmetics in `style` — ready to pass straight to
+  `eidoverse.record`. Drafting composes nothing itself; recording still lands
+  on the local `vernacular` layer, matching every other authored foundation,
+  and publishing to the shared baseline remains the separate, explicit
+  `eidoverse.promote` act above.
+
+**`eidoverse.record` derives, never trusts, a `district-template`'s
+placement.** When a recorded `district-template`'s `body` carries
+`{layoutId, anchor}` (with an optional `seed`), `recordEidoverseFoundation()`
+(`services/eidoverseFoundationLedger.js`) replays
+`generateDistrictTemplatePlacement()` server-side and stores the result as
+`body.placement` — REPLACING any placement the caller supplied, not merging
+it. That is what makes the replay claim above hold for a hand-assembled
+`eidoverse.record` call too, not only for one built from
+`eidoverse.draft-foundation`'s output, and it is why the same `district-template`
+is comparable and replayable on an older or newer install that later inherits
+it (#7625).
+
+## Observation-first discovery (#7457)
+
+SwarmWorld's finding is that reuse between agents starts by **looking at the
+world**, not by asking its author about it. PortOS's mind tools grew the other
+way round: a mind could speak (`eidoverse.say`), travel (`eidoverse.visit`) and
+chat (`eidoverse.chat`, `eidoverse.visit-chat`) long before it could see what
+was already standing in its own Commons. The continuous-play playbook has told
+it to "move through the world and map what already exists" since that loop
+landed — naming places, projections and affordances it had no tool to read.
+
+`eidoverse.observe` is that missing read, and the playbook now leads with it.
+
+### What it answers
+
+One mind-scoped call (`manageEidoverse`, the same grant as the foundation and
+controller reads it summarizes) returns:
+
+- **`places`** — the eight districts as somewhere a mind can stand and
+  describe: label, direction, landmark, which signal sources feed it, how many
+  live signals those sources currently report, and whether any of them want
+  attention. Districts come from the install's **resolved design recipe**, not
+  from a constant, so a mind never names a district a later design version
+  renamed (V3 calls it the Federation Terminal, not the V2 Harbor) or one the
+  user's own overrides moved. A source the recipe has switched off reports as
+  `disabled` rather than counted — the projection places nothing for it.
+- **`peers`** — the opaque travel ids `eidoverse.destinations` also returns, so
+  one carries straight into `eidoverse.visit` — each with **how many
+  foundations this install inherited through it**.
+- **`foundations.inherited`** — a peer's contributions, newest first, with the
+  peer they arrived through and the instance that authored them (distinct on
+  purpose: a multi-hop re-share is only legible when they are).
+- **`controllers.needsAttention`** — only installs that are disarmed or
+  failing. A controller that has never ticked yet is one interval away from its
+  first tick, which is normal, not an alarm.
+- **`changes`** — what is new since this mind last observed.
+
+That third bullet is the epic's acceptance criterion: **a peer contribution is
+discoverable by touring the Commons**, because the Federation Terminal chamber
+carries the count and the inherited list names the build — no repository read
+and no conversation with its author required.
+
+### Three distinctions the report refuses to collapse
+
+- **Unavailable is not empty.** A district whose source failed to read reports
+  `signalCount: null` and `status: 'unknown'`, never `0`/`quiet`. Reporting an
+  unreadable app list as "the terraces are empty" is the same misreport #7458
+  fixed for district density, and it would be worse here, where the mind acts
+  on it.
+- **`signalCount` counts signals, not placed entities.** The projection
+  allocates a capped, round-robin sample of live signals into the world, so the
+  world may hold fewer. Counting sources keeps the tour readable **without a
+  running world runtime** — a mind that cannot start the runtime still needs to
+  know what is in its Commons — and the field name says "signals" so the
+  difference is never implied away.
+- **Never-observed is not nothing-new.** A first observation reports
+  `firstObservation: true` with no new items rather than handing a mind waking
+  into a months-old install its entire world as "new".
+- **A section that failed to collect is not an empty section.** It arrives as
+  `null`, contributes no changes, and **carries the previous marker's ids
+  forward**. Collapsing it to `[]` would report every peer as departed on a
+  transient read failure, rewrite the marker without them, and then report them
+  all as new on the next observation — a flap that repeats for as long as the
+  source keeps failing intermittently.
+
+### Local attention reasons
+
+Each place includes `attentionSignals` and `attentionTruncated`. Contributors
+identify the enabled, successfully read `source`, its actual `severity`
+(`attention` or `error`), its contributing `signalCount` (rows), and `reasons`.
+The district's total `signalCount` includes healthy rows and is not a fault count.
+An app group is one signal row even when it represents many applications.
+Each reason contains an allowlisted `code` and `affectedCount`, an aggregate
+number of affected records when known, otherwise `null`.
+
+Use `app_not_started`, `app_stopped`, and `app_unknown` to distinguish registry
+conditions before choosing a process diagnostic; not-started is not proof of a
+crash. Nexus can report `runtime_data_disk_pressure` or
+`runtime_data_disk_critical` (capacity of the filesystem holding runtime data),
+`memory_pressure` or `memory_critical`, `backup_failure`, `review_alerts`, and
+`cos_paused`. These come from the same predicates that determine source status;
+health does not alarm on not-started apps, while App Arcade does. Other sources
+and older reason-less inputs use `source_attention` or `source_error`: these
+say only that a coarse source status requires attention, without inventing a
+cause. Error sources remain identifiable even though district status is attention.
+
+Reasons are ordered by source, severity (error first), then code and capped at
+24 entries per district. `attentionTruncated: true` means some entries were
+omitted. Healthy recovery removes reasons on the next collection; disabled and
+unreadable sources emit none, and unavailable inputs never reuse previous causes.
+Diagnostics contain no app names, record identities, paths or raw errors. They
+are collected only for local observation under the existing mind
+`manageEidoverse` grant, without new routes, grants, world logs, renderer
+payloads or peer exports. A subsequent observe still advances the visit marker;
+use the internal `commit: false` form to inspect without consuming its delta.
+
+### The visit marker
+
+"What is new since I last looked" has to cross a **wake boundary**: a mind
+wakes, observes, acts, and ends its turn, and the next wake is a different
+process. Nothing in-memory survives that. The world chat cursor lives in a
+100-entry ring buffer a restart empties; the peer sync's `lastOfferingListHash`
+is per-peer content-change detection for a background sweep, also in memory.
+
+So observing **stamps a marker** — `data/eidoverse/observation.json`, covered
+in [STORAGE.md](../STORAGE.md). That is the stigmergic half of the slice: the
+trail a mind leaves is what makes the next observation's `changes` mean
+anything. It also means `eidoverse.observe` is **not idempotent**, and that it
+is declared `sideEffect: 'write'` even though a mind reads it like a read.
+That is not a label: `mindToolRecipes.js` only lets a saved recipe compose
+`'read'` tools, and the MCP bridge exports `readOnlyHint: sideEffect ===
+'read'`. Calling a marker-stamping tool a read would let a replayable recipe
+silently consume the `changes` delta the playbook depends on, and would tell an
+external MCP client the tool touches nothing.
+`observeEidoverseWorld({ commit: false })` is the internal look-without-stamping
+form.
+
+The marker holds ids, per-district status, and a timestamp — no body, no style,
+no record content — and is machine-local like the ledger and the controller
+store beside it. A marker written by a newer PortOS degrades to one honest
+`firstObservation` rather than being diffed against fields this build does not
+understand, and an *unreadable* marker file throws rather than reading as
+never-observed, because the next write would otherwise replace a real marker
+and re-report a settled world.
+
+### Signal, not noise
+
+Two filters keep `changes` worth reading on a busy install:
+
+- **Places diff on a status flip, never on a count change.** Signal counts move
+  every wake as agents and tasks come and go; diffing them would make `changes`
+  pure churn. The live count stays in `places` for a mind that wants it.
+- **A controller already wanting attention last visit is not re-reported.** A
+  long-broken controller would otherwise re-alarm every wake and drown the one
+  that just broke.
+
+### Where it lives
+
+`server/lib/eidoverseObservation.js` is pure: `buildEidoverseObservation()`
+takes already-collected snapshots plus the previous marker and returns
+`{ report, marker }`, so the whole diff contract is testable without a world
+runtime, a socket or a file. `server/services/eidoverseObservationLedger.js` is
+the I/O, clock and marker shell around it — and every collection failure
+degrades that section to `null` rather than failing the tour, because a mind
+that cannot read its controllers should still get to see its districts.
+
+
+## Executable world controllers (#7456)
+
+SwarmWorld's strongest result is that technologies are *executable*: they keep
+running once the agent that authored them is gone. PortOS minds wake
+intermittently, so a world that only changes during a mind turn is a world that
+is dead most of the time. A **controller** is the durable thing that keeps
+running between wakes — a resource tick, an ambient verb, a gentle NPC, a
+maintenance hook — supervised by PortOS rather than by whoever installed it.
+
+**Behavior is code PortOS ships; an install is data a mind authors.** The only
+thing an install may say about behavior is a `controllerId`, resolved by
+`server/services/eidoverseControllerRegistry.js` against a fixed directory of
+shipped modules. There is deliberately no path-taking export on that resolver at
+all: an install arrives from an HTTP body or a mind's tool call, and "import the
+module this request names" is arbitrary code execution wearing a feature's
+clothes. This is the same rule the resilience-assay contribution registry
+already applies, for the same reason.
+
+**A tick cannot reach an AI provider.** `runControllerStep`
+(`server/lib/eidoverseControllers.js`) refuses a step that returns a Promise, so
+there is no await for a network, disk, or provider call to hide behind. Root
+`AGENTS.md`'s "no cold-bootstrap LLM calls" rule is therefore a structural
+property of the tick path rather than a convention — boot arms a timer and
+nothing else. The same synchronous rule is why every shipped controller is
+replayable by the agent-free assay with no extra authoring: the controller
+registry is both the assay CLI's second contribution source and what a
+`controller` foundation's promote gate resolves `body.controller.definitionId`
+against — replaying the definition against **this install's own config**, so the
+evidence is about the controller this install actually configured.
+
+**Effects are proposals, from a closed vocabulary.** A step returns effects, it
+does not perform them — the same proposal-versus-consequence separation the
+construction tools have. `note` never leaves the ledger; `say` and `augment`
+reach the world only for an install whose `deliverEffects` was explicitly turned
+on (it defaults to `false`), and `augment` reuses the existing world-verb
+operation schema rather than inventing a second one. A delivery that fails is
+recorded and the step still counts: the controller's own state advanced, and
+re-running it to retry a world write would double-count everything it did.
+
+**Supervision.** `server/services/eidoverseControllerRuntime.js` registers one
+`eidoverse-controller-tick` interval with the event scheduler and steps every
+install whose own cadence is due. Arming is reconciled at every gate move —
+install, retire, arm/disarm — and not only at boot, so a controller installed at
+16:00 is not waiting for a restart to start ticking. A pass never replays a
+backlog: a machine asleep for three days wakes to ONE tick, because a cadence is
+"about this often", never a ledger of owed executions. A controller that fails
+`maxConsecutiveFailures` ticks in a row is disarmed with a recorded reason rather
+than retried forever, and an install whose `controllerId` this version no longer
+ships is disarmed immediately.
+
+**Every tick revalidates the stored install against its own definition
+(#7629).** `record.config` is re-parsed through `definition.configSchema`
+before each step rather than trusted from install time — a config that no
+longer parses (a shipped schema tightened, a hand-edited file) disarms the
+install immediately instead of stepping it, and a newly-added default lands on
+the record the first time it re-parses cleanly. `definition.invariants` — the
+same predicates the resilience assay replays — run against the state a step
+just produced; a violation fails that step and counts toward
+`maxConsecutiveFailures` like any other failure, so the live supervisor holds a
+controller to the same contract the promote gate does. The store's own
+`schemaVersion` stamp is read back (not assumed to be this build's constant):
+a store written by a newer build disarms rather than stepping under rules it
+does not fully understand — and the writes that disarm never re-stamp the file
+with this build’s older constant, so the signal survives the pass that reads it
+rather than being erased by it.
+
+**Storage** is `data/eidoverse/controllers.json` — `file-primary` and machine
+local, never federated (`docs/STORAGE.md`). A controller crosses to a peer only
+as the *body* of a promoted foundation, which carries no install.
+
+**Delivery evidence (#10818).** Both the common list and semantic inspect
+projection expose nullable `lastCompletedDelivery: { at, tick, ok, delivered,
+reason }`. It changes only after a `say` or `augment` delivery finishes and
+still matches the installed record's latest tick. `at` is that tick's time;
+read it and `tick` to assess the age of the acknowledgement. A refusal (including
+partial delivery) or thrown error replaces prior success. Quiet ticks, local
+notes, disabled delivery, step failures and in-flight requests leave the prior
+completed verdict intact. Arming/config edits preserve it; reinstall resets it.
+
+`lastDelivery` retains its latest-tick contract: quiet ticks report unknown
+(`ok: null`). Neither historical acknowledgement nor pulse/failure counters or
+`recentEffects` proposals prove current world state or visible rendering.
+Migration 425 upgrades older stores to schema version 2 with unknown (`null`)
+completed history, preserving their state and counters rather than manufacturing
+success from ambiguous old outcomes. There is no shipped store seed.
+
+**Shipped controllers.** `ambient-beacon` counts ticks and marks a pulse every
+Nth one (`announce` decides whether that pulse is spoken into the world or kept
+as a note). `lantern-keeper` re-issues the `light` verb for a fixed set of world
+entities every Nth tick, so lamps an author placed stay lit across host restarts
+while the author is away — re-lighting an already-lit lamp is a no-op, which is
+what makes running it on a schedule safe.
+
+**The mind needs its own grant to install.** `eidoverse.install-controller` and
+`eidoverse.retire-controller` are gated on `manageEidoverse` **and** the separate
+default-off `installEidoverseControllers` grant, and are mind-scope only:
+building in the world during a turn is a different act from leaving something
+running in it afterwards. The reads beside them, `eidoverse.controllers` and
+`eidoverse.inspect-controller`, need only `manageEidoverse` — a mind that can
+build should be able to see what is already ticking, and seeing is what makes
+the writes usable rather than guesswork. `eidoverse.controllers` never carries
+`config`/`state` (`summarizeControllerInstall`'s LIST projection); a caller that
+wants one install's config and accumulated state back reads
+`eidoverse.inspect-controller`, backed by the same `GET
+/api/eidoverse/world/controllers/:id` the panel's Details view uses (#7629).
+
+**Changing a config without losing state.** Re-installing an existing id
+rebuilds its state from the new config from scratch — the deliberate behavior
+for "I want this to start over." `updateEidoverseControllerConfig` (routed at
+`PATCH /api/eidoverse/world/controllers/:id/config`) is the other verb: it
+re-parses the new config through the definition's own schema and leaves
+`state` untouched, for a later mind that wants to tune a value on a controller
+it inherited without destroying what it has already accumulated.

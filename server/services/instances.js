@@ -1,0 +1,1569 @@
+/**
+ * Instances Service
+ *
+ * Manages PortOS peer orchestration — peer registration, health probing,
+ * query proxying, and reciprocal sync. This install's own federation identity
+ * (instanceId/name) and the data/instances.json file I/O + mutex live in
+ * services/instanceIdentity.js; this module is a consumer of that leaf.
+ * Data persists to data/instances.json.
+ */
+
+import net from 'net';
+import crypto from 'crypto';
+import { loadData, withData, UNKNOWN_INSTANCE_ID, getInstanceId, getSelf } from './instanceIdentity.js';
+import { createKeyCachedQueue } from '../lib/createKeyCachedQueue.js';
+import { canonicalStringify } from '../lib/objects.js';
+import { instanceEvents } from './instanceEvents.js';
+import { connectToPeer, disconnectFromPeer } from './peerSocketRelay.js';
+import { DEFAULT_PEER_PORT } from '../lib/ports.js';
+import { peerBaseUrl } from '../lib/peerUrl.js';
+import { isPeerApiRequestAllowed } from '../lib/apiAccessPolicy.js';
+import { peerFetch, peerAuthHeaders, PEER_AUTH_HEADER } from '../lib/peerHttpClient.js';
+import { withAbortTimeout } from '../lib/abortTimeout.js';
+import { ServerError } from '../lib/errorHandler.js';
+import { getSelfHost } from '../lib/peerSelfHost.js';
+import { getTailscaleStatus } from '../lib/tailscale.js';
+import { autoSubscribePeerToAllRecords } from './sharing/recordEvents.js';
+import {
+  mergePeerMediaProviderConfig,
+  normalizePeerMediaProviderConfig,
+  probeFederatedMediaProvider,
+} from './federatedMediaConsumer.js';
+import {
+  classifyPeerProbeFailure,
+  buildLastProbeRecord,
+  formatProbeDiagnosticLog,
+} from '../lib/peerProbeDiagnostics.js';
+
+const PROBE_TIMEOUT_MS = 5000;
+const POLL_INTERVAL_MS = 30000;
+const INITIAL_PROBE_DELAY_MS = 2000;
+// While peer probing is deferred (Tailscale not connected at boot), re-check
+// Tailscale on this cadence and start polling the moment it comes up — so the
+// user just has to connect Tailscale, no manual "sync now" required.
+const TAILSCALE_RECHECK_MS = 60_000;
+
+// Backoff tiers for consecutive probe failures (in ms)
+// 30s → 1m → 5m → 15m → 1h → 24h
+const BACKOFF_TIERS_MS = [
+  30_000,      // tier 0: normal (1 failure)
+  60_000,      // tier 1: 1 minute
+  300_000,     // tier 2: 5 minutes
+  900_000,     // tier 3: 15 minutes
+  3_600_000,   // tier 4: 1 hour
+  86_400_000   // tier 5: 24 hours (max)
+];
+
+let pollTimer = null;
+// Set while we're waiting for Tailscale to connect before starting the real
+// probe loop (see startPolling). Kept separate from pollTimer so stopPolling can
+// tear down either state, and so the boot gate is idempotent under double-start.
+let tailscaleWatchTimer = null;
+let pollingStartPending = false;
+// Bumped by stopPolling() to cancel any in-flight startPolling gate or deferred
+// watcher callback that is mid-await when the stop lands — without it, a stop
+// during the async window is a silent no-op and a timer gets created after stop
+// was requested.
+let pollingGeneration = 0;
+
+function classifyProbeError(err, peer, tunnelError = null) {
+  const classified = classifyPeerProbeFailure(err, {
+    peer,
+    tunnelError,
+    probeTimeoutMs: PROBE_TIMEOUT_MS,
+  });
+  // Keep emoji prefixes for classic log grepping; structured class is on lastProbe.
+  if (classified.class === 'dns') return `🌐 ❌ ${classified.message}`;
+  if (classified.class === 'local_refused') return `🌐 ❌ ${classified.message}`;
+  if (classified.class === 'host_unreachable') return `🌐 ❌ ${classified.message}`;
+  if (classified.class === 'probe_timeout') return `🌐 ⏱️ ${classified.message}`;
+  if (classified.class === 'tunnel_dial') return `🐈 ❌ ${classified.message}`;
+  if (classified.class === 'auth_required') return `🔒 ${classified.message}`;
+  if (classified.class === 'probe_http') return `🌐 ❌ ${classified.message}`;
+  return classified.message;
+}
+
+/** Best-effort live forward hint for a tailcat peer (dynamic import avoids a cycle). */
+async function lookupTailcatForwardHint(peer) {
+  if (peer?.transport !== 'tailcat') return null;
+  try {
+    const { listTailcatForwards } = await import('./tailcatPeer.js');
+    const forwards = await listTailcatForwards();
+    return forwards.find((f) => f.peerId === peer.id) || null;
+  } catch {
+    return null;
+  }
+}
+
+// Normalize a credential object off a peer add/update payload. Returns:
+//   - `undefined` for absent / malformed input, or a username-only payload
+//     (caller leaves the field as-is — see below)
+//   - `null` for an explicit clear (both fields blank)
+//   - `{ username, password }` for a credential to store
+// The password is the secret that defines the credential; username defaults to
+// '' so a password-only credential is valid Basic auth. A payload with a
+// username but no password is treated as "ignore", NOT a blank-password store:
+// the client only ever receives a redacted peer (`{ username, hasPassword }`),
+// so round-tripping that shape back into a PATCH must not silently wipe a
+// working password. An explicit clear always goes through `auth: null`.
+function sanitizePeerAuth(auth) {
+  if (auth === null) return null;
+  if (!auth || typeof auth !== 'object' || Array.isArray(auth)) return undefined;
+  const username = typeof auth.username === 'string' ? auth.username.trim() : '';
+  const password = typeof auth.password === 'string' ? auth.password : '';
+  if (!password) return username ? undefined : null;
+  return { username, password };
+}
+
+// True when two credential values (null or { username, password }) are
+// equivalent — used to skip a needless socket-relay reconnect on a no-op
+// credential write.
+function sameAuth(a, b) {
+  if (!a && !b) return true;
+  if (!a || !b) return false;
+  return a.username === b.username && a.password === b.password;
+}
+
+// Strip the locally-stored proxy credential before a peer record crosses the
+// wire (e.g. the announce response echoes the matched local peer back to the
+// announcing instance). The password is OUR secret for reaching THEM and must
+// never leak to the peer itself. Consumer routing policy and cached capacity
+// are local-only too, so peers cannot discover or influence our assignments.
+export function redactPeerForWire(peer) {
+  if (!peer || typeof peer !== 'object') return peer;
+  if (!('auth' in peer) && !('mediaProvider' in peer) && !('mediaProviderStatus' in peer)
+    && !('tcAddress' in peer) && !('syncSecret' in peer)) {
+    return peer;
+  }
+  const {
+    auth: _auth,
+    syncSecret: _syncSecret,
+    mediaProvider: _mediaProvider,
+    mediaProviderStatus: _mediaProviderStatus,
+    tcAddress: _tcAddress,
+    ...rest
+  } = peer;
+  return rest;
+}
+
+// Redact the stored credential before a peer record is returned to the local
+// client (API responses + socket broadcasts). Keeps the non-secret username
+// and a `hasPassword` marker so the UI can show "credential set" and prefill
+// the username, but never ships the password to the browser — mirrors the
+// `hasApiKey` pattern in server/routes/providers.js. The password stays only
+// on the server-side record, where peerAuthHeaders reads it.
+export function sanitizePeerForClient(peer) {
+  if (!peer || typeof peer !== 'object') return peer;
+  const auth = peer.auth && typeof peer.auth === 'object'
+    ? { username: peer.auth.username ?? '', hasPassword: Boolean(peer.auth.password) }
+    : peer.auth;
+  // EFFECTIVE categories, not the raw stored map — the SAME resolution the sync
+  // loop runs. Shipping the raw map would render a default-ON category's
+  // checkbox off while the server is actively syncing it (and make turning it
+  // off take two clicks), and a second, subtly different resolver here would
+  // put the UI and the sync loop back out of step on the legacy no-map peer.
+  // `masterSwitch: false` — show what the user has CONFIGURED, not what the
+  // master switch currently lets through. The UI renders `peer.syncEnabled`
+  // separately, so masking here would hide the stored selection: every box on a
+  // `syncEnabled: false` peer would read unchecked, and ticking one would
+  // silently reactivate every other category still true underneath it.
+  const { tcAddress: _tcAddress, syncSecret: _syncSecret, ...safePeer } = peer;
+  return { ...safePeer, auth, hasSyncSecret: Boolean(peer.syncSecret), syncCategories: resolveEffectiveCategories(peer, { masterSwitch: false }) };
+}
+
+/**
+ * The instances this install can direct a CoS task at (#4520): this machine
+ * plus every peer that can actually RECEIVE the task. Two filters, both of
+ * which exist to stop a pin from stranding work:
+ *
+ * - `instanceId` must be set. A peer that has never completed a probe/connect
+ *   has no addressable federation identity yet, so nothing could ever match a
+ *   pin naming it.
+ * - The peer must be an enabled full-sync peer. CoS task replication only
+ *   sweeps `fullSync === true && enabled !== false` peers (see
+ *   sharing/peerCosSync.js) — pin a task to any other peer and it never leaves
+ *   this machine, while this machine skips it for being pinned elsewhere, so it
+ *   sits pending forever.
+ *
+ * Returns only the id/name/isSelf triple the picker needs; no addresses, no
+ * credentials, no sync state.
+ */
+export async function getAssignableInstances() {
+  const data = await loadData();
+  const assignable = [];
+  if (data.self?.instanceId) {
+    assignable.push({ instanceId: data.self.instanceId, name: data.self.name || 'This instance', isSelf: true });
+  }
+  for (const peer of data.peers || []) {
+    if (!peer.instanceId || peer.fullSync !== true || peer.enabled === false) continue;
+    assignable.push({ instanceId: peer.instanceId, name: peer.name || peer.address || peer.instanceId, isSelf: false });
+  }
+  return assignable;
+}
+
+// --- Peer CRUD ---
+
+export async function getPeers() {
+  const data = await loadData();
+  return data.peers;
+}
+
+function validName(name, fallback) {
+  if (!name || typeof name !== 'string') return fallback;
+  if (!name.trim()) return fallback;
+  return name.trim();
+}
+
+// "NaN" and "undefined" are what a missing number or a missing value stringify
+/**
+ * Peer display names, hosts, addresses and instance IDs can identify a machine.
+ * Keep server logs generic so runtime sync events do not persist that data.
+ */
+export function peerLogLabel(ordinal = null) {
+  return Number.isInteger(ordinal) && ordinal >= 0 ? `peer ${ordinal + 1}` : 'peer';
+}
+
+function isIPAddress(str) {
+  return net.isIP(str) !== 0;
+}
+
+// Returns: null = explicit clear, undefined = invalid input (callers should
+// ignore), string = valid lowercased hostname. Three-state distinction lets
+// callers choose between "noisy/optional input" (use undefined) vs "user
+// asked to clear" (use null).
+function validHost(str) {
+  if (str === '' || str === null) return null;
+  if (typeof str !== 'string') return undefined;
+  const trimmed = str.trim();
+  if (!trimmed) return null;
+  // Accept DNS names: letters, digits, hyphens, dots. No scheme, no port, no path.
+  if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/i.test(trimmed)) {
+    return undefined;
+  }
+  return trimmed.toLowerCase();
+}
+
+export { validHost };
+
+// Default sync categories. Everything that replicates the user's own CONTENT is
+// off until explicitly enabled per-peer; the exception is `usage`, which is
+// default-ON (see DEFAULT_ON_SYNC_CATEGORIES below).
+const DEFAULT_SYNC_CATEGORIES = {
+  brain: false,
+  memory: false,
+  goals: false,
+  character: false,
+  digitalTwin: false,
+  meatspace: false,
+  universe: false,
+  pipeline: false,
+  mediaCollections: false,
+  videoHistory: false,
+  storyBuilder: false,
+  // ON by default — the only category that is. Rationale + the rules that
+  // follow from it: docs/decisions/2026-09-01-federated-usage-metrics.md.
+  usage: true,
+  fableLoom: false,
+  authors: false,
+  artists: false,
+  albums: false,
+  tracks: false,
+  creativeDirectorProjects: false,
+  moodBoards: false,
+  writersRoomWorks: false,
+  writersRoomFolders: false,
+  writersRoomExercises: false,
+  musicVideoProjects: false,
+  commissionFeedback: false,
+  creativeCommissions: false,
+  decks: false,
+  catalog: false
+};
+
+export { DEFAULT_SYNC_CATEGORIES };
+
+// How this install obtains the image/video BYTES behind a synced Media
+// Collection from a peer: `copy` downloads them into local `data/` (default —
+// the historical behavior), `host` keeps only the references and streams each
+// file from the peer on demand (see services/peerHostedMedia.js).
+export const MEDIA_SYNC_MODES = Object.freeze(['copy', 'host']);
+export const DEFAULT_MEDIA_SYNC_MODE = 'copy';
+export const peerMediaSyncMode = (peer) => (MEDIA_SYNC_MODES.includes(peer?.mediaSyncMode) ? peer.mediaSyncMode : DEFAULT_MEDIA_SYNC_MODE);
+
+// Categories that stay on for a peer even when the user's master `syncEnabled`
+// switch is off — that switch predates them and means "don't replicate my
+// content to this peer", so it must not silently retract a default-ON one.
+// Turning one off is an explicit per-category act; disabling the PEER
+// (`enabled: false`) still stops everything.
+export const DEFAULT_ON_SYNC_CATEGORIES = Object.freeze(
+  Object.entries(DEFAULT_SYNC_CATEGORIES).filter(([, on]) => on).map(([key]) => key)
+);
+const DEFAULT_ON_SET = new Set(DEFAULT_ON_SYNC_CATEGORIES);
+
+/** Is this category one that ships ON? The single definition of that policy. */
+export const isDefaultOnCategory = (key) => DEFAULT_ON_SET.has(key);
+
+// Does this category map enable anything the user actually opted into?
+//
+// `syncEnabled` is derived from this, and it is NOT a cosmetic flag: it also
+// gates per-record OUTBOUND pushes (`peerAllowsOutbound`). A default-ON category
+// must therefore never flip it on by itself, or adding one would silently widen
+// what every existing peer is allowed to receive.
+function hasOptedInCategory(categories) {
+  return Object.entries(categories || {}).some(([key, on]) => on === true && !isDefaultOnCategory(key));
+}
+
+/**
+ * Did the USER establish this peer relationship from this machine? Mirrors
+ * `peerAllowsOutbound`'s reading of `directions`: an absent/empty array is a
+ * legacy record (permissive), `['outbound']` is a peer the user added here, and
+ * `['inbound']` is one that merely ANNOUNCED itself to us and was auto-created
+ * by `handleAnnounce` — never approved by anyone.
+ */
+function peerUserEstablished(peer) {
+  const directions = Array.isArray(peer?.directions) ? peer.directions : [];
+  return directions.length === 0 || directions.includes('outbound');
+}
+
+/**
+ * The effective sync-category map for a peer — the single resolution of "what
+ * syncs with this peer", used by BOTH the sync loop (syncOrchestrator) and the
+ * client-facing peer payload (sanitizePeerForClient). Two resolvers would drift,
+ * and the UI would then show something the loop doesn't do.
+ *
+ * The rules, in order:
+ *  - A full-sync ("mirror everything") peer implies every current AND future
+ *    category on, whatever its stored map says.
+ *  - The shipped defaults sit UNDER the stored map, so a category added after
+ *    this peer record was written picks up its default instead of reading as
+ *    `undefined` (= off) forever. No migration needed; a key the user actually
+ *    toggled is present in the stored map and always wins.
+ *  - **A default-ON category defaults on only for a peer the user established.**
+ *    `handleAnnounce` auto-creates an inbound-only record for any host that can
+ *    reach the port, with no approval step — so letting a default reach those
+ *    would start pulling an unknown machine's data into this install the moment
+ *    it announced itself. An explicit stored `true` still wins there: if the
+ *    user ticked the box for an inbound peer, that is a decision, not a default.
+ *  - `masterSwitch` (default true) applies `syncEnabled: false` — the user's
+ *    "don't replicate my content to this peer" switch — by masking the result
+ *    down to the default-ON categories rather than silencing the peer outright.
+ *    Pass `false` to read what the user has CONFIGURED, independent of that
+ *    switch (what the settings UI renders). Disabling the PEER
+ *    (`enabled: false`) always stops everything, in either mode.
+ */
+export function resolveEffectiveCategories(peer, { masterSwitch = true } = {}) {
+  if (peer?.fullSync === true) return allSyncCategoriesOn();
+  const defaults = { ...DEFAULT_SYNC_CATEGORIES };
+  if (!peerUserEstablished(peer)) {
+    for (const key of DEFAULT_ON_SYNC_CATEGORIES) defaults[key] = false;
+  }
+  const storedRaw = peer?.syncCategories
+    ? { ...defaults, ...peer.syncCategories }
+    // Legacy fallback: a peer with no stored map but sync on gets brain+memory,
+    // the pre-per-category behavior.
+    : { ...defaults, ...(peer?.syncEnabled !== false ? { brain: true, memory: true } : {}) };
+  // Video-history rows are the metadata half of Media Collections: a synced
+  // collection's `{ kind:'video' }` items only render once the matching row
+  // exists. There is no separate user-facing toggle, so `mediaCollections`
+  // implies `videoHistory`; a legacy peer that only had `videoHistory` on keeps
+  // it (OR, never AND), so upgrading stops nothing that was flowing.
+  const stored = storedRaw.mediaCollections ? { ...storedRaw, videoHistory: true } : storedRaw;
+  if (!masterSwitch || peer?.syncEnabled !== false) return stored;
+  return Object.fromEntries(DEFAULT_ON_SYNC_CATEGORIES.map((key) => [key, stored[key] === true]));
+}
+
+// A category map with every key forced on — the effective view a full-sync
+// ("mirror everything") peer presents. Derived from DEFAULT_SYNC_CATEGORIES so a
+// newly added category is covered by full-sync peers with no per-peer change.
+// Used by the snapshot orchestrator (what a full-sync peer pulls) and the
+// reciprocation send (the all-on map a full-sync peer asks its mirror to adopt).
+export function allSyncCategoriesOn() {
+  return Object.fromEntries(Object.keys(DEFAULT_SYNC_CATEGORIES).map((k) => [k, true]));
+}
+
+// Sync categories whose records ride the PER-RECORD push pipeline (not the 60s
+// snapshot loop), paired with the record kind autoSubscribePeerToAllRecords
+// backfills. A false→true toggle on any of these triggers an inline backfill of
+// existing local records so the user doesn't have to wait for the next
+// `peer:online` / manual sync-now. Mirror of peerSync's KIND_TO_CATEGORY
+// (inverted). `pipeline → series` bundles child issues at push time; authors,
+// music records, and mediaCollections are standalone per-record kinds with no
+// snapshot category, so toggle-time backfill is the main path that subscribes
+// existing records short of a reconnect.
+const PER_RECORD_CATEGORY_KINDS = Object.freeze([
+  ['universe', 'universe'],
+  ['pipeline', 'series'],
+  ['mediaCollections', 'mediaCollection'],
+  ['authors', 'author'],
+  ['artists', 'artist'],
+  ['albums', 'album'],
+  ['tracks', 'track'],
+  ['creativeDirectorProjects', 'creativeDirectorProject'],
+  ['moodBoards', 'moodBoard'],
+  ['fableLoom', 'fableLoom'],
+  ['writersRoomWorks', 'writersRoomWork'],
+  ['writersRoomFolders', 'writersRoomFolder'],
+  ['writersRoomExercises', 'writersRoomExercise'],
+  ['musicVideoProjects', 'musicVideoProject'],
+  ['commissionFeedback', 'commissionFeedback'],
+  ['creativeCommissions', 'creativeCommission'],
+  ['decks', 'deck'],
+]);
+
+export async function addPeer({ address, port = DEFAULT_PEER_PORT, name, host, auth, transport, protocol = 'http' }) {
+  const peer = await withData(async (data) => {
+    const normalizedHost = validHost(host);
+    const normalizedAuth = sanitizePeerAuth(auth);
+    const entry = {
+      id: crypto.randomUUID(),
+      address,
+      host: normalizedHost || null,
+      // Optional HTTP Basic credential for peers gated behind an auth proxy.
+      // null when unset; `peerAuthHeaders` no-ops on it. Stays local — never
+      // synced or announced (see redactPeerForWire).
+      auth: normalizedAuth || null,
+      // Set to true once the user explicitly chooses a host (set/clear via UI).
+      // Once true, handleAnnounce never auto-overwrites — it's the only way to
+      // honor "the user explicitly cleared this; stay on IP" against a peer
+      // that keeps announcing its DNS name.
+      hostManual: transport === 'tailcat' || !!normalizedHost,
+      port,
+      name: validName(name, normalizedHost || address),
+      // Optional transport marker (e.g. 'tailcat'). Never carries the tc address —
+      // that capability lives only in data/tailcat-forwards.json.
+      ...(transport === 'tailcat' ? { transport: 'tailcat', protocol: protocol === 'https' ? 'https' : 'http' } : {}),
+      instanceId: null,
+      addedAt: new Date().toISOString(),
+      lastSeen: null,
+      lastHealth: null,
+      status: 'unknown',
+      enabled: true,
+      // Full-sync ("mirror everything") mode. When true, every current and
+      // future sync category is implied on for this peer and a back-subscribe
+      // sweep keeps all subscribable records mirrored. New peers inherit the
+      // self-side default so a user who runs full-mirror node pairs doesn't have
+      // to flip it on every peer by hand.
+      fullSync: data.self?.defaultPeerFullSync === true,
+      syncEnabled: data.self?.defaultPeerFullSync === true,
+      syncCategories: { ...DEFAULT_SYNC_CATEGORIES },
+      // Consumer-side routing is explicit and machine-local. Enabling a peer
+      // here never changes that peer's provider settings.
+      mediaProvider: { enabled: false, audioModels: [], imageModels: [], videoModels: [] },
+      consecutiveFailures: 0,
+      nextProbeAt: null,
+      directions: ['outbound']
+    };
+    data.peers.push(entry);
+    console.log(`🌐 Peer added: ${entry.name} (${peerBaseUrl(entry)})`);
+    instanceEvents.emit('peers:updated', data.peers);
+    return entry;
+  });
+  announceSelf(peer);
+  return peer;
+}
+
+/**
+ * Repoint a tailcat peer at a new loopback port.
+ *
+ * The public updatePeer deliberately owns no `port` field — a peer's address is
+ * how the operator reached it, not something the server rewrites. A managed
+ * tailcat forward is the exception: PortOS chose that loopback port itself, so
+ * when a retry has to bind a different one (the old port got taken while the
+ * forward was down) the peer record has to follow or every request keeps dialing
+ * a dead port. Restricted to `transport: 'tailcat'` for exactly that reason.
+ */
+export async function setTailcatPeerPort(id, port) {
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+  const updated = await withData(async (data) => {
+    const peer = data.peers.find(p => p.id === id && p.transport === 'tailcat');
+    if (!peer || peer.port === port) return peer || null;
+    peer.port = port;
+    console.log(`🐈 Tailcat peer ${peer.name} repointed to 127.0.0.1:${port}`);
+    instanceEvents.emit('peers:updated', data.peers);
+    return peer;
+  });
+  // The relay pins the peer URL at connect time, so it has to redial the new port.
+  if (updated) disconnectFromPeer(id);
+  return updated;
+}
+
+export async function removePeer(id, { stopTransport = true } = {}) {
+  disconnectFromPeer(id);
+  // Retire the transport outside the data lock: its lifecycle may itself need
+  // that lock when rolling back a failed add. Keep the peer on retirement errors.
+  if (stopTransport && (await getPeers()).some(peer => peer.id === id && peer.transport === 'tailcat')) {
+    const { stopForwardForPeer } = await import('./tailcatPeer.js');
+    await stopForwardForPeer(id);
+  }
+  const removed = await withData(async (data) => {
+    const idx = data.peers.findIndex(p => p.id === id);
+    if (idx === -1) return null;
+    const [entry] = data.peers.splice(idx, 1);
+    console.log(`🌐 Peer removed: ${entry.name}`);
+    instanceEvents.emit('peers:updated', data.peers);
+    return entry;
+  });
+  // Retire that instance's federated usage digest. Without this the row stays in
+  // the fleet report forever: our own snapshot forwards every digest we hold, so
+  // a surviving peer would hand it straight back on the next cycle. Dynamic
+  // import keeps peerUsage (and its usage.js graph) off this module's load path.
+  if (removed?.instanceId) {
+    const { forgetInstanceUsage } = await import('./peerUsage.js');
+    await forgetInstanceUsage(removed.instanceId)
+      .catch((err) => console.log(`⚠️ instances: retiring usage digest failed: ${err.message}`));
+  }
+  return removed;
+}
+
+export async function updatePeer(id, updates, { probe = true } = {}) {
+  let hostChanged = false;
+  // Credential edits must reconnect the live socket relay (it pins the
+  // Basic-auth header into extraHeaders at connect time), not just the next
+  // probe cycle — otherwise an online relayed peer keeps the stale credential
+  // until a natural reconnect. Tracked like hostChanged, consumed below.
+  let authChanged = false;
+  // Track false→true transitions for the per-record-subscribable categories
+  // so we can backfill-subscribe existing local records after the data write
+  // settles. Set inside withData (where we have the merged before/after
+  // peer object) and consumed after the lock releases.
+  const turnedOnKinds = [];
+  let backfillPeerInstanceId = null;
+  // Set when a syncCategories change should be mirrored back to the peer so the
+  // sync is bidirectional (the user owns all machines). The actual send reads
+  // the freshest persisted map at send time via the serialized queue below.
+  let reciprocate = false;
+  const result = await withData(async (data) => {
+    const peer = data.peers.find(p => p.id === id);
+    if (!peer) return null;
+    if (updates.syncSecret !== undefined) {
+      if (updates.syncSecret !== null && (typeof updates.syncSecret !== 'string' || updates.syncSecret.length < 32 || updates.syncSecret.length > 256)) {
+        throw new Error('Peer sync secret must contain 32 to 256 characters');
+      }
+      if (updates.syncSecret !== peer.syncSecret) {
+        peer.syncSecret = updates.syncSecret;
+        // The pair token is derived from this secret, so the receiver's earlier
+        // confirmation no longer applies: present Basic again (when stored)
+        // until the next probe re-confirms, and reconnect the relay with the
+        // new headers (#8356).
+        peer.peerAuthAccepted = false;
+        authChanged = true;
+      }
+      // Entering the pair secret is the local inbound-admission action.
+      if (peer.syncSecret && !peer.directions?.includes('inbound')) {
+        const directions = Array.isArray(peer.directions) && peer.directions.length ? peer.directions : ['outbound'];
+        peer.directions = [...directions, 'inbound'];
+      }
+    }
+    if (updates.name !== undefined) peer.name = validName(updates.name, peer.name);
+    if (updates.mediaSyncMode !== undefined && MEDIA_SYNC_MODES.includes(updates.mediaSyncMode)) {
+      peer.mediaSyncMode = updates.mediaSyncMode;
+    }
+    if (updates.enabled !== undefined) peer.enabled = updates.enabled;
+    if (updates.syncEnabled !== undefined) peer.syncEnabled = updates.syncEnabled;
+    // Full-sync ("mirror everything") toggle. A false→true flip implies every
+    // subscribable category, so back-subscribe ALL record kinds (not just the
+    // ones whose individual syncCategories bit flipped) and reciprocate so the
+    // peer mirrors us back. Enabling full-sync also implies the peer is sync-
+    // enabled — otherwise peerAllowsOutbound would gate every push off.
+    if (updates.fullSync !== undefined && updates.fullSync !== peer.fullSync) {
+      peer.fullSync = updates.fullSync === true;
+      if (peer.fullSync) {
+        peer.syncEnabled = true;
+        for (const [, kind] of PER_RECORD_CATEGORY_KINDS) turnedOnKinds.push(kind);
+        backfillPeerInstanceId = peer.instanceId || null;
+      } else {
+        // Turning full mirror off restores the per-category selection preserved
+        // underneath — recompute syncEnabled from it so a peer with no remaining
+        // enabled categories doesn't read as "sync on, nothing to sync".
+        peer.syncEnabled = hasOptedInCategory(peer.syncCategories);
+      }
+      // Reciprocate the full-sync intent (and its all-on category view) to the
+      // peer whenever we know its identity, so a node pair converges to a mutual
+      // mirror in one round-trip.
+      if (peer.instanceId) reciprocate = true;
+    }
+    if (updates.syncCategories !== undefined) {
+      const prev = peer.syncCategories || DEFAULT_SYNC_CATEGORIES;
+      const incoming = updates.syncCategories;
+      // Detect false→true flips for kinds the per-record push pipeline owns
+      // (PER_RECORD_CATEGORY_KINDS). enabled + outbound-allowed gating is
+      // enforced inside peerSync.autoSubscribePeerToAllRecords.
+      for (const [cat, kind] of PER_RECORD_CATEGORY_KINDS) {
+        if (prev[cat] !== true && incoming[cat] === true) turnedOnKinds.push(kind);
+      }
+      peer.syncCategories = { ...prev, ...incoming };
+      // `syncEnabled` is DERIVED from the category map — it gates per-record
+      // outbound pushes (peerAllowsOutbound), so it must reflect what the user
+      // opted into, not what a caller computed. Recomputing here (rather than
+      // honoring `updates.syncEnabled` on this path) is what keeps a default-ON
+      // category from widening outbound consent: a client that sums the whole
+      // map would see `usage: true` and send `syncEnabled: true`.
+      peer.syncEnabled = hasOptedInCategory(peer.syncCategories);
+      if (turnedOnKinds.length > 0) backfillPeerInstanceId = peer.instanceId || null;
+      // Reciprocate so the peer enables the same categories toward us. Only when
+      // we know the peer's identity (post-handshake).
+      if (peer.instanceId) reciprocate = true;
+    }
+    // Optional proxy credential. `null` (or both fields blank) clears it; a
+    // valid object replaces it; malformed input (sanitizePeerAuth → undefined)
+    // is ignored so a stray payload can't wipe a working credential.
+    if (updates.auth !== undefined) {
+      const normalizedAuth = sanitizePeerAuth(updates.auth);
+      if (normalizedAuth !== undefined) {
+        if (!sameAuth(peer.auth, normalizedAuth)) {
+          peer.auth = normalizedAuth; // null clears, object sets
+          authChanged = true;
+          console.log(`🌐 Peer credential ${peer.auth ? 'set' : 'cleared'}: ${peer.name}`);
+        }
+        // When sameAuth was true (credential unchanged), authChanged is still
+        // false. If the peer is stuck in authRequired+backoff the user is
+        // explicitly asking for a retry — clear backoff so the immediate probe
+        // below fires instead of waiting up to 24h.
+        if (!authChanged && normalizedAuth !== null && peer.authRequired) {
+          peer.consecutiveFailures = 0;
+          peer.nextProbeAt = null;
+          peer.authRequired = false;
+          authChanged = true; // ensure probe fires
+        }
+      }
+    }
+    if (updates.mediaProvider !== undefined
+      && updates.mediaProvider && typeof updates.mediaProvider === 'object'
+      && !Array.isArray(updates.mediaProvider)) {
+      const previous = peer.mediaProvider;
+      const next = mergePeerMediaProviderConfig(previous, updates.mediaProvider);
+      if (canonicalStringify(previous ?? null) !== canonicalStringify(next)) {
+        peer.mediaProvider = next;
+        if (!next.enabled) delete peer.mediaProviderStatus;
+        console.log(`🌐 Remote media provider ${next.enabled ? 'enabled' : 'disabled'}: ${peer.name}`);
+      }
+    }
+    if (peer.transport !== 'tailcat' && updates.host !== undefined) {
+      const normalized = validHost(updates.host);
+      if (normalized !== undefined && normalized !== peer.host) {
+        peer.host = normalized; // null clears, string sets
+        // Latch manual mode so handleAnnounce stops auto-learning (esp.
+        // important for clears — without this the next inbound announce
+        // re-adopts the DNS name and the user can't revert to IP).
+        peer.hostManual = true;
+        hostChanged = true;
+        console.log(`🌐 Peer host ${peer.host ? `set to ${peer.host}` : 'cleared'}: ${peer.name}`);
+      }
+    }
+    // Per-(peer, category) schema-version gaps, populated by syncOrchestrator
+    // when a remote snapshot is rejected because the sender's schemaVersions
+    // are ahead of local. Stored on the peer record so the Instances UI's
+    // SchemaGapBadge can read it via the standard peers payload. Accept
+    // either a plain object (set/replace the map) or null (clear all gaps).
+    // Any other value is silently ignored.
+    if (updates.schemaGaps !== undefined) {
+      if (updates.schemaGaps === null) {
+        delete peer.schemaGaps;
+      } else if (updates.schemaGaps && typeof updates.schemaGaps === 'object' && !Array.isArray(updates.schemaGaps)) {
+        peer.schemaGaps = updates.schemaGaps;
+      }
+    }
+    instanceEvents.emit('peers:updated', data.peers);
+    return peer;
+  });
+  // Tear down the socket relay only after a real state transition so it can
+  // reconnect using the new URL on the next probe cycle. Invalid/no-op host
+  // writes no longer disrupt an already-healthy connection.
+  if (updates.enabled === false || hostChanged || authChanged) disconnectFromPeer(id);
+  // A credential edit is almost always the fix for a 401, but the peer may be
+  // deep in exponential probe backoff (up to 24h) from those failures — so the
+  // regular poll loop would skip it for hours. Retry immediately: probePeer
+  // bypasses the nextProbeAt gate and, on success, resets backoff + reconnects
+  // the relay with the new credential. Fire-and-forget; failure just re-arms
+  // backoff as before.
+  if (probe && authChanged && result && result.enabled !== false) {
+    probePeer(result).catch((err) => console.log(`⚠️ Probe after credential change failed: ${err.message}`));
+  }
+  // Backfill-subscribe every local record of any kind whose category just
+  // flipped on. Fire-and-forget — `autoSubscribePeerToAllRecords` is
+  // idempotent + per-record-error tolerant, and we don't want to block the
+  // PATCH response on a slow peer's initial-push round-trip. Goes through the
+  // recordEvents subscription adapter (peerSync statically imports getPeers
+  // from us, so importing it back would close a cycle). Per-kind catch so a
+  // transient failure in one kind's backfill (e.g. universe) doesn't abort
+  // the loop and leave the peer with no series subscriptions either; the next
+  // category-toggle PATCH or peer-online event re-fires any kind that didn't
+  // land.
+  if (turnedOnKinds.length > 0 && backfillPeerInstanceId) {
+    (async () => {
+      for (const kind of turnedOnKinds) {
+        await autoSubscribePeerToAllRecords(backfillPeerInstanceId, kind).catch((err) => {
+          console.log(`⚠️ peer: backfill-subscribe ${kind} after category toggle failed: ${err.message}`);
+        });
+      }
+    })();
+  }
+  // Mirror the category change back to the peer so sync is bidirectional.
+  // Fire-and-forget, but SERIALIZED per peer (see enqueueReciprocalSync): two
+  // rapid toggles must not race — an earlier send arriving after a later one
+  // would push a stale full map and undo the newer change on the peer.
+  if (reciprocate && result?.instanceId) {
+    enqueueReciprocalSync(result.id);
+  }
+  return result;
+}
+
+/**
+ * Generate and provision the same pair secret on both ends of a peer link.
+ * The peer's saved instance password is used only for this one setup request;
+ * subsequent federation requests use the scoped pair token.
+ */
+const peerPairingQueue = createKeyCachedQueue();
+
+export function pairPeerSyncSecret(id) {
+  return peerPairingQueue(id, () => pairPeerSyncSecretNow(id));
+}
+
+async function pairPeerSyncSecretNow(id) {
+  const peer = (await getPeers()).find((item) => item.id === id);
+  if (!peer) throw new ServerError('Peer not found', { status: 404 });
+  if (!peer.instanceId || peer.instanceId === UNKNOWN_INSTANCE_ID) {
+    throw new ServerError('Probe or connect this peer before pairing sync.', { status: 409, code: 'PEER_IDENTITY_REQUIRED' });
+  }
+  if (typeof peer.auth?.password !== 'string' || !peer.auth.password) {
+    throw new ServerError('Save this peer’s instance password before pairing automatically.', {
+      status: 400, code: 'PEER_PAIR_CREDENTIAL_REQUIRED',
+    });
+  }
+
+  const selfInstanceId = await getInstanceId();
+  if (!selfInstanceId || selfInstanceId === UNKNOWN_INSTANCE_ID) {
+    throw new ServerError('This instance identity is not ready for peer pairing.', { status: 409, code: 'INSTANCE_IDENTITY_REQUIRED' });
+  }
+  const syncSecret = typeof peer.syncSecret === 'string' && peer.syncSecret.length >= 32 && peer.peerAuthAccepted !== true
+    ? peer.syncSecret
+    : crypto.randomBytes(32).toString('base64url');
+  const headers = {
+    'Content-Type': 'application/json',
+    // Force this one-time bootstrap to use the saved instance password, even
+    // if a stale pair token is cached locally. The receiver rejects peer-token
+    // authority on this operator-scoped setup route.
+    [PEER_AUTH_HEADER]: '',
+    ...peerAuthHeaders(peer),
+  };
+  let response;
+  try {
+    response = await withAbortTimeout(PROBE_TIMEOUT_MS, (signal) => peerFetch(
+      `${peerBaseUrl(peer)}/api/instances/peers/pair-secret`,
+      {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ syncSecret }),
+        redirect: 'error',
+        signal,
+      },
+      peer,
+    ));
+  } catch {
+    throw new ServerError('Couldn’t reach this peer to pair the sync secret. Retry when it is online.', {
+      status: 502, code: 'PEER_PAIR_UNREACHABLE',
+    });
+  }
+
+  if (!response.ok) {
+    const message = response.status === 401
+      ? 'The peer rejected its saved instance password. Update the peer credential, then retry.'
+      : response.status === 404
+        ? 'The peer could not pair this instance. Upgrade both peers and make sure they are connected.'
+        : response.status === 403
+          ? 'The peer requires its instance password for automatic pairing. Save that password on this peer, then retry.'
+          : `The peer could not pair the sync secret (HTTP ${response.status}).`;
+    throw new ServerError(message, { status: 502, code: 'PEER_PAIR_REJECTED' });
+  }
+  const body = await response.json().catch(() => null);
+  if (body?.paired !== true) {
+    throw new ServerError('The peer did not confirm sync-secret pairing.', { status: 502, code: 'PEER_PAIR_UNCONFIRMED' });
+  }
+
+  const updated = await updatePeer(id, { syncSecret }, { probe: false });
+  if (!updated) throw new ServerError('Peer not found', { status: 404 });
+  if (updated.enabled !== false) return (await probePeer(updated).catch(() => null)) || updated;
+  return updated;
+}
+
+/** Save a pair secret only for the already-registered peer named by its identity header. */
+export async function acceptPeerSyncSecretFromPeer(instanceId, syncSecret) {
+  let changed = false;
+  const peer = await withData(async (data) => {
+    const matches = data.peers.filter((item) => item.instanceId === instanceId);
+    if (matches.length !== 1) return null;
+    const entry = matches[0];
+    if (entry.syncSecret !== syncSecret) {
+      entry.syncSecret = syncSecret;
+      entry.peerAuthAccepted = false;
+      changed = true;
+    }
+    // Pairing also records this machine's choice to accept inbound pushes;
+    // sync/category flags still decide which records may be written.
+    if (entry.syncSecret && !entry.directions?.includes('inbound')) {
+      const directions = Array.isArray(entry.directions) && entry.directions.length ? entry.directions : ['outbound'];
+      entry.directions = [...directions, 'inbound'];
+      changed = true;
+    }
+    instanceEvents.emit('peers:updated', data.peers);
+    return entry;
+  });
+  if (changed && peer) disconnectFromPeer(peer.id);
+  return peer;
+}
+
+const reciprocalSyncQueue = createKeyCachedQueue();
+
+// Per-peer tail that serializes reciprocal-sync sends. Two rapid category
+// toggles for the same peer each want to push the full resulting map; if their
+// fire-and-forget requests raced, the earlier (staler) map could land last on
+// the peer and undo the newer change. Chaining per peer.id guarantees in-order
+// delivery, and each send re-reads the FRESHEST persisted category map (not a
+// value captured at enqueue time) so the final send always carries final state.
+// Per-peer serialization (silence prior + self-pruning tail) via the shared
+// helper — `work` runs on both fulfil and reject of the prior send, so a failed
+// send can't break the chain.
+export function enqueueReciprocalSync(peerId) {
+  return reciprocalSyncQueue(peerId, async () => {
+    // Re-read the peer fresh at send time — the last enqueued send wins with
+    // the latest persisted syncCategories, regardless of enqueue order.
+    const data = await loadData();
+    const peer = data.peers.find(p => p.id === peerId);
+    if (!peer?.instanceId) return { ok: false, reason: 'no-peer-identity' };
+    // For a full-sync peer send the all-on category view (its stored
+    // syncCategories can be all-false underneath — sending that raw would tell
+    // the peer to DISABLE everything, since reciprocal-sync apply is an
+    // authoritative overlay; the all-on map also makes a peer too old to
+    // understand the fullSync flag still mirror every category) plus the
+    // fullSync flag. A regular peer keeps sending its raw partial map so a
+    // category it never set stays untouched on the peer (absent ≠ false).
+    const reciprocalCategories = peer.fullSync === true ? allSyncCategoriesOn() : (peer.syncCategories || {});
+    return requestReciprocalSync(peer, reciprocalCategories, { fullSync: peer.fullSync === true }).catch((err) => {
+      console.log(`⚠️ peer: reciprocal sync request failed: ${err.message}`);
+      return { ok: false, reason: err.message };
+    });
+  });
+}
+
+// --- Probing ---
+
+export async function probePeer(peer) {
+  const baseUrl = peerBaseUrl(peer);
+
+  const previousStatus = peer.status;
+  let status, lastHealth, lastSeen, remoteInstanceId, remoteVersion, remoteApps, remoteSyncSeqs;
+  let remoteMediaProviderStatus = null;
+  // Latches when the peer answers 401/403 — a reachable-but-auth-gated peer, as
+  // opposed to an unreachable one. The Instances UI reads this to prompt for a
+  // credential instead of showing a generic offline state.
+  let authRequired = false;
+  let probeFailure = null;
+  const probeStartedAt = Date.now();
+  // For tailcat peers, read the live forward's tunnelError up front so a probe
+  // that times out / resets can be classified as tunnel dial vs local refuse vs
+  // PortOS health/details failure — the three operator-visible cases.
+  const forwardHint = await lookupTailcatForwardHint(peer);
+  const tunnelError = forwardHint?.tunnelError || null;
+  // One shared abort signal spans the instanceId read, all three parallel
+  // fetches, AND their body reads, so a single PROBE_TIMEOUT_MS bounds the whole
+  // probe (the instanceId read is inside the budget, as it was before).
+  await withAbortTimeout(PROBE_TIMEOUT_MS, async (signal) => {
+    // Pass our own instanceId as `forPeer` so the peer also returns ITS cursor
+    // into our data (`cursorForYou`) — our push-frontier toward it. Best-effort:
+    // an unresolved/unknown id just omits the param and we get the inbound-only
+    // shape (push count renders "unknown" client-side, never a misleading 0).
+    const ourInstanceId = await getInstanceId().catch(() => null);
+    const forPeerQs = typeof ourInstanceId === 'string' && ourInstanceId && ourInstanceId !== UNKNOWN_INSTANCE_ID
+      ? `?forPeer=${encodeURIComponent(ourInstanceId)}`
+      : '';
+    // Fetch health details, the PM2-backed app probe projection, sync status, and opted-in media capacity in
+    // parallel under the same bounded probe budget. The first three paths are
+    // the frozen peer-probe contract documented in docs/API.md: deployed peers
+    // call them across independently upgraded installs, so remove/rename or
+    // incompatible response changes require a versioned replacement rather
+    // than a silent change here. Older/unconfigured peers incur no fourth
+    // request.
+    const [healthRes, appsRes, syncRes, mediaProviderStatus] = await Promise.all([
+      peerFetch(`${baseUrl}/api/system/health/details`, { signal }, peer),
+      peerFetch(`${baseUrl}/api/apps?view=probe`, { signal }, peer).catch(() => null),
+      peerFetch(`${baseUrl}/api/instances/sync-status${forPeerQs}`, { signal }, peer).catch(() => null),
+      normalizePeerMediaProviderConfig(peer).enabled
+        ? probeFederatedMediaProvider(peer, { signal })
+        : Promise.resolve(null),
+    ]);
+    remoteMediaProviderStatus = mediaProviderStatus;
+    if (!healthRes.ok) {
+      const err = new Error(`HTTP ${healthRes.status}`);
+      err.httpStatus = healthRes.status;
+      throw err;
+    }
+    const json = await healthRes.json();
+    status = 'online';
+    lastHealth = json;
+    lastSeen = new Date().toISOString();
+    remoteInstanceId = json.instanceId ?? null;
+    remoteVersion = json.version ?? null;
+
+    if (appsRes?.ok) {
+      const appsJson = await appsRes.json().catch(() => null);
+      const appsList = Array.isArray(appsJson) ? appsJson : appsJson?.apps;
+      remoteApps = appsList?.map(a => ({
+        id: a.id, name: a.name, icon: a.icon,
+        overallStatus: a.overallStatus, uiPort: a.uiPort, apiPort: a.apiPort, type: a.type
+      })) ?? null;
+    }
+    if (syncRes?.ok) {
+      remoteSyncSeqs = await syncRes.json().catch(() => null);
+    }
+  }).catch((err) => {
+    probeFailure = err;
+    status = 'offline';
+    authRequired = err?.httpStatus === 401 || err?.httpStatus === 403;
+    lastHealth = peer.lastHealth; // preserve last known
+    lastSeen = peer.lastSeen;
+    if (normalizePeerMediaProviderConfig(peer).enabled && !remoteMediaProviderStatus) {
+      remoteMediaProviderStatus = {
+        checkedAt: new Date().toISOString(),
+        state: 'unreachable',
+        reason: 'peer-offline',
+        freshUntil: null,
+        snapshot: null,
+      };
+    }
+  });
+
+  const latencyMs = Date.now() - probeStartedAt;
+  const probedAt = new Date().toISOString();
+  const classification = probeFailure
+    ? classifyPeerProbeFailure(probeFailure, {
+      peer,
+      tunnelError,
+      probeTimeoutMs: PROBE_TIMEOUT_MS,
+    })
+    : { class: 'ok', message: null, httpStatus: 200 };
+  const lastProbe = buildLastProbeRecord({
+    ok: status === 'online',
+    classification,
+    latencyMs,
+    at: probedAt,
+  });
+  if (status !== 'online') {
+    console.log(`⚠️ Probe failed for ${baseUrl}: ${classifyProbeError(probeFailure, peer, tunnelError)} ${formatProbeDiagnosticLog(lastProbe)}`);
+  }
+
+  const stored = await withData(async (data) => {
+    const entry = data.peers.find(p => p.id === peer.id);
+    if (!entry) return null;
+    entry.status = status;
+    entry.lastSeen = lastSeen;
+    entry.lastHealth = lastHealth;
+    entry.lastProbe = lastProbe;
+    // Surface "reachable but needs a credential" distinctly from plain offline.
+    // Cleared on any successful probe (including after the user adds the password).
+    entry.authRequired = authRequired;
+    // Peer credential handshake (#8356). Latch on the receiver's confirmation
+    // that this probe's pair token verified; after that peerFetch stops sending
+    // the stored Basic password. A 401/403 unlatches, so a receiver that loses
+    // its side of the pairing (or is downgraded) gets Basic again next probe.
+    // Other failures (timeouts, offline) keep the last answer.
+    if (status === 'online') entry.peerAuthAccepted = lastHealth?.peerAuth?.accepted === true;
+    else if (authRequired) entry.peerAuthAccepted = false;
+    entry.lastApps = remoteApps ?? entry.lastApps ?? null;
+    entry.remoteSyncSeqs = remoteSyncSeqs ?? entry.remoteSyncSeqs ?? null;
+    if (normalizePeerMediaProviderConfig(entry).enabled) {
+      if (remoteMediaProviderStatus) entry.mediaProviderStatus = remoteMediaProviderStatus;
+    } else {
+      delete entry.mediaProviderStatus;
+    }
+    if (remoteInstanceId && (!entry.syncSecret || !entry.instanceId)) entry.instanceId = remoteInstanceId;
+    if (status === 'online') entry.version = remoteVersion;
+    // Auto-update name from hostname if current name is just an IP address
+    const remoteHostname = validName(lastHealth?.hostname, null);
+    if (remoteHostname && isIPAddress(entry.name)) {
+      entry.name = remoteHostname;
+    }
+
+    // Backoff tracking for failed probes
+    if (status === 'online') {
+      if (entry.consecutiveFailures > 0) {
+        console.log(`🌐 Peer ${entry.name} recovered after ${entry.consecutiveFailures} consecutive failures`);
+      }
+      entry.consecutiveFailures = 0;
+      entry.nextProbeAt = null;
+    } else {
+      entry.consecutiveFailures = (entry.consecutiveFailures ?? 0) + 1;
+      const tier = Math.min(entry.consecutiveFailures - 1, BACKOFF_TIERS_MS.length - 1);
+      const backoffMs = BACKOFF_TIERS_MS[tier];
+      entry.nextProbeAt = new Date(Date.now() + backoffMs).toISOString();
+      console.log(`⏳ Peer ${entry.name} backoff tier ${tier} (${backoffMs / 1000}s), failures: ${entry.consecutiveFailures}`);
+    }
+
+    return entry;
+  });
+
+  // Manage peer socket relay based on status
+  if (status === 'online') {
+    connectToPeer(peer);
+  } else {
+    disconnectFromPeer(peer.id);
+  }
+
+  // Announce ourselves only when peer transitions to online (not every poll cycle)
+  if (status === 'online' && previousStatus !== 'online') {
+    if (stored) {
+      announceSelf(stored);
+      instanceEvents.emit('peer:online', stored);
+    }
+  }
+
+  return stored;
+}
+
+export async function probeAllPeers() {
+  const data = await loadData();
+  const now = Date.now();
+  const enabled = data.peers.filter(p => {
+    if (!p.enabled) return false;
+    // Respect backoff: skip peers whose next probe time hasn't arrived
+    if (p.nextProbeAt && new Date(p.nextProbeAt).getTime() > now) return false;
+    return true;
+  });
+  if (enabled.length === 0) return;
+
+  await Promise.allSettled(enabled.map(p => probePeer(p)));
+
+  // Re-read to get updated state and emit
+  const updated = await loadData();
+  instanceEvents.emit('peers:updated', updated.peers);
+}
+
+// --- Query Proxy ---
+
+const PEER_PLACEHOLDER_ORIGIN = 'http://peer.invalid';
+
+// Resolve a caller-supplied proxy path to "pathname + query" that is guaranteed
+// to stay on the peer origin and on the documented federation surface
+// (PEER_API_SURFACE), or null. The allowlist runs on the path exactly as it will
+// be sent, so a segment a URL parser would normalize away (`..`, tabs, `\`) is
+// refused rather than argued past.
+function resolvePeerQueryTarget(apiPath) {
+  if (typeof apiPath !== 'string' || !apiPath.startsWith('/') || /[\s\\#]/.test(apiPath)) return null;
+  const queryAt = apiPath.indexOf('?');
+  const rawPath = queryAt === -1 ? apiPath : apiPath.slice(0, queryAt);
+  const search = queryAt === -1 ? '' : apiPath.slice(queryAt);
+  let parsed;
+  try {
+    parsed = new URL(rawPath, PEER_PLACEHOLDER_ORIGIN);
+  } catch {
+    return null;
+  }
+  if (parsed.origin !== PEER_PLACEHOLDER_ORIGIN || parsed.username || parsed.password) return null;
+  if (parsed.pathname !== rawPath) return null;
+  const lower = rawPath.toLowerCase();
+  // The `/api/peer-sync/` read prefix also spans the POST-only push endpoint,
+  // which carries the sync secret; a GET proxy never has a reason to name it.
+  if (lower.replace(/\/$/, '') === '/api/peer-sync/push') return null;
+  if (!isPeerApiRequestAllowed('GET', lower)) return null;
+  return `${rawPath}${search}`;
+}
+
+export async function queryPeer(id, apiPath) {
+  const data = await loadData();
+  const peer = data.peers.find(p => p.id === id);
+  if (!peer) return { error: 'Peer not found' };
+
+  const target = resolvePeerQueryTarget(apiPath);
+  if (!target) return { error: 'Path is not on the peer federation surface', status: 400 };
+
+  const url = `${peerBaseUrl(peer)}${target}`;
+  return withAbortTimeout(PROBE_TIMEOUT_MS, async (signal) => {
+    const res = await peerFetch(url, { signal }, peer);
+    return { success: true, data: await res.json() };
+  }).catch((err) => ({ error: `Failed to query peer: ${err.message}` }));
+}
+
+// --- Announce (Bidirectional Registration) ---
+
+export async function handleAnnounce({ address, port, instanceId, name, host }) {
+  const result = await withData(async (data) => {
+    // Check for existing peer by instanceId
+    let existing = data.peers.find(p => p.instanceId === instanceId);
+    // instanceId is public (GET /api/system/health returns it unauthenticated),
+    // so a match on instanceId alone does not prove the caller IS that peer —
+    // only that it knows a public value. Track whether the match instead came
+    // through the address+port fallback below, where the caller's address is
+    // already part of the match.
+    let matchedByAddress = false;
+    // Fallback: check by address + port
+    if (!existing) {
+      existing = data.peers.find(p => p.address === address && p.port === port);
+      matchedByAddress = true;
+    }
+
+    const normalizedHost = validHost(host);
+
+    if (existing?.syncSecret) return { created: false, peer: existing };
+
+    // A forged announce: instanceId matches a stored peer, but the caller's
+    // source address does not match the stored one. Record the sighting only
+    // — never let it teach host/port/name/status, or an attacker who merely
+    // reads a peer's public instanceId could redirect our future requests
+    // (and the peer's Basic credential) to a host they control.
+    // Exempt tailcat: its stored `address` is intentionally the LOCAL forward's
+    // loopback address, never the remote caller's — a mismatch there is the
+    // normal case, not a forgery signal, and its host/port are already pinned
+    // to the local forward by the `transport !== 'tailcat'` guards below.
+    if (existing && !matchedByAddress && existing.transport !== 'tailcat' && existing.address !== address) {
+      console.warn(`⚠️ Peer announce instanceId matched but address mismatched (expected ${existing.address}, got ${address}) — ignoring host/port/name update`);
+      existing.lastSeen = new Date().toISOString();
+      instanceEvents.emit('peers:updated', data.peers);
+      return { created: false, peer: existing };
+    }
+
+    if (existing) {
+      existing.lastSeen = new Date().toISOString();
+      existing.status = 'online';
+      existing.instanceId = instanceId;
+      // A managed forward uses local coordinates, not the remote listen port.
+      if (existing.transport !== 'tailcat') existing.port = port;
+      // Only auto-update name if still an IP address (preserve user-set names)
+      const sanitized = validName(name, null);
+      if (sanitized && isIPAddress(existing.name)) {
+        existing.name = sanitized;
+      }
+      // Adopt host from inbound announce only when we don't already have one
+      // AND the user hasn't manually intervened. The hostManual flag covers
+      // the "user explicitly cleared this — stay on IP" case that the
+      // existing.host check alone can't distinguish from "never set".
+      if (existing.transport !== 'tailcat' && normalizedHost && !existing.host && !existing.hostManual) {
+        existing.host = normalizedHost;
+        console.log(`🌐 Peer host learned via announce: ${existing.name} → ${normalizedHost}`);
+      }
+      // Mark that this peer has announced to us (inbound connection)
+      existing.directions = existing.directions || [];
+      if (!existing.directions.includes('inbound')) existing.directions.push('inbound');
+      console.log(`🌐 Peer announced (existing): ${existing.name} (${address}:${port})`);
+      instanceEvents.emit('peers:updated', data.peers);
+      return { created: false, peer: existing };
+    }
+
+    // Create new peer entry from remote announcement
+    const peer = {
+      id: crypto.randomUUID(),
+      address,
+      host: normalizedHost || null,
+      // A credential can only be entered locally, never learned from an
+      // announce — start null. If this peer needs auth, our probe to it will
+      // 401 and the user sets the password from the Instances UI.
+      auth: null,
+      // The host came from the peer's announce, not from a user — leave
+      // hostManual false so subsequent updates from the peer can still refine.
+      hostManual: false,
+      port,
+      name: validName(name, normalizedHost || address),
+      instanceId,
+      addedAt: new Date().toISOString(),
+      lastSeen: new Date().toISOString(),
+      lastHealth: null,
+      status: 'online',
+      enabled: true,
+      syncEnabled: false,
+      syncCategories: { ...DEFAULT_SYNC_CATEGORIES },
+      consecutiveFailures: 0,
+      nextProbeAt: null,
+      directions: ['inbound']
+    };
+    data.peers.push(peer);
+    console.log(`🌐 Peer announced (new): ${peer.name} (${peerBaseUrl(peer)})`);
+    instanceEvents.emit('peers:updated', data.peers);
+    return { created: true, peer };
+  });
+
+  // Immediately probe newly announced peers to populate health data
+  if (result.created) {
+    probePeer(result.peer).catch(err => {
+      console.log(`⚠️ Initial probe failed for announced peer ${result.peer.name}: ${err.message}`);
+    });
+  }
+
+  return result;
+}
+
+async function announceSelf(peer) {
+  const data = await loadData();
+  if (!data.self) return;
+
+  const selfPort = parseInt(process.env.PORT, 10) || DEFAULT_PEER_PORT;
+  const selfHost = getSelfHost();
+  const url = `${peerBaseUrl(peer)}/api/instances/peers/announce`;
+
+  await withAbortTimeout(PROBE_TIMEOUT_MS, async (signal) => {
+    const res = await peerFetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        port: selfPort,
+        instanceId: data.self.instanceId,
+        name: data.self.name,
+        host: selfHost
+      }),
+      signal
+    }, peer);
+    if (res.ok) {
+      console.log(`🌐 Announced self to ${url}`);
+      await markDirection(peer.id, 'outbound');
+    } else {
+      console.log(`🌐 Announce to ${url} failed: HTTP ${res.status}`);
+    }
+  }).catch((err) => {
+    console.log(`🌐 Announce to ${url} unreachable: ${err.message}`);
+  });
+}
+
+export async function connectPeer(id) {
+  const data = await loadData();
+  const peer = data.peers.find(p => p.id === id);
+  if (!peer) return null;
+  await announceSelf(peer);
+  const probed = await probePeer(peer);
+  return probed;
+}
+
+// --- Bidirectional sync reciprocation ---
+//
+// A single user commonly owns every federated machine and expects enabling a
+// sync category toward a peer to make it two-way without also toggling it on
+// the peer by hand. Sync is pull-based per direction, so enabling category C
+// toward peer B only makes US pull B's C. For B to pull OUR C, B must enable C
+// toward US. `requestReciprocalSync` asks B to do exactly that; the peer side
+// is `applyReciprocalSync`, invoked by the POST /sync-categories route.
+//
+// SEMANTICS — full mirror, NOT enable-only (resolved, issue #1094). A peer's
+// announced keys are applied as an authoritative overlay onto our existing map
+// (`{ ...prev, ...sanitized }`) — announced `false` values are authoritative
+// (they DISABLE), while categories the peer omits are preserved untouched. So a
+// peer sending `C:false` DISABLES C on our record for that peer even when we had
+// independently enabled C toward them. This is intentional, not a bug:
+//   - The 'Make mutual' UI deliberately pushes the sender's *current* set
+//     (including its disables) so a previously-offline / one-directional peer
+//     converges to the sender's view in one round-trip.
+//   - It's the recovery path for clearing a stale enabled category after a peer
+//     was offline during a disable (the all-false / offline-disable test below).
+// Treating sync categories as a symmetric mirror (rather than two strictly
+// independent per-direction switches) is the chosen model. If a future change
+// wants per-direction-independent semantics, 'Make mutual' must grow a separate
+// explicit-disable path so reciprocation never clobbers an independent enable —
+// don't quietly switch this to enable-only, which would regress the two paths
+// above. The full-mirror behavior is pinned by tests in instances.test.js.
+
+// Keep only the keys DEFAULT_SYNC_CATEGORIES defines, coerced to booleans, so a
+// peer can never inject unknown/garbage category flags onto our peer record.
+function sanitizeSyncCategories(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return null;
+  const out = {};
+  for (const key of Object.keys(DEFAULT_SYNC_CATEGORIES)) {
+    if (typeof input[key] === 'boolean') out[key] = input[key];
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+/**
+ * Receiver side of reciprocation: a peer is telling us it enabled `categories`
+ * toward us and is asking us to mirror them so the sync is bidirectional.
+ * Find the local peer record for the announcing instance and apply the same
+ * category flags. Returns `{ changed, peer }`; `changed` is false when our
+ * record already matched (the echo guard — the caller never re-reciprocates,
+ * but this keeps a misbehaving peer from churning our state).
+ */
+export async function applyReciprocalSync(instanceId, categories, { fullSync } = {}) {
+  // The admitted peer's direction and categories are machine-local consent.
+  // Anonymous reciprocal callbacks must never broaden or revoke them.
+  const sanitized = sanitizeSyncCategories(categories);
+  // A fullSync-only signal (peer asking us to mirror everything) is valid even
+  // if the category map didn't sanitize to anything actionable. An explicit
+  // `fullSync === false` is the peer telling us it STOPPED mirroring us, so we
+  // drop our mirror toward it too — keeping enable AND disable symmetric (a peer
+  // too old to send the field leaves it undefined, which touches nothing).
+  const wantsFullSync = fullSync === true;
+  const wantsFullSyncOff = fullSync === false;
+  if (!sanitized && !wantsFullSync && !wantsFullSyncOff) return { changed: false, peer: null };
+  const turnedOnKinds = [];
+  let backfillInstanceId = null;
+  let changed = false;
+  const peer = await withData(async (data) => {
+    const entry = data.peers.find(p => p.instanceId === instanceId);
+    if (!entry || entry.syncSecret) return null;
+    // Default the baseline so a partial stored map doesn't make absent-vs-false
+    // diverge — otherwise sanitized adding `goals:false` to a `prev` missing
+    // `goals` reads as a change (`false !== undefined`) and defeats the guard.
+    const prev = { ...DEFAULT_SYNC_CATEGORIES, ...(entry.syncCategories || {}) };
+    const next = sanitized ? { ...prev, ...sanitized } : prev;
+    const fullSyncFlips = wantsFullSync && entry.fullSync !== true;
+    const fullSyncOffFlips = wantsFullSyncOff && entry.fullSync === true;
+    const categoriesFlip = !Object.keys(next).every(k => next[k] === prev[k]);
+    // Does THIS reciprocal request itself ask us to push per-record data back —
+    // full mirror, or at least one per-record category carried IN the request?
+    // Scope the consent decision to what the peer asked for this time (wantsFullSync
+    // / sanitized), NOT the preserved `next` map: a request that only reciprocates a
+    // snapshot category (or a per-record kind we merely happen to already have on
+    // locally) must not silently widen us to push every locally-enabled kind back.
+    // The request is the consent signal, so it also scopes what that consent covers.
+    const requestEnablesPushable = wantsFullSync
+      || (sanitized ? PER_RECORD_CATEGORY_KINDS.some(([cat]) => sanitized[cat] === true) : false);
+    const directions = Array.isArray(entry.directions) ? entry.directions : [];
+    // An `/announce`-created peer record is inbound-only (it announced to us; the
+    // user here never added it back), and `peerAllowsOutbound` then refuses our
+    // pushes — so the backfill below, every future per-record push, and reverse-
+    // subscription creation on incoming pushes would all silently no-op, leaving
+    // the mirror one-directional. An explicit reciprocal-sync request IS the peer
+    // asking us to mirror our data back — its consent to receive our pushes — so
+    // adopt `outbound`. Crucially this must hold even when nothing flips: a record
+    // that adopted fullSync/categories BEFORE this fix (#1636) but stayed inbound-
+    // only never back-fills, and the echo guard below would return first — so the
+    // missing direction has to participate in change detection to heal it.
+    const needsOutboundAdopt = requestEnablesPushable && directions.length > 0 && !directions.includes('outbound');
+    // No-op only when nothing flips AND there's no outbound to adopt — the echo guard.
+    if (!fullSyncFlips && !fullSyncOffFlips && !categoriesFlip && !needsOutboundAdopt) return entry;
+    if (fullSyncFlips) {
+      // Adopting full mirror. fullSync alone drives gating, so the stored
+      // per-category map is PRESERVED untouched — we do NOT apply the sender's
+      // all-on compat overlay. That keeps the user's own selection intact so a
+      // later disable restores it, exactly like the local toggle path. (Legacy
+      // receivers that don't understand fullSync fall into the category branch
+      // below and mirror via the all-on overlay instead — that's its purpose.)
+      entry.fullSync = true;
+    } else if (fullSyncOffFlips) {
+      // Dropping full mirror: clear the flag. If this SAME reciprocal request
+      // also carries a changed per-category selection, adopt it too — otherwise
+      // (the old combined branch fell through without touching categories) the
+      // peer's intended post-full-sync set would be ignored and the stale
+      // preserved map would keep mirroring the wrong categories. With no
+      // category change in the request, the preserved map stands (restore path).
+      entry.fullSync = false;
+      if (categoriesFlip) entry.syncCategories = next;
+    } else if (categoriesFlip) {
+      entry.syncCategories = next;
+    }
+    // Adopt outbound consent from the reciprocal request (see needsOutboundAdopt).
+    // Inline rather than via markDirection — that helper opens its own withData and
+    // would deadlock on this same lock; idempotent (a peer already pushing has
+    // outbound and never reaches here, so directions.push is never a duplicate).
+    if (needsOutboundAdopt) entry.directions = [...directions, 'outbound'];
+    // Recompute from the (possibly preserved) stored map — a full-sync peer is
+    // always sync-enabled; otherwise it follows the per-category selection.
+    entry.syncEnabled = entry.fullSync === true || hasOptedInCategory(entry.syncCategories);
+    // Backfill every per-record kind whose push toward this peer just became
+    // viable: a kind that flipped false→true, all kinds when full mirror was just
+    // adopted, and — when we just adopted outbound on a previously inbound-only
+    // record — every kind already enabled (it was on but never pushed while we
+    // couldn't push outbound). autoSubscribePeerToAllRecords is idempotent, so a
+    // kind already subscribed is a harmless no-op.
+    for (const [cat, kind] of PER_RECORD_CATEGORY_KINDS) {
+      const enabledNow = entry.fullSync === true || !!(entry.syncCategories && entry.syncCategories[cat] === true);
+      const flippedOn = prev[cat] !== true && next[cat] === true;
+      // On a heal (outbound just adopted, no flip) only back-fill kinds THIS request
+      // enabled — full mirror, or the specific per-record category it carried — so a
+      // heal never pushes a kind the current request didn't authorize.
+      const requestEnablesKind = wantsFullSync || !!(sanitized && sanitized[cat] === true);
+      if ((fullSyncFlips && enabledNow) || flippedOn || (needsOutboundAdopt && enabledNow && requestEnablesKind)) {
+        turnedOnKinds.push(kind);
+      }
+    }
+    if (turnedOnKinds.length > 0) backfillInstanceId = entry.instanceId || null;
+    changed = true;
+    instanceEvents.emit('peers:updated', data.peers);
+    return entry;
+  });
+  if (!peer) return { changed: false, peer: null };
+  // Mirror updatePeer's backfill-subscribe so a reciprocally-enabled
+  // per-record category (universe/pipeline) pushes our existing records too.
+  if (changed && turnedOnKinds.length > 0 && backfillInstanceId) {
+    (async () => {
+      for (const kind of turnedOnKinds) {
+        await autoSubscribePeerToAllRecords(backfillInstanceId, kind).catch((err) => {
+          console.log(`⚠️ peer: reciprocal backfill-subscribe ${kind} failed: ${err.message}`);
+        });
+      }
+    })();
+  }
+  if (changed) {
+    const enabledList = sanitized ? Object.keys(sanitized).filter(k => sanitized[k]).join(',') : '';
+    console.log(`🔁 Reciprocal sync applied for peer ${peer.name}: ${peer.fullSync ? 'full-mirror' : (enabledList || 'none')}`);
+  }
+  return { changed, peer };
+}
+
+/**
+ * Sender side: ask `peer` to enable `categories` toward us (mirror what we just
+ * enabled toward them). Best-effort and fire-and-forget at the call site — a
+ * peer that's offline or on an older version (404s the endpoint) just stays
+ * one-directional until the next toggle. Returns `{ ok, reason }`.
+ */
+export async function requestReciprocalSync(peer, categories, { fullSync } = {}) {
+  const self = await getSelf();
+  if (!self?.instanceId) return { ok: false, reason: 'no-self-identity' };
+  const sanitized = sanitizeSyncCategories(categories);
+  // Bail only when there's genuinely nothing to say: no actionable categories
+  // AND no full-sync state to communicate. A full-sync DISABLE (fullSync:false)
+  // on a peer whose stored category map is empty must still send — otherwise the
+  // remote never learns to drop its mirror. `fullSync === undefined` means the
+  // caller didn't communicate a full-sync state at all (legacy direct callers).
+  if (!sanitized && fullSync === undefined) return { ok: false, reason: 'no-categories' };
+  const url = `${peerBaseUrl(peer)}/api/instances/peers/sync-categories`;
+  return withAbortTimeout(PROBE_TIMEOUT_MS, async (signal) => {
+    const res = await peerFetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      // Always carry our current full-sync state (true OR false) so a peer new
+      // enough to understand it adopts mirror mode on enable AND drops it on
+      // disable. Older peers ignore the field; on enable they still mirror via
+      // the all-on syncCategories map we sent. syncCategories defaults to {} so
+      // the receiver's required-object schema still parses a fullSync-only send.
+      body: JSON.stringify({ instanceId: self.instanceId, syncCategories: sanitized || {}, fullSync: fullSync === true }),
+      signal
+    }, peer);
+    if (res.ok) {
+      const enabledList = sanitized ? Object.keys(sanitized).filter(k => sanitized[k]).join(',') : '';
+      console.log(`🔁 Requested reciprocal sync from ${peer.name}: ${fullSync === false ? 'full-mirror-off' : (enabledList || 'none')}`);
+      return { ok: true };
+    }
+    // 404 = peer predates this endpoint; not an error worth surfacing loudly.
+    return { ok: false, reason: `http-${res.status}` };
+  }).catch((err) => ({ ok: false, reason: err.message }));
+}
+
+async function markDirection(peerId, direction) {
+  await withData(async (data) => {
+    const peer = data.peers.find(p => p.id === peerId);
+    if (!peer) return;
+    peer.directions = peer.directions || [];
+    if (!peer.directions.includes(direction)) {
+      peer.directions.push(direction);
+      instanceEvents.emit('peers:updated', data.peers);
+    }
+  });
+}
+
+// --- Polling ---
+
+// Actually create the probe schedule (backoff clear + initial probe + interval).
+// Idempotent: a no-op if the loop is already running.
+function beginPolling() {
+  if (pollTimer) return;
+  console.log(`🌐 Instance polling started (${POLL_INTERVAL_MS / 1000}s interval)`);
+
+  // Backoff is a rate limit on the polling loop, not a durable judgment about
+  // the peer — boot (or a fresh Tailscale connect) may itself be the event that
+  // fixes connectivity, so clear it.
+  withData(async (data) => {
+    let cleared = 0;
+    for (const peer of data.peers) {
+      if (peer.nextProbeAt) {
+        peer.nextProbeAt = null;
+        peer.consecutiveFailures = 0;
+        cleared++;
+      }
+    }
+    if (cleared > 0) console.log(`🌐 Cleared backoff on ${cleared} peer(s) for fresh probe after boot`);
+  }).catch(err => console.error(`❌ Failed to clear peer backoff on boot: ${err.message}`));
+
+  // Initial probe after a short delay. probeAllPeers() awaits fs/network work
+  // that can reject; setTimeout/setInterval don't await the callback, so catch
+  // here to avoid a process-killing unhandled rejection.
+  setTimeout(() => {
+    probeAllPeers().catch(err => console.error(`❌ Initial peer probe failed: ${err?.message || String(err)}`));
+  }, INITIAL_PROBE_DELAY_MS);
+
+  pollTimer = setInterval(() => {
+    probeAllPeers().catch(err => console.error(`❌ Peer probe failed: ${err?.message || String(err)}`));
+  }, POLL_INTERVAL_MS);
+}
+
+// A peer we can only reach over the tailnet: its probe URL (see peerBaseUrl)
+// resolves to a MagicDNS name (*.ts.net) or a Tailscale CGNAT address
+// (100.64.0.0/10 for IPv4, fd7a:115c:a1e0::/48 for IPv6). A peer addressed by a
+// plain LAN/routable IP or a non-tailnet DNS host is reachable with Tailscale
+// down, so it must NOT be deferred by the gate below.
+function peerRequiresTailscale(peer) {
+  if (peer.host) return /\.ts\.net$/i.test(peer.host.trim());
+  const addr = (peer.address || '').trim();
+  const v4 = addr.match(/^100\.(\d{1,3})\./);
+  if (v4) {
+    const second = Number(v4[1]);
+    if (second >= 64 && second <= 127) return true;   // 100.64.0.0/10 CGNAT
+  }
+  if (/^fd7a:115c:a1e0:/i.test(addr)) return true;     // Tailscale IPv6 ULA
+  return false;
+}
+
+// Decide whether to start probing now or defer until Tailscale connects.
+// Probing a tailnet-only peer's MagicDNS hostname while Tailscale is down just
+// spams DNS-failure + backoff logs (a laptop booted off-tailnet). So we defer
+// ONLY when every enabled peer is tailnet-dependent; a LAN/IP-reachable peer is
+// probed immediately (it doesn't need Tailscale). While deferred, a slow watcher
+// starts polling automatically the moment Tailscale connects. `gen` is captured
+// at startPolling time so a stopPolling() during either await aborts cleanly.
+async function evaluatePollingGate(gen) {
+  if (pollTimer || tailscaleWatchTimer) return;
+
+  const data = await loadData();
+  if (gen !== pollingGeneration) return;   // stopPolling() landed during loadData
+  const enabledPeers = Array.isArray(data.peers) ? data.peers.filter(p => p.enabled) : [];
+
+  // No peers, or at least one peer reachable without Tailscale → run the loop
+  // now (silent no-op when there are no peers). Only an all-tailnet peer set
+  // gets deferred, so solo installs and LAN peers are unaffected.
+  const needsTailscale = enabledPeers.length > 0 && enabledPeers.every(peerRequiresTailscale);
+  if (!needsTailscale) {
+    beginPolling();
+    return;
+  }
+
+  const status = await getTailscaleStatus();
+  if (gen !== pollingGeneration) return;   // stopPolling() landed during status check
+  if (status.running) {
+    beginPolling();
+    return;
+  }
+
+  console.log(`🌐 Peer sync deferred — Tailscale not connected (${status.state || status.reason}); polling starts automatically once it's up`);
+  // Capture the handle locally so a stale in-flight callback can't clear/null a
+  // watcher installed by a later startPolling() (identity guard below).
+  const myTimer = setInterval(() => {
+    getTailscaleStatus().then((s) => {
+      if (!s.running || tailscaleWatchTimer !== myTimer) return;
+      clearInterval(myTimer);
+      tailscaleWatchTimer = null;
+      console.log('🌐 Tailscale connected — starting peer sync polling');
+      beginPolling();
+    }).catch(() => {});
+  }, TAILSCALE_RECHECK_MS);
+  tailscaleWatchTimer = myTimer;
+  // Don't let the recheck timer keep the process alive on its own.
+  if (typeof myTimer.unref === 'function') myTimer.unref();
+}
+
+export function startPolling() {
+  // pollingStartPending guards the async gap in evaluatePollingGate so two
+  // synchronous startPolling() calls can't each spin up a schedule/watcher.
+  if (pollTimer || tailscaleWatchTimer || pollingStartPending) return;
+  pollingStartPending = true;
+  const gen = pollingGeneration;
+  evaluatePollingGate(gen)
+    .catch(err => console.error(`❌ Failed to start peer polling: ${err.message}`))
+    .finally(() => { pollingStartPending = false; });
+}
+
+export function stopPolling() {
+  // Invalidate any in-flight startPolling gate / deferred watcher callback.
+  pollingGeneration++;
+  if (tailscaleWatchTimer) {
+    clearInterval(tailscaleWatchTimer);
+    tailscaleWatchTimer = null;
+  }
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+    console.log('🌐 Instance polling stopped');
+  }
+}

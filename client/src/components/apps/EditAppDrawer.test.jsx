@@ -1,0 +1,342 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react';
+import { MemoryRouter } from 'react-router';
+
+// Mock the API surface EditAppDrawer touches on mount, plus the work-tracker
+// resolver and the update path used on save.
+vi.mock('../../services/api', () => ({
+  getDatadogInstances: vi.fn(),
+  getInstanceFeatures: vi.fn(),
+  getAppWorkTracker: vi.fn(),
+  getAppLayeredIntelligence: vi.fn(),
+  getAppTaskTypes: vi.fn(),
+  updateAppTaskTypeOverride: vi.fn(),
+  getProviders: vi.fn(),
+  updateApp: vi.fn(),
+  upgradeAppTls: vi.fn(),
+}));
+
+import * as api from '../../services/api';
+import { __resetInstanceFeatureCache } from '../../hooks/useInstanceFeatures.js';
+import EditAppDrawer from './EditAppDrawer';
+
+const APP = {
+  id: 'app-1',
+  name: 'My App',
+  repoPath: '/repo',
+  workTracker: 'auto',
+};
+
+// The drawer is now tabbed and deep-links its active tab via a URL search param
+// (useDrawerTab), so every render needs a real router around it.
+function renderDrawer(props = {}) {
+  return render(
+    <MemoryRouter>
+      <EditAppDrawer app={APP} onClose={() => {}} onSave={() => {}} {...props} />
+    </MemoryRouter>
+  );
+}
+
+// Switch to a named tab pill (both a desktop tab button and a mobile <select>
+// option render; target the tab button).
+async function openTab(name) {
+  fireEvent.click(await screen.findByRole('tab', { name }));
+}
+
+beforeEach(() => {
+  __resetInstanceFeatureCache();
+  api.getDatadogInstances.mockResolvedValue({ instances: {} });
+  api.getInstanceFeatures.mockResolvedValue({
+    features: [
+      { id: 'datadog', label: 'DataDog', enabled: true },
+      { id: 'jira', label: 'JIRA', enabled: true },
+      { id: 'gsd', label: 'GSD', enabled: true },
+    ],
+  });
+  api.getAppWorkTracker.mockResolvedValue({
+    configured: 'auto',
+    resolved: 'github',
+    host: 'github.com',
+    forge: 'gh',
+    source: 'origin',
+  });
+  api.getAppLayeredIntelligence.mockResolvedValue({
+    appId: 'app-1',
+    isPortos: false,
+    config: {
+      enabled: false,
+      intervalMs: 86400000,
+      providerId: null,
+      model: null,
+      rules: '',
+      sources: { goals: true, appMetrics: true, cosMetrics: true, healthReport: true, planMd: true, openIssues: true, custom: [] },
+      allowedScopes: ['app-improvement', 'app-data-gap'],
+    },
+  });
+  api.getProviders.mockResolvedValue({ providers: [] });
+  // Scheduling (enabled/interval/provider/model) is read from the per-app task
+  // override now (#2322); default to an empty override.
+  api.getAppTaskTypes.mockResolvedValue({ taskTypeOverrides: {} });
+  api.updateAppTaskTypeOverride.mockResolvedValue({ success: true });
+  api.updateApp.mockResolvedValue({});
+});
+
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+});
+
+describe('EditAppDrawer tabbed layout', () => {
+  it('opens on the General tab with the name field visible', async () => {
+    renderDrawer();
+    expect(await screen.findByLabelText('Name')).toBeInTheDocument();
+    // Work Tracker lives on a different tab, so it should not be mounted yet.
+    expect(screen.queryByLabelText('Work Tracker')).not.toBeInTheDocument();
+  });
+
+  it('renders all six section tabs', async () => {
+    renderDrawer();
+    for (const label of ['General', 'Ports & TLS', 'Commands', 'Workflow', 'Intelligence', 'Features']) {
+      expect(await screen.findByRole('tab', { name: label })).toBeInTheDocument();
+    }
+  });
+
+  it('has no JIRA tab — that config moved to the app detail page JIRA tab', async () => {
+    renderDrawer();
+    await screen.findByRole('tab', { name: 'General' });
+    expect(screen.queryByRole('tab', { name: 'JIRA' })).not.toBeInTheDocument();
+  });
+
+  it('lets each managed-app feature inherit or override the global setting', async () => {
+    renderDrawer();
+    await openTab('Features');
+
+    expect(screen.getByLabelText('DataDog availability')).toHaveValue('inherit');
+    expect(screen.getByLabelText('JIRA availability')).toHaveValue('inherit');
+    expect(screen.getByLabelText('GSD availability')).toHaveValue('inherit');
+
+    fireEvent.change(screen.getByLabelText('JIRA availability'), { target: { value: 'enabled' } });
+    fireEvent.change(screen.getByLabelText('GSD availability'), { target: { value: 'disabled' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save Changes' }));
+
+    await waitFor(() => expect(api.updateApp).toHaveBeenCalled());
+    expect(api.updateApp.mock.calls[0][1].featureOverrides).toEqual({
+      datadog: null,
+      jira: true,
+      gsd: false,
+    });
+  });
+});
+
+describe('EditAppDrawer work tracker selector', () => {
+  it('renders a labeled select with the five tracker options on the Workflow tab', async () => {
+    renderDrawer();
+    await openTab('Workflow');
+
+    const select = await screen.findByLabelText('Work Tracker');
+    expect(select).toBeInTheDocument();
+    expect(select).toHaveValue('auto');
+
+    const optionValues = Array.from(select.querySelectorAll('option')).map(o => o.value);
+    expect(optionValues).toEqual(['auto', 'plan', 'github', 'gitlab', 'jira']);
+  });
+
+  it('shows the resolved auto target from the work-tracker endpoint', async () => {
+    renderDrawer();
+    await openTab('Workflow');
+
+    await screen.findByLabelText('Work Tracker');
+    expect(api.getAppWorkTracker).toHaveBeenCalledWith('app-1');
+    await waitFor(() =>
+      expect(screen.getByText(/Auto → GitHub Issues \(origin: github\.com\)/)).toBeInTheDocument()
+    );
+  });
+
+  it('updates the selection locally and includes workTracker in the save payload', async () => {
+    renderDrawer();
+    await openTab('Workflow');
+
+    const select = await screen.findByLabelText('Work Tracker');
+    fireEvent.change(select, { target: { value: 'gitlab' } });
+    expect(select).toHaveValue('gitlab');
+
+    // The Save button lives in the footer and is present on every tab.
+    fireEvent.click(screen.getByRole('button', { name: 'Save Changes' }));
+
+    await waitFor(() => expect(api.updateApp).toHaveBeenCalled());
+    const [id, payload] = api.updateApp.mock.calls[0];
+    expect(id).toBe('app-1');
+    expect(payload.workTracker).toBe('gitlab');
+  });
+
+  it('saves a trimmed GitHub account pin and defaults it to blank', async () => {
+    renderDrawer();
+    await openTab('Workflow');
+
+    const input = await screen.findByLabelText('GitHub Account');
+    // Blank is the documented "infer from the repo owner" default, so an app
+    // that never set one must not send a value that looks deliberate.
+    expect(input).toHaveValue('');
+    fireEvent.change(input, { target: { value: '  acme-bot  ' } });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save Changes' }));
+    await waitFor(() => expect(api.updateApp).toHaveBeenCalled());
+    expect(api.updateApp.mock.calls[0][1].forgeAccount).toBe('acme-bot');
+  });
+
+  it('omits `jira` from the save payload so a drawer save cannot clobber the JIRA tab config', async () => {
+    // The server shallow-merges the PUT, so an ABSENT `jira` key preserves the
+    // stored config. Sending `{ enabled: false }` (what the removed drawer tab
+    // did when its checkbox was unmounted) would silently disable an app's JIRA
+    // integration on an unrelated save.
+    renderDrawer({ app: { ...APP, jira: { enabled: true, instanceId: 'inst-1', projectKey: 'PROJ' } } });
+    await screen.findByLabelText('Name');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save Changes' }));
+
+    await waitFor(() => expect(api.updateApp).toHaveBeenCalled());
+    expect(api.updateApp.mock.calls[0][1]).not.toHaveProperty('jira');
+    expect(api.updateApp.mock.calls[0][1]).not.toHaveProperty('datadog');
+  });
+
+  it('saves the selected default PR completion policy', async () => {
+    renderDrawer({ app: { ...APP, defaultUseWorktree: true, defaultOpenPR: true } });
+    await openTab('Workflow');
+
+    const select = await screen.findByLabelText('Default PR completion');
+    expect(select).toHaveValue('review-then-merge');
+    fireEvent.change(select, { target: { value: 'leave-open' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save Changes' }));
+
+    await waitFor(() => expect(api.updateApp).toHaveBeenCalled());
+    expect(api.updateApp.mock.calls[0][1].defaultPrCompletion).toBe('leave-open');
+  });
+  it('defaults the repo-state audit ON for an app that has never set it, and saves an opt-out', async () => {
+    // Unset means ON server-side (repoStateVerificationEnabled), so an app record
+    // with no such key must render checked — otherwise the first save of an
+    // unrelated field would silently turn the audit off.
+    renderDrawer({ app: { ...APP, defaultUseWorktree: true } });
+    await openTab('Workflow');
+
+    const toggle = await screen.findByLabelText(/Verify repo state after each agent/);
+    expect(toggle).toBeChecked();
+    fireEvent.click(toggle);
+    fireEvent.click(screen.getByRole('button', { name: 'Save Changes' }));
+
+    await waitFor(() => expect(api.updateApp).toHaveBeenCalled());
+    expect(api.updateApp.mock.calls[0][1].verifyRepoStateOnCompletion).toBe(false);
+  });
+
+  // Publishing writes to the app's own repo, so the stored value must round-trip
+  // exactly: an app that opted in stays checked, and turning it back off has to
+  // reach the server as `false` rather than being dropped from the payload.
+  it('round-trips the opt-in repo quality snapshot toggle', async () => {
+    renderDrawer({ app: { ...APP, publishQualitySnapshot: true } });
+    await openTab('Workflow');
+
+    const toggle = await screen.findByLabelText(/Publish quality snapshot to repo/);
+    expect(toggle).toBeChecked();
+    fireEvent.click(toggle);
+    fireEvent.click(screen.getByRole('button', { name: 'Save Changes' }));
+
+    await waitFor(() => expect(api.updateApp).toHaveBeenCalled());
+    expect(api.updateApp.mock.calls[0][1].publishQualitySnapshot).toBe(false);
+  });
+
+  it('leaves repo snapshot publishing off for an app that never opted in', async () => {
+    renderDrawer();
+    await openTab('Workflow');
+
+    expect(await screen.findByLabelText(/Publish quality snapshot to repo/)).not.toBeChecked();
+  });
+});
+
+describe('EditAppDrawer native launch target', () => {
+  it('edits the separate native action without changing standard web fields', async () => {
+    renderDrawer({
+      app: {
+        ...APP,
+        uiPort: 3000,
+        nativeLaunch: {
+          label: 'Godot',
+          command: './scripts/game run',
+          processName: 'my-app-game'
+        }
+      }
+    });
+    await openTab('Commands');
+
+    expect(screen.getByLabelText('Separate native launch action')).toBeChecked();
+    fireEvent.change(screen.getByLabelText('Button Label'), { target: { value: 'Play Game' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save Changes' }));
+
+    await waitFor(() => expect(api.updateApp).toHaveBeenCalled());
+    expect(api.updateApp.mock.calls[0][1]).toMatchObject({
+      uiPort: 3000,
+      nativeLaunch: {
+        label: 'Play Game',
+        command: './scripts/game run',
+        processName: 'my-app-game'
+      }
+    });
+  });
+});
+
+describe('EditAppDrawer update command', () => {
+  it('saves the explicitly configured app update routine', async () => {
+    renderDrawer();
+    await openTab('Commands');
+
+    fireEvent.change(screen.getByLabelText('Update Command'), { target: { value: 'npm run update' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save Changes' }));
+
+    await waitFor(() => expect(api.updateApp).toHaveBeenCalled());
+    expect(api.updateApp.mock.calls[0][1].updateCommand).toBe('npm run update');
+  });
+});
+
+describe('EditAppDrawer required-field validation across tabs', () => {
+  // The required Name/Repository Path inputs live on the General tab and are
+  // unmounted while another tab is active, so browser `required` validation
+  // can't block a Save from another tab. handleSubmit must validate explicitly.
+  it('blocks Save from a non-General tab when Name is empty and surfaces General', async () => {
+    renderDrawer({ app: { ...APP, name: '' } });
+    await openTab('Workflow');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save Changes' }));
+
+    await waitFor(() =>
+      expect(screen.getByText('Name and Repository Path are required.')).toBeInTheDocument()
+    );
+    expect(api.updateApp).not.toHaveBeenCalled();
+    // The General tab is surfaced so the offending field is visible again.
+    expect(await screen.findByLabelText('Name')).toBeInTheDocument();
+  });
+
+  it('blocks Save when Repository Path is empty', async () => {
+    renderDrawer({ app: { ...APP, repoPath: '   ' } });
+    await openTab('Workflow');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save Changes' }));
+
+    await waitFor(() =>
+      expect(screen.getByText('Name and Repository Path are required.')).toBeInTheDocument()
+    );
+    expect(api.updateApp).not.toHaveBeenCalled();
+  });
+
+  it('blocks Save when a hidden port field holds a non-integer value', async () => {
+    renderDrawer({ app: { ...APP, uiPort: '1.5' } });
+    // Leave the Ports tab and try to save; the unmounted number input can't
+    // self-validate, so handleSubmit must catch it and surface the Ports tab.
+    await openTab('Workflow');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save Changes' }));
+
+    await waitFor(() =>
+      expect(screen.getByText('UI Port must be a whole number between 1 and 65535.')).toBeInTheDocument()
+    );
+    expect(api.updateApp).not.toHaveBeenCalled();
+    expect(await screen.findByLabelText('UI Port')).toBeInTheDocument();
+  });
+});

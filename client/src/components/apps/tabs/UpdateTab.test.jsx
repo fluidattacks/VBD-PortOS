@@ -1,0 +1,376 @@
+import { StrictMode } from 'react';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { act, render, screen, fireEvent, waitFor } from '@testing-library/react';
+
+// ── Mock socket — capture registered handlers so the test can fire 'disconnect' ──
+const handlers = new Map();
+vi.mock('../../../services/socket', () => ({
+  default: {
+    on: (event, fn) => { handlers.set(event, fn); },
+    off: (event, fn) => { if (handlers.get(event) === fn) handlers.delete(event); },
+  },
+}));
+
+// ── Mock toast ────────────────────────────────────────────────────────────────
+const mockToast = vi.hoisted(() => Object.assign(vi.fn(), { success: vi.fn(), error: vi.fn(), loading: vi.fn(), dismiss: vi.fn() }));
+vi.mock('../../ui/Toast', () => ({ default: mockToast }));
+
+// ── Mock API ──────────────────────────────────────────────────────────────────
+const mockGetUpdateStatus = vi.fn();
+const mockCheckHealth = vi.fn();
+const mockExecutePortosUpdate = vi.fn();
+vi.mock('../../../services/api', () => ({
+  getUpdateStatus: (...a) => mockGetUpdateStatus(...a),
+  checkHealth: (...a) => mockCheckHealth(...a),
+  executePortosUpdate: (...a) => mockExecutePortosUpdate(...a),
+  checkForUpdate: vi.fn(),
+  ignoreUpdateVersion: vi.fn(),
+  clearIgnoredVersions: vi.fn(),
+  syncPortosFork: vi.fn(),
+}));
+
+vi.mock('./AutoUpdatePanel', () => ({ default: () => null }));
+
+const UpdateTab = (await import('./UpdateTab')).default;
+
+const OUT_OF_SYNC_STATUS = {
+  currentVersion: '2.24.0',
+  installState: { outOfSync: true, runningStaleCode: true },
+};
+
+// Fires 'disconnect' and advances past the 1.5s unreachability-confirmation
+// delay in handleDisconnect, flushing the checkHealth() microtask through it.
+const fireDisconnectAndConfirm = async () => {
+  // Flush pending passive effects FIRST. The component mirrors `updating` into
+  // `updatingRef` via a separate effect (`useEffect(() => { updatingRef.current
+  // = updating }, [updating])`), and handleDisconnect's guard reads that ref
+  // synchronously. runUpdate() calls setUpdating(true) outside any act (after
+  // awaiting the pre-update health check), so the "Reconciling..." button —
+  // driven directly by the `updating` state — can commit to the DOM (and
+  // satisfy the caller's waitFor) a scheduler tick before the ref-sync effect
+  // runs. Without this flush the
+  // ref can still be stale-false when we fire 'disconnect', the confirmation
+  // timer never arms, and "Restarting..." never appears: the intermittent CI
+  // failure (#2065). Draining effects here syncs the ref to the state
+  // production always reaches over real network time.
+  await act(async () => {});
+  vi.useFakeTimers();
+  handlers.get('disconnect')();
+  await act(async () => { await vi.advanceTimersByTimeAsync(1500); });
+  vi.useRealTimers();
+};
+
+describe('UpdateTab reconcile flow', () => {
+  beforeEach(() => {
+    handlers.clear();
+    mockGetUpdateStatus.mockReset().mockResolvedValue(OUT_OF_SYNC_STATUS);
+    mockCheckHealth.mockReset().mockResolvedValue({ version: '2.24.0', uptime: 120 });
+    mockExecutePortosUpdate.mockReset().mockResolvedValue({ tag: 'v2.24.0' });
+    mockToast.mockClear();
+    mockToast.loading.mockClear();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('arms the restart-polling fallback once a disconnect is confirmed by an unreachable health check', async () => {
+    render(<UpdateTab />);
+
+    const button = await screen.findByRole('button', { name: 'Reconcile Now' });
+    fireEvent.click(button);
+
+    // runUpdate flips to "Reconciling..." once the update starts.
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Reconciling...' })).toBeTruthy());
+    expect(mockExecutePortosUpdate).toHaveBeenCalledWith({ reconcile: true });
+
+    // The server process dies mid-update (pm2-stop kills it) before it ever
+    // emits a 'restart' step or 'portos:update:complete' — only the socket
+    // disconnecting tells the client the process is gone. Simulate the real
+    // death: the health check that follows the disconnect also fails.
+    expect(handlers.has('disconnect')).toBe(true);
+    mockCheckHealth.mockResolvedValue(null);
+    await fireDisconnectAndConfirm();
+
+    // The fallback must arm from a confirmed 'disconnect' — the UI should not
+    // stay stuck showing "Reconciling..." forever waiting for a step event
+    // that will never arrive from the now-dead process.
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Restarting...' })).toBeTruthy());
+    // The confirmation check must be silent — a real disconnect is the
+    // primary case this fallback exists for, and a generic "Server
+    // unreachable" toast firing right alongside the intended "restarting"
+    // toast would be a confusing double-toast on the common path.
+    expect(mockCheckHealth).toHaveBeenLastCalledWith({ silent: true });
+  });
+
+  it('does not pop an undismissable "restarting" toast if the component unmounts before the disconnect confirmation resolves', async () => {
+    const { unmount } = render(<UpdateTab />);
+
+    const button = await screen.findByRole('button', { name: 'Reconcile Now' });
+    fireEvent.click(button);
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Reconciling...' })).toBeTruthy());
+
+    // The server really did go down (confirms), but the user navigated away
+    // before the 1.5s confirmation delay elapsed. Nothing is left mounted to
+    // ever dismiss a toast.loading({ duration: Infinity }) popped after this.
+    mockCheckHealth.mockResolvedValue(null);
+    // Flush pending effects so updatingRef is true when we fire 'disconnect'
+    // (see fireDisconnectAndConfirm) — otherwise the confirmation timer never
+    // arms and this asserts "no toast" for the wrong reason.
+    await act(async () => {});
+    vi.useFakeTimers();
+    handlers.get('disconnect')();
+    unmount();
+    await act(async () => { await vi.advanceTimersByTimeAsync(1500); });
+    vi.useRealTimers();
+
+    expect(mockToast.loading).not.toHaveBeenCalled();
+  });
+
+  it('ignores a disconnect caused by a transient network blip (server still reachable)', async () => {
+    render(<UpdateTab />);
+
+    const button = await screen.findByRole('button', { name: 'Reconcile Now' });
+    fireEvent.click(button);
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Reconciling...' })).toBeTruthy());
+
+    // PortOS is commonly used remotely over Tailscale — a socket 'disconnect'
+    // can fire from a mobile network blip during the pre-pm2-stop steps, well
+    // before the server actually dies. The health check right after the
+    // disconnect still succeeds (server alive, same pre-update version), so
+    // this must NOT be treated as proof of a restart.
+    expect(handlers.has('disconnect')).toBe(true);
+    await fireDisconnectAndConfirm();
+
+    expect(screen.getByRole('button', { name: 'Reconciling...' })).toBeTruthy();
+    expect(mockToast.loading).not.toHaveBeenCalled();
+  });
+
+  it('still confirms a real disconnect under StrictMode (mountedRef survives the dev-mode phantom mount→cleanup→remount)', async () => {
+    // React 18 StrictMode (on app-wide in main.jsx) double-invokes effects on
+    // mount: mount → cleanup → remount. A mountedRef implemented as a bare
+    // `useRef(true)` + cleanup-only effect never resets to `true` on the
+    // remount, so it reads permanently `false` for the rest of the
+    // component's real lifetime — silently killing the disconnect
+    // confirmation fallback in dev mode from the very first render. Plain
+    // `render()` doesn't reproduce this; wrap in StrictMode explicitly.
+    render(<StrictMode><UpdateTab /></StrictMode>);
+
+    const button = await screen.findByRole('button', { name: 'Reconcile Now' });
+    fireEvent.click(button);
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Reconciling...' })).toBeTruthy());
+
+    mockCheckHealth.mockResolvedValue(null);
+    await fireDisconnectAndConfirm();
+
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Restarting...' })).toBeTruthy());
+  });
+
+  it('ignores a disconnect that happens while no update is in progress', async () => {
+    render(<UpdateTab />);
+    await screen.findByRole('button', { name: 'Reconcile Now' });
+
+    expect(handlers.has('disconnect')).toBe(true);
+    await fireDisconnectAndConfirm();
+
+    // No update was running, so disconnect must not fake-arm the restart flow.
+    expect(screen.getByRole('button', { name: 'Reconcile Now' })).toBeTruthy();
+    expect(mockToast.loading).not.toHaveBeenCalled();
+  });
+
+  it('surfaces stale pinned submodules as a reconcile action', async () => {
+    mockGetUpdateStatus.mockResolvedValue({
+      currentVersion: '2.24.0',
+      installState: {
+        outOfSync: true,
+        submodules: { stale: true, paths: ['lib/example'] },
+      },
+    });
+
+    render(<UpdateTab />);
+
+    expect(await screen.findByText(/1 submodule checkout is out of sync with the revisions pinned by PortOS/i)).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Reconcile Now' })).toHaveAttribute(
+      'title',
+      expect.stringMatching(/sync pinned submodules/i),
+    );
+  });
+});
+
+describe('UpdateTab — active CoS agent suppression', () => {
+  beforeEach(() => {
+    handlers.clear();
+    mockCheckHealth.mockReset().mockResolvedValue({ version: '2.24.0', uptime: 120 });
+    mockExecutePortosUpdate.mockReset();
+    mockToast.mockClear();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('suppresses the reconcile prompt and shows a paused notice while agents are live', async () => {
+    mockGetUpdateStatus.mockReset().mockResolvedValue({
+      ...OUT_OF_SYNC_STATUS,
+      activeCosAgents: 2,
+    });
+    render(<UpdateTab />);
+
+    // The paused notice appears in place of the reconcile action.
+    await screen.findByText(/Update paused — CoS agents running/i);
+    expect(screen.getByText(/2 CoS agents are currently running/i)).toBeTruthy();
+    // The reconcile button must be gone — a restart would sever the agents.
+    expect(screen.queryByRole('button', { name: 'Reconcile Now' })).toBeNull();
+  });
+
+  it('shows the reconcile button again once no agents are running', async () => {
+    mockGetUpdateStatus.mockReset().mockResolvedValue({
+      ...OUT_OF_SYNC_STATUS,
+      activeCosAgents: 0,
+    });
+    render(<UpdateTab />);
+
+    await screen.findByRole('button', { name: 'Reconcile Now' });
+    expect(screen.queryByText(/Update paused/i)).toBeNull();
+  });
+
+  it('keeps safe non-restart actions (Ignore) available while agents run, hides Update Now', async () => {
+    // P2: only restart-triggering buttons are suppressed. A non-fork install with
+    // an available update and a live agent should hide "Update Now" (restarts)
+    // but still offer "Ignore" (no restart).
+    mockGetUpdateStatus.mockReset().mockResolvedValue({
+      currentVersion: '2.24.0',
+      updateAvailable: true,
+      latestRelease: { version: '2.25.0' },
+      remoteInfo: { isFork: false, hasOrigin: true, fullName: 'atomantic/PortOS' },
+      activeCosAgents: 1,
+    });
+    render(<UpdateTab />);
+
+    await screen.findByText(/Update paused — CoS agents running/i);
+    expect(screen.queryByRole('button', { name: 'Update Now' })).toBeNull();
+    // Ignore is safe (no restart) and must remain available.
+    expect(screen.getByRole('button', { name: /Ignore v2\.25\.0/i })).toBeTruthy();
+  });
+
+  it('keeps Sync Fork Only available while agents run (it does not restart), hides fork update buttons', async () => {
+    mockGetUpdateStatus.mockReset().mockResolvedValue({
+      currentVersion: '2.24.0',
+      updateAvailable: true,
+      latestRelease: { version: '2.25.0' },
+      remoteInfo: { isFork: true, hasOrigin: true, fullName: 'alice/PortOS' },
+      upstream: { fullName: 'atomantic/PortOS' },
+      activeCosAgents: 1,
+    });
+    render(<UpdateTab />);
+
+    await screen.findByText(/Update paused — CoS agents running/i);
+    // Restart-triggering fork actions hidden.
+    expect(screen.queryByRole('button', { name: 'Sync Fork & Update' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Update from Fork As-Is' })).toBeNull();
+    // Sync Fork Only only runs `gh repo sync` — no restart — so it stays.
+    expect(screen.getByRole('button', { name: 'Sync Fork Only' })).toBeTruthy();
+  });
+
+  it('suppresses restart buttons when an agent starts while the update surface is showing (activity event)', async () => {
+    let agentCount = 0;
+    mockGetUpdateStatus.mockReset().mockImplementation(async () => ({
+      currentVersion: '2.24.0',
+      updateAvailable: true,
+      latestRelease: { version: '2.25.0' },
+      remoteInfo: { isFork: false, hasOrigin: true, fullName: 'atomantic/PortOS' },
+      activeCosAgents: agentCount,
+    }));
+    vi.useFakeTimers();
+    render(<UpdateTab />);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(screen.getByRole('button', { name: 'Update Now' })).toBeTruthy();
+    expect(screen.queryByText(/Update paused/i)).toBeNull();
+
+    agentCount = 1;
+    await act(async () => { handlers.get('system:activity')({}); });
+    vi.useRealTimers();
+
+    expect(screen.queryByRole('button', { name: 'Update Now' })).toBeNull();
+    expect(screen.getByText(/Update paused — CoS agents running/i)).toBeTruthy();
+  });
+
+  it('auto-clears the paused notice when the last agent finishes (activity event)', async () => {
+    let agentCount = 1;
+    mockGetUpdateStatus.mockReset().mockImplementation(async () => ({
+      ...OUT_OF_SYNC_STATUS,
+      activeCosAgents: agentCount,
+    }));
+    vi.useFakeTimers();
+    render(<UpdateTab />);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(screen.getByText(/Update paused — CoS agents running/i)).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Reconcile Now' })).toBeNull();
+
+    agentCount = 0;
+    await act(async () => { handlers.get('system:activity')({}); });
+    vi.useRealTimers();
+
+    expect(screen.queryByText(/Update paused/i)).toBeNull();
+    expect(screen.getByRole('button', { name: 'Reconcile Now' })).toBeTruthy();
+  });
+});
+
+describe('UpdateTab — last update log', () => {
+  beforeEach(() => {
+    handlers.clear();
+    mockCheckHealth.mockReset().mockResolvedValue({ version: '2.24.0', uptime: 120 });
+    mockExecutePortosUpdate.mockReset();
+    mockToast.mockClear();
+  });
+
+  it('wraps a long single-line update log so its tail stays reachable', async () => {
+    // Real update logs contain long unbroken paths/URLs. The app shell is
+    // `overflow-x-hidden`, so an unwrapped <pre> clips the tail with no
+    // horizontal scrollbar to recover it — the wrap pair is the fix.
+    const log = `error: ${'no-spaces-in-this-path/'.repeat(20)}done`;
+    mockGetUpdateStatus.mockReset().mockResolvedValue({
+      currentVersion: '2.24.0',
+      lastUpdateResult: { success: false, version: '2.25.0', log },
+    });
+
+    render(<UpdateTab />);
+
+    const pre = await screen.findByText(log);
+    expect(pre.tagName).toBe('PRE');
+    expect(pre.className).toContain('whitespace-pre-wrap');
+    expect(pre.className).toContain('break-all');
+    // A multi-thousand-line log must not push the rest of the tab off-screen.
+    expect(pre.className).toContain('overflow-y-auto');
+  });
+});
+
+it('reads once per recovery, coalesces events, never polls, and releases listeners', async () => {
+  vi.useFakeTimers();
+  mockGetUpdateStatus.mockReset().mockResolvedValue(OUT_OF_SYNC_STATUS);
+  const view = render(<UpdateTab />);
+  await act(async () => {});
+  expect(mockGetUpdateStatus).toHaveBeenCalledTimes(1);
+  await act(async () => { await vi.advanceTimersByTimeAsync(60000); });
+  expect(mockGetUpdateStatus).toHaveBeenCalledTimes(1);
+  await act(async () => {
+    handlers.get('portos:update:checked')({});
+    handlers.get('portos:auto-update:changed')({});
+  });
+  expect(mockGetUpdateStatus).toHaveBeenCalledTimes(2);
+  await act(async () => { handlers.get('connect')(); });
+  expect(mockGetUpdateStatus).toHaveBeenCalledTimes(3);
+  Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
+  act(() => document.dispatchEvent(new Event('visibilitychange')));
+  Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
+  await act(async () => {
+    document.dispatchEvent(new Event('visibilitychange'));
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+  expect(mockGetUpdateStatus).toHaveBeenCalledTimes(4);
+  view.unmount();
+  expect(handlers.size).toBe(0);
+  vi.useRealTimers();
+});

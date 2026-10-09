@@ -1,0 +1,107 @@
+import { useState } from 'react';
+import { Link } from 'react-router';
+import { ListTodo, Pin } from 'lucide-react';
+import * as api from '../../../services/api';
+import { useSocketResource } from '../../../hooks/useSocketResource';
+import { useTimeTick } from '../../../hooks/useTimeTick';
+import { isThreadOverdue, threadNextLine } from '../../../lib/brainThreads.js';
+import { formatCount, formatDateShort } from '../../../utils/formatters';
+import ThreadSourceClosedAction from '../../brain/ThreadSourceClosedAction';
+
+const RESOURCE_EVENTS = ['brain:threads:changed'];
+
+// The Brain bullet journal's open loops (#7664) with the next action on each,
+// so what you are on the hook for is one glance away. A *thread* here is a
+// tracked topic, never a message thread. Rows deep-link to `?thread=<id>`,
+// which opens the record's drawer on the Threads tab.
+//
+// Deliberately narrower than the tab's working set: `someday` is parked by
+// definition, so the widget asks the server for open + waiting only, and only
+// the first page — `total` carries the count without shipping the rest.
+// Self-fetched (like UpcomingTasksWidget) rather than read off dashboardState:
+// nothing else on the dashboard needs the list.
+const ROWS = 6;
+const WIDGET_STATUSES = 'open,waiting';
+
+export default function OpenThreadsWidget() {
+  const [completed, setCompleted] = useState({});
+  // Overdue coloring is local clock state, not a reason to re-read the API.
+  useTimeTick(60000);
+  const { data, loading, error, refetch } = useSocketResource(
+    () => api.listThreads({ status: WIDGET_STATUSES, limit: ROWS, offset: 0 }, { silent: true }),
+    { events: RESOURCE_EVENTS },
+  );
+
+  const hasResults = data != null;
+
+  const fetchedRows = Array.isArray(data?.threads) ? data.threads : [];
+  // Retain successful writes over a read that started before completion.
+  // A genuinely newer record (e.g. reopened in Brain) becomes visible again.
+  const rows = fetchedRows.filter((t) => !completed[t.id] || t.updatedAt > completed[t.id]);
+  const total = (Number.isFinite(data?.total) ? data.total : fetchedRows.length) - (fetchedRows.length - rows.length);
+  const onCompleted = (thread) => setCompleted((prev) => ({ ...prev, [thread.id]: thread.updatedAt }));
+
+  return (
+    <div className="@container bg-port-card border border-port-border rounded-xl p-4 h-full">
+      <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+        <Link to="/brain/threads" className="flex items-center gap-2 hover:text-port-accent">
+          <ListTodo size={16} className="text-gray-500" aria-hidden="true" />
+          <h3 className="text-sm font-semibold text-white">Open Threads</h3>
+        </Link>
+        {hasResults && total > 0 && <span className="text-xs text-gray-500">{formatCount(total)} open</span>}
+      </div>
+
+      {error && (
+        <div className="mb-3 space-y-2 text-xs" role="status">
+          <p className="text-port-warning">
+            {hasResults
+              ? 'Showing last-loaded results — threads could not be refreshed.'
+              : 'Threads unavailable — your open loops could not be loaded.'}
+          </p>
+          <div className="flex flex-wrap items-center gap-2">
+            <button type="button" onClick={refetch} disabled={loading} className="min-h-11 px-3 rounded-lg border border-port-border text-port-accent disabled:opacity-50">
+              {loading ? 'Retrying…' : 'Retry'}
+            </button>
+            <Link to="/brain/threads" className="text-port-accent hover:underline">Open Brain Threads</Link>
+          </div>
+        </div>
+      )}
+      {!hasResults && !error && <p role="status" className="text-xs text-gray-500">Loading threads…</p>}
+      {hasResults && (rows.length === 0 ? (
+        <p className="text-xs text-gray-500">
+          {total > 0
+            ? 'More open loops are available in Brain.'
+            : error ? 'No open loops in the last-loaded results.' : <>No open loops. <Link to="/brain/threads" className="text-port-accent hover:underline">Track one</Link></>}
+        </p>
+      ) : (
+        <ul className="space-y-2">
+          {rows.map((t) => {
+            const nextLine = threadNextLine(t);
+            return (
+              <li key={t.id}>
+                <Link to={`/brain/threads?thread=${encodeURIComponent(t.id)}`} className="group flex items-start gap-2 text-xs">
+                  {t.pinned
+                    ? <Pin size={12} className="shrink-0 mt-0.5 text-port-accent" aria-label="Pinned" />
+                    : <span className="shrink-0 mt-1 w-2 h-2 rounded-full border border-port-border" aria-hidden="true" />}
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-gray-300 group-hover:text-white" title={t.title}>{t.title}</span>
+                    {nextLine && <span className="block truncate text-gray-500">{nextLine}</span>}
+                  </span>
+                  {t.dueAt && (
+                    <span className={`shrink-0 ${isThreadOverdue(t) ? 'text-port-error' : 'text-gray-500'}`}>{formatDateShort(t.dueAt)}</span>
+                  )}
+                </Link>
+                <ThreadSourceClosedAction thread={t} onCompleted={onCompleted} />
+              </li>
+            );
+          })}
+        </ul>
+      ))}
+      {hasResults && total > rows.length && (
+        <Link to="/brain/threads" className="block text-xs text-gray-500 hover:text-port-accent mt-2">
+          +{formatCount(total - rows.length)} more
+        </Link>
+      )}
+    </div>
+  );
+}

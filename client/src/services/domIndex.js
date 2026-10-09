@@ -1,0 +1,309 @@
+// DOM indexer for voice accessibility mode.
+//
+// Walks the visible UI and produces a compact list of interactable elements
+// (tabs, buttons, inputs, selects, etc.) each tagged with a stable ref.
+// The server-side LLM receives this index per turn so it can drive the UI
+// by label ("select the Memory tab", "fill search with 'foo'", etc.) via
+// the ui_click / ui_fill / ui_select tools.
+
+const MAX_ELEMENTS = 200;
+const MAX_LABEL = 80;
+
+const truncate = (s, n = MAX_LABEL) => {
+  if (!s) return '';
+  const trimmed = s.replace(/\s+/g, ' ').trim();
+  return trimmed.length > n ? `${trimmed.slice(0, n - 1)}…` : trimmed;
+};
+
+const isVisible = (el) => {
+  if (!el || !el.isConnected) return false;
+  if (el.hasAttribute('hidden') || el.getAttribute('aria-hidden') === 'true') return false;
+  // Fast-path: offsetParent is null for display:none ancestors and for
+  // elements with display:none themselves. Catches ~80% of hidden cases
+  // without forcing getComputedStyle/getBoundingClientRect layout reads.
+  // Skips for position:fixed (offsetParent is always null) — for those we
+  // fall through to the expensive checks.
+  if (el.offsetParent === null && window.getComputedStyle(el).position !== 'fixed') return false;
+  const style = window.getComputedStyle(el);
+  if (style.visibility === 'hidden' || style.pointerEvents === 'none') return false;
+  const rect = el.getBoundingClientRect();
+  if (rect.width === 0 && rect.height === 0) return false;
+  return true;
+};
+
+const classify = (el) => {
+  const tag = el.tagName.toLowerCase();
+  const role = (el.getAttribute('role') || '').toLowerCase();
+  if (role === 'tab') return 'tab';
+  if (role === 'menuitem') return 'button';
+  if (tag === 'a' && el.href) return 'link';
+  if (tag === 'button' || role === 'button') return 'button';
+  if (tag === 'select') return 'select';
+  if (tag === 'textarea') return 'textarea';
+  if (tag === 'input') {
+    const type = (el.type || 'text').toLowerCase();
+    if (type === 'checkbox') return 'checkbox';
+    if (type === 'radio') return 'radio';
+    if (type === 'submit' || type === 'button' || type === 'reset') return 'button';
+    if (type === 'hidden' || type === 'file') return null;
+    return 'input';
+  }
+  return null;
+};
+
+const extractLabel = (el) => {
+  const aria = el.getAttribute('aria-label');
+  if (aria) return truncate(aria);
+
+  const labelledBy = el.getAttribute('aria-labelledby');
+  if (labelledBy) {
+    const parts = labelledBy.split(/\s+/)
+      .map((id) => document.getElementById(id)?.textContent || '')
+      .filter(Boolean);
+    if (parts.length) return truncate(parts.join(' '));
+  }
+
+  const tag = el.tagName.toLowerCase();
+  if (tag === 'input' || tag === 'textarea' || tag === 'select') {
+    if (el.id) {
+      const lab = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+      if (lab?.textContent) return truncate(lab.textContent);
+    }
+    const wrapping = el.closest('label');
+    if (wrapping) {
+      const clone = wrapping.cloneNode(true);
+      clone.querySelectorAll('input, textarea, select').forEach((n) => n.remove());
+      const t = clone.textContent;
+      if (t && t.trim()) return truncate(t);
+    }
+    const placeholder = el.getAttribute('placeholder');
+    if (placeholder) return truncate(placeholder);
+    const name = el.getAttribute('name');
+    if (name) return truncate(name);
+  }
+
+  const text = el.textContent;
+  if (text && text.trim()) return truncate(text);
+
+  const title = el.getAttribute('title');
+  if (title) return truncate(title);
+
+  return null;
+};
+
+const SELECTOR = [
+  'button',
+  '[role="button"]',
+  '[role="tab"]',
+  '[role="menuitem"]',
+  'a[href]',
+  'input',
+  'select',
+  'textarea',
+].join(', ');
+
+export const clearRefs = () => {
+  document.querySelectorAll('[data-voice-ref]').forEach((el) => {
+    el.removeAttribute('data-voice-ref');
+  });
+};
+
+const pickRoot = () => (
+  document.querySelector('main')
+  || document.getElementById('root')
+  || document.body
+);
+
+const findTitle = () => {
+  // Prefer a visible page heading over the tab title — it's the name the user
+  // sees and what they'll naturally reference ("the tasks page").
+  const h1 = document.querySelector('main h1, main [role="heading"][aria-level="1"]');
+  if (h1?.textContent) return truncate(h1.textContent, 60);
+  return truncate(document.title, 60);
+};
+
+// Cap on visible-text snapshot we ship to the server alongside the
+// interactable index. The `ui_read` voice tool returns this so the LLM can
+// answer "what does this say?" without an extra DOM trip. The same 8000
+// cap (and the same word-boundary truncation) is enforced server-side in
+// `server/sockets/voice.js` so the ~8 KB limit documented on `ui_read`
+// holds end-to-end whether the truncation happens here (well-behaved
+// widget) or there (runaway / malicious client).
+const MAX_TEXT_CHARS = 8000;
+
+// Drop chrome the user almost certainly didn't mean — nav rails, the floating
+// voice widget, toast banners. Keep <main> and dialogs so what's visually
+// front-and-center is what shows up in the snapshot. Falls back to whole-
+// body text for pages that don't put content in <main>.
+const TEXT_BLOCK_SELECTORS = ['main', '[role="dialog"]'];
+// Exclude:
+//  - chrome the user didn't mean (nav rails, asides, the floating voice widget)
+//  - non-rendered DOM (script/style/noscript)
+//  - explicitly hidden subtrees: [hidden] is the spec-blessed HTML attribute
+//    for hidden content (e.g., inactive tab panels in component libraries),
+//    and aria-hidden="true" covers content hidden from assistive tech.
+//    Without these, ui_read would include the textContent of tab panels that
+//    aren't visually on the page — the agent would then "read the page" and
+//    recite content from inactive tabs.
+const TEXT_EXCLUDE_SELECTORS = [
+  'nav',
+  'aside',
+  'script',
+  'style',
+  'noscript',
+  '[hidden]',
+  '[aria-hidden="true"]',
+  '[data-voice-widget]',
+];
+
+// Combined selector built once at module load so extractText doesn't pay the
+// O(selectors × DOM) cost of N separate querySelectorAll passes on every
+// snapshot. With ~8 exclude selectors and a deep page, that was the dominant
+// cost in the ui_read path.
+const TEXT_EXCLUDE_QUERY = TEXT_EXCLUDE_SELECTORS.join(',');
+
+// Extract visible textual content from a subtree. We clone the node first so
+// we can prune nav/aside/script subtrees without mutating the live DOM, then
+// pull textContent and collapse whitespace.
+const extractText = (node) => {
+  const clone = node.cloneNode(true);
+  clone.querySelectorAll(TEXT_EXCLUDE_QUERY).forEach((n) => n.remove());
+  const raw = clone.textContent || '';
+  return raw.replace(/\s+/g, ' ').trim();
+};
+
+export const extractVisibleText = () => {
+  const blocks = [];
+  for (const sel of TEXT_BLOCK_SELECTORS) {
+    document.querySelectorAll(sel).forEach((node) => {
+      if (!isVisible(node)) return;
+      const t = extractText(node);
+      if (t) blocks.push(t);
+    });
+  }
+  if (!blocks.length) {
+    const fallback = document.body ? extractText(document.body) : '';
+    if (fallback) blocks.push(fallback);
+  }
+  const joined = blocks.join('\n\n');
+  if (joined.length <= MAX_TEXT_CHARS) return joined;
+  // Truncate on a word boundary so the tail isn't a partial token. Match
+  // ANY whitespace (space/newline/tab) as a boundary — `joined` inserts
+  // `\n\n` between blocks, so a strict space-only search would hard-cut
+  // mid-token when the closest break is the block separator.
+  const cut = joined.slice(0, MAX_TEXT_CHARS);
+  const lastWs = cut.search(/\s[^\s]*$/);
+  return `${cut.slice(0, lastWs > 0 ? lastWs : MAX_TEXT_CHARS)}…`;
+};
+
+// Build the per-page index the voice server uses to drive ui_* tools.
+//
+// The visible-text blob (extractVisibleText) is the heaviest part of the
+// payload and is only needed by the `ui_read` tool. By default we OMIT it and
+// set `textOnDemand: true` so the server knows it can request the text lazily
+// via `voice:ui:read-request` (answered by the client recomputing
+// extractVisibleText on the live DOM). Pass `{ includeText: true }` to embed
+// the text eagerly — kept for the legacy/fallback path where the server never
+// sends a read-request.
+export const buildIndex = ({ includeText = false } = {}) => {
+  clearRefs();
+  const root = pickRoot();
+  const elements = [];
+  const raw = Array.from(root.querySelectorAll(SELECTOR));
+
+  for (const el of raw) {
+    if (elements.length >= MAX_ELEMENTS) break;
+    // `data-voice-guard` resolves from the nearest annotated ancestor, not
+    // just the element itself, so marking a container covers every control
+    // inside it (issue #5907) — otherwise excluding a widget would mean
+    // annotating each of its buttons and missing the next one added. A
+    // control marked `exclude` never reaches the voice index at all; checked
+    // before classify/visibility so it costs nothing else below.
+    const guard = el.closest('[data-voice-guard]')?.getAttribute('data-voice-guard');
+    if (guard === 'exclude') continue;
+    const kind = classify(el);
+    if (!kind) continue;
+    if (!isVisible(el)) continue;
+    if (el.disabled) continue;
+
+    const label = extractLabel(el);
+    if (!label) continue;
+
+    const ref = elements.length;
+    el.setAttribute('data-voice-ref', String(ref));
+
+    const entry = { ref, kind, label };
+    // Carried onto the entry so the server's confirmation gate can require
+    // confirmation for this control regardless of its label — see
+    // `requiresConfirmation` in confirmGate.js.
+    if (guard === 'confirm') entry.guard = 'confirm';
+
+    if (kind === 'tab') {
+      if (el.getAttribute('aria-selected') === 'true') entry.active = true;
+    } else if (kind === 'input' || kind === 'textarea') {
+      entry.type = (el.type || 'text').toLowerCase();
+      if (el.value) entry.value = truncate(el.value, 80);
+    } else if (kind === 'select') {
+      entry.value = el.value;
+      entry.options = Array.from(el.options)
+        .slice(0, 30)
+        .map((o) => o.textContent?.trim() || o.value)
+        .filter(Boolean);
+    } else if (kind === 'checkbox' || kind === 'radio') {
+      entry.checked = !!el.checked;
+    }
+
+    elements.push(entry);
+  }
+
+  const index = {
+    path: window.location.pathname + window.location.search,
+    title: findTitle(),
+    elements,
+  };
+  if (includeText) {
+    // Legacy/fallback path: embed the text eagerly.
+    index.text = extractVisibleText();
+  } else {
+    // Lazy path: tell the server it can ask for the text on demand.
+    index.textOnDemand = true;
+  }
+  return index;
+};
+
+const normalize = (s) => (s || '')
+  .toLowerCase()
+  .replace(/\s+/g, ' ')
+  .trim()
+  .replace(/[.!?:;,"']+$/, '');
+
+export const findByRef = (ref) => {
+  if (ref === undefined || ref === null) return null;
+  return document.querySelector(`[data-voice-ref="${CSS.escape(String(ref))}"]`);
+};
+
+export const findByLabel = (label, kindHint) => {
+  const target = normalize(label);
+  if (!target) return null;
+  const all = Array.from(document.querySelectorAll('[data-voice-ref]'));
+  const candidates = all.map((el) => ({
+    el,
+    kind: classify(el),
+    lab: normalize(extractLabel(el)),
+  })).filter((c) => c.lab && c.kind);
+
+  const withKind = kindHint ? candidates.filter((c) => c.kind === kindHint) : candidates;
+  const pools = [withKind, candidates];
+  const matchers = [
+    (lab) => lab === target,
+    (lab) => lab.startsWith(target),
+    (lab) => lab.includes(target),
+  ];
+  for (const matcher of matchers) {
+    for (const pool of pools) {
+      const hit = pool.find((c) => matcher(c.lab));
+      if (hit) return hit.el;
+    }
+  }
+  return null;
+};

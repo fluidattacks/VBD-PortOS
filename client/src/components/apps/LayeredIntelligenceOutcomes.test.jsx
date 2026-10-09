@@ -1,0 +1,210 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import LayeredIntelligenceOutcomes from './LayeredIntelligenceOutcomes';
+
+vi.mock('../../services/api', () => ({
+  getAppLayeredIntelligenceOutcomes: vi.fn()
+}));
+
+import { getAppLayeredIntelligenceOutcomes } from '../../services/api';
+
+const ready = (overrides = {}) => ({
+  read: true,
+  tracked: true,
+  stats: { total: 4, merged: 1, rejected: 1, abandoned: 1, pending: 1, resolved: 3, mergeRate: 100 / 3 },
+  execution: {
+    approved: 1, completed: 1, abandoned: 0, awaitingExecution: 0, attempted: 1, completionRate: 100,
+    approvalToCompletionRate: 100,
+    duration: { count: 1, averageMs: 3_600_000, medianMs: 3_600_000, p90Ms: 3_600_000, minMs: 3_600_000, maxMs: 3_600_000 },
+    byScope: {
+      'app-improvement': {
+        approved: 1, completed: 1, abandoned: 0, awaitingExecution: 0, attempted: 1, completionRate: 100,
+        approvalToCompletionRate: 100,
+        duration: { count: 1, averageMs: 3_600_000, medianMs: 3_600_000, p90Ms: 3_600_000, minMs: 3_600_000, maxMs: 3_600_000 }
+      }
+    }
+  },
+  metrics: {
+    totalFiled: 4, totalApproved: 1, totalCompleted: 1, totalRejected: 1,
+    totalAbandonedAtFiling: 1, totalPending: 1, totalAwaitingExecution: 0,
+    totalFailedExecution: 0, approvalToCompletionRate: 100, completionRate: 100,
+    byScope: {
+      'app-improvement': {
+        approved: 1, completed: 1, rejected: 0, abandonedAtFiling: 0, failedExecution: 0,
+        awaitingExecution: 0, pending: 0, attempted: 1, completionRate: 100, approvalToCompletionRate: 100
+      }
+    }
+  },
+  rejections: { entries: [{ reason: 'user-rejected', count: 1 }], unknown: 1, unclassified: 0, diagnosed: 1, total: 2 },
+  recent: [
+    { slug: 'add-metrics', scope: 'app-improvement', outcome: 'merged', rejectionReason: null, filedAt: '2026-07-04T00:00:00.000Z', outcomeAt: '2026-07-05T00:00:00.000Z' },
+    { slug: 'drop-feature', scope: 'app-improvement', outcome: 'rejected', rejectionReason: 'user-rejected', filedAt: '2026-07-03T00:00:00.000Z', outcomeAt: '2026-07-04T00:00:00.000Z' }
+  ],
+  ...overrides
+});
+
+describe('LayeredIntelligenceOutcomes', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('renders nothing and never fetches without an appId', () => {
+    const { container } = render(<LayeredIntelligenceOutcomes />);
+    expect(container).toBeEmptyDOMElement();
+    expect(getAppLayeredIntelligenceOutcomes).not.toHaveBeenCalled();
+  });
+
+  it('shows the rounded merge rate, counts, rejection tally, and recent rows', async () => {
+    getAppLayeredIntelligenceOutcomes.mockResolvedValue(ready());
+    render(<LayeredIntelligenceOutcomes appId="app-001" />);
+
+    expect(await screen.findByText('33%')).toBeInTheDocument();
+    expect(screen.getByText(/1 of 3 resolved merged/)).toBeInTheDocument();
+    // Real diagnosis is glossed (in both the tally and the matching recent row);
+    // the undiagnosed row shows as a distinct gap line.
+    expect(screen.getAllByText(/the user declined it/).length).toBeGreaterThan(0);
+    expect(screen.getByText(/closed with no recorded reason/)).toBeInTheDocument();
+    expect(screen.getByText('add-metrics')).toBeInTheDocument();
+    expect(screen.getByText('drop-feature')).toBeInTheDocument();
+    expect(screen.getByText('post-approval hand-off completion')).toBeInTheDocument();
+    expect(screen.getByText(/of approvals delivered \(1\/1\)/)).toBeInTheDocument();
+    expect(screen.getByText(/Filed → completed: median 1h 0m/)).toBeInTheDocument();
+    expect(screen.getByText('app-improvement')).toBeInTheDocument();
+    expect(getAppLayeredIntelligenceOutcomes).toHaveBeenCalledWith('app-001');
+  });
+
+  it('shows approval → completion separately from the attempted-only rate', async () => {
+    // 2 approved, 1 delivered, 1 still awaiting execution: the attempted-only rate is a
+    // perfect 100% while only half the approved work has landed. Both must be visible —
+    // showing only the first would hide that a proposal was approved and then lost.
+    getAppLayeredIntelligenceOutcomes.mockResolvedValue(ready({
+      execution: {
+        approved: 2, completed: 1, abandoned: 0, awaitingExecution: 1, attempted: 1,
+        completionRate: 100, approvalToCompletionRate: 50,
+        duration: { count: 0, averageMs: null, medianMs: null, p90Ms: null, minMs: null, maxMs: null },
+        byScope: {}
+      }
+    }));
+    render(<LayeredIntelligenceOutcomes appId="app-001" />);
+
+    expect(await screen.findByText('100%')).toBeInTheDocument();
+    expect(screen.getByText('50%')).toBeInTheDocument();
+    expect(screen.getByText(/of approvals delivered \(1\/2\)/)).toBeInTheDocument();
+  });
+
+  it('lists a scope whose proposals were only ever rejected', async () => {
+    // `execution.byScope` is built from approved records only, so this scope is absent
+    // from it — it appears solely because the per-scope list reads `metrics.byScope`.
+    // Showing it is the point: a scope that only ever gets rejected is the one a reader
+    // most needs to see, and dropping it silently overstates the app's record.
+    getAppLayeredIntelligenceOutcomes.mockResolvedValue(ready({
+      metrics: {
+        ...ready().metrics,
+        byScope: {
+          ...ready().metrics.byScope,
+          'loop-meta': {
+            approved: 0, completed: 0, rejected: 2, abandonedAtFiling: 0, failedExecution: 0,
+            awaitingExecution: 0, pending: 0, attempted: 0, completionRate: null, approvalToCompletionRate: null
+          }
+        }
+      }
+    }));
+    render(<LayeredIntelligenceOutcomes appId="app-001" />);
+
+    expect(await screen.findByText('loop-meta')).toBeInTheDocument();
+    expect(screen.getByText(/none approved · 2 rejected/)).toBeInTheDocument();
+  });
+
+  it('omits per-scope rows rather than mislabelling them when no metrics block arrives', async () => {
+    // The route always sends `metrics` beside `execution`, so this shape is not
+    // reachable in practice — but if it ever were, `execution.byScope` carries no
+    // `approvalToCompletionRate`, and reading it would render a scope with 1/1 delivered
+    // as "none approved". Rendering nothing is the honest failure.
+    getAppLayeredIntelligenceOutcomes.mockResolvedValue(ready({ metrics: undefined }));
+    render(<LayeredIntelligenceOutcomes appId="app-001" />);
+
+    // The surrounding post-approval block still renders...
+    expect(await screen.findByText('post-approval hand-off completion')).toBeInTheDocument();
+    // ...but no scope row claims this app approved nothing.
+    expect(screen.queryByText('app-improvement')).not.toBeInTheDocument();
+    expect(screen.queryByText(/none approved/)).not.toBeInTheDocument();
+  });
+
+  it('shows a dash for the merge rate when nothing has resolved yet', async () => {
+    getAppLayeredIntelligenceOutcomes.mockResolvedValue(ready({
+      stats: { total: 1, merged: 0, rejected: 0, abandoned: 0, pending: 1, resolved: 0, mergeRate: null },
+      rejections: { entries: [], unknown: 0, unclassified: 0, diagnosed: 0, total: 0 },
+      recent: [{ slug: 'open-one', scope: 'app-improvement', outcome: null, rejectionReason: null, filedAt: '2026-07-01T00:00:00.000Z', outcomeAt: null }]
+    }));
+    render(<LayeredIntelligenceOutcomes appId="app-001" />);
+
+    expect(await screen.findByText('—')).toBeInTheDocument();
+    expect(screen.getByText(/none resolved yet/)).toBeInTheDocument();
+  });
+
+  it('shows the empty state when no proposals have been filed', async () => {
+    getAppLayeredIntelligenceOutcomes.mockResolvedValue(ready({
+      stats: { total: 0, merged: 0, rejected: 0, abandoned: 0, pending: 0, resolved: 0, mergeRate: null },
+      rejections: { entries: [], unknown: 0, unclassified: 0, diagnosed: 0, total: 0 },
+      recent: []
+    }));
+    render(<LayeredIntelligenceOutcomes appId="app-001" />);
+
+    expect(await screen.findByText(/No recent tracked proposals/)).toBeInTheDocument();
+  });
+
+  it('distinguishes tracking-off from an empty history when nothing is recorded', async () => {
+    getAppLayeredIntelligenceOutcomes.mockResolvedValue(ready({
+      tracked: false,
+      stats: { total: 0, merged: 0, rejected: 0, abandoned: 0, pending: 0, resolved: 0, mergeRate: null },
+      rejections: { entries: [], unknown: 0, unclassified: 0, diagnosed: 0, total: 0 },
+      recent: []
+    }));
+    render(<LayeredIntelligenceOutcomes appId="app-001" />);
+
+    expect(await screen.findByText(/Outcome tracking is off for this app/)).toBeInTheDocument();
+    expect(screen.queryByText(/No proposals filed yet/)).not.toBeInTheDocument();
+  });
+
+  it('flags existing records as possibly stale when tracking is currently off', async () => {
+    getAppLayeredIntelligenceOutcomes.mockResolvedValue(ready({ tracked: false }));
+    render(<LayeredIntelligenceOutcomes appId="app-001" />);
+
+    expect(await screen.findByText(/these may be stale/)).toBeInTheDocument();
+    // The data still renders alongside the stale note.
+    expect(screen.getByText('33%')).toBeInTheDocument();
+  });
+
+  it('surfaces an error (and retries) when the store is unreadable', async () => {
+    getAppLayeredIntelligenceOutcomes.mockResolvedValue({ read: false, stats: null, rejections: null, recent: [] });
+    render(<LayeredIntelligenceOutcomes appId="app-001" />);
+
+    expect(await screen.findByText(/Couldn.t load proposal outcomes/)).toBeInTheDocument();
+
+    getAppLayeredIntelligenceOutcomes.mockResolvedValue(ready());
+    fireEvent.click(screen.getByText('Retry'));
+    expect(await screen.findByText('33%')).toBeInTheDocument();
+    expect(getAppLayeredIntelligenceOutcomes).toHaveBeenCalledTimes(2);
+  });
+
+  it('surfaces an error when the request throws', async () => {
+    getAppLayeredIntelligenceOutcomes.mockRejectedValue(new Error('network'));
+    render(<LayeredIntelligenceOutcomes appId="app-001" />);
+    expect(await screen.findByText(/Couldn.t load proposal outcomes/)).toBeInTheDocument();
+  });
+
+  it('collapses the remainder to a count against the full population, not the fetched slice', async () => {
+    // 9 rows fetched, 30 filed total: the "+N older" must count the true remainder
+    // (30 - 6 rendered = 24), not just what was hidden within the returned slice.
+    const many = Array.from({ length: 9 }, (_, i) => ({
+      slug: `item-${i}`, scope: 'app-improvement', outcome: 'merged', rejectionReason: null,
+      filedAt: `2026-07-0${(i % 9) + 1}T00:00:00.000Z`, outcomeAt: `2026-07-0${(i % 9) + 1}T00:00:00.000Z`
+    }));
+    getAppLayeredIntelligenceOutcomes.mockResolvedValue(ready({
+      stats: { total: 30, merged: 30, rejected: 0, abandoned: 0, pending: 0, resolved: 30, mergeRate: 100 },
+      recent: many
+    }));
+    render(<LayeredIntelligenceOutcomes appId="app-001" />);
+
+    await waitFor(() => expect(screen.getByText('item-0')).toBeInTheDocument());
+    expect(screen.getByText('+24 older')).toBeInTheDocument();
+  });
+});

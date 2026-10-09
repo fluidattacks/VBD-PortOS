@@ -1,0 +1,787 @@
+/**
+ * One AI-provider card on the Settings → AI Providers page.
+ *
+ * Lives here rather than inline on the page because the page also owns the
+ * provider EDITOR, the sample-provider panel and the ad-hoc runner — the card
+ * is ~300 lines of its own and was already three `map`s deep once the page
+ * started grouping cards by their card state.
+ *
+ * The card renders no derivation of its own: `cardState`, `runtime` and
+ * `status` all arrive resolved, so what colors the border, what the badge says,
+ * and which section the page filed the card under can never disagree.
+ */
+
+import { useState } from 'react';
+import { hardwareUnavailableReason } from '../../utils/systemCapabilities';
+import { Link } from 'react-router';
+import { ExternalLink, Network, Terminal } from 'lucide-react';
+import {
+  CONTEXT_WINDOW_SOURCE,
+  PROVIDER_CARD_STATE,
+  filterHardwareCompatibleProviderModels,
+  isApiProvider,
+  isCodexSubscriptionProvider,
+  codexRoutingAdvisory,
+  gatewayById,
+  gatewayForProvider,
+  isPrivateNetworkEndpoint,
+  isFleetProvider,
+  isProcessProvider,
+  isRunnerAllowedCommand,
+  isProviderHardwareCompatible,
+  isTuiProvider,
+  isLaunchableTuiProvider,
+  mergeObservedContextWindows,
+  providerTypeClass,
+  resolveModelContextWindow,
+  supportsModelRefresh,
+  withRuntimeContextWindow,
+} from '../../utils/providers';
+import { formatContextLength, formatDateTime } from '../../utils/formatters';
+import { isHttpsUrl } from '../../utils/urlNormalize';
+import ProviderRuntimeStatus from './ProviderRuntimeStatus';
+import ProviderReadiness from './ProviderReadiness';
+import { CodexRoutingNotice, GatewayKeyHint } from './ProviderNotices';
+import InlineConfirmRow from '../ui/InlineConfirmRow';
+import ProviderEnvVars from './ProviderEnvVars';
+import ProviderVisionTest from './ProviderVisionTest';
+
+// One phrasing for "this command isn't on the CoS Agent Runner's allowlist".
+// The editor states the same thing in its own inline banner, in prose.
+const RUNNER_NOT_ALLOWED_HINT = 'This command is not on the CoS Agent Runner’s allowlist, so /spawn and /spawn-tui will refuse it. The provider still works everywhere else (direct spawn, chat, pipeline). The allowlist is curated in the PortOS source, not in this form.';
+
+// Card presentation per card state. Exactly ONE border-color utility is
+// emitted per card — Tailwind resolves same-specificity color utilities by
+// stylesheet order, not by the order they appear in `className` — so the
+// "default provider" highlight is a ring rather than a competing border color.
+export const CARD_STATE_STYLES = {
+  [PROVIDER_CARD_STATE.READY]: {
+    label: 'READY',
+    border: 'border-port-success/40',
+    badge: 'bg-port-success/20 text-port-success',
+    hint: 'Enabled, and every prerequisite is in place.',
+  },
+  [PROVIDER_CARD_STATE.BENCHED]: {
+    label: 'BENCHED',
+    border: 'border-port-error/50',
+    badge: 'bg-port-error/20 text-port-error',
+    hint: 'Enabled, but benched after a failure — calls route to the fallback.',
+  },
+  [PROVIDER_CARD_STATE.BLOCKED]: {
+    label: 'NEEDS SETUP',
+    border: 'border-port-warning/50',
+    badge: 'bg-port-warning/20 text-port-warning',
+    hint: 'Missing a prerequisite — install the CLI or add the API key to use it.',
+  },
+  [PROVIDER_CARD_STATE.UNKNOWN]: {
+    label: 'CHECK ACCOUNT',
+    border: 'border-port-warning/50',
+    badge: 'bg-port-warning/20 text-port-warning',
+    hint: 'PortOS could not determine the ChatGPT subscription state yet.',
+  },
+  [PROVIDER_CARD_STATE.DISABLED]: {
+    label: 'DISABLED',
+    border: 'border-port-border',
+    badge: 'bg-gray-500/20 text-gray-400',
+    // Switched-off cards recede until hovered, so a long list reads as the
+    // handful of providers that are actually live.
+    dim: 'opacity-70 hover:opacity-100 transition-opacity',
+    hint: 'Switched off — nothing to do unless you want to use it.',
+  },
+};
+
+export default function ProviderCard({
+  provider,
+  cardState,
+  daemonReadiness,
+  runtime,
+  status,
+  isDefault,
+  providersById,
+  activeProviderId,
+  statuses = {},
+  runnerAllowedCommands,
+  testResult,
+  refreshing,
+  recovering,
+  onTest,
+  onRefreshModels,
+  onToggleEnabled,
+  onSetActive,
+  onEdit,
+  onDelete,
+  onAddTuiMode,
+  addingTuiMode = false,
+  onRecover,
+  onInstallRuntime,
+  onAutoSetupRuntime,
+  onUseServedModel,
+  onServeWantedModel,
+  servingModel = false,
+  codexAccount,
+  codexModels = null,
+  codexAccountLoading = false,
+  codexLoginLoading = false,
+  onCodexCheckAccount,
+  onCodexSignIn,
+  onCodexCancelLogin,
+  onCodexLogout,
+  onCodexRefreshModels,
+  onCodexCopyCode,
+  onCodexEnable,
+}) {
+  // Deleting a provider is not undoable and the button sits in the same row as
+  // Test/Edit, so it arms an inline confirm row rather than firing immediately.
+  // (Inline confirm, not a two-click-arm button — see client/src/AGENTS.md.)
+  // One card, one record: a plain boolean, not the id-keyed useConfirmDelete
+  // that a component owning several rows needs.
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const modes = (provider.executionModes || []).map(mode => providersById?.[mode.id]).filter(Boolean);
+  const unified = modes.length > 1;
+  const isCardDefault = isDefault || (unified && modes.some(m => m.id === activeProviderId));
+  const displayName = unified ? provider.name.replace(/\b(CLI|TUI)\b\s*/i, '').trim() : provider.name;
+  const shellProvider = unified ? modes.find(isTuiProvider) : provider;
+  const style = CARD_STATE_STYLES[cardState.state];
+  // Non-blocking: it never touches `cardState`, only what the card SAYS about
+  // where this provider's runs actually go.
+  const routingAdvisory = codexRoutingAdvisory(provider);
+  const compatibleModels = filterHardwareCompatibleProviderModels(provider.models, provider);
+  const fleetProvider = isFleetProvider(provider);
+  const fleetHost = fleetProvider && URL.canParse(provider.endpoint)
+    ? new URL(provider.endpoint).hostname
+    : null;
+  // What the provider is missing — carried by both BLOCKED and DISABLED.
+  const missingSummary = cardState.missing.map(m => m.label).join(' · ');
+  // Switched off, so every finding on this card is a note about enabling it
+  // rather than an outstanding task (see `providerCardState`). Read from
+  // `cardState`, not `provider.enabled`, so the setup widgets below can never
+  // tone one way while the badge, border, and section file the card another.
+  const optional = cardState.state === PROVIDER_CARD_STATE.DISABLED;
+  const codexSubscription = isCodexSubscriptionProvider(provider);
+  const subscriptionAccountReady = !codexSubscription || codexAccount?.status === 'ready';
+  // ChatGPT account readiness applies to both Codex modes, but the explicit
+  // text-transport consent only applies to the CLI's app-server path. The TUI
+  // is an interactive PTY launch and must remain selectable before generic
+  // text calls have been opted in.
+  const codexModeReady = (mode) => !isCodexSubscriptionProvider(mode)
+    || (subscriptionAccountReady && (isTuiProvider(mode) || mode.textTransportEnabled === true));
+  const subscriptionReady = codexModeReady(provider);
+  return (
+    <div
+      id={`provider-card-${provider.id}`}
+      data-provider-id={provider.id}
+      data-mode-ids={(provider.executionModes || []).map(m => m.id).join(' ')}
+      tabIndex={isCardDefault ? -1 : undefined}
+      className={`@container ${
+        isCardDefault ? 'bg-port-accent/10' : 'bg-port-card'
+      } border border-l-4 rounded-xl p-4 transition-colors duration-200 ${style.border} ${style.dim || ''} ${
+        isCardDefault ? 'ring-1 ring-port-accent/60' : ''
+      }`}
+    >
+      {/* Identity and actions share the top row; everything else sits BELOW it
+          at the card's full width. The details used to be the row's first flex
+          item, which meant the un-shrinkable seven-button action group claimed
+          its max-content width first and left the details whatever remained —
+          on a real desktop card that was a ~275px column of hard-wrapped text
+          beside an empty half-card. Breakpoints are container-relative (`@`)
+          rather than viewport-relative: the card is what has to be wide enough
+          to split, and it is narrower than the viewport by the sidebar. */}
+      <div className="flex flex-col @2xl:flex-row @2xl:items-start justify-between gap-3">
+        <div className="flex flex-wrap items-center gap-2 min-w-0">
+          <h2 className="text-lg font-semibold text-white">{displayName}</h2>
+          <span className={`text-xs px-2 py-0.5 rounded ${providerTypeClass(provider.type)}`}>
+            {unified ? 'CLI / TUI' : provider.type.toUpperCase()}
+          </span>
+          {isCardDefault && (
+            <span className="text-xs px-2 py-0.5 rounded bg-port-accent/20 text-port-accent">
+              DEFAULT{unified ? ` · ${provider.type.toUpperCase()}` : ''}
+            </span>
+          )}
+          {fleetProvider && (
+            <span
+              className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded bg-cyan-500/20 text-cyan-300 border border-cyan-500/30"
+              title={`Runs on ${fleetHost || 'another private-network machine'}`}
+            >
+              <Network size={11} /> FLEET HOST
+            </span>
+          )}
+          {provider.llamaBacked && (
+            <span className="text-xs px-2 py-0.5 rounded bg-purple-500/20 text-purple-300 border border-purple-500/30">
+              LLAMA.CPP / DFLASH
+            </span>
+          )}
+          {provider.vllmBacked && (
+            <span className="text-xs px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+              vLLM / DFLASH2
+            </span>
+          )}
+          {provider.sglangBacked && (
+            <span className="text-xs px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/30">
+              SGLANG
+            </span>
+          )}
+          {provider.mtplxBacked && (
+            <span className="text-xs px-2 py-0.5 rounded bg-blue-500/20 text-blue-300 border border-blue-500/30">
+              MTPLX
+            </span>
+          )}
+          {/* One badge for the card's state — the same one that
+              colors its border and decides which section it sits in.
+              BENCHED covers what used to render as UNAVAILABLE: an
+              enabled provider sidelined after a failure (usage limit,
+              model-not-found, auth) in favor of its fallback. */}
+          <span
+            className={`text-xs px-2 py-0.5 rounded ${style.badge}`}
+            title={cardState.state === PROVIDER_CARD_STATE.BLOCKED
+              ? missingSummary
+              : (status?.message || (codexSubscription && codexAccount?.status === 'quota-exhausted' ? 'ChatGPT usage limit reached — calls route to the fallback.' : style.hint))}
+          >
+            {style.label}
+            {cardState.state === PROVIDER_CARD_STATE.BENCHED && (status?.reason || (codexSubscription && codexAccount?.status === 'quota-exhausted' ? 'usage-limit' : ''))
+              ? ` · ${status?.reason || 'usage-limit'}`
+              : ''}
+          </span>
+          {/* A switched-off provider that would also need a CLI or a key says
+              so — wearing the DISABLED badge's own colors, because it is an FYI
+              for the day the user wants it, not a task this install is behind on. */}
+          {optional && missingSummary && (
+            <span
+              className={`text-xs px-2 py-0.5 rounded ${style.badge}`}
+              title={`To enable: ${missingSummary}`}
+            >
+              SETUP TO ENABLE
+            </span>
+          )}
+          {/* Off the CoS Agent Runner's exec allowlist: the provider still
+              works for direct spawn, it just can't be launched by /spawn
+              or /spawn-tui. Informational — never a save-time rejection. */}
+          {isProcessProvider(provider) && isRunnerAllowedCommand(provider.command, runnerAllowedCommands) === false && (
+            <span
+              className="text-xs px-2 py-0.5 rounded bg-port-warning/20 text-port-warning"
+              title={RUNNER_NOT_ALLOWED_HINT}
+            >
+              NO AGENT RUNNER
+            </span>
+          )}
+          {!isProviderHardwareCompatible(provider) && (
+            <span
+              className="text-xs px-2 py-0.5 rounded bg-port-warning/20 text-port-warning"
+              title={hardwareUnavailableReason('This provider', provider.hardwareCompatibility)}
+            >
+              HARDWARE MISMATCH
+            </span>
+          )}
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2 @2xl:justify-end">
+          {/* TUI providers are the only ones a human can drive interactively, so
+              they get a one-click hand-off to the Shell page. The link carries
+              only the provider ID: the server resolves both the command line
+              and the provider's `envVars` (its backend and auth) when it spawns
+              the PTY, so an Ollama-backed or Bedrock provider reaches the
+              backend it is configured for instead of the vendor cloud. Sending
+              the command itself would leave that env behind — and those values
+              are secret, so they can't ride a URL anyway. `tuiCommandLine` is
+              the display half of the same resolution: it shows what will run,
+              and an older server that omits it simply renders no button. */}
+          {isLaunchableTuiProvider(shellProvider) && (
+            <Link
+              to={`/shell?provider=${encodeURIComponent(shellProvider.id)}`}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-port-accent/20 text-port-accent hover:bg-port-accent/30 rounded transition-colors"
+              title={`Launch TUI in Shell: ${shellProvider.tuiCommandLine}`}
+            >
+              <Terminal size={14} />
+              Launch in Shell
+            </Link>
+          )}
+
+          <button
+            onClick={() => onTest(provider.id)}
+            disabled={testResult?.testing || !subscriptionReady}
+            className="px-3 py-1.5 text-sm bg-port-border hover:bg-port-border/80 text-white rounded transition-colors disabled:opacity-50"
+          >
+            {testResult?.testing ? 'Testing...' : 'Test'}
+          </button>
+
+          {isApiProvider(provider) && <ProviderVisionTest provider={provider} />}
+
+          {supportsModelRefresh(provider) && (
+            <button
+              onClick={() => onRefreshModels(provider.id)}
+              disabled={refreshing}
+              className="px-3 py-1.5 text-sm bg-port-border hover:bg-port-border/80 text-white rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              title="Refresh available models"
+            >
+              {refreshing ? 'Refreshing...' : 'Refresh Models'}
+            </button>
+          )}
+
+          <button
+            onClick={() => onToggleEnabled(provider)}
+            disabled={!provider.enabled && !subscriptionAccountReady}
+            className={`px-3 py-1.5 text-sm rounded transition-colors ${
+              provider.enabled
+                ? 'bg-port-warning/20 text-port-warning hover:bg-port-warning/30'
+                : 'bg-port-success/20 text-port-success hover:bg-port-success/30'
+            }`}
+          >
+            {provider.enabled ? 'Disable' : 'Enable'}
+          </button>
+
+          {!unified && !isCardDefault && provider.enabled && (
+            <button
+              onClick={() => onSetActive(provider.id)}
+              disabled={!subscriptionReady}
+              className="px-3 py-1.5 text-sm bg-port-accent/20 text-port-accent hover:bg-port-accent/30 rounded transition-colors"
+            >
+              Set Default
+            </button>
+          )}
+
+          {unified && modes.map(mode => (
+            <span key={mode.id} className="inline-flex flex-wrap items-center gap-2">
+              {provider.enabled && (
+                <button
+                  onClick={() => onSetActive(mode.id)}
+                  disabled={mode.id === activeProviderId || !codexModeReady(mode)}
+                  className="px-3 py-1.5 text-sm bg-port-accent/20 text-port-accent rounded disabled:opacity-50"
+                >
+                  {mode.id === activeProviderId ? `${mode.type.toUpperCase()} default` : `Set ${mode.type.toUpperCase()} default`}
+                </button>
+              )}
+              <button onClick={() => onEdit(mode)} className="px-3 py-1.5 text-sm bg-port-border text-white rounded">
+                Edit {mode.type.toUpperCase()}
+              </button>
+            </span>
+          ))}
+          {!unified && <button
+            onClick={() => onEdit(provider)}
+            className="px-3 py-1.5 text-sm bg-port-border hover:bg-port-border/80 text-white rounded transition-colors"
+          >
+            Edit
+          </button>}
+
+          {/* A lone CLI record is half a harness: the same program usually also
+              runs interactively, and configuring that half used to mean adding
+              the provider a second time from /ai/new and retyping the command,
+              endpoint, credentials and env — which only pairs the two records
+              if every one of those matches exactly. The server mints the
+              sibling from the record already on disk instead.
+
+              `canAddTuiMode` is the SERVER's verdict (the provider list
+              decorates it), not a re-derivation here: it also answers whether
+              this harness has an interactive mode at all and whether the
+              sibling id is free, neither of which the card can see. */}
+          {!unified && provider.canAddTuiMode && (
+            <button
+              onClick={() => onAddTuiMode(provider)}
+              disabled={addingTuiMode}
+              title={`Add the interactive (TUI) mode of ${displayName}, using its existing command and connection`}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-port-border hover:bg-port-border/80 text-white rounded transition-colors disabled:opacity-50"
+            >
+              <Terminal size={14} />
+              {addingTuiMode ? 'Adding…' : 'Add interactive mode'}
+            </button>
+          )}
+
+          {!confirmingDelete && (
+            <button
+              onClick={() => setConfirmingDelete(true)}
+              className="px-3 py-1.5 text-sm bg-port-error/20 text-port-error hover:bg-port-error/30 rounded transition-colors"
+            >
+              Delete
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Card body — full width, below the header row rather than beside the
+          action buttons. */}
+      <div className="mt-3 space-y-2">
+        {/* Full-width and directly under the action row so the question is
+            read where the click happened, whatever the buttons wrapped to.
+            A unified card owns BOTH modes: the server deletes the whole mode
+            group, so the question has to say so. */}
+        {confirmingDelete && (
+          <InlineConfirmRow
+            question={`Delete ${displayName}?${unified ? ' Both its CLI and TUI modes are removed.' : ''} Its saved settings and model defaults are gone for good.`}
+            confirmText="Delete provider"
+            autoFocus
+            aria-label={`Confirm deleting ${displayName}`}
+            onConfirm={() => {
+              setConfirmingDelete(false);
+              onDelete(provider.id);
+            }}
+            onCancel={() => setConfirmingDelete(false)}
+          />
+        )}
+        {unified && (
+          <div className="text-xs text-gray-400 space-y-1">
+            <p>CLI and TUI share one provider configuration, including the catalog, model defaults, tier pins, effort, fallback, and generation settings. Edit either mode to update it. Arguments, timeouts, TUI timing, and CLI transport consent stay specific to their mode.</p>
+            {modes.filter(mode => mode.id !== provider.id && statuses[mode.id]?.available === false).map(mode => (
+              <p key={mode.id} className="text-port-warning">
+                {mode.type.toUpperCase()} benched: {statuses[mode.id].message || statuses[mode.id].reason}{' '}
+                <button onClick={() => onRecover(mode.id)} className="underline">Retry {mode.type.toUpperCase()}</button>
+              </p>
+            ))}
+          </div>
+        )}
+        <CodexRoutingNotice
+          advisory={routingAdvisory}
+          className="max-w-3xl"
+          onEdit={() => onEdit(provider)}
+        />
+        {codexSubscription && (
+          <CodexSubscriptionPanel
+            routingOverridden={Boolean(routingAdvisory)}
+            account={codexAccount}
+            models={codexModels}
+            loading={codexAccountLoading}
+            loginLoading={codexLoginLoading}
+            onCheck={onCodexCheckAccount}
+            onSignIn={onCodexSignIn}
+            onCancel={onCodexCancelLogin}
+            onLogout={onCodexLogout}
+            onRefreshModels={onCodexRefreshModels}
+            onCopyCode={onCodexCopyCode}
+            subscriptionEnabled={provider.textTransportEnabled === true}
+            onEnable={onCodexEnable}
+          />
+        )}
+        <ProviderRuntimeStatus
+          runtime={runtime}
+          onInstall={onInstallRuntime}
+          optional={optional}
+        />
+
+        {/* The other half of "can this actually run": is the local daemon this
+            provider points at installed, up, and serving the model it names.
+            Distinct from the card STATE above — that one is about the toggle
+            and the credentials, this one probes the daemon. */}
+        <ProviderReadiness
+          className="max-w-3xl"
+          readiness={daemonReadiness}
+          onAutoSetup={(setup) => onAutoSetupRuntime?.({ ...setup, providerId: provider.id })}
+          onUseServedModel={(modelId) => onUseServedModel?.(provider, modelId)}
+          onServeWantedModel={onServeWantedModel ? () => onServeWantedModel(provider) : undefined}
+          serving={servingModel}
+          optional={optional}
+        />
+
+        {provider.enabled && status?.available === false && (
+          <div className="max-w-3xl text-xs rounded border border-port-error/40 bg-port-error/10 px-3 py-2 text-port-error space-y-1">
+            <p className="break-words">
+              <span className="font-semibold">Benched ({status?.reason || 'unknown'})</span>
+              {status?.timeUntilRecovery ? ` — auto-retries in ${status.timeUntilRecovery}` : ''}
+              . Calls route to the fallback until then.
+            </p>
+            {status?.message && (
+              <p className="break-words text-port-error/80">Why: {status.message}</p>
+            )}
+            <button
+              type="button"
+              onClick={() => onRecover(provider.id)}
+              disabled={recovering}
+              className="mt-1 px-2 py-0.5 rounded bg-port-error/20 hover:bg-port-error/30 disabled:opacity-50 text-port-error"
+            >
+              {recovering ? 'Clearing…' : 'Recover now'}
+            </button>
+          </div>
+        )}
+
+        {!isProviderHardwareCompatible(provider) && (
+          <div className="max-w-3xl text-xs rounded border border-port-warning/40 bg-port-warning/10 px-3 py-2 text-port-warning">
+            {hardwareUnavailableReason('This provider', provider.hardwareCompatibility)}. Hidden from provider/model pickers on this machine.
+          </div>
+        )}
+
+        <div className="text-sm text-gray-400 space-y-1">
+          {provider.llamaBacked && (
+            <p className="text-xs text-purple-300/90">
+              Local llama.cpp / llama-server harness (endpoint: <code className="text-purple-200">{provider.endpoint}</code>) — supports DFlash 2 speculative drafting.
+            </p>
+          )}
+          {provider.vllmBacked && (
+            <p className="text-xs text-emerald-300/90">
+              {fleetProvider ? 'Fleet vLLM runtime' : 'Local vLLM container'} (endpoint: <code className="text-emerald-200">{provider.endpoint}</code>) — Qwen3.8-27B with DFlash 2 drafting. {fleetProvider ? 'This PortOS sends work over the private network; runtime lifecycle stays on the GPU host.' : 'It holds the whole GPU, so stop it before running local image/video generation.'}
+            </p>
+          )}
+          {provider.sglangBacked && (
+            <p className="text-xs text-amber-300/90">
+              Local SGLang container (endpoint: <code className="text-amber-200">{provider.endpoint}</code>) — Qwen3.8-27B on a Hopper or Blackwell card. It holds the whole GPU, so stop it before running local image/video generation.
+            </p>
+          )}
+          {isProcessProvider(provider) && (
+            <p className="break-words">Command: <code className="text-gray-300 break-all">{provider.command} {provider.args?.join(' ')}</code></p>
+          )}
+          {isApiProvider(provider) && (
+            <p className="break-words">Endpoint: <code className="text-gray-300 break-all">{provider.endpoint}</code></p>
+          )}
+          {fleetProvider && (
+            <p className="text-xs text-cyan-300/90">
+              Runs on <span className="font-medium">{fleetHost || 'another private-network machine'}</span>; install, start, and GPU-memory controls belong to that host.
+            </p>
+          )}
+          {/* API-type providers auth solely via the stored apiKey (sent as a
+              Bearer header) — surface its state here so "where does the key
+              go?" is answered from the card, not by spelunking the form. */}
+          {isApiProvider(provider) && (
+            provider.hasApiKey ? (
+              <p className="text-xs">API key: <span className="text-port-success">set</span></p>
+            ) : isPrivateNetworkEndpoint(provider.endpoint) ? (
+              /* Same rule as `providerCardState`'s apiKey prerequisite — a
+                 keyless call to a private OpenAI-compatible server (loopback,
+                 the LAN box, a tailnet peer) is a supported setup, so the two
+                 must not disagree: a card badged READY used to carry an
+                 orange "API key: not set" line for exactly those endpoints. */
+              <p className="text-xs">API key: <span className="text-gray-500">none (private network endpoint)</span></p>
+            ) : (
+              /* Amber only while the provider is switched ON, where a missing
+                 key is what's stopping it — `optional` mutes it otherwise.
+                 A gateway-backed API record (NVIDIA NIM) also names WHERE the
+                 key comes from, so the card answers that without a detour
+                 through the editor. */
+              <p className="text-xs">API key: <span className={optional ? 'text-gray-400' : 'text-port-warning'}>not set — Edit this provider to paste one</span>{(() => {
+                const keyGateway = gatewayById(provider.id) ?? gatewayForProvider(provider);
+                return keyGateway?.keyUrl ? (
+                  <>
+                    {' · '}
+                    <a
+                      className="text-port-accent hover:underline"
+                      href={keyGateway.keyUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      Get a {keyGateway.label} key
+                    </a>
+                  </>
+                ) : null;
+              })()}</p>
+            )
+          )}
+          {compatibleModels.length > 0 && (
+            <p>Models: {compatibleModels.slice(0, 3).join(', ')}{compatibleModels.length > 3 ? ` +${compatibleModels.length - 3}` : ''}</p>
+          )}
+          {provider.defaultModel && (
+            <p className="break-words">Default: <code className="text-gray-300 break-all">{provider.defaultModel}</code></p>
+          )}
+          {provider.effort && (
+            <p className="break-words">Default effort: <code className="text-gray-300">{provider.effort}</code></p>
+          )}
+          {(() => {
+            // The window AND where it came from: the last rung of the ladder is
+            // a blanket 128K guess, and printing that bare made a 1M-context
+            // model look like PortOS had capped it. A reported window prints
+            // plain; a guess says so and names the way to replace it.
+            //
+            // A local daemon's LIVE window (off the readiness poll) is folded in
+            // first, so the meter agrees with what the dispatch gate enforces —
+            // a card reading 128K beside an endpoint serving 32K promised a
+            // budget no run could ever spend. Down or silent → `null`, and the
+            // ladder resolves exactly as it did before. The window PortOS
+            // LAUNCHED that daemon at rides the same payload — it is resolved
+            // server-side because its second rung is the ambient
+            // `OLLAMA_CONTEXT_LENGTH` the browser cannot read (#7472).
+            const { tokens, source } = resolveModelContextWindow(
+              withRuntimeContextWindow(
+                mergeObservedContextWindows(provider, daemonReadiness?.contextWindows),
+                daemonReadiness?.runtimeContextWindow,
+              ),
+              provider.defaultModel
+            );
+            const windowLabel = formatContextLength(tokens);
+            if (!windowLabel) return null;
+            // Only offer Refresh Models when this card HAS that button —
+            // `assumed` is reached by every process provider with an
+            // unrecognized model, including ones with no model-list capability
+            // at all, and pointing those at a button that is not on screen is
+            // worse than saying nothing.
+            const assumed = source === CONTEXT_WINDOW_SOURCE.ASSUMED;
+            const assumedFix = supportsModelRefresh(provider)
+              ? 'assumed — Refresh Models to read the real one'
+              : 'assumed — set a context window when editing this provider';
+            return (
+              <p className="text-xs">
+                Context: <span className="text-gray-300">{windowLabel}</span>
+                {source === CONTEXT_WINDOW_SOURCE.OVERRIDE && <span className="text-gray-500"> override</span>}
+                {assumed && (
+                  <span
+                    className="text-gray-500"
+                    title="PortOS has not been told this model’s real window, so prompt budgeting assumes a conservative 128K rather than the model’s own ceiling."
+                  >
+                    {" "}{assumedFix}
+                  </span>
+                )}
+              </p>
+            );
+          })()}
+          {(provider.lightModel || provider.mediumModel || provider.heavyModel || provider.ultraModel) && (
+            <p className="text-xs">
+              Tiers:
+              {provider.lightModel && <span className="ml-1 text-port-success">{provider.lightModel}</span>}
+              {provider.mediumModel && <span className="ml-1 text-port-warning">{provider.mediumModel}</span>}
+              {provider.heavyModel && <span className="ml-1 text-port-error">{provider.heavyModel}</span>}
+              {provider.ultraModel && <span className="ml-1 text-purple-400">Ultra: {provider.ultraModel}</span>}
+            </p>
+          )}
+          {provider.headlessArgs?.length > 0 && (
+            <p className="text-xs break-words">
+              Headless: <code className="text-gray-300 break-all">{provider.headlessArgs.join(' ')}</code>
+            </p>
+          )}
+          {isTuiProvider(provider) && (
+            <p className="text-xs break-words">
+              TUI: paste delay <span className="text-gray-300">{provider.tuiPromptDelayMs || 2500}ms</span>, completion by sentinel, process exit, or explicit failure
+            </p>
+          )}
+          {provider.fallbackProvider && (
+            <p className="text-xs">
+              Fallback: <span className="text-port-accent">{providersById[provider.fallbackProvider]?.name || provider.fallbackProvider}</span>
+              {provider.fallbackModel && <span className="ml-1 text-gray-300">({provider.fallbackModel})</span>}
+            </p>
+          )}
+          {provider.envVars && Object.keys(provider.envVars).length > 0 && (
+            <ProviderEnvVars
+              envVars={provider.envVars}
+              secretEnvVars={provider.secretEnvVars}
+              className="mt-1"
+            />
+          )}
+        </div>
+
+        {gatewayForProvider(provider) && (
+          <GatewayKeyHint
+            gateway={gatewayForProvider(provider)}
+            sibling={providersById[gatewayForProvider(provider).id]}
+            onEdit={onEdit}
+            className="max-w-3xl"
+          />
+        )}
+
+        {testResult && !testResult.testing && (
+          <div className={`text-sm ${testResult.success ? 'text-port-success' : 'text-port-error'}`}>
+            {testResult.success
+              ? `✓ Available${testResult.version ? ` (${testResult.version})` : ''}`
+              : `✗ ${testResult.error}`
+            }
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+const BUTTON_CLASS = 'px-3 py-1.5 text-sm rounded transition-colors bg-port-accent/20 text-port-accent hover:bg-port-accent/30 disabled:opacity-50 disabled:cursor-not-allowed';
+
+const quotaText = (window) => {
+  if (!window || typeof window !== 'object') return null;
+  const used = typeof window.usedPercent === 'number' ? Math.max(0, Math.min(100, Math.round(window.usedPercent))) : null;
+  const label = typeof window.limitName === 'string' && window.limitName.trim() ? window.limitName.trim() : 'Usage window';
+  const reset = typeof window.resetsAt === 'string' && window.resetsAt.trim() ? ` · resets ${window.resetsAt.trim()}` : '';
+  return used === null ? `${label}${reset}` : `${label}: ${used}% used${reset}`;
+};
+
+function CodexSubscriptionPanel({
+  account,
+  models,
+  loading,
+  loginLoading,
+  onCheck,
+  onSignIn,
+  onCancel,
+  onLogout,
+  onRefreshModels,
+  onCopyCode,
+  subscriptionEnabled,
+  onEnable,
+  routingOverridden = false,
+}) {
+  const status = account?.status || 'unknown';
+  const login = account?.login;
+  const verificationUrl = isHttpsUrl(login?.verificationUrl) ? login.verificationUrl : null;
+  const authUrl = isHttpsUrl(login?.authUrl) ? login.authUrl : null;
+  const windows = [quotaText(account?.rateLimits?.primary), quotaText(account?.rateLimits?.secondary)].filter(Boolean);
+  const catalogCount = Array.isArray(models?.models) ? models.models.length : null;
+  const modelError = models?.error;
+  const action = status === 'runtime-missing'
+    ? 'Install Codex CLI from the runtime control below.'
+    : status === 'signed-out' || status === 'reauth-required'
+      ? 'Sign in with ChatGPT to use this subscription.'
+      : status === 'quota-exhausted'
+        ? 'Wait for a reported usage window to reset, then check the account again.'
+        : status === 'login-pending'
+          ? 'Finish sign-in in the opened browser or use the device-code fallback.'
+          : status === 'ready'
+            ? 'This provider uses ChatGPT subscription limits, not an OpenAI API key.'
+            : 'Check the account again. PortOS could not determine this state.';
+
+  return (
+    <div className="max-w-3xl text-xs rounded border border-port-border bg-port-bg/50 px-3 py-2.5 space-y-2">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="font-medium text-gray-200">ChatGPT subscription</p>
+        <span className="text-gray-400">{account?.account?.planType ? `${account.account.planType} plan` : status.replaceAll('-', ' ')}</span>
+      </div>
+      <p className="text-gray-400">{action}</p>
+      {windows.length > 0 && <p className="text-gray-400">{windows.join(' · ')}</p>}
+      {routingOverridden && (
+        <p className="text-port-warning">
+          These are this ChatGPT account’s limits. Your Codex config re-points model routing, so PortOS
+          runs on this provider may not be counted here.
+        </p>
+      )}
+      {typeof account?.checkedAt === 'number' && <p className="text-gray-500">Last usage refresh: {formatDateTime(account.checkedAt)}</p>}
+      {catalogCount !== null && <p className="text-gray-500">Subscription catalog: {catalogCount} model{catalogCount === 1 ? '' : 's'} available.</p>}
+      {modelError && <p role="status" className="text-port-warning">Using the last known model catalog while a refresh is unavailable.</p>}
+      {verificationUrl && (
+        <div className="rounded bg-port-card px-2.5 py-2 text-gray-300 space-y-1">
+          <p>Headless sign-in: open the verification page and enter this code.</p>
+          {login.userCode && (
+            <div className="flex flex-wrap items-center gap-2">
+              <code className="text-port-accent font-semibold">{login.userCode}</code>
+              <button type="button" className={BUTTON_CLASS} onClick={() => onCopyCode?.(login.userCode)}>Copy code</button>
+            </div>
+          )}
+          <a className="inline-flex items-center gap-1 text-port-accent hover:underline" href={verificationUrl} target="_blank" rel="noreferrer">
+            Open verification page <ExternalLink size={12} />
+          </a>
+        </div>
+      )}
+      {authUrl && (
+        <a className="inline-flex items-center gap-1 text-port-accent hover:underline" href={authUrl} target="_blank" rel="noreferrer">
+          Open ChatGPT sign-in <ExternalLink size={12} />
+        </a>
+      )}
+      <div className="flex flex-wrap gap-2">
+        {(status === 'signed-out' || status === 'reauth-required' || status === 'unknown') && (
+          <button type="button" className={BUTTON_CLASS} disabled={loading || loginLoading} onClick={() => onSignIn?.(false)}>
+            {loginLoading ? 'Starting sign-in…' : 'Sign in with ChatGPT'}
+          </button>
+        )}
+        {(status === 'signed-out' || status === 'reauth-required' || status === 'login-pending' || status === 'unknown') && (
+          <button type="button" className="px-3 py-1.5 text-sm rounded transition-colors bg-port-border hover:bg-port-border/80 text-white disabled:opacity-50" disabled={loading || loginLoading} onClick={() => onSignIn?.(true)}>
+            Use device code
+          </button>
+        )}
+        {status === 'login-pending' && login?.loginId && (
+          <button type="button" className="px-3 py-1.5 text-sm rounded transition-colors bg-port-warning/20 text-port-warning hover:bg-port-warning/30 disabled:opacity-50" disabled={loading || loginLoading} onClick={() => onCancel?.(login.loginId)}>
+            Cancel sign-in
+          </button>
+        )}
+        {status === 'ready' && (
+          <>
+            {!subscriptionEnabled && (
+              <button type="button" className={BUTTON_CLASS} disabled={loading} onClick={onEnable}>
+                Enable subscription transport
+              </button>
+            )}
+            <button type="button" className={BUTTON_CLASS} disabled={loading} onClick={onRefreshModels}>Refresh subscription models</button>
+            <button type="button" className="px-3 py-1.5 text-sm rounded transition-colors bg-port-warning/20 text-port-warning hover:bg-port-warning/30 disabled:opacity-50" disabled={loading} onClick={onLogout}>Log out</button>
+          </>
+        )}
+        {(status === 'quota-exhausted' || status === 'unknown') && (
+          <button type="button" className={BUTTON_CLASS} disabled={loading} onClick={onCheck}>{loading ? 'Checking…' : 'Check account'}</button>
+        )}
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,305 @@
+import { withBackupAssetPublication } from '../../lib/backupSnapshotBoundary.js';
+import { maintenance } from '../../lib/maintenanceAdmission.js';
+import { randomUUID } from 'node:crypto';
+import { imageGenEvents } from '../imageGenEvents.js';
+/**
+ * Image Gen — Mode-aware dispatcher.
+ *
+ * Reads settings.imageGen.mode (default 'external' for backward compat) and
+ * routes generate/status calls to a provider: external SD-API, local
+ * mflux/diffusers, one of the cloud CLIs (codex / grok / agy), or fal.ai's
+ * metered queue API.
+ *
+ * Per-request mode override: callers (the route, the voice tool) may pass
+ * `params.mode` to force a specific backend without changing the saved
+ * default. The Codex backend is also user-gated — even with `mode: 'codex'`
+ * we refuse unless `imageGen.codex.enabled` is true, because that toggle
+ * exists for users whose Codex plan doesn't expose the image_gen tool.
+ */
+
+import { join } from 'path';
+import { getSettings } from '../settings.js';
+import { resolveImageCleaners } from '../../lib/imageCleanDefaults.js';
+import * as external from './external.js';
+import * as local from './local.js';
+import * as codex from './codex.js';
+import * as grok from './grok.js';
+import * as agy from './agy.js';
+import * as fal from './fal.js';
+import {
+  IMAGE_GEN_MODE, IMAGE_GEN_MODES, CLOUD_IMAGE_GEN_MODES, isEditCapableMode,
+} from './modes.js';
+import { DEFAULT_NEGATIVE_PROMPT } from './defaults.js';
+import { resolveCloudProviderConfig } from './cloudProviderConfig.js';
+import { rejectDegenerateFrame } from './frameGuard.js';
+import { PATHS } from '../../lib/fileUtils.js';
+import { ServerError } from '../../lib/errorHandler.js';
+import { IMAGE_RUNTIME_READINESS } from '../../lib/imageRuntimeRemedies.js';
+
+// Cloud-CLI provider modules keyed by mode, so the shared gate in
+// checkConnection/generateImage dispatches without a per-provider branch.
+const CLOUD_PROVIDERS = {
+  [IMAGE_GEN_MODE.CODEX]: codex,
+  [IMAGE_GEN_MODE.GROK]: grok,
+  [IMAGE_GEN_MODE.AGY]: agy,
+  [IMAGE_GEN_MODE.FAL]: fal,
+};
+
+// Re-export the enum + array so the existing import surface from this module
+// keeps working. `IMAGE_GEN_MODE.X` is the preferred form at dispatch sites
+// (server + client); `IMAGE_GEN_MODES` is the alphabet for Zod / OpenAI
+// tool-spec enums. Defined in `./modes.js` to avoid a circular import with
+// the provider modules above.
+export { IMAGE_GEN_MODE, IMAGE_GEN_MODES, CLOUD_IMAGE_GEN_MODES };
+const DEFAULT_MODE = IMAGE_GEN_MODE.EXTERNAL;
+
+const cfg = (s) => s?.imageGen || {};
+const sdapiUrl = (s) => cfg(s).external?.sdapiUrl || cfg(s).sdapiUrl || null;
+const pythonPath = (s) => cfg(s).local?.pythonPath || null;
+
+// One shared load of the diagnosis module, deferred because this dispatcher is
+// reached by ~110 server suites that never probe a local runtime, while
+// `localRuntime.js` pulls the model registry and the setup-check cache
+// (server/AGENTS.md, "Import scoping"). Memoized so two concurrent status polls
+// cannot race two imports of one mocked specifier — under the test runner, one
+// of them escapes the mock. A rejected load is forgotten so a transient failure
+// does not poison every later probe.
+let localRuntimeModule = null;
+const localRuntime = () => (localRuntimeModule ||= import('./localRuntime.js').catch((err) => {
+  localRuntimeModule = null;
+  throw err;
+}));
+
+/**
+ * Wire shape for a local-mode status probe. The verdict itself comes from the
+ * shared diagnosis in `localRuntime.js` — this only projects it onto the
+ * `{ connected, mode, model, … }` envelope every backend answers with, and
+ * carries `remedy`/`runtime` through so the client can render the same
+ * one-button fix the Settings panel and the renderer describe.
+ */
+async function checkLocalConnection(settings, modelIdOverride) {
+  const { diagnoseLocalRuntime } = await localRuntime();
+  const d = await diagnoseLocalRuntime({ modelId: modelIdOverride, settings });
+  return {
+    connected: d.readiness === IMAGE_RUNTIME_READINESS.READY,
+    mode: IMAGE_GEN_MODE.LOCAL,
+    model: d.model?.name || d.modelId,
+    modelId: d.modelId,
+    runner: d.runner,
+    runtime: d.runtime,
+    runtimeLabel: d.runtimeLabel,
+    readiness: d.readiness,
+    reason: d.reason,
+    remedy: d.remedy,
+  };
+}
+
+export { resolveImageCleaners };
+
+export async function getMode() {
+  const s = await getSettings();
+  return cfg(s).mode || DEFAULT_MODE;
+}
+
+export async function checkConnection({ mode: modeOverride, modelId: modelIdOverride } = {}) {
+  const s = await getSettings();
+  const mode = modeOverride || cfg(s).mode || DEFAULT_MODE;
+  if (mode === IMAGE_GEN_MODE.LOCAL) {
+    return checkLocalConnection(s, modelIdOverride);
+  }
+  const cloudCheck = resolveCloudProviderConfig(s, mode);
+  if (cloudCheck) {
+    if (!cloudCheck.enabled) return { connected: false, mode, reason: cloudCheck.connectionReason };
+    return CLOUD_PROVIDERS[mode].checkConnection(cloudCheck.providerParams);
+  }
+  const status = await external.checkConnection(sdapiUrl(s));
+  return { ...status, mode };
+}
+
+export async function generateImage(params) {
+  const jobId = params?.jobId || randomUUID();
+  const permit = maintenance.admit('image', jobId);
+  const terminal = payload => {
+    if (payload?.generationId !== jobId) return;
+    detach();
+    queueMicrotask(() => permit.finish());
+  };
+  const detach = () => { for (const event of ['completed', 'failed', 'canceled']) imageGenEvents.off(event, terminal); };
+  for (const event of ['completed', 'failed', 'canceled']) imageGenEvents.on(event, terminal);
+  try {
+    const result = await permit.run(() => generateAdmittedImage({ ...params, jobId }));
+    // External SD-API is awaited; CLI/local providers return a live job id.
+    if (!result?.jobId) { detach(); permit.finish(); }
+    return result;
+  } catch (err) { detach(); permit.finish(); throw err; }
+}
+
+async function generateAdmittedImage(params) {
+  const s = await getSettings();
+  const requestedMode = params?.mode;
+  const mode = requestedMode || cfg(s).mode || DEFAULT_MODE;
+  // Param normalization: A1111 clients (and the /sdapi/v1/txt2img bridge)
+  // send `cfgScale`; local mflux reads `guidance`. Map cfgScale -> guidance
+  // when guidance is not explicitly set so both spellings work in both modes.
+  const normalized = { ...params };
+  if (normalized.guidance == null && normalized.cfgScale != null) {
+    normalized.guidance = normalized.cfgScale;
+  }
+  // Strip the dispatcher-only `mode` field — providers don't expect it.
+  delete normalized.mode;
+  // Per-render cloud-CLI model override. Dispatcher-only too: it is folded
+  // into the provider's own `model` param by resolveCloudProviderConfig below,
+  // so providers never see the raw field.
+  // Its PROVENANCE rides beside it, for the same reason: a caller that already
+  // walked the render-target ladder hands back a model id the resolver itself
+  // produced, and without this marker a materialized shipped default would read
+  // as a deliberate choice (#7366). Dispatcher-only, so stripped like the id.
+  const cloudModel = normalized.cloudModel;
+  const modelIsShippedDefault = normalized.cloudModelIsShippedDefault;
+  delete normalized.cloudModel;
+  delete normalized.cloudModelIsShippedDefault;
+  // Input images are supported by local (mflux/diffusers --image-path plus
+  // FLUX.2 --reference-images), codex (image_gen.referenced_image_paths via the
+  // CLI's -i flag), grok (image_edit.image), agy (generate_image.ImagePaths) and
+  // fal.ai (the model family's /edit endpoint's image_urls).
+  // External SD-API has no input-image wiring in this codebase, so drop them
+  // there rather than failing the whole render — the prompt still produces a
+  // useful txt2img. (The route/prepareParams path rejects instead, because it
+  // has already staged uploads that would otherwise be orphaned; this branch
+  // covers direct in-process callers.)
+  if (!isEditCapableMode(mode)) {
+    delete normalized.initImagePath;
+    delete normalized.initImageStrength;
+    delete normalized.referenceImagePaths;
+    delete normalized.referenceImageStrengths;
+  }
+  // Cleaners are per-provider-mode. The route layer already resolves them so
+  // the queue/route paths agree, but resolve here too for direct callers
+  // (e.g. `generateAvatar`) that skip the route. Strip from `normalized`
+  // so the explicit args on each provider call aren't shadowed by the spread.
+  const { cleanC2PA, denoise } = resolveImageCleaners(normalized, s, mode);
+  delete normalized.cleanC2PA;
+  delete normalized.denoise;
+  delete normalized.autoClean; // legacy body field — accept-and-ignore
+  // Cloud CLIs share one gate + param bundle — the per-provider
+  // knobs (codexPath/model/effort vs grokPath/aspectRatio) come from the
+  // resolver's spec, so a saved override always wins over the provider's own
+  // internal defaults.
+  const cloud = resolveCloudProviderConfig(s, mode, { model: cloudModel, modelIsShippedDefault });
+  if (cloud) {
+    if (!cloud.enabled) throw cloud.disabledError;
+    return guardResolvedFrame(await CLOUD_PROVIDERS[mode].generateImage({ ...cloud.providerParams, cleanC2PA, denoise, ...normalized }));
+  }
+  if (mode === IMAGE_GEN_MODE.LOCAL) {
+    return guardResolvedFrame(await local.generateImage({ pythonPath: pythonPath(s), cleanC2PA, denoise, ...normalized }));
+  }
+  return guardResolvedFrame(await external.generateImage({ sdapiUrl: sdapiUrl(s), cleanC2PA, denoise, ...normalized }));
+}
+
+/**
+ * Degenerate-frame gate at the dispatcher seam (issue #4173) — a provider must
+ * not be able to hand back an artifact that decodes but has no content.
+ *
+ * This covers every provider that resolves AFTER writing its bytes (the
+ * synchronous external SD-API path, and any future one shaped like it). The
+ * four job-based providers return a `jobId` while the render is still running,
+ * so there is nothing on disk to judge here — they call the same gate from
+ * their own completion handlers, before the sidecar write and the `completed`
+ * event that create the gallery record.
+ */
+async function guardResolvedFrame(result) {
+  return withBackupAssetPublication(async () => {
+    const pngPath = result?.outputPath
+      || (result?.filename && result?.path ? join(PATHS.images, result.filename) : null);
+    const reason = pngPath ? await rejectDegenerateFrame(pngPath) : null;
+    if (reason) throw new ServerError(reason, { status: 502, code: 'DEGENERATE_FRAME' });
+    return result;
+  });
+}
+
+// Build the default avatar prompt for the human-centered Character surface (#2677).
+// The Character page portrays the real human user, so a blank identity must NOT
+// fall back to the old generic D&D adventurer/warrior prompt: an empty name/class
+// yields a neutral human portrait, and any provided identity fields shape a
+// photographic (not fantasy) prompt. Callers that genuinely want a fantasy/RPG
+// avatar pass an explicit `prompt` to opt out of this default.
+export function buildAvatarPrompt({ name, characterClass } = {}) {
+  const descriptors = [name, characterClass]
+    .map((v) => (typeof v === 'string' ? v.trim() : ''))
+    .filter(Boolean)
+    .join(', ');
+  const subject = descriptors ? `portrait of ${descriptors}` : 'portrait of a person';
+  return `${subject}, photographic, natural lighting, detailed, high quality`;
+}
+
+export async function generateAvatar({ name, characterClass, prompt }) {
+  return generateImage({
+    prompt: prompt || buildAvatarPrompt({ name, characterClass }),
+    width: 512,
+    height: 512,
+    negativePrompt: `${DEFAULT_NEGATIVE_PROMPT}, nude, nsfw`,
+  });
+}
+
+// Snapshot of any in-flight generation across all modes — lets the UI
+// rehydrate prompt + settings + progress + last frame after navigating away
+// during a render. Each provider enforces its own single-job invariant
+// (cancel() relies on this — see the note there), so up to three jobs can
+// be in flight concurrently. Return the most-recently-started one based on
+// `createdAt`, falling back to provider order if timestamps are missing.
+// Callers wanting all of them can read individual providers via the
+// re-exports below.
+export async function getActiveJob() {
+  const jobs = [local.getActiveJob(), external.getActiveJob(), codex.getActiveJob(), grok.getActiveJob(), agy.getActiveJob(), fal.getActiveJob()].filter(Boolean);
+  if (!jobs.length) return null;
+  return jobs.sort((a, b) => {
+    const ta = a.createdAt ? Date.parse(a.createdAt) : 0;
+    const tb = b.createdAt ? Date.parse(b.createdAt) : 0;
+    return tb - ta;
+  })[0];
+}
+
+// Try-each-provider SSE attach + cancel — the route only knows the jobId,
+// not which backend produced it, so we ask each provider in turn and let
+// the first one that owns the job handle the attach.
+export const attachSseClient = (jobId, res) => {
+  if (local.attachSseClient(jobId, res)) return true;
+  if (codex.attachSseClient(jobId, res)) return true;
+  if (grok.attachSseClient(jobId, res)) return true;
+  if (agy.attachSseClient(jobId, res)) return true;
+  if (fal.attachSseClient(jobId, res)) return true;
+  return false;
+};
+
+export const cancel = () => {
+  // The "stop everything" dispatcher — invoked by routes/imageGen.js's
+  // `/cancel` fallback when no specific jobId or queue entry is targeted.
+  // local has at most one in-flight, cloud CLIs can have N (parallel cloud
+  // lane), so their bulk variants are the right ones here. Return whether
+  // anything was actually cancelled — short-circuiting on the first hit
+  // would orphan a cloud job whenever local is also active.
+  const localCancelled = local.cancel();
+  const codexCancelled = codex.cancelAll();
+  const grokCancelled = grok.cancelAll();
+  const agyCancelled = agy.cancelAll();
+  const falCancelled = fal.cancelAll();
+  return localCancelled || codexCancelled || grokCancelled || agyCancelled || falCancelled;
+};
+
+// Exact-ID cancel (#9932). The explicit-target counterpart to cancel(): stops
+// ONLY the render that owns `jobId` and never reaches a bulk method, so a
+// request naming a finished/unknown job cancels nothing instead of nuking a
+// concurrent render. Local holds one anonymous process, so it is signalled only
+// when its active job IS the requested one; the cloud backends key by job id.
+// Returns whether a live render was signalled.
+export const cancelJob = (jobId) => {
+  if (!jobId) return false;
+  const localJob = local.getActiveJob();
+  if ((localJob?.id === jobId || localJob?.generationId === jobId) && local.cancel()) return true;
+  return codex.cancel(jobId) || grok.cancel(jobId) || agy.cancel(jobId) || fal.cancel(jobId);
+};
+
+// Re-exports so routes can hit a specific backend directly when the request
+// is shape-specific (gallery, LoRAs). The dispatcher is for the generic
+// generate/status flow used by all modes.
+export { local, external, codex, grok, agy, fal };

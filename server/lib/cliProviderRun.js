@@ -1,0 +1,270 @@
+/**
+ * One-shot invocation of a user-configured CLI AI provider.
+ *
+ * This is the single, dependency-light path for "run a prompt through whatever
+ * CLI provider the user configured for this feature, get text back." It exists
+ * so callers outside the main run machinery — the standalone `portos-autofixer`
+ * process and the Google Calendar MCP sync — stop hardcoding `claude -p` and
+ * instead honor the configured provider/model like every other AI call.
+ *
+ * Imports only node builtins + pure `server/lib` helpers (the arg builder and
+ * the local-runtime classifier), so the separate-process autofixer (its own
+ * minimal package, only `express` installed) can import it without dragging in
+ * the AI toolkit or data layer.
+ *
+ * For full-featured in-process runs (fallback chains, run records, SSE) use
+ * `runPromptThroughProvider` in `promptRunner.js` instead. This helper is the
+ * lightweight cousin for fire-and-collect prompts.
+ */
+
+import { spawn } from './childProcess.js';
+import { buildCliArgs, prepareCliPrompt } from './cliProviderArgs.js';
+import { killProcessTree, guardChildStdin } from './bufferedSpawn.js';
+import { buildCliChildEnv } from './cliChildEnv.js';
+import { modelPinIsOffered } from './localProviderRuntime.js';
+import { filterCallerModeEligible } from './callerModePolicy.js';
+import { buildCodeReviewSpawnConfig, buildVendorSpawnConfig, supportsPublicReviewProvider, toolFreeOneShotArgs } from './providerVendors.js';
+import { isPublicReviewNoToolProfile } from './agentExecutionProfiles.js';
+import { resolveCliModel, stripProviderPinArgs } from './providerModels.js';
+import { resolveCliSpawn, needsProcessGroup, trackDetachedGroup } from './credentialBootstrap.js';
+
+// How much stderr to hand back to callers. Enough to carry a rate-limit banner
+// or a stack's first frames, short enough to embed in an error message or a
+// persisted sync status without dumping a whole log into the UI.
+const STDERR_TAIL_LIMIT = 500;
+
+const stderrTailOf = (stderr) => stderr.trim().slice(-STDERR_TAIL_LIMIT);
+
+// Sanitized result for a synchronous spawn exception. Only the OS error code
+// and the configured command name are echoed; `err.message` can embed argv.
+function spawnThrowResult(err, command) {
+  const code = typeof err?.code === 'string' && /^[A-Z0-9_]{2,32}$/.test(err.code) ? err.code : 'SPAWN_FAILED';
+  const error = code === 'E2BIG'
+    ? `Prompt is too large for ${command}'s command-line transport (E2BIG); the run was not started. Reduce the input size.`
+    : `Failed to spawn ${command} (${code}).`;
+  return { error, code };
+}
+
+/**
+ * Resolve which CLI provider + model a feature should use from the providers
+ * list and the feature's stored `{ providerId, model }` config.
+ *
+ * Only `type === 'cli'` providers are eligible: the autofixer must edit files
+ * and run pm2, and the calendar sync must call MCP tools — neither works
+ * through an API chat-completion provider. Resolution falls back from the
+ * requested provider → `fallbackId` (default `claude-code`, the historical
+ * behavior) → the first enabled CLI provider.
+ *
+ * @param {Array|Object} providers - array of providers OR the on-disk map keyed by id
+ * @param {{ providerId?: string, model?: string, fallbackId?: string }} config
+ * @returns {{ provider: object, model: string|null } | { error: string }}
+ */
+export function pickCliProvider(providers, config = {}) {
+  const { providerId, model, fallbackId = 'claude-code' } = config || {};
+  const list = Array.isArray(providers) ? providers : Object.values(providers || {});
+  // 'cli-harness' is the shared name for this caller context — see
+  // callerModePolicy.js. Same rule the fallback chain and the pickers apply.
+  const cli = filterCallerModeEligible(list.filter((p) => p?.enabled !== false), 'cli-harness');
+  if (cli.length === 0) {
+    return { error: 'No enabled CLI provider is configured — add one under AI Providers.' };
+  }
+
+  const provider =
+    (providerId && cli.find((p) => p.id === providerId)) ||
+    cli.find((p) => p.id === fallbackId) ||
+    cli[0];
+
+  // Honor the requested model only when the provider actually offers it;
+  // otherwise fall back to the provider's own default so a stale stored model
+  // (e.g. left over from a different provider) can't pin a nonexistent id.
+  // `modelPinIsOffered` owns that rule — including the two pass-throughs a bare
+  // `includes` gets wrong: a provider that enumerates NO models has nothing to
+  // validate against, and a locally-backed one carries only a cached snapshot
+  // while the daemon on this machine is the authority.
+  const resolvedModel = model && modelPinIsOffered(provider, model) ? model : (provider.defaultModel || null);
+
+  return { provider, model: resolvedModel };
+}
+
+/**
+ * Spawn a CLI provider, deliver `prompt` via stdin (avoids OS argv limits),
+ * and resolve with the collected stdout once the process exits.
+ *
+ * stdout and stderr are tracked separately: `text` is stdout only (the clean
+ * response, safe to JSON-parse), while `onData(chunk, stream)` receives both
+ * live for logging/progress. Mirrors the canonical `executeCliRun` settle
+ * semantics — never rejects; failures come back as `{ error }`.
+ *
+ * A non-zero exit that still produced stdout resolves as `{ text, partial: true }`
+ * rather than an error, because a CLI that printed a usable answer before dying
+ * (rate-limit banner, context overflow, killed mid-stream) is worth parsing.
+ * **That text may be TRUNCATED.** A caller MUST gate any destructive use of
+ * `text` — pruning, replacing, or overwriting stored records against it — on
+ * `partial === false`; a truncated payload otherwise reads as "these records no
+ * longer exist" and deletes real data. `stderrTail` carries the last
+ * `STDERR_TAIL_LIMIT` chars of stderr so the caller can surface WHY it was partial.
+ *
+ * @param {object} args
+ * @param {object} args.provider - resolved CLI provider (must have `.command`)
+ * @param {string|null} [args.model] - model override; applied as `defaultModel` so buildCliArgs injects it
+ * @param {string} args.prompt - prompt text (sent via stdin)
+ * @param {string} [args.cwd] - working directory for the child process
+ * @param {string[]} [args.extraArgs] - extra argv appended after the built args (e.g. `--allowedTools …`)
+ * @param {number} [args.timeoutMs] - SIGTERM after this many ms (default 300000)
+ * @param {(chunk: string, stream: 'stdout'|'stderr') => void} [args.onData] - live output callback
+ * @param {NodeJS.ProcessEnv} [args.baseEnv] - base env for the child (default process.env); the shared child-env composer filters inherited variables. Explicit provider.envVars still overlays it.
+ * @param {object|null} [args.bootstrapEnv] - Credential-command output, filtered by buildCliChildEnv.
+ * @param {boolean} [args.exactPins] - Per-call model/effort selections override saved CLI argv pins.
+ * @param {string} [args.safetyProfile] - Optional maintained no-tool profile. Refuses unsupported providers and extra argv; both argv and environment use the same profile.
+ * @param {boolean} [args.codeReview] - Code review only, with the no-tool `safetyProfile`: the argv is the vendor's strongest enforced reviewer mode (`buildCodeReviewSpawnConfig`), or its ordinary argv when it maintains none — the caller confines that run to a scratch directory. The environment keeps the no-tool allowlist either way.
+ * @returns {Promise<{ text: string, exitCode: number, stderr: string, partial: boolean, stderrTail: string } | { error: string, exitCode?: number, stderr?: string, stderrTail?: string }>}
+ */
+export function runCliProviderPrompt(args = {}) {
+  const { provider, model = null, prompt, cwd, extraArgs = [], timeoutMs = 300000, onData, baseEnv = process.env, safetyProfile = null, bootstrapEnv = null, exactPins = false, codeReview = false } = args;
+
+  if (!provider?.command) {
+    return Promise.resolve({ error: 'Provider has no command configured' });
+  }
+  if (typeof prompt !== 'string' || prompt.length === 0) {
+    return Promise.resolve({ error: 'prompt must be a non-empty string' });
+  }
+  if (safetyProfile && (!isPublicReviewNoToolProfile(safetyProfile) || !(codeReview || supportsPublicReviewProvider(provider)) || extraArgs.length)) {
+    return Promise.resolve({ error: 'Provider has no enforced tool-free review mode, or extra arguments would override it.' });
+  }
+
+  // Clone with the per-call model as defaultModel so buildCliArgs injects the
+  // right --model/-m flag for this provider's CLI convention.
+  const effectiveProvider = { ...provider, apiKey: provider.apiKey, defaultModel: model ?? provider.defaultModel };
+  if (exactPins) effectiveProvider.args = stripProviderPinArgs(effectiveProvider.args || [], {
+    model: model != null, effort: Boolean(effectiveProvider.effort),
+  });
+  const restrictedConfig = safetyProfile ? (codeReview ? buildCodeReviewSpawnConfig : buildVendorSpawnConfig)(effectiveProvider, {
+    safetyProfile, effectiveModel: resolveCliModel(effectiveProvider.defaultModel), effort: effectiveProvider.effort,
+  }) : null;
+  const ordinaryArgs = [...buildCliArgs(effectiveProvider), ...(Array.isArray(extraArgs) ? extraArgs : [])];
+  // A review-only run on a vendor with no enforced recipe falls back to its
+  // ordinary argv; strip every blanket permission grant from it (#9409) while
+  // keeping the model/effort pins. Authoring runs (no codeReview) are untouched.
+  const builtArgs = restrictedConfig?.args || (safetyProfile && codeReview ? toolFreeOneShotArgs(effectiveProvider, ordinaryArgs).args : ordinaryArgs);
+  const streamFormat = restrictedConfig?.streamFormat || (builtArgs.some((arg, index) => arg === '--output-format=stream-json' || (arg === '--output-format' && builtArgs[index + 1] === 'stream-json')) ? 'stream-json' : null);
+  // Deliver the prompt per provider convention: antigravity gets it as the
+  // --print VALUE (no stdin); grok's `--prompt-file /dev/stdin` is fed via stdin
+  // on POSIX / a temp file on Windows (useStdin=false); everyone else via stdin.
+  // NOTE: extraArgs land AFTER buildCliArgs' output, so for antigravity they sit
+  // past the trailing `--print` marker. prepareAntigravityPrompt relocates the
+  // `--print <prompt>` pair to the very end to absorb that (#4110) — don't
+  // "fix" it by re-ordering the concatenation above.
+  const { args: spawnArgs, useStdin, cleanup: cleanupPromptFile } = prepareCliPrompt(provider.command, builtArgs, prompt, { cwd });
+
+  return new Promise((resolve) => {
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+
+    // Shared composition (provider.envVars + OpenCode models map + PWD pin +
+    // CLAUDECODE strip) — see buildCliChildEnv. No `guard`: this is the
+    // fire-and-collect path, not an autonomous agent, so it keeps the unguarded
+    // PATH it has always had. effectiveProvider carries the per-call model as
+    // defaultModel, which is what the OpenCode declared-models map is built from
+    // (its envVars are provider's, unchanged).
+    const effectiveCwd = cwd || process.cwd();
+    const childEnv = buildCliChildEnv({
+      baseEnv,
+      bootstrapEnv,
+      provider: effectiveProvider,
+      cwd: effectiveCwd,
+      safetyProfile,
+    });
+
+    // npm-installed CLI providers are .cmd/.bat shims on Windows; resolve+wrap
+    // (cmd.exe /c) instead of enabling a shell — shell:true + an args array
+    // does NOT escape arguments (DEP0190), so a prompt/path containing a
+    // space would silently corrupt or be shell-injectable. Resolved against
+    // `childEnv` so a provider-configured PATH override is honored.
+    // `resolveCliSpawn` also applies a credential-bootstrap wrap
+    // (credentialBootstrap.js) when configured — applied AFTER
+    // prepareCliPrompt (above), which still keys prompt-delivery convention
+    // off the harness's own command, not the bootstrap CLI's. This is the
+    // tool-free reviewer's spawn too, and it IS wrapped: a reviewer spawned
+    // bare carries no credential at all (#7720). Only the `sandboxed-actions`
+    // `safetyProfile` skips the wrap — see credentialBootstrap.js.
+    const { command: spawnCommand, args: wrappedArgs, wrapped } = resolveCliSpawn(provider, provider.command, spawnArgs, childEnv, { safetyProfile });
+    // A bootstrap-wrapped child is a supervising WRAPPER, not the harness, so
+    // the timeout kill below has to signal the whole process group or it leaves
+    // the harness running past the run (#7496). False for every unwrapped
+    // spawn — including the `sandboxed-actions` posture, which is never wrapped.
+    const processGroup = needsProcessGroup(wrapped);
+    let child;
+    try {
+      child = spawn(spawnCommand, wrappedArgs, {
+        cwd: effectiveCwd,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env: childEnv,
+        detached: processGroup,
+      });
+    } catch (err) {
+      // spawn can THROW synchronously (E2BIG for an argv-delivered prompt over
+      // the OS limit, EINVAL, ...) which the 'error' listener below never sees.
+      // Honor the never-reject contract: release the prompt file and return a
+      // bounded diagnostic — never argv, env, or prompt text (#10273).
+      cleanupPromptFile();
+      return resolve(spawnThrowResult(err, provider.command));
+    }
+    // Remember the detached group so the graceful-shutdown sweep can reach it:
+    // detaching moved this child out of the server's own process group, and a
+    // shutdown driven by a signal to THAT group would otherwise orphan it (#7496).
+    trackDetachedGroup(child, processGroup);
+
+    // Single settlement gate — the timer, spawn error, and close handler all
+    // race. Without it a SIGKILL that doesn't kill synchronously lets the
+    // timer fire later and settle an already-settled promise.
+    const done = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      cleanupPromptFile();
+      resolve(result);
+    };
+
+    const timer = setTimeout(() => {
+      if (!child.killed) killProcessTree(child, 'SIGTERM', { processGroup });
+      done({ error: `Provider call timed out after ${timeoutMs}ms`, text: stdout.trim(), stderr, stderrTail: stderrTailOf(stderr) });
+    }, timeoutMs);
+
+    // Register listeners BEFORE writing stdin so an immediate spawn failure or
+    // a dead-stdin EPIPE is caught rather than thrown. A child that exits
+    // before reading stdin would otherwise emit an unhandled 'error' on the
+    // stdin stream — fatal in this non-request context (crashes the process).
+    child.on('error', (err) => done({ error: `Failed to spawn ${spawnCommand}: ${err.message}` }));
+    child.stdout?.on('data', (d) => { const t = d.toString(); stdout += t; onData?.(t, 'stdout'); });
+    child.stderr?.on('data', (d) => { const t = d.toString(); stderr += t; onData?.(t, 'stderr'); });
+
+    // Swallow EPIPE on stdin (child gone before/while we write) — the close/
+    // error handler is the authoritative settle point. See guardChildStdin.
+    guardChildStdin(child);
+    try {
+      // When grok is delivered via a Windows temp file, the prompt is already on
+      // disk — just close stdin instead of writing it.
+      if (useStdin) child.stdin.write(prompt);
+      child.stdin.end();
+    } catch {
+      // Synchronous write failure (e.g. already-destroyed stdin) — let the
+      // 'error'/'close' handler settle the promise with the real cause.
+    }
+
+    child.on('close', (code) => {
+      const text = stdout.trim();
+      const stderrTail = stderrTailOf(stderr);
+      // A non-zero exit with no stdout is a hard failure; surface stderr.
+      // Match the historical calendar-sync rule: any stdout means partial
+      // success worth returning to the parser — but flag it `partial` so the
+      // caller can refuse to treat a possibly-truncated payload as complete.
+      if (code !== 0 && !text) {
+        return done({ error: (stderr.trim().slice(0, STDERR_TAIL_LIMIT) || `${provider.command} exited with code ${code}`), exitCode: code, stderr, stderrTail });
+      }
+      done({ text, exitCode: code, stderr, partial: code !== 0, stderrTail,
+        ...(streamFormat ? { streamFormat } : {}),
+      });
+    });
+  });
+}

@@ -1,0 +1,203 @@
+import { meatspaceEvents } from '../meatspaceEvents.js';
+import { dashboardEvents } from '../dashboardEvents.js';
+import { join } from 'path';
+import { atomicWrite, PATHS, ensureDir, readJSONFileStrict, readJSONFile } from '../../lib/fileUtils.js';
+import { isMortalLoomEnabled, mlArrayIfEnabled, mlReplace } from '../mortalLoomStore.js';
+import { createKeyCachedQueue } from '../../lib/createKeyCachedQueue.js';
+
+// === Goal normalization defaults ===
+
+export const PORTOS_GOAL_DEFAULTS = {
+  parentId: null,
+  tags: [],
+  linkedActivities: [],
+  linkedCalendars: [],
+  progress: 0,
+  progressHistory: [],
+  todos: [],
+  targetDate: null,
+  timeBlockConfig: null,
+  scheduledEvents: [],
+  checkIns: [],
+  milestones: [],
+  goalType: 'standard',
+  // A PortOS-created goal always gets `status: 'active'` (`createGoal` in goals.js), but a
+  // MortalLoom-synced one may carry no status at all — and this is the ONLY normalization it
+  // passes through. Without a default the codebase splits on what that means: the voice tools
+  // and the Character card treat a status-less goal as active, while check-in scheduling,
+  // Telegram digests, insights, jobGates, and getGoalsTree's own urgency enrichment all test
+  // `status === 'active'` and silently skip it. Same goal, listed in one place and invisible in
+  // the other. Defaulting here makes both readings agree at the sync boundary (#4123).
+  status: 'active'
+};
+
+// A falsy status — absent, null, or '' — is never a legitimate value (there is no "no status"
+// goal state), so it collapses to the default rather than surviving the spread. That is what
+// makes the strict `status === 'active'` consumers agree with the lenient
+// `status === 'active' || !status` ones for every normalized goal: the set of goals the lenient
+// predicate calls active is exactly the set this stamps 'active'. A plain `{ ...defaults, ...g }`
+// would let an explicit `status: null` from MortalLoom re-open the split.
+export const normalizeGoal = g => {
+  const merged = { ...PORTOS_GOAL_DEFAULTS, ...g };
+  return merged.status ? merged : { ...merged, status: PORTOS_GOAL_DEFAULTS.status };
+};
+
+// === File paths ===
+
+export const IDENTITY_DIR = PATHS.digitalTwin;
+export const IDENTITY_FILE = join(IDENTITY_DIR, 'identity.json');
+export const CHRONOTYPE_FILE = join(IDENTITY_DIR, 'chronotype.json');
+export const LONGEVITY_FILE = join(IDENTITY_DIR, 'longevity.json');
+export const GOALS_FILE = join(IDENTITY_DIR, 'goals.json');
+
+// === Default Data Structures ===
+
+// US Social Security Administration actuarial baseline by decade (average M/F)
+export const SSA_BASELINE_LIFE_EXPECTANCY = 78.5;
+
+export const DEFAULT_IDENTITY = {
+  sections: {
+    genome: { status: 'unavailable', label: 'Genome', updatedAt: null },
+    chronotype: { status: 'unavailable', label: 'Chronotype', updatedAt: null },
+    longevity: { status: 'unavailable', label: 'Longevity', updatedAt: null },
+    aesthetics: { status: 'unavailable', label: 'Aesthetics', updatedAt: null },
+    goals: { status: 'unavailable', label: 'Goals', updatedAt: null }
+  },
+  updatedAt: null
+};
+
+export const DEFAULT_CHRONOTYPE = {
+  type: 'intermediate',
+  confidence: 0,
+  geneticMarkers: {},
+  caffeineMarkers: {},
+  behavioralData: null,
+  recommendations: null,
+  derivedAt: null
+};
+
+export const DEFAULT_LONGEVITY = {
+  longevityMarkers: {},
+  cardiovascularMarkers: {},
+  longevityScore: 0,
+  cardiovascularRisk: 0,
+  lifeExpectancy: {
+    baseline: SSA_BASELINE_LIFE_EXPECTANCY,
+    adjusted: null,
+    longevityAdjustment: 0,
+    cardiovascularAdjustment: 0
+  },
+  confidence: 0,
+  derivedAt: null
+};
+
+export const DEFAULT_GOALS = {
+  birthDate: null,
+  lifeExpectancy: null,
+  timeHorizons: null,
+  goals: [],
+  updatedAt: null
+};
+
+// === File I/O ===
+
+export async function ensureIdentityDir() {
+  await ensureDir(IDENTITY_DIR);
+}
+
+/**
+ * @param {string} filePath
+ * @param {*} defaultVal
+ * @param {{ strict?: boolean }} [options] - `strict: true` throws when `filePath`
+ *   exists but can't be read or parsed, instead of silently returning `defaultVal`.
+ *   Off by default so every existing caller keeps the fallback. Callers that COUNT
+ *   what they load opt in, so an unreadable file can't report as an empty one
+ *   (#2726). A genuinely absent file (never written) still returns `defaultVal`
+ *   under strict — that IS a trustworthy empty.
+ */
+export async function loadJSON(filePath, defaultVal, { strict = false } = {}) {
+  // `readJSONFileStrict` rather than tryReadFile+safeJSONParse: both of those
+  // swallow, so together they can't tell "no goals yet" from "goals.json is
+  // corrupt" — and this is the read the Strategist skill counts. Passing `null` as
+  // its default (rather than `defaultVal`) keeps "the file gave us nothing" legible
+  // here: a parsed file can never BE null (bare `null` fails validation), so `value`
+  // is null exactly when the file was absent, unreadable, or corrupt.
+  const { ok, value } = await readJSONFileStrict(filePath, null);
+  const data = value ?? structuredClone(defaultVal);
+  // When MortalLoom iCloud sync is enabled, the goals array is sourced from
+  // MortalLoom.json; birthDate and lifeExpectancy metadata stay in local PortOS.
+  let mlGoals = null;
+  if (filePath === GOALS_FILE) {
+    // Forward strict into the ML probe so an enabled-but-unreadable MortalLoom
+    // store throws here rather than returning null and falling through to a local
+    // file that may be a genuine ENOENT and score a fake 0 (#2742). A readable
+    // store with no `goals` key returns null (not a throw) and falls through to
+    // the local mirror below — see mlArrayIfEnabled's semantic note.
+    mlGoals = await mlArrayIfEnabled('goals', { strict });
+    if (mlGoals) data.goals = mlGoals.map(normalizeGoal);
+  }
+  // Strictness gates on the source that actually supplies the counted array, which
+  // is why this sits AFTER the MortalLoom probe. On an ML-backed install the local
+  // file contributes only birthDate/lifeExpectancy metadata — failing to read it
+  // costs no goals, so reporting Strategist "unavailable" off it would be a lie in
+  // the opposite direction: the goals were right there and readable.
+  if (strict && !ok && !mlGoals) {
+    throw Object.assign(new Error(`Unreadable identity file: ${filePath}`), { code: 'UNREADABLE_STORE' });
+  }
+  return data;
+}
+
+export async function saveJSON(filePath, data, { mirrorGoals = true } = {}) {
+  await ensureIdentityDir();
+  await atomicWrite(filePath, data);
+  if (filePath === LONGEVITY_FILE) meatspaceEvents.emit('death-clock:changed', {});
+  // Mirror goals array into MortalLoom.json so iOS/macOS app sees the change.
+  if (filePath === GOALS_FILE && mirrorGoals && (await isMortalLoomEnabled()) && Array.isArray(data.goals)) {
+    await mlReplace('goals', data.goals);
+  }
+  if (filePath === GOALS_FILE) dashboardEvents.emit('goals:changed');
+}
+
+// Serializes goals.json read-modify-write across every caller that must run slow
+// work (an LLM call per goal, Google Calendar round-trips) BEFORE the write.
+// Doing the slow work first, then re-reading goals.json inside `fn` right before
+// saving, is what keeps a concurrent edit (a new progress entry, a goal edit or
+// create) from being clobbered by a stale snapshot captured before the slow work
+// started (#8755). The single shared queue key ('goals') also protects two
+// concurrent mutators (e.g. check-in + calendar scheduler) from interleaving
+// their own reads/writes.
+const goalsQueue = createKeyCachedQueue();
+
+/**
+ * @param {(goals: object) => (object | Promise<object>)} fn - receives a freshly
+ *   loaded goals document (post any earlier slow work in the caller) and returns
+ *   the document to persist. Run serialized against every other `mutateGoals`
+ *   call so two in-flight mutations can't race a load/save pair.
+ * Unchanged documents are not written or mirrored. `localOnly` is reserved for
+ * MortalLoom's explicit import: merge into the local mirror without sourcing
+ * from, or replacing, the imported iCloud store. It still shares the same queue.
+ * @returns {Promise<object>} the saved goals document.
+ */
+export function mutateGoals(fn, { localOnly = false } = {}) {
+  return goalsQueue('goals', async () => {
+    const goals = localOnly
+      ? await readJSONFile(GOALS_FILE, structuredClone(DEFAULT_GOALS), { strict: true })
+      : await loadJSON(GOALS_FILE, DEFAULT_GOALS, { strict: true });
+    const before = JSON.stringify(goals);
+    const next = await fn(goals);
+    if (JSON.stringify(next) !== before) {
+      await saveJSON(GOALS_FILE, next, { mirrorGoals: !localOnly });
+    }
+    return next;
+  });
+}
+
+/** Edit the fresh document in place while returning a caller-specific result. */
+export async function editGoals(fn, options) {
+  let result;
+  await mutateGoals(async goals => {
+    result = await fn(goals);
+    return goals;
+  }, options);
+  return result;
+}

@@ -1,0 +1,637 @@
+import { uploadBody, request, API_BASE, throwApiError } from './apiCore.js';
+import { downloadBlob } from '../lib/downloadBlob.js';
+
+export const rectifyModelDuplicates = (payload, options = {}) => request('/system-resources/duplicates/rectify', {
+  method: 'POST', body: JSON.stringify(payload), ...options,
+});
+
+// Health
+export const checkHealth = (options) => request('/system/health', options);
+export const getSystemHealth = (options) => request('/system/health/details', options);
+// Its own route, not a field on health/details — peers scrape that payload and
+// persist it verbatim, and the build stamp must stay machine-local (#4694).
+export const getSystemBuild = (options) => request('/system/build', options);
+export const runSystemResourceReport = (options = {}) => request('/system-resources/report', {
+  method: 'POST',
+  ...options,
+});
+// The tracked downloaded-model inventory, read from the manifest PortOS keeps at
+// install/uninstall time. A GET because it runs no scan — that is what makes it
+// safe to call on page load, unlike `runSystemResourceReport`.
+export const getTrackedModelInventory = (options = {}) => request('/system-resources/models/manifest', options);
+export const triageSystemResources = (payload, options = {}) => request('/system-resources/triage', {
+  method: 'POST',
+  body: JSON.stringify(payload),
+  ...options,
+});
+export const getActiveProcessing = (options) => request('/system/processing', options);
+// Bounded activity snapshot (no GPU shell-out). Shared by the update banner
+// and the live-activity widget; refreshed from `system:activity`, not a poll.
+export const getSystemActivity = (options) => request('/system/activity', options);
+// nvidia-smi samples. Polled only while the live-activity inspector is visible.
+export const getGpuTelemetry = (options) => request('/system/gpu-telemetry', options);
+export const getNetworkExposure = (options) => request('/network-exposure/status', options);
+export const getCapabilities = (options) => request('/capabilities', options);
+// Machine-local hardware facts used for UI fit and recommendation surfaces.
+// This endpoint deliberately stays outside peer-synced health payloads.
+export const getSystemCapabilities = (options) => request('/system/capabilities', options);
+export const updateHealthThresholds = (thresholds, options = {}) => request('/system/health/thresholds', {
+  method: 'PUT',
+  body: JSON.stringify(thresholds),
+  ...options
+});
+// Dismiss/undo a dashboard health warning as resolved. `message` must be the
+// warning's current `message` field — the server keys the dismissal on the
+// (type, message) pair so an unrelated recurrence isn't silently hidden.
+export const dismissHealthWarning = (type, message, options = {}) => request(`/system/health/warnings/${encodeURIComponent(type)}/dismiss`, {
+  method: 'POST',
+  body: JSON.stringify({ message }),
+  ...options
+});
+export const undismissHealthWarning = (type, options = {}) => request(`/system/health/warnings/${encodeURIComponent(type)}/dismiss`, {
+  method: 'DELETE',
+  ...options
+});
+
+// Update
+export const getUpdateStatus = (options) => request('/update/status', options);
+export const checkForUpdate = () => request('/update/check', { method: 'POST' });
+// Automatic-update config + what the scheduler is currently waiting on. Its own
+// route because it walks git status, which /update/status must not do on the
+// Update tab's poll interval.
+export const getAutoUpdateStatus = (options) => request('/update/auto', options);
+export const ignoreUpdateVersion = (version) => request('/update/ignore', {
+  method: 'POST',
+  body: JSON.stringify({ version })
+});
+export const clearIgnoredVersions = () => request('/update/ignore', { method: 'DELETE' });
+export const executePortosUpdate = (opts) => {
+  const body = opts && Object.keys(opts).length ? JSON.stringify(opts) : undefined;
+  return request('/update/execute', body ? { method: 'POST', body } : { method: 'POST' });
+};
+export const syncPortosFork = (opts = {}, requestOpts = {}) => request('/update/sync-fork', {
+  method: 'POST',
+  body: JSON.stringify(opts),
+  ...requestOpts
+});
+
+// Settings
+export const getSettings = (options) => request('/settings', options);
+export const getInstanceFeatures = (options) => request('/settings/features', options);
+export const getCredentialInventory = (options) => request('/settings/credentials', options);
+// `enabled` accepts `null` — the tri-state override going back to "inherit" for
+// a grouped feature (see instanceFeatureUpdateSchema on the server).
+export const updateInstanceFeature = (featureId, enabled, options = {}) => request(`/settings/features/${encodeURIComponent(featureId)}`, {
+  method: 'PUT',
+  body: JSON.stringify({ enabled }),
+  ...options,
+});
+export const updateInstanceFeatureGroup = (groupId, enabled, options = {}) => request(`/settings/features/groups/${encodeURIComponent(groupId)}`, {
+  method: 'PUT',
+  body: JSON.stringify({ enabled }),
+  ...options,
+});
+export const installEidoverseFeature = (worldsRepoUrl, options = {}, worldsBranch = '') => request('/settings/features/eidoverse/install', {
+  method: 'POST',
+  body: JSON.stringify({ worldsRepoUrl, worldsBranch }),
+  ...options,
+});
+export const updateEidoverseWorldsSource = (worldsRepoUrl, options = {}, worldsBranch) => request('/settings/features/eidoverse/source', {
+  method: 'PUT',
+  body: JSON.stringify({ worldsRepoUrl, worldsBranch }),
+  ...options,
+});
+export const startEidoverseHost = (options = {}) => request('/settings/features/eidoverse/host', {
+  method: 'POST',
+  ...options,
+});
+export const getEidoverseWorldStatus = (options) => request('/eidoverse/world/status', options);
+export const getEidoverseWorldProjectionStatus = (options) => request('/eidoverse/world/projection/status', options);
+export const updateEidoverseWorldConfig = (payload, options = {}) => request('/eidoverse/world/config', {
+  method: 'PUT',
+  body: JSON.stringify(payload),
+  ...options,
+});
+export const projectEidoverseWorld = (options = {}) => request('/eidoverse/world/project', {
+  method: 'POST',
+  ...options,
+});
+
+// Eidoverse world foundations — the local-vs-baseline ownership ledger and its
+// promote gate (#7455). Packaging and promoting both return a 200 carrying a
+// refusal verdict when a gate says no, so callers read `outcome` rather than
+// treating a rejection as the failure signal.
+export const listEidoverseFoundations = (options) => request('/eidoverse/world/foundations', options);
+export const recordEidoverseFoundation = (payload, options = {}) => request('/eidoverse/world/foundations', {
+  method: 'POST',
+  body: JSON.stringify(payload),
+  ...options,
+});
+export const packageEidoverseFoundationCandidate = (id, options = {}) => request(`/eidoverse/world/foundations/${encodeURIComponent(id)}/candidate`, {
+  method: 'POST',
+  ...options,
+});
+export const promoteEidoverseFoundation = (id, options = {}) => request(`/eidoverse/world/foundations/${encodeURIComponent(id)}/promote`, {
+  method: 'POST',
+  ...options,
+});
+// Withdrawal (#7632) — retract a promoted foundation so peers that inherited it
+// DROP their copy. Like promote, a refusal ("this is an inherited copy", "it was
+// never promoted") is a 200 carrying `outcome` + `reasons`.
+export const withdrawEidoverseFoundation = (id, options = {}) => request(`/eidoverse/world/foundations/${encodeURIComponent(id)}/withdraw`, {
+  method: 'POST',
+  ...options,
+});
+
+// Eidoverse world controllers — the install/arm/retire surface beside the
+// `eidoverse.controllers` mind-tool group (#7456, #7488). An install/arm
+// refusal (unknown `controllerId`, a bad config, an unknown install id) is a
+// 200 carrying its `outcome`/`reasons`, the same shape as the foundations
+// promote gate: callers read `outcome`, not the HTTP status, for a refusal.
+export const listEidoverseControllers = (options) => request('/eidoverse/world/controllers', options);
+// The INSPECT the list route deliberately omits (#7629) — config and state
+// only ever come back from this call, never from a list row.
+export const getEidoverseControllerInstall = (id, options) => request(`/eidoverse/world/controllers/${encodeURIComponent(id)}`, options);
+export const installEidoverseController = (payload, options = {}) => request('/eidoverse/world/controllers', {
+  method: 'POST',
+  body: JSON.stringify(payload),
+  ...options,
+});
+export const setEidoverseControllerArmed = (id, armed, options = {}) => request(`/eidoverse/world/controllers/${encodeURIComponent(id)}`, {
+  method: 'PATCH',
+  body: JSON.stringify({ armed }),
+  ...options,
+});
+export const updateEidoverseControllerConfig = (id, config, options = {}) => request(`/eidoverse/world/controllers/${encodeURIComponent(id)}/config`, {
+  method: 'PATCH',
+  body: JSON.stringify({ config }),
+  ...options,
+});
+export const retireEidoverseController = (id, options = {}) => request(`/eidoverse/world/controllers/${encodeURIComponent(id)}`, {
+  method: 'DELETE',
+  ...options,
+});
+export const updateSettings = (data, options) => request('/settings', {
+  method: 'PUT',
+  body: JSON.stringify(data),
+  ...options
+});
+export const getAiAssignments = (options) => request('/settings/ai-assignments', options);
+// Local image/video models this instance could offer as a federated media
+// provider — what the Sharing tab lets you pick from. Local-only inventory;
+// the peer-facing status endpoint only ever reports already-shared models.
+export const getMediaShareCandidates = (options) => request('/settings/media-share-candidates', options);
+
+// API Access — the OpenAPI 3.0.3 spec for the public API surface (built from the
+// exposed entries in apiAccess settings). Rendered by the API Access settings tab
+// and the API Explorer REST Reference "Exposed" surface.
+export const getOpenApiSpec = (options) => request('/api-docs/openapi.json', options);
+export const getInternalOpenApiSpec = (options) => request('/api-docs/internal/openapi.json', options);
+export const getApiCatalog = (options) => request('/api-docs/catalog.json', options);
+export const getSocketEventCatalog = (options) => request('/api-docs/events.json', options);
+export const updateAiAssignment = (id, data, options) => request(`/settings/ai-assignments/${encodeURIComponent(id)}`, {
+  method: 'PUT',
+  body: JSON.stringify(data),
+  ...options
+});
+
+const isPlainObject = (v) =>
+  v != null && typeof v === 'object' && !Array.isArray(v);
+
+// PUT /api/settings shallow-merges top-level keys only — patching
+// `{ imageGen: { local: { pythonPath } } }` directly clobbers the rest of
+// `imageGen`. patchSettingsSlice fetches current settings, walks to the slice
+// at a dotted path, shallow-merges `partial` into it, and PUTs the rebuilt
+// top-level key so sibling subkeys survive. `options` flows through to the
+// final updateSettings (e.g. `{ silent: true }`).
+//
+// Non-object values along the path (a hand-edited settings.json with an
+// unexpected primitive/array at a slice or parent) are treated as absent so
+// they don't spread into character-indexed or numeric-indexed keys.
+export const patchSettingsSlice = async (slicePath, partial, options = {}) => {
+  if (typeof slicePath !== 'string' || !slicePath) {
+    throw new Error('patchSettingsSlice: slicePath required');
+  }
+  if (!isPlainObject(partial)) {
+    throw new Error('patchSettingsSlice: partial must be a plain object');
+  }
+  const segments = slicePath.split('.');
+  if (!segments.every(Boolean)) {
+    throw new Error('patchSettingsSlice: slicePath has empty segments');
+  }
+  const current = await getSettings({ silent: true }).catch(() => ({}));
+  let existing = current;
+  for (const seg of segments) existing = existing?.[seg];
+  let updated = { ...(isPlainObject(existing) ? existing : {}), ...partial };
+  for (let i = segments.length - 1; i > 0; i--) {
+    let parent = current;
+    for (let j = 0; j < i; j++) parent = parent?.[segments[j]];
+    updated = { ...(isPlainObject(parent) ? parent : {}), [segments[i]]: updated };
+  }
+  return updateSettings({ [segments[0]]: updated }, options);
+};
+
+// Usage. `params` selects the cost-report window: { period } (7d|30d|90d|all)
+// or { from, to } (YYYY-MM-DD).
+const usageQuery = (params) => {
+  const qs = new URLSearchParams(
+    Object.entries(params).filter(([, v]) => v != null && v !== '')
+  ).toString();
+  return qs ? `?${qs}` : '';
+};
+export const getUsage = (params = {}, options = {}) => request(`/usage${usageQuery(params)}`, options);
+// Per-model token totals for every Claude Code session on this machine, read
+// from the CLI transcripts. Same { period } | { from, to } params as getUsage.
+export const getClaudeCodeModelUsage = (params = {}, options = {}) =>
+  request(`/usage/claude-code/models${usageQuery(params)}`, options);
+export const getUsageBackfillStatus = (options = {}) => request('/usage/backfill', options);
+// Monthly plan prices per provider family, used to compare subscription spend
+// against the report's estimated API cost. `costs` is a partial patch: an
+// omitted family keeps its stored price, `null` clears it. Reads come back with
+// the report (`getUsage().subscriptionSavings`), so there is no getter here.
+export const updateSubscriptionCosts = (costs, options = {}) =>
+  request('/usage/subscriptions', { method: 'PUT', body: JSON.stringify({ costs }), ...options });
+// The Subscriptions page's own model: one row per manageable plan (enabled
+// state, plan tier, monthly price, the provider records a toggle fans out to).
+// Deliberately separate from `getUsage().subscriptionSavings`, which answers
+// what those plans SPENT over a report window — this answers what they are.
+export const getSubscriptions = (options = {}) => request('/usage/subscriptions', options);
+// Save plan prices and/or plan tiers in ONE request, and get the refreshed rows
+// back — so an editor applies a save without a follow-up GET. Both maps are
+// patches: an omitted family keeps its stored value, `null` (or `0` / `''`)
+// clears it.
+export const updateSubscriptions = ({ costs, tiers } = {}, options = {}) =>
+  request('/usage/subscriptions', {
+    method: 'PUT',
+    body: JSON.stringify({ ...(costs ? { costs } : {}), ...(tiers ? { tiers } : {}) }),
+    ...options,
+  });
+// Switch one subscription on or off — PortOS-side enablement only (it flips
+// `enabled` across that family's provider records). Never touches vendor
+// billing. A priced family with no providers answers `applied: false`. The
+// refreshed rows come back with the outcome.
+export const setSubscriptionEnabled = ({ family, enabled }, options = {}) =>
+  request('/usage/subscriptions/enabled', {
+    method: 'PUT',
+    body: JSON.stringify({ family, enabled }),
+    ...options,
+  });
+// Mark one federated instance as paying API rates (`usesSubscriptions: false`)
+// or riding this install's subscriptions (`true`). The Across Instances
+// combined total skips API-billed rows; the row itself stays listed.
+export const updateUsageFleetBilling = ({ instanceId, usesSubscriptions }, options = {}) =>
+  request('/usage/fleet-billing', {
+    method: 'PUT',
+    body: JSON.stringify({ instanceId, usesSubscriptions }),
+    ...options,
+  });
+export const startUsageBackfill = (options = {}) => request('/usage/backfill', { method: 'POST', ...options });
+
+// Subscription-quota status for every enabled provider family (claude, codex,
+// agy, grok). Callers own their inline error UI — silent by default. `family`
+// narrows the read to a single card (the usage page's per-card Refresh) so one
+// provider's multi-second scrape isn't paid for all of them.
+export const getProviderUsage = ({ refresh = false, family = null, ...options } = {}) => {
+  const qs = new URLSearchParams();
+  if (refresh) qs.set('refresh', '1');
+  if (family) qs.set('family', family);
+  const query = qs.toString();
+  return request(`/usage/providers${query ? `?${query}` : ''}`, { silent: true, ...options });
+};
+
+// Backup
+export const getBackupStatus = (options) => request('/backup/status', options);
+export const triggerBackup = (options) => request('/backup/run', { method: 'POST', ...options });
+export const getBackupSnapshots = (options) => request('/backup/snapshots', options);
+export const restoreBackup = (data, options = {}) => request('/backup/restore', { method: 'POST', body: JSON.stringify(data), ...options });
+export async function downloadBackupSnapshot(snapshotId, source) {
+  // The server names the file the same way; deriving it here too lets the save
+  // picker open BEFORE the fetch, while the click's transient user activation is
+  // still valid. Waiting for response headers first — as this used to — routinely
+  // outlives that window on a cold external drive, Chromium then refuses the
+  // picker, and the download falls back to buffering a multi-gigabyte archive in
+  // tab memory: exactly the case the streaming path exists to avoid.
+  const filename = `portos-snapshot-${source ? `${source}-` : ''}${snapshotId}.tar.gz`;
+
+  let writable = null;
+  if (typeof window !== 'undefined' && typeof window.showSaveFilePicker === 'function') {
+    // A dismissed picker is the user declining; it propagates as AbortError and
+    // callers treat it as a cancel, not a failure. Any other picker error (an
+    // unsupported context, say) falls through to the Blob path below.
+    try {
+      const handle = await window.showSaveFilePicker({ suggestedName: filename });
+      writable = await handle.createWritable();
+    } catch (error) {
+      if (error?.name === 'AbortError') throw error;
+    }
+  }
+
+  let writableAborted = false;
+  const abortWritable = async () => {
+    if (!writable || writableAborted) return;
+    writableAborted = true;
+    await writable.abort?.().catch(() => {});
+  };
+
+  try {
+    const query = source ? `?source=${encodeURIComponent(source)}` : '';
+    const response = await fetch(`${API_BASE}/backup/snapshots/${encodeURIComponent(snapshotId)}/download${query}`, {
+      credentials: 'same-origin',
+    });
+    if (!response.ok) {
+      // The catch below closes the handle before propagating the API error, so
+      // the picker doesn't leave a 0-byte file behind.
+      await throwApiError(response);
+    }
+
+    if (writable && response.body?.pipeTo) {
+      await response.body.pipeTo(writable);
+    } else {
+      // No File System Access API (Firefox, Safari): the Blob path is the only
+      // one available, and it is why the server caps nothing — the browser
+      // holds it all. Abort the unused picker stream before falling back.
+      await abortWritable();
+      downloadBlob(await response.blob(), filename);
+    }
+  } catch (error) {
+    // Fetch, response parsing, and pipeTo can all fail after the picker has
+    // created its stream. Abort it on every failure path so the destination is
+    // immediately available for a retry.
+    await abortWritable();
+    throw error;
+  }
+  return { filename };
+}
+export const restoreDatabase = (data, options) => request('/backup/restore-db', { method: 'POST', body: JSON.stringify(data), ...options });
+// Resume a committed database restore awaiting recovery (#9725). Never replays the dump.
+export const recoverDatabaseRestore = (id, options) => request('/backup/restore-db/recover', { method: 'POST', body: JSON.stringify({ id }), ...options });
+export const deleteBackupSnapshot = (snapshotId, source, options = {}) => {
+  const query = source ? `?source=${encodeURIComponent(source)}` : '';
+  return request(`/backup/snapshots/${encodeURIComponent(snapshotId)}${query}`, { method: 'DELETE', ...options });
+};
+
+// Data Manager
+export const getDataOverview = (options) => request('/data', options);
+export const getDataCategory = (key, options = {}) => request(`/data/${key}${options.measure ? '?measure=1' : ''}`, options);
+export const archiveDataCategory = (key, opts) => request(`/data/${key}/archive`, { method: 'POST', body: JSON.stringify(opts || {}) });
+export const purgeDataCategory = (key, opts, options = {}) => request(`/data/${key}`, {
+  method: 'DELETE',
+  body: JSON.stringify(opts || {}),
+  ...options,
+});
+export const getDataBackups = (options) => request('/data/backups', options);
+export const deleteDataBackup = (filename) => request(`/data/backups/${filename}`, { method: 'DELETE' });
+
+// Notifications
+export const getNotifications = (options = {}) => {
+  const params = new URLSearchParams();
+  if (options.type) params.set('type', options.type);
+  if (options.unreadOnly) params.set('unreadOnly', 'true');
+  if (options.limit) params.set('limit', options.limit);
+  return request(`/notifications?${params}`);
+};
+export const getNotificationCount = () => request('/notifications/count');
+export const markNotificationRead = (id) => request(`/notifications/${id}/read`, { method: 'POST' });
+export const markAllNotificationsRead = () => request('/notifications/read-all', { method: 'POST' });
+export const deleteNotification = (id) => request(`/notifications/${id}`, { method: 'DELETE' });
+export const clearNotifications = () => request('/notifications', { method: 'DELETE' });
+
+// Telegram
+export const getTelegramStatus = (options) => request('/telegram/status', options);
+export const updateTelegramConfig = (data, options) => request('/telegram/config', {
+  method: 'PUT',
+  body: JSON.stringify(data),
+  ...options
+});
+export const deleteTelegramConfig = (options) => request('/telegram/config', { method: 'DELETE', ...options });
+export const testTelegram = (message, options) => request('/telegram/test', {
+  method: 'POST',
+  body: JSON.stringify({ message }),
+  ...options
+});
+export const updateTelegramForwardTypes = (forwardTypes, options) => request('/telegram/forward-types', {
+  method: 'PUT',
+  body: JSON.stringify({ forwardTypes }),
+  ...options
+});
+export const updateTelegramMethod = (method, options) => request('/telegram/method', {
+  method: 'PUT',
+  body: JSON.stringify({ method }),
+  ...options
+});
+
+// Browser - CDP browser management
+export const getBrowserStatus = (options) => request('/browser', options);
+export const getBrowserConfig = () => request('/browser/config');
+export const updateBrowserConfig = (config, options = {}) => request('/browser/config', {
+  method: 'PUT',
+  body: JSON.stringify(config),
+  ...options
+});
+export const launchBrowser = (options = {}) => request('/browser/launch', { method: 'POST', ...options });
+export const stopBrowser = (options = {}) => request('/browser/stop', { method: 'POST', ...options });
+export const restartBrowser = (options = {}) => request('/browser/restart', { method: 'POST', ...options });
+export const getBrowserLogs = (lines = 50) => request(`/browser/logs?lines=${lines}`);
+export const deleteBrowserDownload = (name, options = {}) =>
+  request(`/browser/downloads/${encodeURIComponent(name)}`, { method: 'DELETE', ...options });
+export const browserDownloadUrl = (name) =>
+  `/api/browser/downloads/${encodeURIComponent(name)}`;
+export const navigateBrowser = (url, options = {}) => request('/browser/navigate', {
+  method: 'POST',
+  body: JSON.stringify({ url }),
+  ...options
+});
+
+// Instances (Federation)
+export const getInstances = (options) => request('/instances', options);
+export const getSelfInstance = (options) => request('/instances/self', options);
+// Federated instances a CoS task may be pinned to (#4520): id/name/isSelf only.
+export const getAssignableInstances = (options) => request('/instances/assignable', options);
+export const updateSelfInstance = (data) => request('/instances/self', { method: 'PUT', body: JSON.stringify(data) });
+export const addPeer = (data) => request('/instances/peers', { method: 'POST', body: JSON.stringify(data) });
+export const addTailcatPeer = (data) => request('/instances/peers/tailcat', { method: 'POST', body: JSON.stringify(data) });
+// Saved tailcat forwards. Rows never carry the tc address — only its redacted
+// form — so a failed forward can be retried without re-pasting the capability.
+export const getTailcatForwards = (options) => request('/instances/peers/tailcat/forwards', options);
+export const retryTailcatForward = (id, data = {}) => request(`/instances/peers/tailcat/forwards/${id}/retry`, { method: 'POST', body: JSON.stringify(data) });
+export const forgetTailcatForward = (id) => request(`/instances/peers/tailcat/forwards/${id}`, { method: 'DELETE' });
+// Managed tailcat serve on this node (PORTS.API). Status may include the full
+// tc address so the operator can Copy it — this is our own serve capability.
+export const getTailcatServe = (options) => request('/instances/peers/tailcat/serve', options);
+export const startTailcatServe = (data) => request('/instances/peers/tailcat/serve', { method: 'POST', body: JSON.stringify(data || {}) });
+export const retryTailcatServe = () => request('/instances/peers/tailcat/serve/retry', { method: 'POST' });
+export const stopTailcatServe = () => request('/instances/peers/tailcat/serve', { method: 'DELETE' });
+export const updatePeer = (id, data) => request(`/instances/peers/${id}`, { method: 'PUT', body: JSON.stringify(data) });
+export const pairPeerSyncSecret = (id, options) => request(`/instances/peers/${id}/pair-secret`, { method: 'POST', ...options });
+export const removePeer = (id) => request(`/instances/peers/${id}`, { method: 'DELETE' });
+export const connectPeer = (id) => request(`/instances/peers/${id}/connect`, { method: 'POST' });
+export const reciprocatePeer = (id, options) => request(`/instances/peers/${id}/reciprocate`, { method: 'POST', ...options });
+export const probePeer = (id) => request(`/instances/peers/${id}/probe`, { method: 'POST' });
+export const syncPeer = (id, options) => request(`/instances/peers/${id}/sync`, { method: 'POST', ...options });
+export const getPeerFullSyncCoverage = (id, options) => request(`/instances/peers/${id}/full-sync-coverage`, options);
+export const getTailnetInfo = () => request('/instances/tailnet-suffix');
+export const provisionTailnetCert = () => request('/instances/provision-cert', { method: 'POST' });
+
+// Image Generation
+// `mode` is an explicit override, not the saved one, so a surface that is not
+// in local mode can still ask "what would a local render of X do?" — which is
+// what the runtime status card asks. `options` lets a background probe pass
+// `{ silent, signal }`; a foreground check omits them and keeps the toast.
+export const getImageGenStatus = (mode, modelId, options = {}) => {
+  const params = new URLSearchParams();
+  if (mode) params.set('mode', mode);
+  if (modelId) params.set('modelId', modelId);
+  const query = params.toString();
+  return request(`/image-gen/status${query ? `?${query}` : ''}`, options);
+};
+export const generateImage = (data, options = {}) => request('/image-gen/generate', {
+  method: 'POST',
+  body: JSON.stringify(data),
+  ...options,
+});
+// Curated style presets — code-static on the server, so cache the in-flight
+// promise and reuse it for the lifetime of the page. Eliminates the repeat
+// fetch when the user navigates ImageGen → VideoGen → Writers Room.
+let stylePresetsPromise = null;
+export const listImageStylePresets = () => {
+  if (!stylePresetsPromise) {
+    stylePresetsPromise = request('/image-gen/style-presets').catch((err) => {
+      stylePresetsPromise = null;
+      throw err;
+    });
+  }
+  return stylePresetsPromise;
+};
+export const generateAvatar = (data, options = {}) => request('/image-gen/avatar', {
+  method: 'POST',
+  body: JSON.stringify(data),
+  ...options
+});
+// Save an uploaded image into the gallery (`/data/images/`) and get back its
+// `{ filename, path }`. Use this (not the generic `uploadFile`) when the stored
+// URL must sync to peers — the `image` asset path only ships `/data/images/<f>`.
+export const uploadGalleryImage = (base64Data, options = {}) => request('/image-gen/upload', {
+  method: 'POST',
+  body: uploadBody(base64Data),
+  ...options,
+});
+
+// Tools Registry
+export const getToolsList = (options) => request('/tools', options);
+export const registerTool = (data, options) => request('/tools', {
+  method: 'POST',
+  body: JSON.stringify(data),
+  ...options
+});
+export const updateTool = (id, data, options) => request(`/tools/${id}`, {
+  method: 'PUT',
+  body: JSON.stringify(data),
+  ...options
+});
+
+// DataDog
+export const getDatadogInstances = () => request('/datadog/instances');
+export const searchDatadogErrors = (instanceId, serviceName, environment, fromTime, options) =>
+  request(`/datadog/instances/${instanceId}/search-errors`, {
+    method: 'POST',
+    body: JSON.stringify({ serviceName, environment, fromTime }),
+    ...options
+  });
+
+// JIRA
+export const getJiraInstances = () => request('/jira/instances');
+export const getJiraProjects = (instanceId, options) => request(`/jira/instances/${instanceId}/projects`, options);
+export const getJiraBoards = (instanceId, projectKey, options) =>
+  request(`/jira/instances/${instanceId}/projects/${encodeURIComponent(projectKey)}/boards`, options);
+export const getJiraBoardSprints = (instanceId, boardId, options) =>
+  request(`/jira/instances/${instanceId}/boards/${encodeURIComponent(boardId)}/sprints`, options);
+export const searchJiraEpics = (instanceId, projectKey, query, options) =>
+  request(`/jira/instances/${instanceId}/projects/${encodeURIComponent(projectKey)}/epics?q=${encodeURIComponent(query || '')}`, options);
+export const getJiraIssue = (instanceId, issueKey, options) =>
+  request(`/jira/instances/${instanceId}/issues/${encodeURIComponent(issueKey)}`, options);
+export const getMySprintTickets = (instanceId, projectKey, options) => request(`/jira/instances/${instanceId}/my-sprint-tickets/${projectKey}`, options);
+export const getJiraBoardColumns = (instanceId, projectKey, boardId, options) =>
+  request(`/jira/instances/${instanceId}/board-columns/${projectKey}${boardId ? `?boardId=${encodeURIComponent(boardId)}` : ''}`, options);
+export const getJiraTicketTransitions = (instanceId, ticketId, options) => request(`/jira/instances/${instanceId}/tickets/${ticketId}/transitions`, options);
+export const transitionJiraTicket = (instanceId, ticketId, transitionId, options) => request(`/jira/instances/${instanceId}/tickets/${ticketId}/transition`, {
+  method: 'POST',
+  body: JSON.stringify({ transitionId }),
+  ...options
+});
+
+// JIRA Status Reports
+export const getJiraReports = () => request('/jira/reports');
+export const generateJiraReport = (appId) => request('/jira/reports/generate', {
+  method: 'POST',
+  body: JSON.stringify(appId ? { appId } : {})
+});
+export const getJiraReport = (appId, date) => request(`/jira/reports/${appId}/${date}`);
+
+// Insights
+export const getInsightThemes = () => request('/insights/themes');
+export const refreshInsightThemes = (providerId, model, options = {}) => request('/insights/themes/refresh', {
+  method: 'POST',
+  body: JSON.stringify({ providerId, model }),
+  ...options
+});
+export const getInsightNarrative = () => request('/insights/narrative');
+export const refreshInsightNarrative = (providerId, model, options = {}) => request('/insights/narrative/refresh', {
+  method: 'POST',
+  body: JSON.stringify({ providerId, model }),
+  ...options
+});
+
+// Goal effectiveness scorecard (#2157)
+export const getGoalScorecard = () => request('/insights/goal-scorecard');
+export const computeGoalScorecard = (weekStart) => request('/insights/goal-scorecard/compute', {
+  method: 'POST',
+  body: JSON.stringify(weekStart ? { weekStart } : {})
+});
+export const refreshGoalScorecardNarrative = (providerId, model) => request('/insights/goal-scorecard/narrative', {
+  method: 'POST',
+  body: JSON.stringify({ providerId, model })
+});
+export const getGoalScorecardRules = () => request('/insights/goal-scorecard/rules');
+export const saveGoalScorecardRules = (overrides) => request('/insights/goal-scorecard/rules', {
+  method: 'PUT',
+  body: JSON.stringify(overrides ?? {})
+});
+export const getGoalScorecardSettings = () => request('/insights/goal-scorecard/settings');
+export const updateGoalScorecardSettings = (partial) => request('/insights/goal-scorecard/settings', {
+  method: 'PUT',
+  body: JSON.stringify(partial ?? {})
+});
+
+export const getEidoverseDestinations = (options) => request('/eidoverse/travel/destinations', options);
+export const departEidoverse = (peerId, options) => request('/eidoverse/travel/depart', { method: 'POST', body: JSON.stringify({ peerId }), ...options });
+
+export const saveCredential = (id, value, options) => request(`/settings/credentials/${encodeURIComponent(id)}`, { ...options, method: 'PUT', body: JSON.stringify({ value }) });
+
+// CoS raw recordings; metadata, prompts and parsed output are retained.
+export const getCosStorage = (options) => request('/data/cos/storage', options);
+export const previewCosStorage = (filter, offset = 0, options) => request(`/data/cos/storage/preview?offset=${offset}`, { ...options, method: 'POST', body: JSON.stringify(filter) });
+export const runCosStorage = (input, options) => request('/data/cos/storage/run', { ...options, method: 'POST', body: JSON.stringify(input) });
+export const cancelCosStorage = (options) => request('/data/cos/storage/cancel', { ...options, method: 'POST' });
+export const saveCosStoragePolicy = (policy, options) => request('/data/cos/storage/policy', { ...options, method: 'PUT', body: JSON.stringify(policy) });
+export const pinCosRecording = (input, options) => request('/data/cos/storage/pin', { ...options, method: 'PUT', body: JSON.stringify(input) });
+
+export const getMaintenanceStatus = (options) => request('/system/maintenance', options);
+export const beginMaintenance = (reason, options = {}) => request('/system/maintenance', {
+  method: 'POST', body: JSON.stringify({ reason }), ...options,
+});
+export const resumeMaintenance = (hold, options = {}) => request('/system/maintenance/resume', {
+  method: 'POST', body: JSON.stringify({ id: hold.id, revision: hold.revision }), ...options,
+});
+
+// Planning-only peer administration; never dispatches host operations.
+export const getPeerAdminSetup = (peerId, options) => request(`/peer-administration/peers/${encodeURIComponent(peerId)}`, options);
+export const savePeerAdminGrant = (data, options) => request('/peer-administration/grants', { ...options, method: 'POST', body: JSON.stringify(data) });
+export const previewPeerAdministration = (data, options) => request('/peer-administration/preview', { ...options, method: 'POST', body: JSON.stringify(data) });
+
+export const savePeerExecutionGrant = (data, options) => request('/peer-administration/execution-grants', { ...options, method: 'POST', body: JSON.stringify(data) });
+export const previewPeerExecution = (data, options) => request('/peer-administration/execution-preview', { ...options, method: 'POST', body: JSON.stringify(data) });
+export const dispatchPeerExecution = (data, options) => request('/peer-administration/execution-dispatch', { ...options, method: 'POST', body: JSON.stringify(data) });
+export const getPeerExecutionStatus = (data, options) => request('/peer-administration/execution-status', { ...options, method: 'POST', body: JSON.stringify(data) });
+export const getPeerCatalogReviews = (options) => request('/peer-administration/catalog-reviews', options);
+export const getPeerCatalogReview = (backend, catalogKey, options) => request(`/peer-administration/catalog-review?backend=${encodeURIComponent(backend)}&catalogKey=${encodeURIComponent(catalogKey)}`, options);
+export const savePeerCatalogReview = (data, options) => request('/peer-administration/catalog-review', { ...options, method: 'PUT', body: JSON.stringify(data) });

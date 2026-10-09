@@ -1,0 +1,561 @@
+import { selectPersistentMindContextEvents } from '../lib/persistentMindContextEvents.js';
+/**
+ * Persistent-mind context rollups and explicit Brain promotion.
+ *
+ * Raw events remain in the bounded machine-local run-event ledger. Older
+ * sealed ranges are represented by provenance-tagged rollups in a separate
+ * machine-local cache, so assembling one turn never requires an unbounded JSONL
+ * read. A corrupt/unreadable cache fails closed rather than becoming `[]` and
+ * overwriting the only summaries of history that has left raw retention.
+ */
+
+import { join } from 'path';
+import { isRuntimeBudgetError } from '../lib/aiToolkit/errorDetection.js';
+import {
+  PATHS,
+  atomicWrite,
+  readJSONFileStrict,
+  sha256Text,
+} from '../lib/fileUtils.js';
+import { createFileWriteQueue } from '../lib/fileWriteQueue.js';
+import {
+  PERSISTENT_MIND_ID,
+  PERSISTENT_MIND_ROLLUP_PROMPT_VERSION,
+  PERSISTENT_MIND_TRAJECTORY_LIMITS,
+  assemblePersistentMindContext,
+  buildPersistentMindRollup,
+  isPersistentMindCallDenial,
+  isStoredPersistentMindRollup,
+} from '../lib/persistentMindTrajectory.js';
+import {
+  appendMindEvent,
+  readPersistentMindHistory,
+} from './agentRunEventLog.js';
+import {
+  extractPersistentMindJournal,
+  readPersistentMindJournal,
+} from './persistentMindJournal.js';
+import { persistentMindJournalDigest } from '../lib/persistentMindJournal.js';
+import { PERSISTENT_MIND_CHOSEN_NAME_TAG, persistentMindChooseNameSchema, resolvePersistentMindChosenName } from '../lib/persistentMindChosenName.js';
+import * as memoryBackend from './memoryBackend.js';
+import {
+  PERSISTENT_MIND_MEMORY_PROTECTION_TAGS,
+  comparePersistentMindMemories,
+  persistentMindMemoryProtection,
+  persistentMindMemoryTags,
+  persistentMindProtectMemorySchema,
+  projectPersistentMindMemory,
+} from '../lib/persistentMindMemory.js';
+
+const ROLLUP_PATH = join(PATHS.cos, 'persistent-mind-rollups.json');
+const ROLLUP_STORE_SCHEMA_VERSION = 1;
+const queueRollupWrite = createFileWriteQueue();
+const queueMemoryWrite = createFileWriteQueue();
+const promotionRuns = new Map();
+const memoryCreationRuns = new Map();
+
+const emptyStore = () => ({ schemaVersion: ROLLUP_STORE_SCHEMA_VERSION, rollups: [] });
+
+async function loadRollupStore() {
+  const { ok, value } = await readJSONFileStrict(ROLLUP_PATH, emptyStore());
+  if (!ok) throw new Error('Persistent mind rollup cache is unreadable');
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+      || value.schemaVersion !== ROLLUP_STORE_SCHEMA_VERSION || !Array.isArray(value.rollups)
+      || value.rollups.some((rollup) => !isStoredPersistentMindRollup(rollup))) {
+    throw new Error('Persistent mind rollup cache has an invalid shape');
+  }
+  return value;
+}
+
+export async function readPersistentMindRollups(mindId = PERSISTENT_MIND_ID) {
+  const store = await loadRollupStore();
+  return store.rollups
+    .filter((rollup) => rollup.mindId === mindId)
+    .sort((a, b) => a.source.fromSequence - b.source.fromSequence);
+}
+
+/** Drop derived summaries for one mind so the next wake rebuilds from retained history. */
+export function clearPersistentMindRollups(mindId = PERSISTENT_MIND_ID) {
+  return queueRollupWrite(async () => {
+    const store = await loadRollupStore();
+    const rollups = store.rollups.filter((rollup) => rollup.mindId !== mindId);
+    const cleared = store.rollups.length - rollups.length;
+    await atomicWrite(ROLLUP_PATH, { schemaVersion: ROLLUP_STORE_SCHEMA_VERSION, rollups });
+    return { cleared };
+  });
+}
+
+/** Protected memories take precedence over ordinary importance-ranked context. */
+export async function readPersistentMindMemories(mindId = PERSISTENT_MIND_ID) {
+  const options = { status: 'active', sourceAgentId: mindId, sortBy: 'importance', sortOrder: 'desc', limit: 100 };
+  // Query each protection tier separately so a low-score identity cannot fall
+  // outside the first page of ordinary memories before we get to sort it.
+  const pages = await Promise.all([
+    memoryBackend.getMemories(options),
+    memoryBackend.getMemories({ ...options, tags: [PERSISTENT_MIND_CHOSEN_NAME_TAG] }),
+    ...Object.values(PERSISTENT_MIND_MEMORY_PROTECTION_TAGS).map((tag) => memoryBackend.getMemories({ ...options, tags: [tag] })),
+  ]);
+  const candidates = [...new Map(pages.flatMap((page) => page.memories || []).map((memory) => [memory.id, memory])).values()];
+  const details = await Promise.all(candidates.map((memory) => memoryBackend.peekMemory(memory.id)));
+  return details.filter((memory) => memory?.status === 'active' && memory.sourceAgentId === mindId)
+    .sort(comparePersistentMindMemories).slice(0, 100).map(projectPersistentMindMemory);
+}
+
+/** Named installs need only one record for frequent page/turn identity refreshes. */
+export async function readPersistentMindName(mindId = PERSISTENT_MIND_ID) {
+  const { memories = [] } = await memoryBackend.getMemories({
+    status: 'active', sourceAgentId: mindId, tags: [PERSISTENT_MIND_CHOSEN_NAME_TAG],
+    sortBy: 'updatedAt', sortOrder: 'desc', limit: 1,
+  });
+  const memory = memories[0] ? await memoryBackend.peekMemory(memories[0].id) : null;
+  if (memory?.sourceAgentId === mindId && memory.status === 'active') {
+    const name = resolvePersistentMindChosenName([memory]);
+    if (name) return name;
+  }
+  return resolvePersistentMindChosenName(await readPersistentMindMemories(mindId));
+}
+
+/** Bulk cleanup never archives protected memories, regardless of its caller. */
+export function archivePersistentMindMemories(mindId = PERSISTENT_MIND_ID) {
+  return queueMemoryWrite(async () => {
+    let archived = 0;
+    let preserved = 0;
+    let offset = 0;
+    while (true) {
+      const result = await memoryBackend.getMemories({
+        status: 'active', sourceAgentId: mindId,
+        sortBy: 'createdAt', sortOrder: 'asc', limit: 100, offset,
+      });
+      const candidates = result.memories || [];
+      if (candidates.length === 0) break;
+      let batchArchived = 0;
+      for (const candidate of candidates) {
+        const memory = await memoryBackend.peekMemory(candidate.id);
+        if (memory?.status !== 'active' || memory.sourceAgentId !== mindId) continue;
+        if (persistentMindMemoryProtection(memory) !== 'standard') {
+          preserved += 1;
+          continue;
+        }
+        await memoryBackend.archiveMemory(memory.id);
+        archived += 1;
+        batchArchived += 1;
+      }
+      // Archived rows leave the active result set; protected rows remain. Move
+      // past those retained rows even when an entire page is protected.
+      offset += candidates.length - batchArchived;
+    }
+    return { archived, preserved };
+  });
+}
+
+export function recordPersistentMindRollup(input) {
+  const rollup = buildPersistentMindRollup(input);
+  return queueRollupWrite(async () => {
+    const store = await loadRollupStore();
+    const ordered = [...store.rollups.filter((item) => item.id !== rollup.id), rollup]
+      .sort((a, b) => a.source.fromSequence - b.source.fromSequence || a.source.toSequence - b.source.toSequence);
+    const latestReadyByMind = new Map();
+    for (const item of ordered.filter((candidate) => candidate.status === 'ready')) {
+      const previous = latestReadyByMind.get(item.mindId);
+      if (!previous || item.source.toSequence > previous.source.toSequence) {
+        latestReadyByMind.set(item.mindId, item);
+      }
+    }
+    const latestReadyIds = new Set([...latestReadyByMind.values()].map((item) => item.id));
+    const tail = ordered
+      .filter((item) => !latestReadyIds.has(item.id))
+      .slice(-Math.max(0, PERSISTENT_MIND_TRAJECTORY_LIMITS.maxStoredRollups - latestReadyIds.size));
+    const keptIds = new Set([...latestReadyIds, ...tail.map((item) => item.id)]);
+    const rollups = ordered.filter((item) => keptIds.has(item.id));
+    await atomicWrite(ROLLUP_PATH, { schemaVersion: ROLLUP_STORE_SCHEMA_VERSION, rollups });
+    return rollup;
+  });
+}
+
+const latestReadyRollup = (rollups, promptVersion) => rollups
+  .filter((rollup) => rollup.status === 'ready' && rollup.provenance.promptVersion === promptVersion)
+  .sort((a, b) => a.source.toSequence - b.source.toSequence)
+  .at(-1) || null;
+
+// `attempted: false` means the summarizer never reached a provider — the
+// per-call boundary refused it (budget, authorization, lifecycle). Sealing a
+// FAILED rollup for that range would be a lie AND permanent: the range id is
+// deterministic, so `alreadyAttempted` would stop every later turn from
+// retrying, and a transient refusal would silently cost the mind that stretch
+// of its life forever.
+const summaryOutcome = (summarize, input) => Promise.resolve()
+  .then(() => summarize(input))
+  .then(
+    (summary) => typeof summary === 'string' && summary.trim()
+      ? { ok: true, attempted: true, summary }
+      : { ok: false, attempted: true, error: 'Persistent mind summarizer returned no summary text' },
+    (error) => {
+      if (isRuntimeBudgetError(error)) throw error;
+      return {
+        ok: false,
+        attempted: !isPersistentMindCallDenial(error),
+        error: String(error?.message || error || 'Persistent mind summary failed').slice(0, 500),
+      };
+    }
+  );
+
+/**
+ * Assemble context and, when a summarizer is available, incrementally seal the
+ * older range that just fell outside the recent verbatim window.
+ */
+export async function preparePersistentMindContext({
+  mindId = PERSISTENT_MIND_ID,
+  identity = '',
+  instructions = '',
+  memories = [],
+  maxChars,
+  recentEventLimit = PERSISTENT_MIND_TRAJECTORY_LIMITS.recentContextEvents,
+  promptVersion = PERSISTENT_MIND_ROLLUP_PROMPT_VERSION,
+  providerId = null,
+  model = null,
+  summarize = null,
+  extractJournal = null,
+  forceSummary = false,
+} = {}) {
+  const [history, initialRollups, initialJournal] = await Promise.all([
+    readPersistentMindHistory(mindId),
+    readPersistentMindRollups(mindId),
+    readPersistentMindJournal(mindId),
+  ]);
+  let rollups = initialRollups;
+  let journal = initialJournal;
+  const recent = selectPersistentMindContextEvents(history, mindId).slice(-Math.max(1, recentEventLimit));
+  const older = recent.length ? history.filter(event => event.sequence < recent[0].sequence) : [];
+  let coverageGap = null;
+
+  if (older.length > 0) {
+    const previous = latestReadyRollup(rollups, promptVersion);
+    const coveredThrough = previous?.source.toSequence ?? -1;
+    const rangeEvents = older.filter((event) => event.sequence > coveredThrough);
+    if (rangeEvents.length > 0) {
+      const expectedPredecessor = previous?.source.toSequence ?? null;
+      const brokenLinkIndex = rangeEvents.findIndex((event, index) => {
+        const expected = index === 0 ? expectedPredecessor : rangeEvents[index - 1].sequence;
+        return event.data?.previousSequence !== expected;
+      });
+      if (brokenLinkIndex >= 0) {
+        const brokenEvent = rangeEvents[brokenLinkIndex];
+        const expected = brokenLinkIndex === 0
+          ? expectedPredecessor
+          : rangeEvents[brokenLinkIndex - 1].sequence;
+        const actualPredecessor = brokenEvent.data?.previousSequence;
+        coverageGap = {
+          expectedAfterSequence: expected,
+          retainedFromSequence: brokenEvent.sequence,
+          recordedPredecessorSequence: Number.isSafeInteger(actualPredecessor) ? actualPredecessor : null,
+        };
+      }
+      const source = {
+        fromSequence: previous?.source.fromSequence ?? rangeEvents[0].sequence,
+        toSequence: rangeEvents.at(-1).sequence,
+        fromEventId: previous?.source.fromEventId ?? rangeEvents[0].eventId,
+        toEventId: rangeEvents.at(-1).eventId,
+      };
+      const rollupId = `${mindId}:${source.fromSequence}-${source.toSequence}:v${promptVersion}`;
+      const alreadyAttempted = rollups.some((rollup) => rollup.id === rollupId);
+      // Validate coverage against the complete ledger, then project prompt evidence.
+      // Filtering never edits retained history or its provenance chain.
+      const contextEvents = selectPersistentMindContextEvents(history, mindId)
+        .filter(event => event.sequence > coveredThrough && event.sequence <= source.toSequence);
+      // The journal is extracted BEFORE the range is sealed, so the summary
+      // compacts from typed events — what is still decided, owed, open and
+      // risky — instead of re-compressing the transcript. A failed extraction
+      // never blocks the seal: the rollup is still strictly better than losing
+      // the range, and a later turn can re-extract.
+      if (!coverageGap && typeof extractJournal === 'function' && (forceSummary || !alreadyAttempted)) {
+        const extraction = await extractPersistentMindJournal({
+          mindId,
+          events: contextEvents,
+          range: { fromSequence: rangeEvents[0].sequence, toSequence: rangeEvents.at(-1).sequence },
+          extract: extractJournal,
+          providerId,
+          model,
+          isCallDenial: isPersistentMindCallDenial,
+        });
+        if (extraction.attempted) journal = await readPersistentMindJournal(mindId);
+        if (extraction.error) console.error(`❌ Persistent mind journal extraction failed: ${extraction.error}`);
+      }
+      if (!coverageGap && typeof summarize === 'function' && (forceSummary || !alreadyAttempted)) {
+        const outcome = await summaryOutcome(summarize, {
+          mindId,
+          source,
+          events: contextEvents,
+          journal,
+          previousSummary: previous?.summary ?? null,
+          previousProvenance: previous?.provenance ?? null,
+          promptVersion,
+        });
+        // A refused call never reached a provider, so the range stays
+        // unattempted and a later turn can still seal it.
+        if (outcome.attempted) {
+          const rollup = await recordPersistentMindRollup({
+            id: rollupId,
+            mindId,
+            status: outcome.ok ? 'ready' : 'failed',
+            summary: outcome.ok ? outcome.summary : null,
+            error: outcome.ok ? null : outcome.error,
+            source,
+            providerId,
+            model,
+            promptVersion,
+          });
+          await appendMindEvent({
+            kind: 'mind.summary',
+            mindId,
+            // Keyed on the rollup's own createdAt (unique per attempt), not just
+            // rollup.id: a forceSummary retry reuses the same rollup id, and the
+            // shared ledger dedupes mind events by eventId regardless of age — an
+            // id derived from rollup.id alone would make a successful retry's
+            // event silently drop, leaving the replayed trajectory stuck showing
+            // the earlier failed attempt forever.
+            eventId: `mind-summary-${sha256Text(`${rollup.id}:${rollup.provenance.createdAt}`).slice(0, 32)}`,
+            data: {
+              rollupId: rollup.id,
+              status: rollup.status,
+              fromSequence: source.fromSequence,
+              toSequence: source.toSequence,
+              providerId,
+              model,
+              promptVersion,
+              summaryText: rollup.summary,
+              error: rollup.error,
+            },
+          });
+          rollups = await readPersistentMindRollups(mindId);
+        }
+      }
+    }
+  }
+
+  const chosenName = resolvePersistentMindChosenName(memories);
+  return assemblePersistentMindContext({
+    mindId,
+    identity: [chosenName
+      ? `Current chosen display name: ${JSON.stringify(chosenName)}. This supersedes older name memories; mindId and trajectory remain unchanged.`
+      : 'No chosen display name yet.', identity].filter(Boolean).join('\n'),
+    instructions,
+    memories,
+    events: history,
+    rollups,
+    journalDigest: persistentMindJournalDigest(journal, mindId),
+    maxChars,
+    recentEventLimit,
+    promptVersion,
+    coverageGap,
+  });
+}
+
+/** One protected record is the current name; older identity prose remains history. */
+export function choosePersistentMindName(input, mindId = PERSISTENT_MIND_ID) {
+  const { name } = persistentMindChooseNameSchema.parse(input);
+  return queueMemoryWrite(async () => {
+    const memories = await readPersistentMindMemories(mindId);
+    const previousName = resolvePersistentMindChosenName(memories);
+    const existing = memories.find((memory) => memory.tags?.includes(PERSISTENT_MIND_CHOSEN_NAME_TAG));
+    const fields = {
+      content: name,
+      summary: `Current chosen display name: ${name}`,
+      tags: persistentMindMemoryTags([PERSISTENT_MIND_CHOSEN_NAME_TAG, 'name'], 'core-identity'),
+      importance: 1,
+    };
+    const memory = existing
+      ? await memoryBackend.updateMemory(existing.id, fields)
+      : await memoryBackend.createMemory({ ...fields, type: 'fact', category: 'preferences', sourceAgentId: mindId, status: 'active' });
+    if (!memory) throw new Error('Chosen name could not be saved');
+    return { ok: true, success: true, name, previousName, mindId, memoryId: memory.id };
+  });
+}
+
+export function createPersistentMindMemory({ mindId = PERSISTENT_MIND_ID, protection = 'standard', ...input } = {}) {
+  return queueMemoryWrite(async () => projectPersistentMindMemory(await memoryBackend.createMemory({
+    ...input,
+    tags: persistentMindMemoryTags(input.tags, protection),
+    sourceAgentId: mindId,
+    status: 'active',
+  })));
+}
+
+async function findExistingAutomaticMemory({ memoryApi, mindId, turnId, content }) {
+  const result = await memoryApi.getMemories({
+    status: 'active',
+    sourceAgentId: mindId,
+    limit: 1000,
+  });
+  const candidates = result.memories || [];
+  for (const candidate of candidates) {
+    const memory = await memoryApi.peekMemory(candidate.id);
+    if (memory?.sourceTaskId === turnId && memory.content === content) return memory;
+  }
+  return null;
+}
+
+async function performAutomaticMemoryCreation({
+  candidateId,
+  mindId = PERSISTENT_MIND_ID,
+  turnId = null,
+  content,
+  summary,
+  type = 'observation',
+  category = 'other',
+  tags = [],
+  protection = 'standard',
+  memoryApi = memoryBackend,
+} = {}) {
+  if (typeof candidateId !== 'string' || !candidateId.trim()) {
+    throw new Error('Persistent mind memory candidate id is required');
+  }
+  if (typeof content !== 'string' || !content.trim()) {
+    throw new Error('Persistent mind memory content is required');
+  }
+  const id = candidateId.trim();
+  const normalizedContent = content.trim().slice(0, 10_240);
+  const history = await readPersistentMindHistory(mindId);
+  const previous = history.find((event) => (
+    event.kind === 'mind.memory.created' && event.data?.candidateId === id
+  ));
+  if (previous?.data?.memoryId) {
+    return { success: true, duplicate: true, memory: { id: previous.data.memoryId } };
+  }
+
+  const existing = await findExistingAutomaticMemory({ memoryApi, mindId, turnId, content: normalizedContent });
+  const memory = existing || await memoryApi.createMemory({
+    type,
+    content: normalizedContent,
+    summary: typeof summary === 'string' ? summary.trim().slice(0, 500) : undefined,
+    category,
+    tags: persistentMindMemoryTags(tags, protection),
+    sourceTaskId: turnId,
+    sourceAgentId: mindId,
+    status: 'active',
+  });
+  return { success: true, duplicate: Boolean(existing), memory };
+}
+
+/** Persist a structured memory emitted by the mind without a human approval step. */
+export function createPersistentMindMemoryFromCandidate(input = {}) {
+  const key = `${input.mindId || PERSISTENT_MIND_ID}:${input.candidateId || ''}`;
+  if (memoryCreationRuns.has(key)) return memoryCreationRuns.get(key);
+  const run = queueMemoryWrite(() => performAutomaticMemoryCreation(input)).finally(() => memoryCreationRuns.delete(key));
+  memoryCreationRuns.set(key, run);
+  return run;
+}
+
+export function updatePersistentMindMemory(memoryId, updates, mindId = PERSISTENT_MIND_ID) {
+  return queueMemoryWrite(async () => {
+    const existing = await memoryBackend.peekMemory(memoryId);
+    if (!existing || existing.sourceAgentId !== mindId) return null;
+    const { protection, ...fields } = updates;
+    // Older clients send tags without a protection field. Keep the protection
+    // unless the user explicitly selects a different level.
+    const tags = persistentMindMemoryTags(fields.tags ?? existing.tags, protection ?? persistentMindMemoryProtection(existing));
+    return projectPersistentMindMemory(await memoryBackend.updateMemory(memoryId, { ...fields, tags }));
+  });
+}
+
+/** The mind may protect its own active records, never remove their protection. */
+export function protectPersistentMindMemory(input, mindId = PERSISTENT_MIND_ID) {
+  const { memoryId, protection } = persistentMindProtectMemorySchema.parse(input);
+  return queueMemoryWrite(async () => {
+    const existing = await memoryBackend.peekMemory(memoryId);
+    if (!existing || existing.sourceAgentId !== mindId || existing.status !== 'active') {
+      return { ok: false, success: false, error: 'Active mind-owned memory not found' };
+    }
+    const level = persistentMindMemoryProtection(existing) === 'core-identity' ? 'core-identity' : protection;
+    await memoryBackend.updateMemory(memoryId, { tags: persistentMindMemoryTags(existing.tags, level) });
+    return { ok: true, success: true, memoryId, protection: level };
+  });
+}
+
+/** Add an attributable comment/idea to the trajectory. */
+export function appendPersistentMindAnnotation({
+  id,
+  mindId = PERSISTENT_MIND_ID,
+  turnId = null,
+  targetEventId = null,
+  text,
+  at,
+} = {}) {
+  if (typeof id !== 'string' || !id.trim() || typeof text !== 'string' || !text.trim()) {
+    return Promise.resolve({ appended: false, error: 'Annotation id and text are required' });
+  }
+  return appendMindEvent({
+    kind: 'mind.annotation.accepted',
+    mindId,
+    turnId,
+    at,
+    eventId: `mind-annotation:${id.trim()}`,
+    data: {
+      annotationId: id.trim(),
+      targetEventId: typeof targetEventId === 'string' ? targetEventId : null,
+      displayText: text.trim(),
+      textChars: text.trim().length,
+    },
+  });
+}
+
+/**
+ * Promote one user-approved fact into the existing Brain backend. Absence of an
+ * explicit `approved: true` is a refusal, not a pending or empty memory.
+ */
+async function performPersistentMindPromotion({
+  id,
+  approved,
+  mindId = PERSISTENT_MIND_ID,
+  turnId = null,
+  sourceEventId = null,
+  content,
+  summary,
+  type = 'fact',
+  category = 'other',
+  tags = [],
+  memoryApi = memoryBackend,
+} = {}) {
+  if (approved !== true) return { success: false, error: 'Explicit user approval is required' };
+  if (typeof id !== 'string' || !id.trim()) return { success: false, error: 'Promotion id is required' };
+  if (typeof content !== 'string' || !content.trim()) return { success: false, error: 'Memory content is required' };
+  const promotionId = id.trim();
+  const previous = (await readPersistentMindHistory(mindId)).find(
+    (event) => event.kind === 'mind.memory.promoted' && event.data?.promotionId === promotionId
+  );
+  if (previous) {
+    return { success: true, duplicate: true, memory: { id: previous.data.memoryId } };
+  }
+  const memory = await memoryApi.createMemory({
+    type,
+    content: content.trim().slice(0, 10_240),
+    summary: typeof summary === 'string' ? summary.trim().slice(0, 500) : undefined,
+    category,
+    tags: [...new Set(Array.isArray(tags) ? tags.filter((tag) => typeof tag === 'string' && tag) : [])].slice(0, 20),
+    sourceTaskId: turnId,
+    sourceAgentId: mindId,
+    status: 'active',
+  });
+  await appendMindEvent({
+    kind: 'mind.memory.promoted',
+    mindId,
+    turnId,
+    eventId: `mind-memory:${memory.id}`,
+    data: {
+      promotionId,
+      memoryId: memory.id,
+      sourceEventId,
+      type,
+      category,
+      approved: true,
+    },
+  });
+  return { success: true, memory };
+}
+
+export function promotePersistentMindMemory(input = {}) {
+  const key = typeof input.id === 'string' ? input.id.trim() : '';
+  if (key && promotionRuns.has(key)) return promotionRuns.get(key);
+  const run = performPersistentMindPromotion(input).finally(() => promotionRuns.delete(key));
+  if (key) promotionRuns.set(key, run);
+  return run;
+}

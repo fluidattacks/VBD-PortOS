@@ -1,0 +1,434 @@
+// Shared constants and pure helpers for the CoS Schedule tab subcomponents.
+import {
+  PUBLIC_REVIEW_ACTIONS_POSTURE,
+  PUBLIC_REVIEW_NO_TOOL_POSTURE,
+} from '../../../../utils/providers';
+import { timeUntil } from '../../../../utils/formatters';
+import { describeCron, summarizeAppSchedules } from '../../../../utils/cronHelpers';
+import { formatSkipCauses } from '../../../../lib/perpetualSkipCauses';
+import { TASK_READINESS_REASON } from '../../../../../../server/lib/taskReadinessReasons.js';
+
+// The cadence model is two variants; `perpetual` is an orthogonal flag that
+// renders as its own badge alongside whichever one is selected.
+export const INTERVAL_LABELS = {
+  'on-demand': 'On Demand',
+  cron: 'Scheduled'
+};
+
+export const INTERVAL_DESCRIPTIONS = {
+  'on-demand': 'Only runs when manually triggered',
+  cron: 'Runs on a cron schedule'
+};
+
+export const ON_DEMAND_PERPETUAL_LABEL = 'Automatic drain';
+export const ON_DEMAND_PERPETUAL_DESCRIPTION =
+  'Perpetual runs this task automatically while work remains, then resumes on the recheck cadence. Turn automatic starts off to start each drain manually.';
+
+export const PERPETUAL_LABEL = 'Perpetual';
+export const PERPETUAL_DESCRIPTION =
+  'Drains actionable work back-to-back until none remains, then waits for the next manual or automatic start';
+
+// `cyan` is kept as a raw Tailwind hue (not a port-* token) on purpose: it is
+// the 'cron' cadence tone in INTERVAL_BADGE_VARIANT below, and every other tone
+// here already maps onto a port-* token ('accent' covers the blue/info role),
+// so collapsing cyan onto 'accent' would make a Scheduled badge visually
+// indistinguishable from the other accent-toned chips on the same card. See the
+// #1909/#1924 category-color-enum caution.
+const BADGE_COLORS = {
+  accent: 'bg-port-accent/15 text-port-accent border-port-accent/30',
+  purple: 'bg-port-accent-2/15 text-port-accent-2 border-port-accent-2/30',
+  warning: 'bg-port-warning/15 text-port-warning border-port-warning/30',
+  gray: 'bg-gray-600/30 text-gray-400 border-gray-500/30',
+  cyan: 'bg-cyan-500/15 text-cyan-400 border-cyan-500/30',
+  success: 'bg-port-success/15 text-port-success border-port-success/30',
+  error: 'bg-port-error/15 text-port-error border-port-error/30',
+};
+
+export const badge = (variant) => `text-xs font-medium px-2.5 py-1 rounded-full border ${BADGE_COLORS[variant] || BADGE_COLORS.gray}`;
+
+export const IMPROVEMENT_DISABLED_TITLE = 'Improvement is disabled — enable it in CoS → Config';
+
+export const SAVING_TITLE = 'Saving provider/model settings — the run will use them once saved';
+
+// The task's pipeline stages (always an array). A non-empty one means its
+// provider/model are resolved per stage, so a task-level pin would be ignored.
+export const pipelineStages = (config) => config?.taskMetadata?.pipeline?.stages || [];
+
+// pr-reviewer stages are semantic trust-boundary roles, not just numbered
+// cards. Keep the prompt-key fallback for schedules saved before roles were
+// persisted, so an older local schedule still renders with the right policy.
+export const PR_REVIEWER_STAGE_ROLES = Object.freeze(['security', 'eligibility', 'actions']);
+
+export function prReviewerStageRole(stage) {
+  if (PR_REVIEWER_STAGE_ROLES.includes(stage?.role)) return stage.role;
+  return {
+    'pr-reviewer-security': 'security',
+    'pr-reviewer-eligibility': 'eligibility',
+    'pr-reviewer-review': 'actions',
+  }[stage?.promptKey] || null;
+}
+
+// A stage declares an execution PROFILE; the profile maps to the enforceable
+// POSTURE a provider must have a maintained recipe for. Mirrors
+// `server/lib/agentExecutionProfiles.js` so the picker offers exactly the
+// providers the server would accept at spawn time — and so neither side names
+// a vendor. The Security Scan is a managed server-side classifier and has no
+// posture, so it has no provider picker at all.
+export const STAGE_EXECUTION_PROFILE_POSTURES = Object.freeze({
+  'public-review': PUBLIC_REVIEW_NO_TOOL_POSTURE,
+  'public-review-gate': PUBLIC_REVIEW_NO_TOOL_POSTURE,
+  'public-review-actions': PUBLIC_REVIEW_ACTIONS_POSTURE,
+});
+
+// PR roles override stored profiles, including legacy action stages. The server
+// reasserts a tool-free profile on dispatch; the picker must match before saving.
+const PR_REVIEWER_ROLE_POSTURES = Object.freeze({
+  eligibility: PUBLIC_REVIEW_NO_TOOL_POSTURE,
+  actions: PUBLIC_REVIEW_NO_TOOL_POSTURE,
+});
+
+export function stagePublicReviewPosture(stage) {
+  return PR_REVIEWER_ROLE_POSTURES[prReviewerStageRole(stage)]
+    || STAGE_EXECUTION_PROFILE_POSTURES[stage?.executionProfile]
+    || null;
+}
+
+// The optional final stage is deliberately defined as a complete posture, not
+// just a display label. The server sanitizes and reasserts the same contract;
+// this copy lets the schedule UI add it without manufacturing a weaker stage.
+export const PR_REVIEWER_ACTIONS_STAGE_DEFAULTS = Object.freeze({
+  name: 'Code Review & Validated Actions',
+  role: 'actions',
+  promptKey: 'pr-reviewer-review',
+  readOnly: true,
+  useWorktree: true,
+  openPR: false,
+  simplify: false,
+  reviewLoop: false,
+  discardWorktree: true,
+  noCodeOutput: true,
+  managed: true,
+  executionProfile: 'public-review-gate',
+});
+
+export function togglePrReviewerActions(stages, enabled) {
+  const current = Array.isArray(stages) ? stages : [];
+  const withoutActions = current.filter((stage) => prReviewerStageRole(stage) !== 'actions');
+  if (!enabled) return withoutActions;
+  return current.some((stage) => prReviewerStageRole(stage) === 'actions')
+    ? current
+    : [...withoutActions, { ...PR_REVIEWER_ACTIONS_STAGE_DEFAULTS }];
+}
+
+export const triggerButtonClass = (disabled) =>
+  `flex items-center gap-1 min-h-[44px] px-3 py-1.5 text-sm rounded transition-colors ${disabled ? 'bg-port-border/30 text-gray-500 cursor-not-allowed' : 'bg-port-accent/20 hover:bg-port-accent/30 text-port-accent'}`;
+
+export const INTERVAL_BADGE_VARIANT = {
+  'on-demand': 'gray',
+  cron: 'cyan',
+};
+
+// Perpetual is a separate badge, not a cadence variant.
+export const PERPETUAL_BADGE_VARIANT = 'success';
+
+// --- Status grouping -------------------------------------------------------
+// A task falls into exactly one status group, used for the status dot, grid
+// ordering, and the status filters. Order here is the grid sort order.
+export const STATUS_GROUPS = {
+  active: { label: 'Active', dot: 'bg-port-success', order: 0 },
+  'on-demand': { label: 'On-Demand', dot: 'bg-gray-400', order: 1 },
+  waiting: { label: 'Waiting', dot: 'bg-port-warning', order: 2 },
+  disabled: { label: 'Disabled', dot: 'bg-gray-600', order: 3 },
+  unknown: { label: 'Unknown', dot: 'bg-port-warning', order: 4 },
+};
+
+/**
+ * Whether nothing but a human pressing Run ever starts this task.
+ *
+ * Three things can start it without one: a cron of its own, a perpetual drain
+ * that auto-starts, or an APP pinning its own cron on a task that is otherwise
+ * on-demand. The Schedule card's status group and the Timeline's "unpinned"
+ * bucket are the same question asked twice, so they ask it here — they used to
+ * carry separate copies that already disagreed about `autoStart`.
+ *
+ * Takes the cadence fields rather than a whole task config, because the two
+ * callers hold them at different depths (a Schedule config spreads them at the
+ * top level; a Timeline node keeps them under `schedule`).
+ */
+export function isManualOnlyCadence({ type, perpetual, autoStart, appSchedules } = {}) {
+  if (appSchedules?.length > 0) return false;
+  return type === 'on-demand' && (!perpetual || autoStart === false);
+}
+
+// Explicit rendering coverage for every wire reason. The cadence group still
+// depends on the task config; a new reason must be classified deliberately.
+export const TASK_READINESS_REASON_RENDERING = Object.freeze({
+  [TASK_READINESS_REASON.REQUIRES_INSTALL_WIDE_TARGET]: 'cadence',
+  [TASK_READINESS_REASON.DISABLED]: 'cadence',
+  [TASK_READINESS_REASON.FEATURE_DISABLED]: 'cadence',
+  [TASK_READINESS_REASON.ON_DEMAND_ONLY]: 'cadence',
+  [TASK_READINESS_REASON.WEEKDAY_ONLY]: 'cadence',
+  [TASK_READINESS_REASON.DISABLED_FOR_APP]: 'cadence',
+  [TASK_READINESS_REASON.FAILURE_PARKED]: 'cadence',
+  [TASK_READINESS_REASON.PERPETUAL_PARKED]: 'cadence',
+  [TASK_READINESS_REASON.PERPETUAL_RECHECK]: 'cadence',
+  [TASK_READINESS_REASON.PERPETUAL_DRAIN]: 'cadence',
+  [TASK_READINESS_REASON.INVALID_CRON]: 'cadence',
+  [TASK_READINESS_REASON.CRON_DUE]: 'cadence',
+  [TASK_READINESS_REASON.CRON_COOLDOWN]: 'cadence',
+  [TASK_READINESS_REASON.FAILURE_COOLDOWN]: 'cadence',
+  [TASK_READINESS_REASON.WAITING_ON_DEPENDENCIES]: 'waiting',
+});
+
+// Classify a task config into one status group (mutually exclusive).
+// Disabled wins over everything; then dependency-wait; then cadence — a
+// perpetual on-demand task is "active" because its drain runs unattended, and
+// so is one whose apps pin their own cron: something launches it on a clock
+// without anybody pressing Run, which is what this group means.
+export function getTaskStatusGroup(config) {
+  if (!config?.enabled) return 'disabled';
+  const reason = config.status?.reason;
+  if (reason != null && !Object.hasOwn(TASK_READINESS_REASON_RENDERING, reason)) return 'unknown';
+  if (TASK_READINESS_REASON_RENDERING[reason] === 'waiting') return 'waiting';
+  return isManualOnlyCadence(config) ? 'on-demand' : 'active';
+}
+
+export const statusDot = (group) => STATUS_GROUPS[group]?.dot || STATUS_GROUPS.disabled.dot;
+
+// Sort key for the card grid: group order first, then soonest next run, then name.
+// A task with no global cadence still has a next run when one of its apps pins
+// a cron, so fall back to that rather than sorting it last among Active.
+export function taskSortKey(taskType, config) {
+  const group = getTaskStatusGroup(config);
+  const nextIso = config?.status?.nextRunAt || summarizeAppSchedules(config?.appSchedules)?.nextRunAt;
+  const next = nextIso ? new Date(nextIso).getTime() : Infinity;
+  return { order: STATUS_GROUPS[group]?.order ?? 9, next: Number.isFinite(next) ? next : Infinity, taskType };
+}
+
+// The two card orderings the grid offers. "Status" is the long-standing
+// default; "Suggested order" answers "which of these do I run first?" using the
+// advisory `suggestedAfter` list each task carries.
+export const TASK_SORTS = [
+  { id: 'status', label: 'Status' },
+  { id: 'suggested-order', label: 'Suggested order' },
+];
+export const DEFAULT_SORT_ID = TASK_SORTS[0].id;
+
+/**
+ * Rank the tasks that PARTICIPATE in the advisory `suggestedAfter` graph into a
+ * 1-based step — one past the highest step among the predecessors present here.
+ *
+ * Derived on the client, over the tasks actually being shown, because the step
+ * is a property of the whole graph rather than of one task: a server-sent
+ * per-task number goes stale the instant any OTHER task's list is edited, and
+ * ranking server-side would also number a card whose step-1 predecessor is
+ * hidden by a disabled instance feature.
+ *
+ * A task nobody orders and that orders nothing gets NO step — it sits outside
+ * the sequence, and calling every unordered task "step 1" would drown the
+ * answer. Edges naming an absent task are ignored; a user-declared cycle simply
+ * stops improving once the pass budget runs out (nothing enforces these).
+ */
+export function suggestedOrderSteps(tasks) {
+  const entries = Object.entries(tasks || {});
+  const known = new Set(entries.map(([taskType]) => taskType));
+  const deps = new Map(entries.map(([taskType, config]) => [
+    taskType,
+    (Array.isArray(config?.suggestedAfter) ? config.suggestedAfter : []).filter(dep => dep !== taskType && known.has(dep)),
+  ]));
+  const participants = new Set([...deps].flatMap(([taskType, after]) => (after.length ? [taskType, ...after] : [])));
+
+  const steps = Object.fromEntries([...participants].map(taskType => [taskType, 1]));
+  let changed = true;
+  let passes = 0;
+  while (changed && passes <= participants.size) {
+    changed = false;
+    passes++;
+    for (const taskType of participants) {
+      const step = deps.get(taskType).reduce((max, dep) => Math.max(max, steps[dep] + 1), 1);
+      if (step !== steps[taskType]) {
+        steps[taskType] = step;
+        changed = true;
+      }
+    }
+  }
+  return steps;
+}
+
+// Comparator for the default "Status" view: group order, then soonest next run.
+export function compareByStatus([aType, aConfig], [bType, bConfig]) {
+  const a = taskSortKey(aType, aConfig);
+  const b = taskSortKey(bType, bConfig);
+  return a.order - b.order || a.next - b.next || a.taskType.localeCompare(b.taskType);
+}
+
+// Comparator for the "Suggested order" view, over a `suggestedOrderSteps` map.
+// Tasks OUTSIDE the advisory order sort last rather than first — they carry no
+// ordering claim, and putting them on top would bury the answer.
+export const compareBySuggestedOrder = (steps) => ([aType], [bType]) =>
+  (steps[aType] ?? Infinity) - (steps[bType] ?? Infinity) || aType.localeCompare(bType);
+
+// Tailwind tone for the per-task app-coverage bar/label (error none, success full, warning partial).
+export function coverageTone(enabled, total) {
+  if (enabled === 0) return { text: 'text-port-error', bar: 'bg-port-error' };
+  if (enabled === total) return { text: 'text-port-success', bar: 'bg-port-success' };
+  return { text: 'text-port-warning', bar: 'bg-port-warning' };
+}
+
+// Describe a task's "next run" line for the card: text + Tailwind tone, plus an
+// optional title and a `warn` flag for the dependency-wait icon. Pure so it can
+// be unit-tested without rendering.
+export function describeNextRun(config) {
+  const group = getTaskStatusGroup(config);
+  if (group === 'disabled') return { text: 'Paused', tone: 'text-gray-500' };
+  if (group === 'unknown') return { text: 'Unknown schedule state', tone: 'text-port-warning', warn: true };
+  if (group === 'waiting') {
+    const deps = config.status?.pendingDeps?.join(', ');
+    return {
+      text: `waiting on ${deps || 'dependencies'}`,
+      tone: 'text-port-warning',
+      warn: true,
+      title: deps ? `Waiting for: ${deps}` : undefined,
+    };
+  }
+  if (group === 'on-demand') return { text: 'Manual trigger only', tone: 'text-gray-400' };
+  if (config.perpetual) {
+    // Prefer the per-app park aggregate — claim-issue/claim-work park per-app, so
+    // the global status.reason reads 'perpetual-drain' even when all apps are parked.
+    const p = config.perpetualStatus;
+    if (p && (p.trackedAppCount > 0 || p.globalParked)) {
+      // "Parked" only when there's nothing left draining: a global park, or every
+      // tracked app parked. A partial park (some apps still have work) is draining.
+      const allParked = p.globalParked || (p.trackedAppCount > 0 && p.parkedAppCount === p.trackedAppCount);
+      if (allParked) {
+        const scope = p.trackedAppCount > 0 ? `${p.trackedAppCount} app(s) parked` : 'parked';
+        const skipSummary = formatSkipCauses(p.parkSkipCauses);
+        const skipSuffix = skipSummary ? ` — ${skipSummary}` : '';
+        return {
+          text: `${scope}${skipSuffix}${p.nextRecheckAt ? ` · rechecks ${timeUntil(p.nextRecheckAt, 'soon')}` : ' — no work'}`,
+          tone: 'text-gray-400',
+          title: p.parkReason ? `Parked: ${p.parkReason}${skipSuffix}` : skipSummary ? `Parked: ${skipSummary}` : undefined,
+        };
+      }
+      return { text: 'draining — runs back-to-back until done', tone: 'text-port-success' };
+    }
+    // Global (non-app) perpetual task: the global status.reason is accurate.
+    if (config.status?.reason === TASK_READINESS_REASON.PERPETUAL_PARKED) {
+      const next = config.status?.nextRunAt;
+      const skipSummary = formatSkipCauses(config.status?.parkSkipCauses);
+      const skipSuffix = skipSummary ? ` — ${skipSummary}` : '';
+      return {
+        text: `parked${skipSuffix}${next ? ` · rechecks ${timeUntil(next, 'soon')}` : ' — no work'}`,
+        tone: 'text-gray-400',
+        title: config.status?.parkReason ? `Parked: ${config.status.parkReason}${skipSuffix}` : skipSummary ? `Parked: ${skipSummary}` : undefined,
+      };
+    }
+    return { text: 'draining — runs back-to-back until done', tone: 'text-port-success' };
+  }
+  const perApp = summarizeAppSchedules(config.appSchedules);
+  // An app that pins its own cron runs on a different clock from this row, so
+  // the tooltip always names both rather than letting the row imply one.
+  const appSuffix = perApp ? `\nScheduled per app:\n${perApp.detail}` : '';
+  const next = config.status?.nextRunAt;
+  const cronDesc = config.type === 'cron' && config.cronExpression ? describeCron(config.cronExpression) : null;
+  // A task with no cadence of its own but a cron on one of its apps has a real
+  // next run — it just belongs to the app, not to this row. Saying "Manual
+  // trigger only" (what the on-demand group used to say) is simply wrong.
+  if (perApp && !cronDesc) {
+    return {
+      text: perApp.nextRunAt ? `${timeUntil(perApp.nextRunAt, 'soon')} · ${perApp.label}` : perApp.label,
+      tone: 'text-gray-300',
+      title: `On demand globally;${appSuffix}`,
+    };
+  }
+  const cronTitle = config.type === 'cron' && config.cronExpression
+    ? (cronDesc ? `${cronDesc} (${config.cronExpression})` : config.cronExpression)
+    : undefined;
+  return {
+    text: next
+      ? (cronDesc ? `${timeUntil(next, 'soon')} · ${cronDesc}` : timeUntil(next, 'soon'))
+      : `${cronDesc || INTERVAL_LABELS[config.type] || config.type} — pending`,
+    tone: 'text-gray-300',
+    title: `${cronTitle || ''}${appSuffix}`.trim() || undefined,
+  };
+}
+
+export const TASK_FILTERS = [
+  { id: 'all', label: 'All', emptyMessage: 'No tasks configured.', match: () => true },
+  { id: 'active', label: 'Active', emptyMessage: 'No active tasks.', match: ([, config]) => getTaskStatusGroup(config) === 'active' },
+  { id: 'on-demand', label: 'On-Demand', emptyMessage: 'No on-demand tasks.', match: ([, config]) => getTaskStatusGroup(config) === 'on-demand' },
+  { id: 'waiting', label: 'Waiting', emptyMessage: 'No tasks waiting on dependencies.', match: ([, config]) => getTaskStatusGroup(config) === 'waiting' },
+  { id: 'disabled', label: 'Disabled', emptyMessage: 'No disabled tasks.', match: ([, config]) => getTaskStatusGroup(config) === 'disabled' },
+  { id: 'unknown', label: 'Unknown', emptyMessage: 'No tasks with unknown status.', match: ([, config]) => getTaskStatusGroup(config) === 'unknown' },
+];
+export const DEFAULT_FILTER_ID = TASK_FILTERS[0].id;
+
+// Set or clear one per-app taskMetadata override key. '' is every override
+// select's "Inherit" option, and deletes the key so the global config decides
+// again; the server replaces taskMetadata wholesale, so the app's other override
+// keys ride along. Returns null once nothing is overridden, which is how a row
+// drops its override object entirely.
+export function setMetadataOverride(taskMetadata, field, value) {
+  const next = { ...(taskMetadata || {}) };
+  if (value === '') delete next[field];
+  else next[field] = value;
+  return Object.keys(next).length ? next : null;
+}
+
+// Toggle a global taskMetadata field, enforcing the openPR→useWorktree invariant.
+// Persists both true and false values so explicit overrides survive the server-side
+// merge with task-type defaults (e.g., feature-ideas defaults openPR to true).
+// Effective file-issues mode for an audit-capable task: an explicit stored
+// boolean wins, otherwise the catalog default the schedule status published.
+export function fileIssuesEffective(config, overrideMetadata) {
+  if (overrideMetadata?.fileIssues !== undefined) return overrideMetadata.fileIssues === true;
+  if (config?.taskMetadata?.fileIssues !== undefined) return config.taskMetadata.fileIssues === true;
+  return config?.defaultFileIssues === true;
+}
+
+// When file-issues is on, worktree/PR/simplify are meaningless — the UI treats
+// them as managed so the user cannot turn them on under that mode.
+export const FILE_ISSUES_MANAGED_FIELDS = ['useWorktree', 'openPR', 'simplify'];
+
+export function managedAgentOptionsFor(config, overrideMetadata) {
+  const managed = [...(config?.managedAgentOptions || [])];
+  const fileIssues = fileIssuesEffective(config, overrideMetadata);
+  if (config?.fileIssuesCapable && fileIssues) {
+    for (const field of FILE_ISSUES_MANAGED_FIELDS) {
+      if (!managed.includes(field)) managed.push(field);
+    }
+  }
+  if (config?.doWorkRequiresWorktree && !fileIssues && !managed.includes('useWorktree')) {
+    managed.push('useWorktree');
+  }
+  return managed;
+}
+
+export function toggleFileIssuesMetadata(metadata, next, doWorkRequiresWorktree = false) {
+  const taskMetadata = { ...(metadata || {}), fileIssues: next };
+  if (next) {
+    taskMetadata.useWorktree = false;
+    taskMetadata.openPR = false;
+    taskMetadata.simplify = false;
+  } else if (doWorkRequiresWorktree) {
+    taskMetadata.useWorktree = true;
+  }
+  return taskMetadata;
+}
+
+export function toggleMetadataField(metadata, field) {
+  const current = metadata || {};
+  const newMeta = { ...current, [field]: !current[field] };
+  // openPR requires useWorktree
+  if (newMeta.openPR && !newMeta.useWorktree) {
+    newMeta.useWorktree = true;
+  }
+  // useWorktree off means openPR must be off
+  if (newMeta.useWorktree === false && newMeta.openPR) {
+    newMeta.openPR = false;
+  }
+  return newMeta;
+}
+
+// Shipped clusters remain discoverable alongside the operator's own labels.
+export const taskLabels = config => [...new Set([...(config.defaultLabels || []), ...(config.labels || [])])];

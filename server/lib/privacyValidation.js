@@ -1,0 +1,428 @@
+import { z } from 'zod';
+import { isSafeHref } from './isSafeHref.js';
+
+// Reject non-http(s) schemes (`javascript:`/`data:`/etc.) on a URL field while
+// preserving the field's existing empty/absent handling — an empty string or
+// undefined value was allowed before and must stay allowed here; only a
+// non-empty, non-http(s) value is a new rejection.
+const safeUrlRefine = (val) => !val || isSafeHref(val);
+const SAFE_URL_MESSAGE = 'must be an http(s) URL';
+
+// =============================================================================
+// PRIVACY CENTER SCHEMAS (issue #2140, epic #2138)
+// =============================================================================
+// Zod schemas for the encrypted PII Vault. Records are db-primary Postgres
+// (`privacy_vault_records` / `privacy_consents`), machine-local (federation is
+// a deferred child issue). validation.js re-exports everything here so deep
+// imports keep working; the lib barrel also namespace-exports this module as
+// `privacyValidation`.
+
+// =============================================================================
+// HOUSEHOLD SUBJECTS (issue #3658)
+// =============================================================================
+// The Privacy Center works on behalf of one or more consenting people. `self`
+// is a seeded row at a FIXED uuid so the DDL (server/lib/db/schema/privacy.js),
+// the fresh-install seed (server/scripts/init-db.sql), and the services all
+// name the same row without a lookup — change all three or none.
+export const PRIVACY_SELF_SUBJECT_ID = '00000000-0000-4000-8000-000000000001';
+
+export const PRIVACY_SUBJECT_RELATIONSHIPS = Object.freeze([
+  'self', 'partner', 'child', 'parent', 'dependent', 'other',
+]);
+
+// How a subject's consent was captured. Carried verbatim from unbroker's
+// no-consent-no-action rule: the engine refuses to scan or submit for a subject
+// without an active consent row of that purpose's scope, so this is an audit
+// fact, not a UI label.
+export const PRIVACY_CONSENT_METHODS = Object.freeze([
+  'self', 'verbal', 'written', 'signed_form', 'guardian', 'power_of_attorney', 'other',
+]);
+
+// Scope (purpose) of a consent row (#8332). Each purpose is granted and gated
+// independently — a grant for one NEVER implies another:
+//   - `pii_vault`     — local-only storage in the encrypted vault. Written at
+//                       subject creation / first vault record. Discloses nothing.
+//   - `broker_scan`   — the read-only exposure scan: scan-eligible identity
+//                       values fill external broker search URLs.
+//   - `broker_optout` — the removal workflow: opt-out emails / web forms that
+//                       SEND name, email, phone, city/state (and DOB when a
+//                       broker requires it) to the broker, plus the verification
+//                       re-probes of those brokers.
+// The engine requires an ACTIVE (unrevoked) row of the EXACT scope before each
+// purpose's work. Existing `pii_vault` rows stay local-only — never widened.
+export const PRIVACY_CONSENT_SCOPES = Object.freeze(['pii_vault', 'broker_scan', 'broker_optout']);
+
+// The external-disclosure purposes — the only scopes that can be revoked
+// without deleting the subject. Revoking `pii_vault` (local storage) still
+// means deleting the subject, which hard-deletes their records.
+export const PRIVACY_BROKER_CONSENT_SCOPES = Object.freeze(['broker_scan', 'broker_optout']);
+
+// A subject reference on an existing input/query. Optional everywhere — omitted
+// means `self`, so every pre-#3658 client keeps working unchanged.
+const subjectIdField = { subjectId: z.string().uuid().optional() };
+
+// The bare subject-scope query (`?subjectId=`) shared by every read endpoint
+// that carries no other filter — status readouts, the change list, the digest.
+export const privacySubjectScopeQuerySchema = z.object({
+  subjectId: z.string().uuid().optional(),
+  limit: z.string().optional(),
+  offset: z.string().optional(),
+}).strict();
+
+export const privacySubjectCreateSchema = z.object({
+  displayName: z.string().trim().min(1).max(200),
+  relationship: z.enum(PRIVACY_SUBJECT_RELATIONSHIPS).optional(),
+  // REQUIRED: a household member may not exist in the vault without a recorded
+  // consent method. The service writes the consent row in the same transaction.
+  consentMethod: z.enum(PRIVACY_CONSENT_METHODS),
+  consentNote: z.string().max(2000).optional(),
+}).strict();
+
+export const privacySubjectUpdateSchema = z.object({
+  displayName: z.string().trim().min(1).max(200).optional(),
+  relationship: z.enum(PRIVACY_SUBJECT_RELATIONSHIPS).optional(),
+}).strict();
+
+export const privacySubjectIdParamsSchema = z.object({
+  id: z.string().uuid(),
+}).strict();
+
+// POST /api/privacy/subjects/:id/consents — record a further consent (e.g. the
+// subject agreed to broker opt-outs after being added for vault records only).
+export const privacySubjectConsentSchema = z.object({
+  scope: z.enum(PRIVACY_CONSENT_SCOPES).optional(),
+  method: z.enum(PRIVACY_CONSENT_METHODS),
+  note: z.string().max(2000).optional(),
+}).strict();
+
+// POST /api/privacy/subjects/:id/consents/revoke — withdraw one broker-processing
+// purpose. Timestamps the active grant rows (audit trail kept); the subject and
+// their vault records are untouched (#8332).
+export const privacySubjectConsentRevokeSchema = z.object({
+  scope: z.enum(PRIVACY_BROKER_CONSENT_SCOPES),
+}).strict();
+
+export const PRIVACY_VAULT_TYPES = Object.freeze([
+  'legal_name', 'address', 'phone', 'email', 'dob',
+  'ssn', 'passport', 'drivers_license', 'financial_account', 'custom',
+]);
+
+// Types that may NEVER be used for broker scans — `use_for_scans: true` is
+// rejected at the API AND hard-forced false in the service (defense in depth).
+// Disclosing these to a data broker's search form is never least-disclosure.
+export const PRIVACY_SENSITIVE_TYPES = Object.freeze([
+  'ssn', 'passport', 'drivers_license', 'financial_account',
+]);
+
+// Types whose `use_for_scans` DEFAULTS to true (broker scans need name /
+// contact facts to find listings). Everything else defaults false.
+export const PRIVACY_SCAN_DEFAULT_TYPES = Object.freeze([
+  'legal_name', 'email', 'phone', 'address',
+]);
+
+export const PRIVACY_VAULT_STATUSES = Object.freeze(['current', 'previous']);
+
+// ISO calendar date (DATE column) — nullable to clear.
+const isoDateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'expected YYYY-MM-DD').nullable().optional();
+
+// Opt-in pagination query params (?limit=&offset=) spread into the .strict()
+// list-query schemas below so the paginateArray envelope can be requested
+// without the strict guard rejecting the keys. Kept as passthrough strings —
+// parsePagination (validation.js) does the parseInt + clamp, so garbage falls
+// back to the default page rather than 400-ing. Defined locally (not imported
+// from validation.js) to avoid a circular import: validation.js re-exports this
+// module. Mirror any change into validation.js's parsePagination contract.
+const paginationQueryFields = {
+  limit: z.string().optional(),
+  offset: z.string().optional(),
+};
+
+const rejectSensitiveScans = (val, ctx) => {
+  if (val.useForScans === true && PRIVACY_SENSITIVE_TYPES.includes(val.type)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['useForScans'],
+      message: `useForScans cannot be true for sensitive type "${val.type}"`,
+    });
+  }
+};
+
+export const privacyVaultCreateSchema = z.object({
+  type: z.enum(PRIVACY_VAULT_TYPES),
+  label: z.string().trim().min(1).max(200),
+  value: z.string().min(1).max(10000),
+  status: z.enum(PRIVACY_VAULT_STATUSES).optional(),
+  validFrom: isoDateSchema,
+  validTo: isoDateSchema,
+  shareWithTwin: z.boolean().optional(),
+  useForScans: z.boolean().optional(),
+  notes: z.string().max(5000).optional(),
+  ...subjectIdField,
+}).strict().superRefine(rejectSensitiveScans);
+
+// PUT is a partial update. `type` is immutable (it drives masking + scan
+// defaults; changing a record's type is a delete + re-create). The sensitive
+// use_for_scans hard-false is re-enforced in the service against the STORED
+// type, since the schema can't see it here.
+export const privacyVaultUpdateSchema = z.object({
+  label: z.string().trim().min(1).max(200).optional(),
+  value: z.string().min(1).max(10000).optional(),
+  status: z.enum(PRIVACY_VAULT_STATUSES).optional(),
+  validFrom: isoDateSchema,
+  validTo: isoDateSchema,
+  shareWithTwin: z.boolean().optional(),
+  useForScans: z.boolean().optional(),
+  notes: z.string().max(5000).optional(),
+}).strict();
+
+export const privacyVaultListQuerySchema = z.object({
+  type: z.enum(PRIVACY_VAULT_TYPES).optional(),
+  ...subjectIdField,
+  ...paginationQueryFields,
+}).strict();
+
+export const privacyVaultIdParamsSchema = z.object({
+  id: z.string().uuid(),
+}).strict();
+
+// =============================================================================
+// TRUSTED ORGANIZATIONS REGISTRY SCHEMAS (issue #2141, epic #2138)
+// =============================================================================
+// Zod schemas for `privacy_orgs` / `privacy_org_holdings` — db-primary Postgres,
+// machine-local and NEVER federated (same guarantee as the vault — ADR
+// docs/decisions/2026-08-08-privacy-records-machine-local.md, #2148).
+
+export const PRIVACY_ORG_CATEGORIES = Object.freeze([
+  'bank', 'utility', 'government', 'employer', 'subscription',
+  'medical', 'insurance', 'platform', 'broker', 'other',
+]);
+
+export const PRIVACY_ORG_TRUST_LEVELS = Object.freeze(['trusted', 'tolerated', 'unwanted']);
+
+export const PRIVACY_ORG_STATUSES = Object.freeze(['active', 'closed', 'opted_out']);
+
+export const PRIVACY_ORG_HOLDING_STATUSES = Object.freeze([
+  'current', 'update_pending', 'updated', 'removed', 'unknown',
+]);
+
+const privacyOrgContactSchema = z.object({
+  email: z.string().max(320).optional(),
+  phone: z.string().max(64).optional(),
+  portalUrl: z.string().max(2000).optional().refine(safeUrlRefine, SAFE_URL_MESSAGE),
+  mailingAddress: z.string().max(2000).optional(),
+}).strict();
+
+export const privacyOrgCreateSchema = z.object({
+  name: z.string().trim().min(1).max(200),
+  category: z.enum(PRIVACY_ORG_CATEGORIES).optional(),
+  website: z.string().max(2000).optional().refine(safeUrlRefine, SAFE_URL_MESSAGE),
+  trust: z.enum(PRIVACY_ORG_TRUST_LEVELS).optional(),
+  status: z.enum(PRIVACY_ORG_STATUSES).optional(),
+  contact: privacyOrgContactSchema.optional(),
+  socialAccountId: z.string().max(200).nullable().optional(),
+  notes: z.string().max(5000).optional(),
+  ...subjectIdField,
+}).strict();
+
+// PUT is a partial update — every field optional, same shape otherwise.
+export const privacyOrgUpdateSchema = z.object({
+  name: z.string().trim().min(1).max(200).optional(),
+  category: z.enum(PRIVACY_ORG_CATEGORIES).optional(),
+  website: z.string().max(2000).optional().refine(safeUrlRefine, SAFE_URL_MESSAGE),
+  trust: z.enum(PRIVACY_ORG_TRUST_LEVELS).optional(),
+  status: z.enum(PRIVACY_ORG_STATUSES).optional(),
+  contact: privacyOrgContactSchema.optional(),
+  socialAccountId: z.string().max(200).nullable().optional(),
+  notes: z.string().max(5000).optional(),
+}).strict();
+
+export const privacyOrgListQuerySchema = z.object({
+  trust: z.enum(PRIVACY_ORG_TRUST_LEVELS).optional(),
+  status: z.enum(PRIVACY_ORG_STATUSES).optional(),
+  category: z.enum(PRIVACY_ORG_CATEGORIES).optional(),
+  ...subjectIdField,
+  ...paginationQueryFields,
+}).strict();
+
+export const privacyOrgIdParamsSchema = z.object({
+  id: z.string().uuid(),
+}).strict();
+
+// PUT /api/privacy/orgs/:id/holdings — replace-set semantics: body is the
+// full list of vault record ids (+ optional status) this org holds. An empty
+// array clears all holdings for the org.
+export const privacyOrgHoldingsSetSchema = z.object({
+  holdings: z.array(z.object({
+    vaultRecordId: z.string().uuid(),
+    status: z.enum(PRIVACY_ORG_HOLDING_STATUSES).optional(),
+  }).strict()).max(500),
+}).strict();
+
+// =============================================================================
+// CHANGE-OF-ADDRESS EVENTS + INVENTORY SCHEMAS (issue #2143, epic #2138)
+// =============================================================================
+// Zod schemas for `privacy_change_events` — db-primary Postgres, machine-local
+// and NEVER federated (same guarantee as the vault — ADR
+// docs/decisions/2026-08-08-privacy-records-machine-local.md, #2148). Declaring a change flips
+// every `current` holding of the old vault record to `update_pending`; the
+// Changes tab then works that per-org checklist.
+
+export const PRIVACY_CHANGE_KINDS = Object.freeze([
+  'address_change', 'phone_change', 'email_change', 'name_change', 'other',
+]);
+
+// The replacement value can be supplied inline (a brand-new vault record is
+// created for it) — the same shape as a vault create MINUS status (always
+// 'current') and validTo (an active replacement has no end date yet). `type`
+// defaults to the OLD record's type in the service when omitted.
+const privacyChangeReplacementSchema = z.object({
+  type: z.enum(PRIVACY_VAULT_TYPES).optional(),
+  label: z.string().trim().min(1).max(200),
+  value: z.string().min(1).max(10000),
+  validFrom: isoDateSchema,
+  shareWithTwin: z.boolean().optional(),
+  useForScans: z.boolean().optional(),
+  notes: z.string().max(5000).optional(),
+}).strict();
+
+// POST /api/privacy/changes — declare a change. Supply the replacement EITHER
+// inline (`replacement`) OR by id (`replacementRecordId`), never both; omit both
+// for a removal-only change (the field went away with no successor). `kind`
+// defaults in the service from the old record's type when omitted.
+export const privacyChangeDeclareSchema = z.object({
+  vaultRecordId: z.string().uuid(),
+  replacement: privacyChangeReplacementSchema.optional(),
+  replacementRecordId: z.string().uuid().optional(),
+  kind: z.enum(PRIVACY_CHANGE_KINDS).optional(),
+  note: z.string().max(5000).optional(),
+}).strict().refine(
+  (v) => !(v.replacement && v.replacementRecordId),
+  { message: 'provide either replacement or replacementRecordId, not both', path: ['replacement'] },
+);
+
+// GET /api/privacy/changes?subjectId= — a change event inherits its subject from
+// the OLD vault record, so there is no subjectId on the DECLARE body; it only
+// filters the list.
+export const privacyChangeListQuerySchema = privacySubjectScopeQuerySchema;
+
+export const privacyChangeIdParamsSchema = z.object({
+  id: z.string().uuid(),
+}).strict();
+
+export const privacyChangeOrgParamsSchema = z.object({
+  id: z.string().uuid(),
+  orgId: z.string().uuid(),
+}).strict();
+
+// =============================================================================
+// DATA-BROKER DATABASE + CASE LEDGER SCHEMAS (issue #2144, epic #2138)
+// =============================================================================
+// Zod schemas for `privacy_brokers` / `privacy_broker_cases` — db-primary
+// Postgres, machine-local and NEVER federated (same guarantee as the vault —
+// ADR docs/decisions/2026-08-08-privacy-records-machine-local.md, #2148).
+// The broker rows themselves are curated seed / auto-refresh, not user-created,
+// so there is no broker create/update input schema — only read filters and the
+// scan/refresh action bodies.
+
+export const PRIVACY_BROKER_CASE_STATES = Object.freeze([
+  'unscanned',
+  'found', 'not_found', 'indirect_exposure', 'blocked',
+  'optout_in_progress', 'submitted', 'verification_pending', 'awaiting_processing',
+  'confirmed_removed', 'human_task_queued', 'reappeared',
+]);
+
+// GET /api/privacy/brokers?enabled=true — z.coerce so the string query "true"/
+// "false" becomes a boolean (matches the storage of the enabled column).
+export const privacyBrokerListQuerySchema = z.object({
+  enabled: z.preprocess(
+    (v) => (v === undefined ? undefined : v === 'true' || v === true),
+    z.boolean().optional(),
+  ),
+  ...paginationQueryFields,
+}).strict();
+
+// GET /api/privacy/broker-cases?state=found
+export const privacyBrokerCaseListQuerySchema = z.object({
+  state: z.enum(PRIVACY_BROKER_CASE_STATES).optional(),
+  ...subjectIdField,
+  ...paginationQueryFields,
+}).strict();
+
+// POST /api/privacy/brokers/refresh — no body; empty object.
+export const privacyBrokerRefreshSchema = z.object({}).strict();
+
+// PUT /api/privacy/brokers/:id — broker ids are slugs (curated) or `ca-`/badbool
+// tokens (auto), NOT uuids. Only the `enabled` toggle is user-writable — the
+// rest of a broker row is curated seed / auto-refresh, never user-edited (#2146).
+export const privacyBrokerIdParamsSchema = z.object({
+  id: z.string().min(1).max(128),
+}).strict();
+
+export const privacyBrokerUpdateSchema = z.object({
+  enabled: z.boolean(),
+}).strict();
+
+// Case-id path param (a uuid) — force-recheck + manual transition controls.
+export const privacyCaseIdParamsSchema = z.object({
+  id: z.string().uuid(),
+}).strict();
+
+// POST /api/privacy/broker-cases/:id/transition — manual case controls from the
+// digest / case drawer. Only the human-reachable targets are exposed here; the
+// verification-only targets (`confirmed_removed`, `reappeared`) are NOT — they
+// stay reachable ONLY from a verifying re-scan inside the engine. The service's
+// assertTransition still enforces the full state machine on top of this.
+export const PRIVACY_MANUAL_CASE_TARGETS = Object.freeze([
+  // `found` backs the blocked-case "I'm listed" manual verdict (the user
+  // checked the broker in their own browser past the bot wall).
+  'submitted', 'not_found', 'found', 'human_task_queued', 'optout_in_progress', 'blocked',
+]);
+export const privacyCaseTransitionSchema = z.object({
+  toState: z.enum(PRIVACY_MANUAL_CASE_TARGETS),
+  reason: z.string().max(2000).optional(),
+}).strict();
+
+// POST /api/privacy/scan — optional concurrency knob.
+export const privacyScanStartSchema = z.object({
+  concurrency: z.number().int().min(1).max(6).optional(),
+  ...subjectIdField,
+}).strict();
+
+// =============================================================================
+// OPT-OUT AUTOMATION ENGINE SCHEMAS (issue #2145, epic #2138)
+// =============================================================================
+// Zod schemas for the opt-out run/verify actions + the user-configured recheck
+// settings slice (`settings.privacy.recheck`). The engine reads its submission
+// autonomy (auto-approve emails / auto-submit web forms) from that slice —
+// BOTH default OFF (a fresh install never auto-sends or auto-submits anything).
+
+// POST /api/privacy/optout — run one opt-out pass. `runVerification` (default
+// true) folds the verification poll into the same pass.
+export const privacyOptOutPassSchema = z.object({
+  runVerification: z.boolean().optional(),
+  ...subjectIdField,
+}).strict();
+
+// POST /api/privacy/optout/verify — run only the verification pass. No body.
+export const privacyOptOutVerifySchema = z.object({ ...subjectIdField }).strict();
+
+// A basic 5-field cron expression validator (minute hour dom month dow). Kept
+// permissive (tokens can be `*`, numbers, ranges, lists, steps) — the scheduler
+// library does the strict parse; this just rejects obvious garbage before disk.
+const cronExpressionSchema = z.string().trim().min(1).max(120).regex(
+  /^(\S+\s+){4}\S+$/, 'expected a 5-field cron expression',
+);
+
+// The `privacy.recheck` settings slice. Validated by PUT /api/settings when the
+// `privacy` key is present (partial). Everything OFF/absent by default.
+export const privacyRecheckConfigSchema = z.object({
+  enabled: z.boolean().optional(),
+  cronExpression: cronExpressionSchema.optional(),
+  autoApproveOptOutEmails: z.boolean().optional(),
+  autoSubmitWebForms: z.boolean().optional(),
+}).strict();
+
+// The `privacy` settings slice (only `recheck` for now — room to grow).
+export const privacySettingsSchema = z.object({
+  recheck: privacyRecheckConfigSchema.optional(),
+}).strict();

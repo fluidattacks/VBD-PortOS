@@ -1,0 +1,594 @@
+import { maintenance } from '../../lib/maintenanceAdmission.js';
+import { withBackupAssetPublication } from '../../lib/backupSnapshotBoundary.js';
+/**
+ * Image-to-3D model orchestration (issue #2952) — gallery-image lineage, target
+ * dispatch, guarded local render, persistence, and GLB export.
+ *
+ * This is the record/create/generate layer that sits on top of the pluggable
+ * target registry (`targets.js`) and the TRELLIS.2 runner (`trellis2.js`). It
+ * mirrors the role `threejsModels/index.js` plays for procedural models, but the
+ * inference is a LOCAL on-device render (no AI provider) landing a real `.glb`
+ * mesh on disk rather than an LLM-authored scene spec.
+ *
+ * The render NEVER auto-runs: it is only reached from an explicit user create /
+ * generate request, and it is gated on the target being installed + runnable on
+ * this host (AGENTS.md no-cold-bootstrap AI policy + the host's sensitivity to
+ * sustained GPU load). Adding a second target is a registration in `adapters.js`,
+ * not a rewrite here.
+ */
+
+import { randomUUID } from 'crypto';
+import { join } from 'node:path';
+import { access } from 'node:fs/promises';
+import { ServerError } from '../../lib/errorHandler.js';
+import { PATHS, resolveGalleryImage, ensureDir, rmGuarded, writeFileGuarded } from '../../lib/fileUtils.js';
+import { claimHeavyLocalJob } from '../../lib/heavyJobClaim.js';
+import { noteSystemActivity } from '../systemActivityNotify.js';
+
+// One heavy render occupies the generating set. Leaving it (ready, failed, or
+// canceled) drains that set; the client re-reads rather than trusting the phase.
+function noteImageTo3d(phase) {
+  noteSystemActivity('imageTo3d', phase);
+  if (phase !== 'start') noteSystemActivity('imageTo3d', 'drained');
+}
+import { prepareLocalMemory, gpuBlockersMessage } from '../localMemory.js';
+import { slugifyForFilename } from '../../lib/civitai.js';
+import {
+  detectHostCapabilities, resolveTarget, renderOptionSupportFor, DEFAULT_IMAGE_TO_3D_TARGET,
+} from './targets.js';
+import { getTargetAdapter } from './adapters.js';
+import {
+  normalizeRenderOptions, randomRenderSeed, honorTargetRenderSupport,
+} from './renderOptions.js';
+import { prepareSourceImage } from './sourceKeying.js';
+import * as store from './db.js';
+
+const MAX_RUNS = 30;
+const activeOperations = new Set();
+// operationId → the runner's SIGTERM handle for an in-flight render, so deleting a
+// record mid-render can terminate its subprocess promptly. Populated when the render
+// spawns (executeRender) and drained in its `finally`.
+const activeRenders = new Map();
+
+/** Injectable existence probe — `access` resolves/rejects rather than returning. */
+const pathExists = (p) => access(p).then(() => true, () => false);
+
+const trimRuns = (runs) => runs.slice(-MAX_RUNS);
+const cleanError = (error) => String(error?.message || error || 'Render failed').slice(0, 2_000);
+
+/** The served URL for a record's exported GLB (static-mounted under /data). */
+const assetUrl = (id) => `/data/image-to-3d/${id}/model.glb`;
+/** A record's render directory on disk. */
+const recordDir = (id) => join(PATHS.imageTo3d, id);
+/** The on-disk destination the runner writes the GLB to. */
+const assetDiskPath = (id) => join(recordDir(id), 'model.glb');
+/**
+ * The full-resolution mesh `generate.py` writes alongside the GLB.
+ *
+ * This is the decoder's mesh BEFORE the bake-time decimation — 22.7M faces on a
+ * `1024_cascade` render where the GLB carries ~1M — so it is the only place the
+ * discarded detail still exists. It is plain `v`/`f` OBJ: no UVs, no normals, no
+ * material, and often several hundred MB. That is why it is a separate download
+ * rather than the served asset: the 3D page has to load something a browser can
+ * actually render.
+ */
+const fullMeshDiskPath = (id) => join(recordDir(id), 'model.obj');
+/** Where a background-keyed copy of the source lands (never the gallery file). */
+// The prepared (keyed and/or subject-framed) copy of the source. Filename retained
+// from when keying was the only preparation step, so upgrading an install doesn't
+// strand an orphan beside the new one in every existing record directory.
+const preparedSourcePath = (id) => join(recordDir(id), 'source-keyed.png');
+
+/**
+ * The value stored on `record.usdzPath` once an AR export exists — the static
+ * `/data` mount's path for it, and the record's "has been exported" marker.
+ * `null` (or, on records predating this feature, ABSENT — readers must treat the
+ * two the same, exactly like `rig`) means nobody has exported it yet.
+ *
+ * The 3D page still points its AR anchor at `GET /api/image-to-3d/models/:id/usdz`
+ * rather than at this path: AR Quick Look needs `model/vnd.usdz+zip` served
+ * `inline`, and only that route guarantees the pair.
+ */
+const usdzUrl = (id) => `/data/image-to-3d/${id}/model.usdz`;
+/**
+ * The AR Quick Look artifact, exported by the viewer from the SAME `model.glb`
+ * the 3D page loads and stored beside it.
+ *
+ * Deliberately NOT in backup's DEFAULT_EXCLUDES: it is a few megabytes (the
+ * viewer-grade GLB with 1024px textures, not the gigabyte `model.obj` sidecar),
+ * and re-deriving it needs a browser session with the model open — so it is
+ * cheaper to keep than to reproduce, exactly like the published `rig/` pair.
+ */
+const usdzDiskPath = (id) => join(recordDir(id), 'model.usdz');
+
+/**
+ * Remove a record's render directory (the exported GLB + its folder). Used to
+ * clean the orphaned mesh a killed/deleted render may have left on disk. `force`
+ * makes an absent path a no-op ("if written"), so this is safe to call whether or
+ * not the render got far enough to emit a file.
+ */
+async function cleanupRenderDir(id) {
+  await rmGuarded(recordDir(id), { recursive: true, force: true })
+    .catch((err) => { maintenance.markCurrentUnsettled(); console.error(`❌ Image-to-3D cleanup failed for ${id}: ${err.message}`); });
+}
+
+/**
+ * Best-effort patch of one run entry (progress-class writes). Guarded on the
+ * operation still owning the record, fire-and-forget — a lost frame must never
+ * fail or stall a render.
+ */
+function patchRun(id, operationId, patch) {
+  void store.mutateModel(id, (current) => {
+    if (current.generationOperationId !== operationId) return null;
+    return { ...current, runs: updateRun(current.runs, operationId, patch) };
+  }).catch(() => {});
+}
+
+/**
+ * Verify a target can actually run on this host right now — unknown target →
+ * 400, hardware-unsupported → 409 (reason surfaced), not-installed → 409 so the
+ * UI can open the install flow. Returns the resolved adapter. Pure w.r.t. the DB;
+ * `caps` is injected so the check is deterministic.
+ */
+function assertTargetReady(targetId, caps) {
+  const { target, available, reason } = resolveTarget(targetId, caps);
+  if (!target) {
+    throw new ServerError(`Unknown image-to-3D target: ${targetId}`, { status: 400, code: 'UNKNOWN_TARGET' });
+  }
+  if (!available) {
+    throw new ServerError(
+      `This host cannot run ${target.label} (${reason}).`,
+      { status: 409, code: 'TARGET_UNAVAILABLE', context: { reason } },
+    );
+  }
+  const adapter = getTargetAdapter(targetId);
+  if (!adapter) {
+    throw new ServerError(`Target ${target.label} has no runner wired`, { status: 501, code: 'TARGET_NO_RUNNER' });
+  }
+  if (!adapter.isInstalled()) {
+    throw new ServerError(
+      `${target.label} is not installed. Install it before generating.`,
+      { status: 409, code: 'TARGET_NOT_INSTALLED' },
+    );
+  }
+  return adapter;
+}
+
+function updateRun(runs, operationId, patch) {
+  return trimRuns((Array.isArray(runs) ? runs : []).map((run) => (
+    run.operationId === operationId ? { ...run, ...patch } : run
+  )));
+}
+
+async function failGeneration(id, operationId, error) {
+  const message = cleanError(error);
+  // includeDeleted so a record the user deleted mid-render resolves (rather than
+  // throwing NOT_FOUND → a spurious "failure could not be persisted" log); the
+  // `deleted` guard then no-ops the write — the delete already recorded the intent.
+  const updated = await store.mutateModel(id, (current) => {
+    if (current.deleted || current.generationOperationId !== operationId) return null;
+    return {
+      ...current,
+      status: 'failed',
+      error: message,
+      generationOperationId: null,
+      runs: updateRun(current.runs, operationId, {
+        status: 'failed',
+        error: message,
+        completedAt: new Date().toISOString(),
+      }),
+    };
+  }, { includeDeleted: true }).catch((persistError) => {
+    maintenance.markCurrentUnsettled();
+    console.error(`❌ Image-to-3D model ${id} failure could not be persisted: ${persistError.message}`);
+    return null;
+  });
+  // A deleted record no-ops the write (delete already noted cancellation).
+  // A failed persist stays unnoted: the reconnect read must not be told the
+  // build ended when the row may still say generating.
+  if (updated && !updated.deleted && updated.status === 'failed') noteImageTo3d('failure');
+}
+
+async function executeRender({ id, operationId, adapter, sourcePath, caps, options }) {
+  const outputPath = assetDiskPath(id);
+  // keyBackground and subjectScale are consumed here (they preprocess the SOURCE,
+  // and no runner takes them); the sampler knobs ride through to the adapter as-is,
+  // so a future knob added to the options shape flows without touching this call
+  // chain.
+  const { keyBackground, subjectScale, ...samplerOptions } = options;
+  let lastPersistedPercent = -1;
+  let heavyClaim = null;
+  try {
+    await ensureDir(recordDir(id));
+    // Preprocess the source (into THIS record's render dir — the shared gallery file
+    // is never touched): key a solid background out, and/or centre the subject on a
+    // square canvas so its extremities get margin. Both opt-in — keying because
+    // handing the pipeline an alpha channel makes it consume that INSTEAD OF running
+    // its own learned matte, framing because resampling a source that is already
+    // well-framed only costs detail. See sourceKeying.js. Runs BEFORE the heavy-job
+    // claim: it is CPU-only preprocessing, so other heavy jobs shouldn't queue behind
+    // it and resident models shouldn't be evicted for it. Best-effort: a preparation
+    // failure must never fail a render the model could still attempt raw.
+    const needsPreparedSource = keyBackground || subjectScale < 1;
+    const prepared = needsPreparedSource
+      ? await prepareSourceImage({
+        sourcePath, targetPath: preparedSourcePath(id), keyBackground, subjectScale,
+      })
+        .catch((err) => {
+          console.error(`❌ Image-to-3D source preparation failed for ${id}: ${err.message}`);
+          return null;
+        })
+      : null;
+    if (prepared?.keyed) console.log(`🎨 Image-to-3D keyed a solid background for ${id}`);
+    if (prepared?.framed) console.log(`🖼️ Image-to-3D framed ${id} at ${subjectScale} of the canvas`);
+    // Record what the render actually consumed (best-effort, like percent below).
+    patchRun(id, operationId, {
+      sourceKeyed: Boolean(prepared?.keyed),
+      sourceFramed: Boolean(prepared?.framed),
+    });
+    heavyClaim = await claimHeavyLocalJob({ kind: 'image-to-3D generation', id: operationId });
+    if (!heavyClaim.ok) {
+      throw new ServerError(heavyClaim.message, { status: 409, code: 'HEAVY_LOCAL_JOB_BUSY', context: { holder: heavyClaim.holder } });
+    }
+    const memoryReport = await prepareLocalMemory();
+    // A GPU tenant the unload path cannot evict (today: the vLLM Qwen container)
+    // makes this render unwinnable — refuse before the model load rather than
+    // after minutes of it, with the prose that names the stop command.
+    if (memoryReport.blockers.length) {
+      throw new ServerError(gpuBlockersMessage(memoryReport.blockers), { status: 409, code: 'GPU_BLOCKED', context: { blockers: memoryReport.blockers } });
+    }
+    if (memoryReport.unloaded.length) console.log(`🧹 Image-to-3D render freed ${memoryReport.unloaded.length} resident model(s)`);
+    // Resolve this target's own credential/env needs via its adapter (e.g.
+    // TRELLIS.2 resolves the stored Hugging Face token) — omitted for a target
+    // with nothing to resolve. Resolving HERE (an async caller) keeps `run`
+    // synchronous so its { promise, kill } contract holds.
+    const env = adapter.resolveEnv ? await adapter.resolveEnv() : undefined;
+    // The runner returns a { promise, kill } pair (see runTrellis2Generate) — retain
+    // the kill handle so deleteModel can SIGTERM this render if the record is deleted
+    // mid-flight.
+    const { promise, kill } = adapter.run({
+      imagePath: prepared?.path ?? sourcePath,
+      outputPath,
+      env,
+      // The per-run sampler knobs resolved in beginRender: `seed` is always a
+      // concrete integer (pinned or freshly rolled), `steps: null` means the
+      // pipeline default.
+      ...samplerOptions,
+      // The host capabilities resolved at the request boundary, passed down rather
+      // than re-probed: a target whose output budget scales with the hardware (the
+      // CUDA lane's atlas size, keyed on VRAM) reads the same values the readiness
+      // gate used, instead of reaching for a module-global snapshot that an injected
+      // `caps` would leave unset.
+      caps,
+      onProgress: (frame) => {
+        // Sparse, low-frequency render progress — persist only when the whole
+        // percent actually advances so a chatty parser can't hot-write the row.
+        const percent = Number.isFinite(frame?.percent) ? Math.round(frame.percent) : null;
+        if (percent === null || percent <= lastPersistedPercent) return;
+        lastPersistedPercent = percent;
+        patchRun(id, operationId, { percent });
+      },
+    });
+    activeRenders.set(operationId, kill);
+    // Close the pre-registration window: if the record was deleted between
+    // beginRender flipping it to `generating` and this point (deleteModel's kill
+    // lookup found no handle yet and took its dir-cleanup branch), terminate the
+    // render we just spawned so it doesn't run to completion on a deleted record.
+    const preDeleted = await store.getModel(id, { includeDeleted: true }).catch(() => null);
+    if (preDeleted?.deleted) kill();
+    await promise;
+
+    const completedAt = new Date().toISOString();
+    // includeDeleted + `deleted` guard: if the user deleted the record while the
+    // render ran, complete quietly as a no-op (the GLB on disk is orphaned — full
+    // kill-on-delete is tracked as a follow-up) instead of throwing NOT_FOUND.
+    // The runner wrote model.glb before this commit, so the row that first names
+    // the mesh as ready takes a backup lease (#9982): a cut either follows the
+    // commit, with the mesh already on disk to copy, or precedes it, and the dumped
+    // row is still `generating` and never serves the file.
+    const finished = await withBackupAssetPublication(() => store.mutateModel(id, (current) => {
+      if (current.deleted || current.generationOperationId !== operationId) return null;
+      return {
+        ...current,
+        status: 'ready',
+        assetPath: assetUrl(id),
+        // A new mesh invalidates the AR export derived from the OLD one. Cleared on
+        // success only: a FAILED render leaves model.glb untouched, so its USDZ is
+        // still a faithful copy of what the viewer shows and must survive.
+        usdzPath: null,
+        error: null,
+        generationOperationId: null,
+        generatedAt: completedAt,
+        runs: updateRun(current.runs, operationId, {
+          status: 'completed',
+          percent: 100,
+          completedAt,
+        }),
+      };
+    }, { includeDeleted: true }));
+    if (finished?.status === 'ready' && !finished.deleted) noteImageTo3d('completion');
+    await rmGuarded(usdzDiskPath(id), { force: true })
+      .catch((err) => console.error(`❌ Image-to-3D stale USDZ cleanup failed for ${id}: ${err.message}`));
+    console.log(`🧊 Image-to-3D mesh ready: ${id}`);
+  } catch (error) {
+    console.error(`❌ Image-to-3D render failed for ${id}: ${cleanError(error)}`);
+    await failGeneration(id, operationId, error);
+  } finally {
+    await heavyClaim?.release().catch((err) => console.error(`❌ Image-to-3D claim release failed: ${err.message}`));
+    activeRenders.delete(operationId);
+    activeOperations.delete(operationId);
+    // If the record was deleted while the render ran, the completion/failure writes
+    // no-op'd on the `deleted` guard and any GLB the render produced is orphaned —
+    // remove it now that the child has fully settled (no further writes can race us).
+    const record = await store.getModel(id, { includeDeleted: true }).catch(() => null);
+    if (record?.deleted) await cleanupRenderDir(id);
+  }
+}
+
+export const listModels = store.listModels;
+export const listGeneratingModelSummaries = store.listGeneratingModelSummaries;
+export const getModel = store.getModel;
+
+/**
+ * Delete a record and, if a render is in flight, kill its subprocess so it stops
+ * burning GPU the moment the user walks away. The soft-delete write itself stays a
+ * clean no-op on the record. When a live render exists we SIGTERM it and let
+ * executeRender's `finally` remove the orphaned GLB once the child settles (avoids a
+ * delete-then-rewrite race). With no live render — a stale `generating` row that
+ * survived a restart, OR a render still in the pre-registration window (spawned
+ * momentarily later) — we clean any orphaned mesh directly; in the latter case
+ * executeRender's own post-registration `deleted` re-check terminates the child.
+ */
+export async function deleteModel(id) {
+  const current = await store.getModel(id, { includeDeleted: true });
+  const result = await store.deleteModel(id);
+  if (current?.status === 'generating') noteImageTo3d('cancellation');
+  if (current?.status === 'generating' && current.generationOperationId) {
+    const kill = activeRenders.get(current.generationOperationId);
+    if (kill) {
+      kill();
+    } else {
+      await cleanupRenderDir(id);
+    }
+  }
+  return result;
+}
+
+// `detectHostCapabilities` is async (its CUDA half shells to nvidia-smi), so it
+// can't be a default parameter — resolve it in the body, and only when the caller
+// didn't already supply capabilities.
+export async function createModel(input, { caps } = {}) {
+  const sourcePath = resolveGalleryImage(input.filename);
+  if (!sourcePath) {
+    throw new ServerError('Gallery image not found', { status: 400, code: 'GALLERY_IMAGE_NOT_FOUND' });
+  }
+  const targetId = input.target || DEFAULT_IMAGE_TO_3D_TARGET;
+  // Validate the target is runnable BEFORE persisting a record so we never leave
+  // a dangling draft when the host can't render / the model isn't installed.
+  const hostCaps = caps ?? await detectHostCapabilities();
+  const adapter = assertTargetReady(targetId, hostCaps);
+  const created = await store.createModel({ ...input, target: targetId });
+  // Thread the already-validated adapter + resolved source straight into the
+  // render — createModel and startGeneration share `beginRender`, so the create
+  // path does NOT re-resolve the gallery image, re-assert readiness, or re-fetch
+  // the row it just wrote. `input` carries the optional per-run knobs
+  // (steps/seed/keyBackground/subjectScale); beginRender normalizes them.
+  return beginRender(created, adapter, sourcePath, hostCaps, input);
+}
+
+export async function startGeneration(id, { caps, options } = {}) {
+  const current = await store.getModel(id);
+  if (!current) throw new ServerError('Image-to-3D model not found', { status: 404, code: 'NOT_FOUND' });
+  if (current.status === 'generating'
+    || (current.generationOperationId && activeOperations.has(current.generationOperationId))) {
+    throw new ServerError('This model is already generating', { status: 409, code: 'MODEL_BUSY' });
+  }
+
+  const hostCaps = caps ?? await detectHostCapabilities();
+  const adapter = assertTargetReady(current.target, hostCaps);
+  const sourcePath = resolveGalleryImage(current.sourceImage?.filename);
+  if (!sourcePath) {
+    throw new ServerError('The source gallery image is no longer available', { status: 409, code: 'GALLERY_IMAGE_NOT_FOUND' });
+  }
+  return beginRender(current, adapter, sourcePath, hostCaps, options);
+}
+
+/**
+ * Flip a validated record to `generating`, append a run, and dispatch the async
+ * render. The single write path shared by create + regenerate — callers do the
+ * validation (target readiness, gallery-image resolution) and pass the resolved
+ * adapter + source through. The transactional `status==='generating'` guard here
+ * is the authoritative race check (the callers' pre-check is just a fast 409).
+ *
+ * Render options are PER-RUN parameters: normalized from this request alone
+ * (nothing persists between runs), with an unpinned seed rolled fresh so
+ * re-render actually samples a new model. The run entry records the concrete
+ * values the subprocess receives — the truthful, reproducible record.
+ */
+async function beginRender(record, adapter, sourcePath, caps, requestOptions) {
+  const permit = maintenance.admit('image-to-3d', record.id);
+  try { return await permit.run(() => beginAdmittedRender(record, adapter, sourcePath, caps, requestOptions, permit)); }
+  catch (err) { permit.finish(); throw err; }
+}
+
+async function beginAdmittedRender(record, adapter, sourcePath, caps, requestOptions, permit) {
+  const { id } = record;
+  const operationId = randomUUID();
+  const startedAt = new Date().toISOString();
+  const normalized = normalizeRenderOptions(requestOptions);
+  // Drop knobs this target's runner won't honor BEFORE the run entry is written, so the
+  // persisted record is what the subprocess actually received rather than what was
+  // asked for (renderOptions.js's stated invariant). Pixal3D is the case in point: its
+  // `inference.py` has no step override, so a recorded `steps: 48` would be a lie.
+  const options = honorTargetRenderSupport(
+    { ...normalized, seed: normalized.seed ?? randomRenderSeed() },
+    renderOptionSupportFor(record.target),
+  );
+  const next = await store.mutateModel(id, (fresh) => {
+    if (fresh.status === 'generating') {
+      throw new ServerError('This model is already generating', { status: 409, code: 'MODEL_BUSY' });
+    }
+    return {
+      ...fresh,
+      status: 'generating',
+      error: null,
+      generationOperationId: operationId,
+      runs: trimRuns([
+        ...(Array.isArray(fresh.runs) ? fresh.runs : []),
+        {
+          operationId,
+          status: 'running',
+          target: fresh.target,
+          percent: 0,
+          steps: options.steps,
+          seed: options.seed,
+          keyBackground: options.keyBackground,
+          subjectScale: options.subjectScale,
+          // Recorded so the detail view can render the knobs this run actually
+          // used — and so the viewer knows whether transparency was requested,
+          // which decides if its force-opaque pass should apply.
+          detail: options.detail,
+          alphaMode: options.alphaMode,
+          normalMap: options.normalMap,
+          startedAt,
+          completedAt: null,
+          error: null,
+        },
+      ]),
+    };
+  });
+
+  if (next?.status === 'generating') noteImageTo3d('start');
+  activeOperations.add(operationId);
+  setImmediate(() => {
+    void executeRender({ id, operationId, adapter, sourcePath, caps, options }).then(() => permit.finish())
+      .catch(err => console.error(`❌ Image-to-3D maintenance settlement pending: ${err.message}`));
+  });
+  return next;
+}
+
+/**
+ * Resolve a ready record's exported GLB for download — 404 when the record is
+ * gone, 409 while it has no rendered mesh yet.
+ */
+export async function getModelAsset(id) {
+  const model = await store.getModel(id);
+  if (!model) throw new ServerError('Image-to-3D model not found', { status: 404, code: 'NOT_FOUND' });
+  if (model.status !== 'ready' || !model.assetPath) {
+    throw new ServerError('This model has no generated mesh yet', { status: 409, code: 'MODEL_NOT_READY' });
+  }
+  return { path: assetDiskPath(id), filename: `${slugifyForFilename(model.name)}.glb` };
+}
+
+/**
+ * Resolve a ready record's full-resolution OBJ for download.
+ *
+ * Separate from `getModelAsset` because its absence is NOT an error state of the
+ * record: every readiness check the GLB passes can pass while the OBJ is missing,
+ * since it is an upstream side-effect file rather than something PortOS's pipeline
+ * guarantees. A render from before this was exposed, a `--no-texture` run, or an
+ * upstream that stops writing it all land here — and each is a plain 404 on the
+ * download, not a sign the model is broken. Hence the explicit `exists` probe
+ * rather than reusing the record's `status`.
+ */
+export async function getModelFullMesh(id, { exists = pathExists } = {}) {
+  const model = await store.getModel(id);
+  if (!model) throw new ServerError('Image-to-3D model not found', { status: 404, code: 'NOT_FOUND' });
+  if (model.status !== 'ready' || !model.assetPath) {
+    throw new ServerError('This model has no generated mesh yet', { status: 409, code: 'MODEL_NOT_READY' });
+  }
+  const path = fullMeshDiskPath(id);
+  if (!await exists(path)) {
+    throw new ServerError(
+      'This render has no full-resolution mesh on disk. Only renders that kept the '
+      + 'upstream OBJ sidecar have one; re-render to produce it.',
+      { status: 404, code: 'FULL_MESH_MISSING' },
+    );
+  }
+  return { path, filename: `${slugifyForFilename(model.name)}-full.obj` };
+}
+
+/**
+ * The largest USDZ the AR export route will accept.
+ *
+ * The viewer exports from the SAME viewer-grade GLB the page already rendered, so a
+ * legitimate payload is single-digit megabytes; the cap exists so a wrong/hostile
+ * body can't fill the record directory, not to shape a real export.
+ */
+export const USDZ_MAX_BYTES = 64 * 1024 * 1024;
+
+/** USDZ is a plain (stored, uncompressed) zip archive — every one starts `PK\x03\x04`. */
+const isZipArchive = (bytes) => bytes.length >= 4
+  && bytes[0] === 0x50 && bytes[1] === 0x4b && bytes[2] === 0x03 && bytes[3] === 0x04;
+
+/**
+ * Store the viewer's USDZ export for a ready record, beside its GLB.
+ *
+ * The bytes come from the CLIENT (three's USDZExporter over the already-loaded
+ * scene) rather than from a server-side converter, so they are validated here as
+ * untrusted input: ready record, non-empty, under the cap, and actually a zip.
+ * Re-exporting simply overwrites — the file is derived, so there is no version to
+ * preserve.
+ */
+export async function saveModelUsdz(id, bytes) {
+  const model = await store.getModel(id);
+  if (!model) throw new ServerError('Image-to-3D model not found', { status: 404, code: 'NOT_FOUND' });
+  if (model.status !== 'ready' || !model.assetPath) {
+    throw new ServerError('This model has no generated mesh yet', { status: 409, code: 'MODEL_NOT_READY' });
+  }
+  if (!bytes?.length) {
+    throw new ServerError('USDZ payload is empty', { status: 400, code: 'USDZ_INVALID' });
+  }
+  if (bytes.length > USDZ_MAX_BYTES) {
+    throw new ServerError(
+      `USDZ payload exceeds the ${Math.round(USDZ_MAX_BYTES / (1024 * 1024))} MB limit`,
+      { status: 413, code: 'USDZ_TOO_LARGE' },
+    );
+  }
+  if (!isZipArchive(bytes)) {
+    throw new ServerError('Payload is not a USDZ archive', { status: 400, code: 'USDZ_INVALID' });
+  }
+  // The export replaces model.usdz in place and the row stamps it, so the pair is
+  // one backup-admitted workflow (#9982): a cut never copies the old export beside
+  // a row that names the new one.
+  return withBackupAssetPublication(async () => {
+    await ensureDir(recordDir(id));
+    await writeFileGuarded(usdzDiskPath(id), bytes);
+    console.log(`🥽 Image-to-3D stored AR export for ${id} (${bytes.length} bytes)`);
+    return store.mutateModel(id, (current) => ({
+      ...current,
+      usdzPath: usdzUrl(id),
+      usdzGeneratedAt: new Date().toISOString(),
+    }));
+  });
+}
+
+/**
+ * Resolve a record's stored USDZ for download.
+ *
+ * Like `getModelFullMesh`, its absence is not an error state of the RECORD — a
+ * model nobody has exported for AR yet is perfectly healthy — so it probes disk
+ * rather than trusting `usdzPath` alone. That also covers the reverse skew: a
+ * record whose file was pruned out from under it still 404s instead of streaming a
+ * missing path.
+ */
+export async function getModelUsdz(id, { exists = pathExists } = {}) {
+  const model = await store.getModel(id);
+  if (!model) throw new ServerError('Image-to-3D model not found', { status: 404, code: 'NOT_FOUND' });
+  const path = usdzDiskPath(id);
+  if (!await exists(path)) {
+    throw new ServerError(
+      'This model has not been exported for AR yet. Open it in the 3D viewer and export it.',
+      { status: 404, code: 'USDZ_MISSING' },
+    );
+  }
+  return { path, filename: `${slugifyForFilename(model.name)}.usdz` };
+}
+
+export async function recoverInterruptedModels() {
+  const result = await store.recoverInterruptedModels();
+  if (result.recovered > 0) {
+    console.log(`🧊 Recovered ${result.recovered} interrupted image-to-3D render(s)`);
+  }
+  return result;
+}

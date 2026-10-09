@@ -1,0 +1,180 @@
+import { isTruthyMeta } from './metadataFlags.js';
+/**
+ * PR disposition for CoS agent tasks — how a pull request completes.
+ *
+ * The default is that *something* lands it: the review-loop follow-up when a
+ * Review Loop is configured, a merge follow-up (or the agent's own completion
+ * workflow) on green CI when it isn't. A PR nobody merges is a leaked branch.
+ *
+ * The exception is a task that deliberately hands its PR to a human AND records
+ * that hand-off somewhere PortOS can't update afterwards. `jira-sprint-manager`
+ * is the case that exists today: its prompt transitions the ticket to "In
+ * Review", so merging the PR behind the board's back would leave the work merged
+ * and the ticket permanently in review — and nothing in the completion path
+ * knows the ticket key to transition it to Done.
+ *
+ * This lives in `lib/` because both halves of the decision need it: the prompt
+ * builder (agent-owned PR flows, where the agent merges) and the worktree
+ * cleanup (PortOS-owned PR flows, where a follow-up agent merges). A predicate
+ * that only one half consults produces exactly the split-brain it's meant to
+ * prevent.
+ */
+
+export const PR_COMPLETIONS = Object.freeze({
+  REVIEW_THEN_MERGE: 'review-then-merge',
+  MERGE_ON_GREEN: 'merge-on-green',
+  LEAVE_OPEN: 'leave-open',
+  // A creation contract; lifecycle consumers resolve it to LEAVE_OPEN.
+  DRAFT: 'draft',
+});
+
+export const PR_COMPLETION_VALUES = Object.freeze(Object.values(PR_COMPLETIONS));
+
+const PR_COMPLETION_SET = new Set(PR_COMPLETION_VALUES);
+
+/**
+ * WHO performs the code review an action triggers — orthogonal to
+ * `PR_COMPLETIONS` above, which decides whether a review happens at all.
+ *
+ * - `delegated` — the historical shape. The agent running the action is an
+ *   ORCHESTRATOR: it spawns the install's Code Review Defaults roster (or a
+ *   per-run override) as separate reviewer processes, collects their findings,
+ *   and applies them. Several models, several invocations, the most coverage.
+ * - `self` — one agent. The provider the action runs on reviews the change
+ *   itself and no reviewer CLI is spawned. Cheaper and faster, and the right
+ *   answer when the top-level provider is already the model you wanted the
+ *   review from; the orchestration layer was pure overhead in that case.
+ *
+ * Deliberately a mode rather than "an empty reviewer roster": an empty roster
+ * already means *no review at all* (`spawnReviewLoopFollowUp`'s merge-only
+ * path), and collapsing "nobody reviews this" into "I review this myself" would
+ * make the two indistinguishable at every layer downstream.
+ *
+ * Lives here, beside `PR_COMPLETIONS`, because both halves of the PR lifecycle
+ * read it: the routes that queue an action and the prompt sections that tell the
+ * agent what it is responsible for. This module imports nothing, so the client
+ * mirrors the vocabulary by importing it rather than restating it.
+ */
+export const PR_REVIEW_MODES = Object.freeze({
+  DELEGATED: 'delegated',
+  SELF: 'self',
+});
+
+export const PR_REVIEW_MODE_VALUES = Object.freeze(Object.values(PR_REVIEW_MODES));
+
+/** What an action runs under when the caller names no mode. */
+export const DEFAULT_PR_REVIEW_MODE = PR_REVIEW_MODES.DELEGATED;
+
+/**
+ * True when this run's review is the running agent's own job. Written as a
+ * predicate so a caller never compares against the string literal — the two
+ * spellings that matter (`'self'` and "not delegated") would otherwise drift
+ * apart the first time a third mode appears.
+ */
+export const isSelfReviewMode = (mode) => mode === PR_REVIEW_MODES.SELF;
+
+/**
+ * Resolve a task's PR completion policy without migrating stored task data.
+ *
+ * New tasks persist `prCompletion`; legacy records retain their `reviewLoop`
+ * bit and resolve to the same behavior they had before this field existed.
+ * `openPR` remains the separate decision of whether to create a PR at all.
+ *
+ * @param {Object|null|undefined} metadata
+ * @returns {'review-then-merge'|'merge-on-green'|'leave-open'}
+ */
+export function resolvePrCompletion(metadata = {}) {
+  if (metadata?.prCompletion === PR_COMPLETIONS.DRAFT) return PR_COMPLETIONS.LEAVE_OPEN;
+  if (PR_COMPLETION_SET.has(metadata?.prCompletion)) return metadata.prCompletion;
+  return isTruthyMeta(metadata?.reviewLoop)
+    ? PR_COMPLETIONS.REVIEW_THEN_MERGE
+    : PR_COMPLETIONS.MERGE_ON_GREEN;
+}
+
+/**
+ * Scheduled task types whose prompt hands the PR to a human. Keep this tiny —
+ * every entry is a PR a person must remember to merge.
+ */
+export const PR_STAYS_OPEN_TASK_TYPES = Object.freeze(['jira-sprint-manager']);
+
+const PR_STAYS_OPEN_SET = new Set(PR_STAYS_OPEN_TASK_TYPES);
+
+/**
+ * True when a task's PR must be left open for a human rather than merged: an
+ * exempt task type, or any task carrying a JIRA ticket (the ticket status is the
+ * hand-off, and no completion path here can transition it).
+ *
+ * Reviewers still run when configured — this governs the *merge*, not the review.
+ *
+ * @param {Object|null} task - the CoS task (or its metadata holder).
+ * @returns {boolean}
+ */
+export function leavesPrForHuman(task) {
+  const metadata = task?.metadata || {};
+  return PR_STAYS_OPEN_SET.has(metadata.analysisType) || !!metadata.jiraTicketId;
+}
+
+// Shared by the PR-claim producer and cleanup classifier.
+export const PR_MISSING_CATEGORY = 'pr-missing';
+
+/**
+ * Who opens the change request for a completing worktree agent (#3733).
+ *
+ * One tri-state rather than two booleans, because two booleans have an
+ * unrepresentable-in-practice pair ("check first, but never create") and a
+ * caller has to keep them consistent by hand.
+ *
+ * - `NEVER`    — the agent owns it and finalize ALREADY verified the claim
+ *                (`prExpected`), so a run that reaches cleanup as a success has
+ *                a confirmed PR. Also the no-PR-at-all case.
+ * - `IF_MISSING` — the agent owns it and finalize did NOT verify (a slashdo-free
+ *                harness). Cleanup asks the forge once and creates one only on a
+ *                definite "none".
+ * - `ALWAYS`   — PortOS owns it (a lean `--bare` session hands the lifecycle back).
+ */
+export const PR_CREATION = Object.freeze({
+  NEVER: 'never',
+  IF_MISSING: 'if-missing',
+  ALWAYS: 'always',
+});
+
+/**
+ * Resolve `PR_CREATION` for a completing agent — one place, so the three
+ * completion paths (runner, TUI spawner, direct-CLI spawner) can't drift into
+ * double-firing `gh pr create` or into leaving a branch with no PR.
+ *
+ * @param {Object} opts
+ * @param {boolean} opts.taskOpenPR - the task asked for a PR at all
+ * @param {boolean} opts.agentOpensOwnPr - the prompt told the agent to open it
+ * @param {boolean} opts.prClaimVerified - finalize ran `verifyPrClaim` for this
+ *   run (i.e. `prExpected` was true), so cleanup must not ask a second time
+ * @param {boolean} [opts.branchProvenEmpty] - finalize verified an opted-in audit
+ *   left no commits and no change request, so cleanup must not create an empty PR
+ * @returns {string} a `PR_CREATION` value
+ */
+export function resolvePrCreation({ taskOpenPR, agentOpensOwnPr, prClaimVerified, branchProvenEmpty = false }) {
+  if (!taskOpenPR || branchProvenEmpty) return PR_CREATION.NEVER;
+  if (!agentOpensOwnPr) return PR_CREATION.ALWAYS;
+  return prClaimVerified ? PR_CREATION.NEVER : PR_CREATION.IF_MISSING;
+}
+
+/**
+ * Did a `verifyPrClaim` result actually come from the forge about a real branch?
+ *
+ * `{ ok: true }` alone does NOT mean "a PR exists" — it is also what the
+ * function returns when there was nothing to verify (`prExpected` false, a
+ * failed run, no workspace), when the branch could not be named (detached
+ * HEAD → `{ ok: true, branch: null }`), and what the callers substitute when
+ * the check itself threw or the run was user-terminated. Every one of those is
+ * "we did not ask", and collapsing them into "asked and it's there" is how a
+ * branch with no PR gets cleaned up as if it had one.
+ *
+ * A verified verdict therefore requires BOTH `ok` and a named `branch` — which
+ * only the `found` and `branchProvenEmpty` shapes carry.
+ *
+ * @param {{ok?: boolean, branch?: string|null}|null|undefined} prVerdict
+ * @returns {boolean}
+ */
+export function prClaimWasVerified(prVerdict) {
+  return prVerdict?.ok === true && !!prVerdict.branch;
+}

@@ -1,0 +1,163 @@
+/**
+ * Task Enhancer Service
+ *
+ * Uses AI to enhance task descriptions/prompts to be more detailed,
+ * actionable, and comprehensive for agent execution.
+ *
+ * Uses the 'cos-task-enhance' prompt stage for provider/model configuration.
+ */
+
+import { getActiveProvider, getProviderById } from './providers.js';
+import { getStage, buildPrompt } from './promptService.js';
+import { runPromptThroughProvider } from './promptRunner.js';
+import { resolveModel } from './stageRunner.js';
+
+const STAGE_NAME = 'cos-task-enhance';
+
+/**
+ * Fallback enhancement prompt template (used if stage template not found)
+ */
+const FALLBACK_PROMPT = `You are a task prompt enhancer for an AI agent system. Your job is to take a brief task description, research the relevant parts of the codebase, and produce a comprehensive, codebase-informed prompt that an AI coding agent can execute effectively.
+
+## Process
+
+### Step 1: Research the Codebase
+
+Before writing the enhanced prompt, investigate the codebase to understand:
+- Which files and directories are relevant to this task
+- Existing patterns, conventions, and code structure in those areas
+- Related functionality that may be affected
+- Any tests, configs, or documentation that should be updated
+
+Use your tools to search for files, read relevant code, and understand the current state. Focus your research on what's directly relevant to the task.
+
+### Step 2: Plan the Approach
+
+Based on your research, determine:
+- The specific files that need to be created or modified
+- The order of changes and any dependencies between them
+- Patterns to follow from existing code
+- Tests that should be run or written
+- Potential pitfalls or edge cases specific to this codebase
+
+### Step 3: Write the Enhanced Prompt
+
+Produce a detailed prompt that gives the executing agent everything it needs to complete the task without redundant exploration. Include:
+- Specific file paths discovered during research
+- Code patterns and conventions to follow (with examples from the codebase)
+- Step-by-step implementation plan grounded in the actual code structure
+- Success criteria and verification steps
+- Any caveats or constraints discovered during research
+
+## Original Task Description
+{description}
+
+{contextSection}
+
+## Your Enhanced Prompt
+
+Research the codebase, then provide an enhanced version of this task that an AI agent can execute. The prompt should be grounded in actual file paths, existing patterns, and codebase structure — not generic advice. Output ONLY the enhanced prompt text, nothing else. Do not include any preamble like "Here is the enhanced prompt:" - just output the prompt itself.`;
+
+/**
+ * Enhance a task prompt using AI
+ *
+ * @param {string} description - The original task description
+ * @param {string} context - Optional additional context
+ * @returns {Promise<{enhancedDescription: string, originalDescription: string, model: string, provider: string}>}
+ */
+export async function enhanceTaskPrompt(description, context = '') {
+  console.log(`✨ Enhancing task prompt: "${description.substring(0, 50)}..."`);
+
+  // Get prompt stage configuration for cos-task-enhance
+  const stage = getStage(STAGE_NAME);
+
+  // Determine provider and model from stage config or fallback.
+  // `stage.model` is usually a TIER name (`default`/`quick`/`coding`/`heavy`)
+  // rather than a model id — that is what the Prompt Manager's model dropdown
+  // writes — so it has to go through `resolveModel`, which maps the tier onto
+  // the provider's per-tier model field and falls back to defaultModel /
+  // models[0]. Passing the raw value straight through would send the literal
+  // string `default` to the provider as a model name (#3314: shipping the
+  // `cos-task-enhance` stage-config entry is what first made stage.model
+  // non-null here).
+  let provider;
+  let model;
+
+  if (stage?.provider) {
+    // Use stage-configured provider
+    provider = await getProviderById(stage.provider).catch(() => null);
+    if (provider) model = resolveModel(provider, stage.model);
+  }
+
+  // Fallback to active provider if stage provider not available
+  if (!provider) {
+    provider = await getActiveProvider();
+    if (provider) model = resolveModel(provider, stage?.model);
+  }
+
+  if (!provider) {
+    throw new Error('No AI provider available for enhancement');
+  }
+
+  // Build the enhancement prompt using stage template or fallback
+  let fullPrompt;
+  const templatePrompt = await buildPrompt(STAGE_NAME, { description, context }).catch(() => null);
+
+  if (templatePrompt) {
+    fullPrompt = templatePrompt;
+  } else {
+    // Fallback to hardcoded template
+    const contextSection = context ? `## Additional Context\n${context}` : '';
+    fullPrompt = FALLBACK_PROMPT
+      .replace('{description}', description)
+      .replace('{contextSection}', contextSection);
+  }
+
+  const { text, model: effectiveModel } = await runPromptThroughProvider({
+    provider, prompt: fullPrompt, source: 'task-enhancement', model,
+  });
+  // Keep the caller's chosen model (or provider default) when the runner
+  // resolves to a null effectiveModel — overwriting unconditionally would
+  // report `model: null` in logs + return values even though we explicitly
+  // chose one upstream.
+  model = effectiveModel || model || provider.defaultModel || null;
+
+  // Clean up the response - remove any leading/trailing whitespace and common prefixes
+  let enhancedDescription = text.trim();
+
+  // Remove common AI response prefixes
+  const prefixesToRemove = [
+    /^Here is the enhanced prompt[:\s]*/i,
+    /^Enhanced prompt[:\s]*/i,
+    /^Here's the enhanced version[:\s]*/i,
+    /^Certainly[!,.\s]*/i,
+    /^Sure[!,.\s]*/i
+  ];
+
+  for (const prefix of prefixesToRemove) {
+    enhancedDescription = enhancedDescription.replace(prefix, '');
+  }
+
+  enhancedDescription = enhancedDescription.trim();
+
+  // Fall back to original description if enhancement returned empty
+  if (!enhancedDescription) {
+    console.warn(`⚠️ Task enhancement returned empty result from ${provider.name}/${model}, using original`);
+    return {
+      enhancedDescription: description,
+      originalDescription: description,
+      model,
+      provider: provider.id,
+      fallback: true
+    };
+  }
+
+  console.log(`✅ Enhanced task prompt (${enhancedDescription.length} chars) using ${provider.name}/${model}`);
+
+  return {
+    enhancedDescription,
+    originalDescription: description,
+    model,
+    provider: provider.id
+  };
+}

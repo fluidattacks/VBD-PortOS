@@ -1,0 +1,282 @@
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { createPortal } from 'react-dom';
+import { Plus, Search } from 'lucide-react';
+import BrailleSpinner from '../BrailleSpinner';
+import toast from '../ui/Toast';
+import { listMediaCollections, createMediaCollection } from '../../services/api';
+import usePopoverPosition, { VIEWPORT_PADDING } from '../../hooks/usePopoverPosition.js';
+import useClickOutside from '../../hooks/useClickOutside.js';
+import useFocusTrap from '../../hooks/useFocusTrap.js';
+import { applyCollectionView } from '../../lib/mediaCollectionList.js';
+
+// Shared popover shell for the list-pick-or-create pickers:
+//
+//   - AddToCollectionMenu (one item → many collections, toggles membership)
+//   - BulkTargetPicker     (many items → one destination, pick + dispatch)
+//   - PinToMoodBoardMenu   (one media item → many mood boards, toggles pin)
+//
+// All portal a fixed-position popover into <body>, compute placement relative
+// to a trigger element, ship a search input above a threshold, and end with a
+// "create new" inline form. This shell owns all of that plumbing; the caller
+// provides `renderItem` for the per-row UI and `onCreated`/`onPickCreated` for
+// what to do after the inline create succeeds.
+//
+// Data flow:
+//   - If `collections` is provided by the parent, we never call `loadItems()`
+//     ourselves — this lets MediaCollectionDetail reuse its already-fetched
+//     list instead of paying a per-mount round-trip.
+//   - If `collections` is `null`/omitted, the shell auto-loads on mount (old
+//     AddToCollectionMenu behavior). Use `onCollectionsLoaded` if the parent
+//     wants to learn the fetched list (e.g. for membership rendering).
+//
+// The data source is injectable: `loadItems`/`createItem` default to the media-
+// collection API so the two collection pickers need no extra wiring, but mood-
+// board (or any future `{ id, name, items }`-shaped) pickers pass their own
+// loader/creator + nouns. The record shape the shell assumes is minimal:
+// `{ id, name }` plus whatever `renderItem` reads. `orderItems` is injectable
+// for the same reason — the default is the media-collection search/ordering
+// view, which is domain-specific and must be overridden alongside the loader.
+//
+// `excludeId` is a single-item allow-list filter so BulkTargetPicker can hide
+// the current collection from its move/copy target list.
+
+const DEFAULT_MENU_WIDTH = 260;
+const MENU_GAP = 6;
+const SEARCH_THRESHOLD = 6;
+
+// Default row search + ordering: the same view the /media/collections grid uses
+// (#3283), so the picker and the grid agree on what a query matches and what
+// order rows land in — auto-generated empties sink to the bottom instead of
+// burying the real collections in the raw list order (#3312).
+//
+// "Hide empty" is deliberately NOT applied: filing an item INTO an empty
+// collection is the picker's main job, so the empties are ordered last, never
+// removed. The AND-token matcher replaces the old single-substring filter — it's
+// a strict superset (every token of a query is itself a substring of that
+// query), so nothing that matched before stops matching, and multi-word queries
+// now match in any order, which matters once the shared "Creative Director: "
+// prefix lives in a badge and users type only the tail.
+//
+// Module-scope so the default prop value is referentially stable across renders.
+const orderCollectionRows = (records, query) => applyCollectionView(records, { query });
+
+export default function CollectionPickerShell({
+  anchorRef,
+  open = true,
+  title,
+  emptyMessage = 'No collections yet — create one below.',
+  noMatchMessage = (query) => `No matches for "${query}"`,
+  excludeId,
+  busy = false,
+  width = DEFAULT_MENU_WIDTH,
+  minWidth = 200,
+  newCollectionPlaceholder = 'New collection',
+  createTitle = 'Create and pick',
+  // The caller renders each collection row — keeps the per-row UI flexible
+  // (membership checkmarks vs item counts vs anything else) without dragging
+  // every prop combination through the shell.
+  renderItem,
+  collections: collectionsProp,
+  onCollectionsLoaded,
+  onCollectionsChange,
+  onCreated,
+  onClose,
+  // Injectable data source — defaults to the media-collection API so the two
+  // collection pickers stay zero-config. `loadItems()` resolves to an array of
+  // `{ id, name, ... }`; `createItem({ name })` resolves to the created record.
+  loadItems = listMediaCollections,
+  createItem = createMediaCollection,
+  // `(records, query) => records` — filters AND orders the rows. Defaults to the
+  // media-collection view; a non-collection data source (mood boards) must pass
+  // its own, since the default's "auto-generated" bucketing is collection
+  // provenance and would misread a board that merely looks like one.
+  orderItems = orderCollectionRows,
+  searchPlaceholder = 'Search collections…',
+}) {
+  const [collectionsState, setCollectionsState] = useState(collectionsProp ?? null);
+  const [query, setQuery] = useState('');
+  const [creating, setCreating] = useState(false);
+  const [newName, setNewName] = useState('');
+  const {
+    triggerRef,
+    popoverRef: menuRef,
+    style,
+  } = usePopoverPosition({
+    open,
+    width,
+    minWidth,
+    gap: MENU_GAP,
+    position: 'above',
+    anchorRef,
+    // The popover height changes as the user filters/searches or the list loads;
+    // the hook re-measures synchronously (pre-paint) when these change. `filtered`
+    // is a pure function of these plus `excludeId`, so they cover its height
+    // effect without forward-referencing it.
+    contentDeps: [collectionsState, query, excludeId],
+  });
+
+  // Wait for placement before claiming focus; the loading state already has
+  // a stable create field, so resolving the list never strands keyboard focus.
+  useFocusTrap(open && Boolean(style), menuRef);
+
+  // Close on outside-click — placement and scroll/resize reflow are
+  // owned by usePopoverPosition. The menu is portaled to <body>, so the trigger
+  // and the panel both have to count as "inside": that's the array form of
+  // useClickOutside. `triggerRef` mirrors the caller's `anchorRef` when one was
+  // passed, so this works in either mode. The hook reads the handler through a
+  // ref, so the inline arrow doesn't resubscribe on every parent render.
+  useClickOutside([triggerRef, menuRef], open, () => onClose?.());
+
+  // When the parent owns `collections`, mirror it into local state on each
+  // change so the same render path works for both modes.
+  useEffect(() => {
+    if (collectionsProp !== undefined) setCollectionsState(collectionsProp);
+  }, [collectionsProp]);
+
+  // Auto-load only when uncontrolled (no `collections` prop). Mirrors the old
+  // AddToCollectionMenu behavior of fetching when the popover opens.
+  useEffect(() => {
+    if (collectionsProp !== undefined) return undefined;
+    if (!open) return undefined;
+    let cancelled = false;
+    loadItems({ silent: true }).then(
+      (data) => {
+        if (cancelled) return;
+        const list = Array.isArray(data) ? data : [];
+        setCollectionsState(list);
+        onCollectionsLoaded?.(list);
+      },
+      (err) => {
+        if (cancelled) return;
+        toast.error(err?.message || 'Failed to load list');
+        setCollectionsState([]);
+      },
+    );
+    return () => { cancelled = true; };
+  }, [open, collectionsProp, loadItems]);
+
+  const filtered = useMemo(() => {
+    if (!collectionsState) return null;
+    const base = excludeId ? collectionsState.filter((c) => c.id !== excludeId) : collectionsState;
+    return orderItems(base, query);
+  }, [collectionsState, query, excludeId, orderItems]);
+
+  const updateCollections = useCallback((updater) => {
+    setCollectionsState((prev) => {
+      const next = typeof updater === 'function' ? updater(prev) : updater;
+      onCollectionsChange?.(next);
+      return next;
+    });
+  }, [onCollectionsChange]);
+
+  const handleCreate = async (e) => {
+    e.preventDefault();
+    const name = newName.trim();
+    if (!name) return;
+    setCreating(true);
+    const created = await createItem({ name }, { silent: true }).catch((err) => {
+      toast.error(err?.message || 'Create failed');
+      return null;
+    });
+    setCreating(false);
+    if (!created) return;
+    setNewName('');
+    // Parent decides what happens next — AddToCollectionMenu wants to also add
+    // the item to the new collection, BulkTargetPicker just picks it as the
+    // destination. The shell tells the parent which collection was created
+    // and how the parent should merge it back into the local list.
+    onCreated?.(created, { addToCollectionsState: (mergeFn) => updateCollections(mergeFn) });
+  };
+
+  if (!open) return null;
+
+  const showSearch = (collectionsState?.length || 0) >= SEARCH_THRESHOLD;
+  // `filtered` is null only while the list is still loading (same sentinel as
+  // `collectionsState`), so it is the single render source once loaded.
+  const list = filtered;
+
+  return createPortal(
+    // An anchored dialog owns focus while open. Keep native list/form
+    // controls rather than menu semantics, which promise arrow-key navigation.
+    <div
+      ref={menuRef}
+      role="dialog"
+      aria-modal="true"
+      aria-label={title}
+      className="fixed bg-port-card border border-port-border rounded-lg shadow-xl z-[100] p-1.5 flex flex-col max-h-dvh-cap"
+      style={{
+        left: style?.left ?? `${VIEWPORT_PADDING}px`,
+        top: style?.top ?? `${VIEWPORT_PADDING}px`,
+        width: style?.width ?? `${width}px`,
+        '--dvh-cap': '360px',
+        '--dvh-inset': '16px',
+        visibility: style ? 'visible' : 'hidden',
+      }}
+      onClick={(e) => e.stopPropagation()}
+      onKeyDown={(e) => {
+        e.stopPropagation();
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          onClose?.();
+        }
+      }}
+    >
+      {title && (
+        <div className="text-[10px] text-gray-500 uppercase tracking-wide px-1 pt-1 pb-1.5 shrink-0">{title}</div>
+      )}
+      {showSearch && (
+        <div className="relative shrink-0 mb-1.5">
+          <Search className="absolute left-2 top-1/2 -translate-y-1/2 w-3 h-3 text-gray-500 pointer-events-none" />
+          <input
+            type="text"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder={searchPlaceholder}
+            aria-label={searchPlaceholder}
+            className="w-full bg-port-bg border border-port-border rounded pl-7 pr-2 py-1 text-[11px] text-white focus:outline-none focus:border-port-accent"
+          />
+        </div>
+      )}
+      <div className="flex-1 min-h-0 overflow-y-auto">
+        {collectionsState == null && (
+          <div className="text-[11px] px-2 py-2"><BrailleSpinner text="Loading…" /></div>
+        )}
+        {collectionsState != null && collectionsState.length === 0 && (
+          <div className="text-[11px] text-gray-500 px-2 py-2">{emptyMessage}</div>
+        )}
+        {list != null && collectionsState?.length > 0 && list.length === 0 && (
+          <div className="text-[11px] text-gray-500 px-2 py-2">{noMatchMessage(query)}</div>
+        )}
+        {list != null && list.length > 0 && (
+          // A real list — "list, N items" is the honest announcement for these
+          // rows; the roles menu/menuitem promised arrow-key navigation this
+          // popover does not implement.
+          <ul>
+            {list.map((c) => <li key={c.id}>{renderItem(c, { updateCollections })}</li>)}
+          </ul>
+        )}
+      </div>
+      <form onSubmit={handleCreate} className="mt-1.5 pt-1.5 border-t border-port-border flex gap-1 shrink-0">
+        <input
+          type="text"
+          value={newName}
+          onChange={(e) => setNewName(e.target.value)}
+          placeholder={newCollectionPlaceholder}
+          aria-label={newCollectionPlaceholder}
+          maxLength={80}
+          disabled={busy}
+          className="flex-1 bg-port-bg border border-port-border rounded px-2 py-1 text-[11px] text-white focus:outline-none focus:border-port-accent disabled:opacity-50"
+        />
+        <button
+          type="submit"
+          disabled={creating || busy || !newName.trim()}
+          className="px-2 py-1 bg-port-accent/20 hover:bg-port-accent/40 text-port-accent text-[11px] rounded disabled:opacity-40 flex items-center gap-1"
+          title={createTitle} aria-label={createTitle}
+        >
+          <Plus className="w-3 h-3" />
+        </button>
+      </form>
+    </div>,
+    document.body,
+  );
+}

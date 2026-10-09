@@ -1,0 +1,364 @@
+import { describe, it, expect } from 'vitest';
+import { isEmbeddingModel, isGenerationModel, isVisionModel, isVisionCapableCliProvider, isToolUseModel, recommendEditorialModel } from './localModelHeuristics.js';
+
+describe('localModelHeuristics', () => {
+  describe('isToolUseModel', () => {
+    it('flags known tool-use-capable families by id', () => {
+      for (const id of [
+        'qwen2.5:7b',
+        'qwen3:32b',
+        'qwen2.5-coder:14b',
+        'llama3.1:8b',
+        'llama3.3:70b',
+        'mistral-small:24b',
+        'mixtral:8x7b',
+        'command-r:35b',
+        'hermes3:8b',
+        'glm-4:9b',
+        'granite3-dense:8b',
+        'gpt-oss:20b',
+        // Families added with the 2026-08 catalog refresh.
+        'granite4.1:8b',
+        'gemma4:12b',
+        'lmstudio-community/gemma-4-31B-it-GGUF',
+        'functiongemma:270m',
+        'ministral-3:8b',
+        'lfm2.5:8b',
+        'lfm2.5-thinking:1.2b',
+        'ornith:35b',
+        'muse-glimmer:30b',
+        'north-mini-code-1.0',
+        'olmo-3.1:32b-instruct',
+        'nemotron-3-nano:4b',
+        'deepseek-r1:8b',
+        'qwen2.5-coder:7b',
+      ]) {
+        expect(isToolUseModel(id), id).toBe(true);
+      }
+    });
+
+    it('does not flag families without dependable tool use by id', () => {
+      for (const id of [
+        'llama3:8b',          // Llama 3.0 — tool use landed in 3.1
+        'gemma2:9b',
+        'gemma3:4b',          // Gemma 3 — tool use landed in Gemma 4
+        'phi3:mini',
+        'orca-mini',
+        'nomic-embed-text',
+        // Contains the literal `gemma`, but is an embedder — the anchored gemma
+        // rule must not promote it into a tool-capable model.
+        'embeddinggemma:300m',
+      ]) {
+        expect(isToolUseModel(id), id).toBe(false);
+      }
+    });
+
+    it('prefers explicit capability metadata in both directions', () => {
+      // `tools` present → true even when the id wouldn't match.
+      expect(isToolUseModel({ id: 'some-custom-model', capabilities: ['completion', 'tools'] })).toBe(true);
+      // Non-empty capabilities WITHOUT `tools` → explicit negative, even when the
+      // id family would otherwise match the heuristic.
+      expect(isToolUseModel({ id: 'qwen2.5:7b', capabilities: ['completion', 'vision'] })).toBe(false);
+      // No capability metadata → fall back to the id heuristic.
+      expect(isToolUseModel({ id: 'qwen2.5:7b' })).toBe(true);
+      expect(isToolUseModel({ id: 'gemma2:9b' })).toBe(false);
+    });
+
+    it('handles falsy / non-model inputs', () => {
+      expect(isToolUseModel(null)).toBe(false);
+      expect(isToolUseModel(undefined)).toBe(false);
+      expect(isToolUseModel(42)).toBe(false);
+      expect(isToolUseModel('')).toBe(false);
+    });
+  });
+
+  describe('isEmbeddingModel', () => {
+    it('flags known embedding models', () => {
+      for (const id of [
+        'nomic-embed-text:latest',
+        'mxbai-embed-large',
+        'bge-m3',
+        'snowflake-arctic-embed:latest',
+        'text-embedding-3-small',
+        'gte-large',
+        // Glues the `embedding` marker straight onto the family, so the anchored
+        // marker alone misses it — it must never be offered for generation.
+        'embeddinggemma:300m',
+        'lmstudio-community/embeddinggemma-300m-qat-GGUF',
+        // No `embed` marker anywhere in the id — matched by FAMILY, or the
+        // assessment sweep benchmarks it and Ollama answers every sample with
+        // `400 "all-minilm:latest" does not support chat`.
+        'all-minilm:latest',
+        'all-minilm:33m',
+        'paraphrase-multilingual:latest',
+      ]) {
+        expect(isEmbeddingModel(id), id).toBe(true);
+      }
+    });
+
+    it('does not flag chat/generation models', () => {
+      for (const id of [
+        'qwen3.6:35b',
+        'gpt-oss:20b',
+        'llama3.2:latest',
+        'command-r-plus:latest',
+        'gemma2:27b',
+        'mistral-small:latest',
+      ]) {
+        expect(isEmbeddingModel(id), id).toBe(false);
+      }
+    });
+
+    it('handles non-strings', () => {
+      expect(isEmbeddingModel(null)).toBe(false);
+      expect(isEmbeddingModel(undefined)).toBe(false);
+      expect(isEmbeddingModel('')).toBe(false);
+      expect(isEmbeddingModel(42)).toBe(false);
+    });
+
+    it('prefers backend capability metadata over the id, in both directions', () => {
+      // Ollama's /api/show reports `capabilities: ['embedding']`.
+      expect(isEmbeddingModel({ id: 'mystery-model:latest', capabilities: ['embedding'] })).toBe(true);
+      // A normalized PortOS model card carries the BADGE label instead
+      // (`localLlm.js#OLLAMA_CAPABILITY_BADGES` maps `embedding` → `embeddings`,
+      // and LM Studio cards always carry a non-empty badge array), so matching
+      // only the raw spelling would turn every such card into a false negative.
+      expect(isEmbeddingModel({ id: 'mystery-model:latest', capabilities: ['embeddings'] })).toBe(true);
+      expect(isEmbeddingModel({ id: 'all-minilm:latest', capabilities: ['chat'] })).toBe(false);
+      // A non-empty capabilities array WITHOUT `embedding` is an explicit
+      // negative — a chat model whose name happens to match must not be hidden.
+      expect(isEmbeddingModel({ id: 'all-minilm:latest', capabilities: ['completion'] })).toBe(false);
+      // LM Studio types every model instead of listing capabilities.
+      expect(isEmbeddingModel({ id: 'mystery', type: 'embeddings' })).toBe(true);
+      expect(isEmbeddingModel({ id: 'all-minilm', type: 'llm' })).toBe(false);
+      // No metadata at all → fall back to the id.
+      expect(isEmbeddingModel({ id: 'all-minilm:latest' })).toBe(true);
+      expect(isEmbeddingModel({ name: 'qwen3.6:35b' })).toBe(false);
+    });
+
+    it('isGenerationModel is the inverse for real ids', () => {
+      expect(isGenerationModel('qwen3.6:35b')).toBe(true);
+      expect(isGenerationModel('nomic-embed-text:latest')).toBe(false);
+      expect(isGenerationModel('all-minilm:latest')).toBe(false);
+      expect(isGenerationModel('')).toBe(false);
+      expect(isGenerationModel({ id: 'qwen3.6:35b' })).toBe(true);
+      expect(isGenerationModel({ id: 'all-minilm:latest', capabilities: ['embedding'] })).toBe(false);
+      expect(isGenerationModel(null)).toBe(false);
+    });
+  });
+
+  describe('isVisionModel', () => {
+    it('flags known vision/multimodal model ids', () => {
+      for (const id of [
+        'qwen2.5-vl:7b',
+        'qwen2.5vl',       // Ollama's hyphen-free tag for Qwen2.5-VL
+        'qwen2.5vl:32b',
+        'llava:latest',
+        'bakllava',
+        'moondream:latest',
+        'minicpm-v:8b',
+        'llama3.2-vision:11b',
+        'pixtral-12b',
+        'gemma3:4b',
+        'internvl2:8b',
+        'glm-4v:9b',
+        'paligemma',
+        'gemma4:31b',
+        'qwen3-vl:8b',
+        'minicpm-v4.6:1b',
+      ]) {
+        expect(isVisionModel(id), id).toBe(true);
+      }
+    });
+
+    it('does not flag text-only models', () => {
+      for (const id of [
+        'llama3.1:8b',
+        'qwen2.5:7b',
+        'gpt-oss:20b',
+        'mistral-small:latest',
+        'nomic-embed-text:latest',
+        // `embeddinggemma-300m` contains the literal `gemma-3`; the family rule
+        // is anchored so an embedder isn't offered as a caption model.
+        'lmstudio-community/embeddinggemma-300m-qat-GGUF',
+      ]) {
+        expect(isVisionModel(id), id).toBe(false);
+      }
+    });
+
+    it('treats explicit backend metadata as authoritative in both directions', () => {
+      // LM Studio tags vision models type: 'vlm' even when the id is opaque.
+      expect(isVisionModel({ id: 'some-opaque-id', type: 'vlm' })).toBe(true);
+      expect(isVisionModel({ id: 'x', capabilities: ['vision'] })).toBe(true);
+      // A text model card with no vision markers stays false.
+      expect(isVisionModel({ id: 'llama3.1:8b', type: 'llm' })).toBe(false);
+      // An explicit non-vision type must NOT be overridden by an id that the
+      // regex would otherwise match — `gemma3:1b` is a text-only Gemma 3
+      // (type:'llm'), not a vision model, even though `gemma-?3` matches.
+      expect(isVisionModel({ id: 'gemma3:1b', type: 'llm' })).toBe(false);
+      expect(isVisionModel({ id: 'llava-phi3', type: 'embeddings' })).toBe(false);
+      // …but a regex-matching id with NO type metadata (Ollama /api/tags) still
+      // falls through to the heuristic.
+      expect(isVisionModel({ id: 'gemma3:4b' })).toBe(true);
+    });
+
+    it('handles non-values', () => {
+      expect(isVisionModel(null)).toBe(false);
+      expect(isVisionModel(undefined)).toBe(false);
+      expect(isVisionModel('')).toBe(false);
+      expect(isVisionModel(42)).toBe(false);
+    });
+  });
+
+  describe('isVisionCapableCliProvider', () => {
+    it('accepts codex / claude CLI providers', () => {
+      expect(isVisionCapableCliProvider({ type: 'cli', command: 'codex' })).toBe(true);
+      expect(isVisionCapableCliProvider({ type: 'cli', command: 'claude' })).toBe(true);
+    });
+
+    it('rejects non-vision CLI commands and non-CLI providers', () => {
+      expect(isVisionCapableCliProvider({ type: 'cli', command: 'agy' })).toBe(false);
+      expect(isVisionCapableCliProvider({ type: 'api', command: 'codex' })).toBe(false);
+      expect(isVisionCapableCliProvider({ type: 'tui', command: 'claude' })).toBe(false);
+      expect(isVisionCapableCliProvider(null)).toBe(false);
+      expect(isVisionCapableCliProvider({})).toBe(false);
+    });
+  });
+
+  describe('recommendEditorialModel', () => {
+    it('prefers a large general instruct model over a small one', () => {
+      const rec = recommendEditorialModel([
+        { id: 'llama3.2:latest', params: '3.2B' },
+        { id: 'qwen3.6:35b', params: '35B' },
+      ]);
+      expect(rec?.id).toBe('qwen3.6:35b');
+      expect(rec.reason).toMatch(/editorial/i);
+    });
+
+    it('never recommends an embedding model', () => {
+      const rec = recommendEditorialModel([
+        { id: 'nomic-embed-text:latest' },
+        { id: 'llama3.2:latest', params: '3.2B' },
+      ]);
+      expect(rec?.id).toBe('llama3.2:latest');
+    });
+
+    it('never recommends an embedding model whose id carries no embed marker', () => {
+      // `all-minilm` / `paraphrase-multilingual` name no `embed` token at all;
+      // without the family markers they land in the candidate pool and win
+      // whenever nothing better is installed.
+      expect(recommendEditorialModel([{ id: 'all-minilm:latest' }])).toBeNull();
+      expect(recommendEditorialModel([{ id: 'paraphrase-multilingual:latest' }])).toBeNull();
+      expect(recommendEditorialModel([
+        { id: 'all-minilm:latest' },
+        { id: 'llama3.2:latest', params: '3.2B' },
+      ])?.id).toBe('llama3.2:latest');
+    });
+
+    it('skips code-specialized and vision models', () => {
+      const rec = recommendEditorialModel([
+        { id: 'codellama:13b', params: '13B' },
+        { id: 'llava:13b', params: '13B' },
+        { id: 'gemma2:9b', params: '9B' },
+      ]);
+      expect(rec?.id).toBe('gemma2:9b');
+    });
+
+    it('skips vision-specialist and OCR models but keeps general models that read images', () => {
+      // Qwen3-VL / GLM-4.6V / *-ocr exist to describe pictures — never the best
+      // pick for prose. Gemma 4 reads images too but is a general instruct model.
+      const rec = recommendEditorialModel([
+        { id: 'qwen3-vl:30b', params: '30B' },
+        { id: 'glm-4.6v-flash', params: '30B' },
+        { id: 'deepseek-ocr:3b', params: '3B' },
+        { id: 'gemma4:31b', params: '31B' },
+      ]);
+      expect(rec?.id).toBe('gemma4:31b');
+    });
+
+    it('accepts plain string ids', () => {
+      const rec = recommendEditorialModel(['command-r-plus:latest', 'phi3:mini']);
+      expect(rec?.id).toBe('command-r-plus:latest');
+    });
+
+    it('prefers an instruction-tuned model over chatty Command R+ for fix generation', () => {
+      // Command R+ is larger but RAG/long-form-tuned and leaks commentary into
+      // structured fixes; an instruction-tight model is the better editorial pick.
+      const rec = recommendEditorialModel([
+        { id: 'command-r-plus:latest', params: '104B' },
+        { id: 'qwen3.6:35b', params: '35B' },
+      ]);
+      expect(rec?.id).toBe('qwen3.6:35b');
+    });
+
+    it('returns null when nothing is suitable', () => {
+      expect(recommendEditorialModel([])).toBeNull();
+      expect(recommendEditorialModel(['nomic-embed-text:latest', 'mxbai-embed-large'])).toBeNull();
+      expect(recommendEditorialModel(null)).toBeNull();
+    });
+
+    describe('with measured evidence', () => {
+      const models = [
+        { id: 'qwen3.6:35b', params: '35B' },
+        { id: 'gemma4:9b', params: '9B' },
+      ];
+
+      it('drops a model measured not to run here, however good its name looks', () => {
+        const rec = recommendEditorialModel(models, {
+          measured: { 'qwen3.6:35b': { verdict: 'does-not-fit', stale: false } },
+        });
+        expect(rec?.id).toBe('gemma4:9b');
+        expect(rec.ruledOutByMeasurement).toEqual(['qwen3.6:35b']);
+        expect(rec.reason).toMatch(/ruled out by measurement/i);
+      });
+
+      it('drops a model the backend refused outright', () => {
+        const rec = recommendEditorialModel(models, {
+          measured: { 'qwen3.6:35b': { verdict: 'incompatible', stale: false } },
+        });
+        expect(rec?.id).toBe('gemma4:9b');
+      });
+
+      it('ignores a STALE measurement — it describes a machine that no longer exists', () => {
+        const rec = recommendEditorialModel(models, {
+          measured: { 'qwen3.6:35b': { verdict: 'does-not-fit', stale: true } },
+        });
+        expect(rec?.id).toBe('qwen3.6:35b');
+        expect(rec.evidence).toBe('estimated');
+      });
+
+      it('lets a proven model beat a merely-plausible one of similar standing', () => {
+        const close = [
+          { id: 'qwen3.6:14b', params: '14B' },
+          { id: 'llama3.3:14b', params: '14B' },
+        ];
+        // Without evidence the family ranking picks Qwen.
+        expect(recommendEditorialModel(close)?.id).toBe('qwen3.6:14b');
+        // A fresh "fits" on the runner-up is enough to flip it.
+        const rec = recommendEditorialModel(close, {
+          measured: { 'llama3.3:14b': { verdict: 'fits', stale: false } },
+        });
+        expect(rec?.id).toBe('llama3.3:14b');
+        expect(rec.evidence).toBe('measured');
+        expect(rec.reason).toMatch(/it runs here/i);
+      });
+
+      it('leaves an unmeasured model untouched — unknown is not a mark against it', () => {
+        const rec = recommendEditorialModel(models, { measured: {} });
+        expect(rec?.id).toBe('qwen3.6:35b');
+        expect(rec.evidence).toBe('estimated');
+        expect(rec.ruledOutByMeasurement).toEqual([]);
+      });
+
+      it('returns null when measurement rules out everything installed', () => {
+        const rec = recommendEditorialModel(models, {
+          measured: {
+            'qwen3.6:35b': { verdict: 'does-not-fit', stale: false },
+            'gemma4:9b': { verdict: 'incompatible', stale: false },
+          },
+        });
+        expect(rec).toBeNull();
+      });
+    });
+  });
+});

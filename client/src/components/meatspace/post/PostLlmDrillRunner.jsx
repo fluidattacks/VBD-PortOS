@@ -1,0 +1,956 @@
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { CheckCircle, XCircle } from 'lucide-react';
+import ProgressBar from '../../ui/ProgressBar';
+import { scorePostLlmDrill } from '../../../services/api';
+import { DRILL_LABELS, WORDPLAY_LLM_DRILL_TYPES } from './constants';
+import { pluralize } from '../../../lib/textUtils';
+import { shouldIgnoreGlobalKey } from '../../../lib/a11yKeyboard.js';
+import { AILoadingIndicator, MissedExamplesDisplay, CompoundChainUI, BridgeWordUI, DoubleMeaningUI, IdiomTwistUI, scoreWordplayResponse } from './WordplayDrillUI';
+
+export function combineTrainingScoreResults(scoreResults) {
+  if (!scoreResults.length) return null;
+  const scores = scoreResults.flatMap((result) => result.evaluation.scores);
+  const representativeProvenance = scoreResults.find(
+    (result) => result.evaluation.provenance.scorer.kind !== 'local',
+  )?.evaluation.provenance || scoreResults[0].evaluation.provenance;
+  const overallScore = Math.round(
+    scoreResults.reduce((sum, result) => sum + result.evaluation.overallScore, 0) / scoreResults.length,
+  );
+  return {
+    score: Math.round(scoreResults.reduce((sum, result) => sum + result.score, 0) / scoreResults.length),
+    evaluation: {
+      overallScore,
+      scores,
+      summary: `Average ${overallScore}% across ${scores.length} training responses`,
+      provenance: representativeProvenance,
+    },
+  };
+}
+
+export default function PostLlmDrillRunner({ drill, timeLimitSec, drillIndex, drillCount, onComplete, isTraining, providerId, model }) {
+  const [questionIndex, setQuestionIndex] = useState(0);
+  const [responses, setResponses] = useState([]);
+  const [inputValue, setInputValue] = useState('');
+  const [timeLeft, setTimeLeft] = useState(0);
+  const [phase, setPhase] = useState('active'); // active | reading | recall
+  const [items, setItems] = useState([]); // for verbal-fluency
+  const [trainingFeedback, setTrainingFeedback] = useState(null); // { score, feedback, scoring }
+  const [completionFeedback, setCompletionFeedback] = useState(null); // { scoring, error, responses, totalMs }
+  const inputRef = useRef(null);
+  const timerRef = useRef(null);
+  const questionStartRef = useRef(Date.now());
+  const drillStartRef = useRef(Date.now());
+  const responsesRef = useRef([]);
+  const questionIndexRef = useRef(0);
+  const trainingScoreResultsRef = useRef([]);
+  const completionInFlightRef = useRef(false);
+
+  const timeLimitMs = (timeLimitSec || 120) * 1000;
+  const drillType = drill?.type;
+
+  // Get the list of prompts depending on drill type
+  const prompts = getPrompts(drill);
+  const totalPrompts = prompts.length;
+  const currentPrompt = prompts[questionIndex];
+
+  const finishDrill = useCallback((finalResponses, preservedTotalMs) => {
+    if (completionInFlightRef.current) return;
+    completionInFlightRef.current = true;
+    clearInterval(timerRef.current);
+    const totalMs = preservedTotalMs ?? Date.now() - drillStartRef.current;
+    const preScored = isTraining ? combineTrainingScoreResults(trainingScoreResultsRef.current) : null;
+    setCompletionFeedback({ scoring: true, error: null, responses: finalResponses, totalMs });
+    Promise.resolve()
+      .then(() => onComplete({
+        module: 'llm-drills',
+        type: drillType,
+        config: drill.config,
+        drillData: drill,
+        responses: finalResponses,
+        totalMs,
+        ...(preScored || {}),
+      }))
+      .catch((err) => {
+        setCompletionFeedback({ scoring: false, error: err.message, responses: finalResponses, totalMs });
+      })
+      .finally(() => { completionInFlightRef.current = false; });
+  }, [drill, drillType, isTraining, onComplete]);
+
+  const handleTimeExpired = useCallback(() => {
+    // Submit whatever we have so far (use refs to avoid stale closures in interval callback)
+    const currentResponses = responsesRef.current;
+    const currentIndex = questionIndexRef.current;
+    const remaining = prompts.slice(currentIndex).map(() => ({
+      response: '',
+      responseMs: 0
+    }));
+    const finalResponses = [...currentResponses, ...remaining];
+    finishDrill(finalResponses);
+  }, [finishDrill, prompts]);
+
+  useEffect(() => {
+    drillStartRef.current = Date.now();
+    questionStartRef.current = Date.now();
+    setPhase(drillType === 'story-recall' ? 'reading' : 'active');
+    setTrainingFeedback(null);
+    setCompletionFeedback(null);
+    trainingScoreResultsRef.current = [];
+    completionInFlightRef.current = false;
+
+    if (isTraining) {
+      setTimeLeft(0);
+      return;
+    }
+
+    const startTime = Date.now();
+    const limit = timeLimitMs;
+    setTimeLeft(limit);
+
+    timerRef.current = setInterval(() => {
+      const elapsed = Date.now() - startTime;
+      const remaining = Math.max(0, limit - elapsed);
+      setTimeLeft(remaining);
+      if (remaining <= 0) {
+        clearInterval(timerRef.current);
+        handleTimeExpired();
+      }
+    }, 100);
+
+    return () => clearInterval(timerRef.current);
+  }, [drill, drillType, handleTimeExpired, isTraining, timeLimitMs]);
+
+  // Keep refs in sync with state for use in interval callbacks
+  useEffect(() => { responsesRef.current = responses; }, [responses]);
+  useEffect(() => { questionIndexRef.current = questionIndex; }, [questionIndex]);
+
+  useEffect(() => {
+    setInputValue('');
+    setItems([]);
+    inputRef.current?.focus();
+  }, [questionIndex, phase]);
+
+  const handleSubmit = useCallback(async (e) => {
+    e?.preventDefault();
+    const responseMs = Date.now() - questionStartRef.current;
+
+    const responseObj = buildLlmResponseObj({ drillType, questionIndex, items, inputValue, currentPrompt, responseMs });
+
+    // Training mode: score this response immediately and show feedback.
+    // The four wordplay types (compound-chain/bridge-word/double-meaning/
+    // idiom-twist) delegate to scoreWordplayResponse — the same scoring core
+    // the standalone WordplayTrainer tab uses (issue #2097) — so both entry
+    // points share one scoring path. The other 10 LLM drill types keep their
+    // existing inline path unchanged.
+    if (isTraining) {
+      setTrainingFeedback({ scoring: true });
+      const scoreResult = await (
+        WORDPLAY_LLM_DRILL_TYPES.includes(drillType)
+          ? scoreWordplayResponse(drillType, drill, responseObj, timeLimitMs, providerId, model, { silent: true })
+            .then((result) => result.scoreResult)
+          : scorePostLlmDrill(drillType, drill, [responseObj], timeLimitMs, providerId, model, { silent: true })
+      ).catch((err) => {
+        setTrainingFeedback({ scoring: false, error: err.message });
+        return null;
+      });
+      if (!scoreResult) return;
+      const scoredResponse = scoreResult.questions[0];
+      const feedback = scoreResult.evaluation.scores[0];
+      const newResponses = [...responses, scoredResponse];
+      trainingScoreResultsRef.current = [...trainingScoreResultsRef.current, scoreResult];
+      setResponses(newResponses);
+      setTrainingFeedback({
+        scoring: false,
+        score: feedback.score,
+        feedback: feedback.feedback || scoreResult.evaluation.summary,
+        invalidItems: feedback.invalidItems,
+        duplicateItems: feedback.duplicateItems,
+        missedExamples: feedback.missedExamples,
+      });
+      return;
+    }
+
+    const newResponses = [...responses, responseObj];
+    setResponses(newResponses);
+
+    if (questionIndex + 1 >= totalPrompts) {
+      finishDrill(newResponses);
+    } else {
+      setQuestionIndex(questionIndex + 1);
+      questionStartRef.current = Date.now();
+      if (drillType === 'story-recall') {
+        setPhase('reading');
+        setItems([]);
+      }
+    }
+  }, [drill, drillType, currentPrompt, finishDrill, inputValue, isTraining, items, model, providerId, questionIndex, responses, timeLimitMs, totalPrompts]);
+
+  // Training mode: advance after acknowledging feedback
+  const acknowledgeTrainingFeedback = useCallback(() => {
+    setTrainingFeedback(null);
+    if (questionIndex + 1 >= totalPrompts) {
+      finishDrill(responses);
+    } else {
+      setQuestionIndex(questionIndex + 1);
+      questionStartRef.current = Date.now();
+      if (drillType === 'story-recall') {
+        setPhase('reading');
+        setItems([]);
+      }
+    }
+  }, [drillType, finishDrill, questionIndex, responses, totalPrompts]);
+
+  // Enter advances past the training verdict from here rather than from an
+  // `autoFocus` on the Next button — see the rule in client/src/AGENTS.md. The
+  // LLM round-trip that scores the answer means Enter is usually long released
+  // by the time the verdict lands, so this is the latent form of the same bug,
+  // but the shape is the shape.
+  // A scoring FAILURE is also `scoring: false`, but its screen offers only
+  // "Retry scoring" — the answer was never appended to `responses`, so
+  // advancing from there would discard it and score the drill one response
+  // short. Stay disarmed until there is a verdict to acknowledge.
+  useEffect(() => {
+    if (!isTraining || !trainingFeedback || trainingFeedback.scoring || trainingFeedback.error) return undefined;
+    const onKey = (e) => {
+      if (e.key !== 'Enter' || shouldIgnoreGlobalKey(e)) return;
+      e.preventDefault();
+      acknowledgeTrainingFeedback();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [isTraining, trainingFeedback, acknowledgeTrainingFeedback]);
+
+  // Story recall: transition from reading to answering
+  function handleStartRecall() {
+    setPhase('recall');
+    setItems([]);
+    questionStartRef.current = Date.now();
+    setTimeout(() => inputRef.current?.focus(), 50);
+  }
+
+  // Verbal fluency: add item to list
+  function handleAddItem(e) {
+    e?.preventDefault();
+    const val = inputValue.trim();
+    if (!val) return;
+    if (!items.some(item => item.toLowerCase() === val.toLowerCase())) {
+      setItems(prev => [...prev, val]);
+    }
+    setInputValue('');
+    inputRef.current?.focus();
+  }
+
+  // Verbal fluency: remove item
+  function handleRemoveItem(index) {
+    setItems(prev => prev.filter((_, i) => i !== index));
+  }
+
+  // Story recall: add recall answer
+  function handleAddRecallAnswer(e) {
+    e?.preventDefault();
+    const val = inputValue.trim();
+    if (!val) return;
+    setItems(prev => [...prev, val]);
+    setInputValue('');
+    inputRef.current?.focus();
+  }
+
+  const timePct = timeLimitMs > 0 ? (timeLeft / timeLimitMs) * 100 : 0;
+  let timerTone = 'accent';
+  if (timePct <= 10) timerTone = 'error';
+  else if (timePct <= 25) timerTone = 'warning';
+
+  if (completionFeedback) {
+    if (completionFeedback.scoring) {
+      return (
+        <div className="max-w-lg mx-auto space-y-6">
+          <AILoadingIndicator label="Scoring your completed drill..." />
+        </div>
+      );
+    }
+    return (
+      <div className="max-w-lg mx-auto space-y-6">
+        <div className="bg-port-card border border-port-error/50 rounded-lg p-5 space-y-3 text-center">
+          <XCircle size={40} className="mx-auto text-port-error" />
+          <p className="text-sm text-gray-200">Scoring failed: {completionFeedback.error}</p>
+          <p className="text-xs text-gray-500">Your completed responses are preserved and have not been assigned a fallback score.</p>
+        </div>
+        <button
+          onClick={() => finishDrill(completionFeedback.responses, completionFeedback.totalMs)}
+          className="w-full px-6 py-3 bg-port-accent hover:bg-port-accent/80 text-white font-medium rounded-lg transition-colors"
+        >
+          Retry scoring
+        </button>
+      </div>
+    );
+  }
+
+  // Training mode: feedback overlay
+  if (isTraining && trainingFeedback) {
+    if (trainingFeedback.scoring) {
+      return (
+        <div className="max-w-lg mx-auto space-y-6">
+          <div className="flex items-center justify-between text-sm text-gray-400">
+            <span className="text-port-accent-2">{DRILL_LABELS[drillType] || drillType} — Training</span>
+            <span>Drill {drillIndex + 1} of {drillCount}</span>
+          </div>
+          <AILoadingIndicator label="Evaluating your response..." />
+        </div>
+      );
+    }
+
+    if (trainingFeedback.error) {
+      return (
+        <div className="max-w-lg mx-auto space-y-6">
+          <div className="bg-port-card border border-port-error/50 rounded-lg p-5 space-y-3 text-center">
+            <XCircle size={40} className="mx-auto text-port-error" />
+            <p className="text-sm text-gray-200">Scoring failed: {trainingFeedback.error}</p>
+            <p className="text-xs text-gray-500">Your response is still available. Retry when the provider is ready.</p>
+          </div>
+          <button
+            onClick={handleSubmit}
+            className="w-full px-6 py-3 bg-port-accent-2 hover:bg-port-accent-2/80 text-port-on-accent-2 font-medium rounded-lg transition-colors"
+          >
+            Retry scoring
+          </button>
+        </div>
+      );
+    }
+
+    const fbScoreColor = (trainingFeedback.score || 0) >= 70 ? 'text-port-success' :
+      (trainingFeedback.score || 0) >= 40 ? 'text-port-warning' : 'text-port-error';
+    const FbIcon = (trainingFeedback.score || 0) >= 70 ? CheckCircle : XCircle;
+
+    return (
+      <div className="max-w-lg mx-auto space-y-6">
+        <div className="flex items-center justify-between text-sm text-gray-400">
+          <span className="text-port-accent-2">{DRILL_LABELS[drillType] || drillType} — Training</span>
+          <span>Drill {drillIndex + 1} of {drillCount}</span>
+        </div>
+        <div className="text-center py-6">
+          <FbIcon size={40} className={fbScoreColor} />
+          <div className={`text-3xl font-mono font-bold mt-2 ${fbScoreColor}`}>{trainingFeedback.score}</div>
+        </div>
+        <div className="bg-port-card border border-port-border rounded-lg p-4 space-y-2">
+          <p className="text-sm text-gray-300">{trainingFeedback.feedback}</p>
+          {trainingFeedback.invalidItems?.length > 0 && (
+            <p className="text-xs text-port-error">Invalid: {trainingFeedback.invalidItems.join(', ')}</p>
+          )}
+          {trainingFeedback.duplicateItems?.length > 0 && (
+            <p className="text-xs text-gray-500">Duplicates: {trainingFeedback.duplicateItems.join(', ')}</p>
+          )}
+          <MissedExamplesDisplay examples={trainingFeedback.missedExamples} />
+        </div>
+        <button
+          onClick={acknowledgeTrainingFeedback}
+          className="w-full px-6 py-3 bg-port-accent-2 hover:bg-port-accent-2/80 text-port-on-accent-2 font-medium rounded-lg transition-colors"
+        >
+          Next
+        </button>
+        <PromptProgress index={questionIndex} total={totalPrompts} tone="accent2" showPercent={false} />
+      </div>
+    );
+  }
+
+  return (
+    <div className="max-w-lg mx-auto space-y-6">
+      {/* Header */}
+      <div className="flex items-center justify-between text-sm text-gray-400">
+        <span className={isTraining ? 'text-port-accent-2' : ''}>
+          {DRILL_LABELS[drillType] || drillType}
+          {isTraining && ' — Training'}
+        </span>
+        <span>Drill {drillIndex + 1} of {drillCount}</span>
+      </div>
+
+      {/* Timer bar (hidden in training mode) */}
+      {!isTraining && (
+        <>
+          <ProgressBar
+            percent={timePct}
+            tone={timerTone}
+            size="md"
+            track="border"
+            duration={100}
+            label={`Time remaining: ${Math.ceil(timeLeft / 1000)}s`}
+          />
+          <div className="text-center text-sm text-gray-500">{Math.ceil(timeLeft / 1000)}s remaining</div>
+        </>
+      )}
+
+      {/* Drill-specific UI */}
+      {drillType === 'word-association' && (
+        <WordAssociationUI
+          prompt={currentPrompt}
+          inputValue={inputValue}
+          setInputValue={setInputValue}
+          onSubmit={handleSubmit}
+          inputRef={inputRef}
+          questionIndex={questionIndex}
+          totalPrompts={totalPrompts}
+        />
+      )}
+
+      {drillType === 'story-recall' && (
+        <StoryRecallUI
+          exercise={currentPrompt}
+          phase={phase}
+          onStartRecall={handleStartRecall}
+          items={items}
+          inputValue={inputValue}
+          setInputValue={setInputValue}
+          onAddAnswer={handleAddRecallAnswer}
+          onSubmit={handleSubmit}
+          inputRef={inputRef}
+          questionIndex={questionIndex}
+          totalPrompts={totalPrompts}
+        />
+      )}
+
+      {drillType === 'verbal-fluency' && (
+        <VerbalFluencyUI
+          category={currentPrompt}
+          items={items}
+          inputValue={inputValue}
+          setInputValue={setInputValue}
+          onAddItem={handleAddItem}
+          onRemoveItem={handleRemoveItem}
+          onSubmit={handleSubmit}
+          inputRef={inputRef}
+          questionIndex={questionIndex}
+          totalPrompts={totalPrompts}
+        />
+      )}
+
+      {drillType === 'wit-comeback' && (
+        <WitComebackUI
+          scenario={currentPrompt}
+          inputValue={inputValue}
+          setInputValue={setInputValue}
+          onSubmit={handleSubmit}
+          inputRef={inputRef}
+          questionIndex={questionIndex}
+          totalPrompts={totalPrompts}
+        />
+      )}
+
+      {drillType === 'pun-wordplay' && (
+        <PunWordplayUI
+          challenge={currentPrompt}
+          inputValue={inputValue}
+          setInputValue={setInputValue}
+          onSubmit={handleSubmit}
+          inputRef={inputRef}
+          questionIndex={questionIndex}
+          totalPrompts={totalPrompts}
+        />
+      )}
+
+      {drillType === 'compound-chain' && (
+        <CompoundChainUI
+          challenge={currentPrompt}
+          items={items}
+          inputValue={inputValue}
+          setInputValue={setInputValue}
+          onAddItem={handleAddItem}
+          onRemoveItem={handleRemoveItem}
+          onSubmit={handleSubmit}
+          inputRef={inputRef}
+          questionIndex={questionIndex}
+          totalPrompts={totalPrompts}
+        />
+      )}
+
+      {drillType === 'bridge-word' && (
+        <BridgeWordUI
+          puzzle={currentPrompt}
+          inputValue={inputValue}
+          setInputValue={setInputValue}
+          onSubmit={handleSubmit}
+          inputRef={inputRef}
+          questionIndex={questionIndex}
+          totalPrompts={totalPrompts}
+        />
+      )}
+
+      {drillType === 'double-meaning' && (
+        <DoubleMeaningUI
+          challenge={currentPrompt}
+          inputValue={inputValue}
+          setInputValue={setInputValue}
+          onSubmit={handleSubmit}
+          inputRef={inputRef}
+          questionIndex={questionIndex}
+          totalPrompts={totalPrompts}
+          TextInput={TextInput}
+        />
+      )}
+
+      {drillType === 'idiom-twist' && (
+        <IdiomTwistUI
+          challenge={currentPrompt}
+          inputValue={inputValue}
+          setInputValue={setInputValue}
+          onSubmit={handleSubmit}
+          inputRef={inputRef}
+          questionIndex={questionIndex}
+          totalPrompts={totalPrompts}
+          TextInput={TextInput}
+        />
+      )}
+
+      {drillType === 'what-if' && (
+        <ImaginationUI
+          label="Imagine this scenario"
+          prompt={currentPrompt?.prompt}
+          badge={currentPrompt?.category}
+          badgeColor="bg-port-accent/20 text-port-accent"
+          placeholder="Describe what would happen..."
+          inputValue={inputValue}
+          setInputValue={setInputValue}
+          onSubmit={handleSubmit}
+          inputRef={inputRef}
+          questionIndex={questionIndex}
+          totalPrompts={totalPrompts}
+        />
+      )}
+
+      {drillType === 'alternative-uses' && (
+        <AlternativeUsesUI
+          object={currentPrompt}
+          items={items}
+          inputValue={inputValue}
+          setInputValue={setInputValue}
+          onAddItem={handleAddItem}
+          onRemoveItem={handleRemoveItem}
+          onSubmit={handleSubmit}
+          inputRef={inputRef}
+          questionIndex={questionIndex}
+          totalPrompts={totalPrompts}
+        />
+      )}
+
+      {drillType === 'story-prompt' && (
+        <>
+          <div className="text-center py-4">
+            <div className="text-sm text-gray-500 mb-3">Write a micro-story using all 3 words:</div>
+            <div className="flex justify-center gap-3">
+              {(currentPrompt?.words || []).map((w, i) => (
+                <span key={i} className="px-3 py-1.5 bg-port-accent-2/20 text-port-accent-2 rounded-lg text-lg font-medium">{w}</span>
+              ))}
+            </div>
+          </div>
+          <TextInput inputRef={inputRef} value={inputValue} onChange={setInputValue} onSubmit={handleSubmit} placeholder="Your micro-story (2-4 sentences)..." buttonLabel="Next" />
+          <PromptProgress index={questionIndex} total={totalPrompts} />
+        </>
+      )}
+
+      {drillType === 'invention-pitch' && (
+        <ImaginationUI
+          label="Invent a solution"
+          prompt={currentPrompt?.problem}
+          badge={currentPrompt?.difficulty}
+          badgeColor={currentPrompt?.difficulty === 'hard' ? 'bg-port-error/20 text-port-error' : currentPrompt?.difficulty === 'medium' ? 'bg-port-warning/20 text-port-warning' : 'bg-port-success/20 text-port-success'}
+          placeholder="Pitch your invention in 2-3 sentences..."
+          inputValue={inputValue}
+          setInputValue={setInputValue}
+          onSubmit={handleSubmit}
+          inputRef={inputRef}
+          questionIndex={questionIndex}
+          totalPrompts={totalPrompts}
+        />
+      )}
+
+      {drillType === 'reframe' && (
+        <ImaginationUI
+          label="Reframe positively"
+          prompt={currentPrompt?.situation}
+          badge={currentPrompt?.severity}
+          badgeColor="bg-amber-500/20 text-amber-400"
+          placeholder="Find the silver lining..."
+          inputValue={inputValue}
+          setInputValue={setInputValue}
+          onSubmit={handleSubmit}
+          inputRef={inputRef}
+          questionIndex={questionIndex}
+          totalPrompts={totalPrompts}
+        />
+      )}
+    </div>
+  );
+}
+
+export function getPrompts(drill) {
+  if (!drill) return [];
+  switch (drill.type) {
+    case 'word-association': return drill.questions || [];
+    case 'story-recall': return drill.exercises || [];
+    case 'verbal-fluency': return drill.categories || [];
+    case 'wit-comeback': return drill.scenarios || [];
+    case 'pun-wordplay': return drill.challenges || [];
+    case 'compound-chain': return drill.challenges || [];
+    case 'bridge-word': return drill.puzzles || [];
+    case 'double-meaning': return drill.challenges || [];
+    case 'idiom-twist': return drill.challenges || [];
+    case 'what-if': return drill.scenarios || [];
+    case 'alternative-uses': return drill.objects || [];
+    case 'story-prompt': return drill.prompts || [];
+    case 'invention-pitch': return drill.problems || [];
+    case 'reframe': return drill.situations || [];
+    default: return [];
+  }
+}
+
+// Pure per-type response-object builder — the shape scorePostLlmDrill and the
+// server's finishDrill counterpart key off of. Every shape stamps
+// `questionIndex` so the server can pair a response with its originating
+// prompt/challenge/scenario by explicit index rather than array position —
+// array position broke pairing for hosts (e.g. the standalone WordplayTrainer
+// tab) that submit one response at a time wrapped in a single-item array
+// (fixed in 0a60c8457, "pair wordplay responses with correct challenge by
+// index"). Regressing this field silently mis-scores every response.
+export function buildLlmResponseObj({ drillType, questionIndex, items, inputValue, currentPrompt, responseMs }) {
+  if (drillType === 'story-recall') {
+    return {
+      questionIndex,
+      answers: items.length > 0 ? items : [inputValue.trim()],
+      responseMs,
+    };
+  }
+  if (drillType === 'verbal-fluency' || drillType === 'compound-chain' || drillType === 'alternative-uses') {
+    return {
+      questionIndex,
+      // Compound Chain's root word (undefined/dropped for the other two
+      // items-based types) — needed so a completed training round can
+      // persist a readable per-question prompt (issue #2114), matching the
+      // standalone WordplayTrainer tab's compound-chain result shape.
+      prompt: currentPrompt?.rootWord,
+      items,
+      responseMs,
+    };
+  }
+  return {
+    questionIndex,
+    // Bridge Word puzzles have no rootWord/word/idiom field, only `clues` —
+    // without this fallback the persisted per-question prompt silently fell
+    // through to '' for this mode (issue #2114, same bug fixed in the
+    // standalone WordplayTrainer tab).
+    prompt: currentPrompt?.prompt || currentPrompt?.setup || currentPrompt?.category || currentPrompt?.rootWord || currentPrompt?.word || currentPrompt?.idiom
+      || (currentPrompt?.clues || []).join(' / ') || '',
+    response: inputValue.trim(),
+    responseMs,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DRILL-SPECIFIC UI COMPONENTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+// "Prompt N of M" counter over the shared meter. Both knobs exist for the
+// training-feedback screen, which draws the same counter without the numeric
+// readout and in the accent-2 tone that marks training throughout this runner.
+function PromptProgress({ index, total, tone = 'accent', showPercent = true }) {
+  const pct = total > 0 ? ((index + 1) / total) * 100 : 0;
+  return (
+    <div className="space-y-1">
+      <div className="flex justify-between text-xs text-gray-500">
+        <span>Prompt {index + 1} of {total}</span>
+        {showPercent && <span>{Math.round(pct)}%</span>}
+      </div>
+      <ProgressBar
+        percent={pct}
+        tone={tone}
+        track="border"
+        label={`Prompt ${index + 1} of ${total}`}
+      />
+    </div>
+  );
+}
+
+function TextInput({ inputRef, value, onChange, onSubmit, placeholder, buttonLabel = 'Submit' }) {
+  return (
+    <form onSubmit={onSubmit} className="space-y-3">
+      <textarea
+        aria-label={placeholder || 'Your answer'}
+        ref={inputRef}
+        value={value}
+        onChange={e => onChange(e.target.value)}
+        placeholder={placeholder}
+        rows={3}
+        autoFocus
+        className="w-full bg-port-bg border border-port-border rounded-lg px-4 py-3 text-white placeholder-gray-600 focus:border-port-accent focus:outline-none resize-none"
+      />
+      <button
+        type="submit"
+        disabled={!value.trim()}
+        className="w-full px-6 py-2.5 bg-port-accent hover:bg-port-accent/80 disabled:opacity-50 text-white font-medium rounded-lg transition-colors"
+      >
+        {buttonLabel}
+      </button>
+    </form>
+  );
+}
+
+function WordAssociationUI({ prompt, inputValue, setInputValue, onSubmit, inputRef, questionIndex, totalPrompts }) {
+  return (
+    <>
+      <div className="text-center py-6">
+        <div className="text-sm text-gray-500 mb-2">What comes to mind?</div>
+        <div className="text-4xl font-bold text-white">{prompt?.prompt}</div>
+        {prompt?.hints && <div className="text-sm text-gray-500 mt-2">{prompt.hints}</div>}
+      </div>
+      <TextInput
+        inputRef={inputRef}
+        value={inputValue}
+        onChange={setInputValue}
+        onSubmit={onSubmit}
+        placeholder="Type your associations..."
+        buttonLabel="Next"
+      />
+      <PromptProgress index={questionIndex} total={totalPrompts} />
+    </>
+  );
+}
+
+function StoryRecallUI({ exercise, phase, onStartRecall, items, inputValue, setInputValue, onAddAnswer, onSubmit, inputRef, questionIndex, totalPrompts }) {
+  if (phase === 'reading') {
+    return (
+      <>
+        <div className="bg-port-card border border-port-border rounded-lg p-6">
+          <div className="text-sm text-gray-500 mb-3">Read carefully — you'll be asked questions about this:</div>
+          <p className="text-white text-lg leading-relaxed">{exercise?.paragraph}</p>
+        </div>
+        <button
+          onClick={onStartRecall}
+          className="w-full px-6 py-3 bg-port-accent hover:bg-port-accent/80 text-white font-medium rounded-lg transition-colors"
+        >
+          I'm Ready — Show Questions
+        </button>
+        <PromptProgress index={questionIndex} total={totalPrompts} />
+      </>
+    );
+  }
+
+  const recallQuestions = exercise?.questions || [];
+  return (
+    <>
+      <div className="space-y-4">
+        <div className="text-sm text-gray-400">Answer from memory:</div>
+        {recallQuestions.map((q, i) => (
+          <div key={i} className="bg-port-card border border-port-border rounded-lg p-4">
+            <div className="text-white text-sm mb-2">{q.question}</div>
+            {items[i] !== undefined ? (
+              <div className="text-port-accent text-sm font-mono">{items[i]}</div>
+            ) : (
+              <form onSubmit={onAddAnswer} className="flex gap-2">
+                <input
+                  ref={i === items.length ? inputRef : undefined}
+                  type="text"
+                  value={i === items.length ? inputValue : ''}
+                  onChange={e => i === items.length && setInputValue(e.target.value)}
+                  disabled={i !== items.length}
+                  placeholder="Your answer..."
+                  aria-label="Your answer"
+                  autoFocus={i === items.length}
+                  className="flex-1 bg-port-bg border border-port-border rounded px-3 py-1.5 text-sm text-white placeholder-gray-600 focus:border-port-accent focus:outline-none disabled:opacity-50"
+                />
+                {i === items.length && (
+                  <button type="submit" disabled={!inputValue.trim()} className="px-3 py-1.5 bg-port-accent hover:bg-port-accent/80 disabled:opacity-50 text-white text-sm rounded transition-colors">
+                    Answer
+                  </button>
+                )}
+              </form>
+            )}
+          </div>
+        ))}
+      </div>
+      {items.length >= recallQuestions.length && (
+        <button onClick={onSubmit} className="w-full px-6 py-2.5 bg-port-success hover:bg-port-success/80 text-white font-medium rounded-lg transition-colors">
+          Submit All Answers
+        </button>
+      )}
+      <PromptProgress index={questionIndex} total={totalPrompts} />
+    </>
+  );
+}
+
+function VerbalFluencyUI({ category, items, inputValue, setInputValue, onAddItem, onRemoveItem, onSubmit, inputRef, questionIndex, totalPrompts }) {
+  return (
+    <>
+      <div className="text-center py-4">
+        <div className="text-sm text-gray-500 mb-2">Name as many as you can:</div>
+        <div className="text-3xl font-bold text-white">{category?.category}</div>
+        {category?.minExpected && (
+          <div className="text-sm text-gray-500 mt-2">Target: {category.minExpected}+</div>
+        )}
+      </div>
+
+      <form onSubmit={onAddItem} className="flex gap-2">
+        <input
+          ref={inputRef}
+          type="text"
+          value={inputValue}
+          onChange={e => setInputValue(e.target.value)}
+          placeholder="Type an item and press Enter..."
+          aria-label="Next item"
+          autoFocus
+          className="flex-1 bg-port-bg border border-port-border rounded-lg px-4 py-2.5 text-white placeholder-gray-600 focus:border-port-accent focus:outline-none"
+        />
+        <button type="submit" disabled={!inputValue.trim()} className="px-4 py-2.5 bg-port-accent hover:bg-port-accent/80 disabled:opacity-50 text-white font-medium rounded-lg transition-colors">
+          Add
+        </button>
+      </form>
+
+      {items.length > 0 && (
+        <div className="bg-port-card border border-port-border rounded-lg p-4">
+          <div className="flex items-center justify-between text-sm text-gray-400 mb-2">
+            <span>Items ({items.length})</span>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {items.map((item, i) => (
+              <span key={i} className="inline-flex items-center gap-1 px-2 py-1 bg-port-bg border border-port-border rounded text-sm text-white">
+                {item}
+                <button onClick={() => onRemoveItem(i)} className="text-gray-500 hover:text-port-error ml-1">&times;</button>
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <button
+        onClick={onSubmit}
+        disabled={items.length === 0}
+        className="w-full px-6 py-2.5 bg-port-success hover:bg-port-success/80 disabled:opacity-50 text-white font-medium rounded-lg transition-colors"
+      >
+        Done — Submit {pluralize(items.length, 'item')}
+      </button>
+      <PromptProgress index={questionIndex} total={totalPrompts} />
+    </>
+  );
+}
+
+function WitComebackUI({ scenario, inputValue, setInputValue, onSubmit, inputRef, questionIndex, totalPrompts }) {
+  return (
+    <>
+      <div className="bg-port-card border border-port-border rounded-lg p-6 text-center">
+        <div className="text-sm text-gray-500 mb-3">
+          {scenario?.difficulty && <span className={`inline-block px-2 py-0.5 rounded text-xs mr-2 ${
+            scenario.difficulty === 'hard' ? 'bg-port-error/20 text-port-error' :
+            scenario.difficulty === 'medium' ? 'bg-port-warning/20 text-port-warning' :
+            'bg-port-success/20 text-port-success'
+          }`}>{scenario.difficulty}</span>}
+          Respond with wit
+        </div>
+        <p className="text-white text-lg leading-relaxed">"{scenario?.setup}"</p>
+        {scenario?.context && <p className="text-gray-500 text-sm mt-2">{scenario.context}</p>}
+      </div>
+      <TextInput
+        inputRef={inputRef}
+        value={inputValue}
+        onChange={setInputValue}
+        onSubmit={onSubmit}
+        placeholder="Your witty response..."
+        buttonLabel="Next"
+      />
+      <PromptProgress index={questionIndex} total={totalPrompts} />
+    </>
+  );
+}
+
+function PunWordplayUI({ challenge, inputValue, setInputValue, onSubmit, inputRef, questionIndex, totalPrompts }) {
+  return (
+    <>
+      <div className="bg-port-card border border-port-border rounded-lg p-6 text-center">
+        <div className="text-sm text-gray-500 mb-3">
+          {challenge?.type && <span className="inline-block px-2 py-0.5 rounded text-xs mr-2 bg-port-accent-2/20 text-port-accent-2">{challenge.type}</span>}
+          Create wordplay
+        </div>
+        <p className="text-white text-lg leading-relaxed">{challenge?.prompt}</p>
+        {challenge?.topic && <p className="text-gray-500 text-sm mt-2">Topic: {challenge.topic}</p>}
+      </div>
+      <TextInput
+        inputRef={inputRef}
+        value={inputValue}
+        onChange={setInputValue}
+        onSubmit={onSubmit}
+        placeholder="Your pun or wordplay..."
+        buttonLabel="Next"
+      />
+      <PromptProgress index={questionIndex} total={totalPrompts} />
+    </>
+  );
+}
+
+function ImaginationUI({ label, prompt, badge, badgeColor, placeholder, inputValue, setInputValue, onSubmit, inputRef, questionIndex, totalPrompts }) {
+  return (
+    <>
+      <div className="bg-port-card border border-port-border rounded-lg p-6 text-center">
+        <div className="text-sm text-gray-500 mb-3">
+          {badge && <span className={`inline-block px-2 py-0.5 rounded text-xs mr-2 ${badgeColor}`}>{badge}</span>}
+          {label}
+        </div>
+        <p className="text-white text-lg leading-relaxed">{prompt}</p>
+      </div>
+      <TextInput
+        inputRef={inputRef}
+        value={inputValue}
+        onChange={setInputValue}
+        onSubmit={onSubmit}
+        placeholder={placeholder}
+        buttonLabel="Next"
+      />
+      <PromptProgress index={questionIndex} total={totalPrompts} />
+    </>
+  );
+}
+
+function AlternativeUsesUI({ object, items, inputValue, setInputValue, onAddItem, onRemoveItem, onSubmit, inputRef, questionIndex, totalPrompts }) {
+  return (
+    <>
+      <div className="text-center py-4">
+        <div className="text-sm text-gray-500 mb-2">List creative uses for:</div>
+        <div className="text-3xl font-bold text-white">{object?.object}</div>
+        {object?.commonUse && <div className="text-sm text-gray-500 mt-2">Common use: {object.commonUse}</div>}
+        {object?.minExpected && <div className="text-sm text-gray-500">Target: {object.minExpected}+ uses</div>}
+      </div>
+
+      <form onSubmit={onAddItem} className="flex gap-2">
+        <input
+          ref={inputRef}
+          type="text"
+          value={inputValue}
+          onChange={e => setInputValue(e.target.value)}
+          placeholder="Type a creative use and press Enter..."
+          aria-label="Next creative use"
+          autoFocus
+          className="flex-1 bg-port-bg border border-port-border rounded-lg px-4 py-2.5 text-white placeholder-gray-600 focus:border-port-accent focus:outline-none"
+        />
+        <button type="submit" disabled={!inputValue.trim()} className="px-4 py-2.5 bg-port-accent hover:bg-port-accent/80 disabled:opacity-50 text-white font-medium rounded-lg transition-colors">
+          Add
+        </button>
+      </form>
+
+      {items.length > 0 && (
+        <div className="bg-port-card border border-port-border rounded-lg p-4">
+          <div className="text-sm text-gray-400 mb-2">Uses ({items.length})</div>
+          <div className="flex flex-wrap gap-2">
+            {items.map((item, i) => (
+              <span key={i} className="inline-flex items-center gap-1 px-2 py-1 bg-port-bg border border-port-border rounded text-sm text-white">
+                {item}
+                <button onClick={() => onRemoveItem(i)} className="text-gray-500 hover:text-port-error ml-1">&times;</button>
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <button
+        onClick={onSubmit}
+        disabled={items.length === 0}
+        className="w-full px-6 py-2.5 bg-port-success hover:bg-port-success/80 disabled:opacity-50 text-white font-medium rounded-lg transition-colors"
+      >
+        Done — Submit {pluralize(items.length, 'use')}
+      </button>
+      <PromptProgress index={questionIndex} total={totalPrompts} />
+    </>
+  );
+}

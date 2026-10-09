@@ -1,0 +1,94 @@
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+const mocks = vi.hoisted(() => ({ status: vi.fn(), install: vi.fn(), score: vi.fn(), toggle: vi.fn(), publish: vi.fn(), enabled: true }));
+vi.mock('../../services/api', () => ({ getLayaStatus: mocks.status, installLaya: mocks.install, scoreLaya: mocks.score, updateInstanceFeature: mocks.toggle }));
+vi.mock('../../hooks/useInstanceFeatures', () => ({ publishInstanceFeatures: mocks.publish, useInstanceFeatures: () => ({ features: [{ id: 'laya-mlx', enabled: mocks.enabled }] }) }));
+vi.mock('../../services/socket', async () => {
+  const { EventEmitter } = await import('node:events');
+  return { default: new EventEmitter() };
+});
+import socket from '../../services/socket';
+import LayaMlxPanel from './LayaMlxPanel';
+afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); });
+beforeEach(() => {
+  vi.clearAllMocks(); mocks.enabled = true;
+  mocks.status.mockResolvedValue({ supported: true, ready: true });
+  mocks.score.mockResolvedValue({ ok: true, choice: 'billing', margin: 0.8, entropyConfidence: 0.53, elapsedMs: 1200, scores: [{ option: 'billing', probability: 0.9 }, { option: 'sales', probability: 0.1 }] });
+});
+it('scores only on explicit action and clears stale results when input changes', async () => {
+  render(<LayaMlxPanel />);
+  await screen.findByText(/Runtime: installed/);
+  expect(mocks.score).not.toHaveBeenCalled(); expect(mocks.install).not.toHaveBeenCalled();
+  fireEvent.change(screen.getByLabelText('Premise'), { target: { value: 'Duplicate invoice' } });
+  fireEvent.change(screen.getByLabelText(/Options/), { target: { value: 'billing\nsales' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Run experiment' }));
+  expect(await screen.findByText('Choice: billing')).toBeInTheDocument();
+  await waitFor(() => expect(screen.getByRole('button', { name: 'Run experiment' })).toBeEnabled());
+  expect(mocks.score).toHaveBeenCalledWith(expect.objectContaining({ premise: 'Duplicate invoice', options: ['billing', 'sales'] }), { silent: true });
+  fireEvent.change(screen.getByLabelText('Premise'), { target: { value: 'Another input' } });
+  expect(screen.queryByText('Choice: billing')).not.toBeInTheDocument();
+});
+it('keeps setup discoverable while disabled and publishes confirmed enablement', async () => {
+  mocks.enabled = false;
+  mocks.toggle.mockResolvedValue({ features: [{ id: 'laya-mlx', enabled: true }], groups: [] });
+  render(<LayaMlxPanel />);
+  await screen.findByText(/Runtime: installed/);
+  expect(screen.getByRole('button', { name: 'Run experiment' })).toBeDisabled();
+  fireEvent.click(screen.getByRole('button', { name: 'Enable experiments' }));
+  await waitFor(() => expect(mocks.publish).toHaveBeenCalled());
+  expect(mocks.toggle).toHaveBeenCalledWith('laya-mlx', true, { silent: true });
+});
+it('explains unsupported hardware without offering installation or scoring', async () => {
+  mocks.enabled = false;
+  mocks.status.mockResolvedValue({ supported: false, ready: false });
+  render(<LayaMlxPanel />);
+  await screen.findByText(/Jev remains available on other platforms/);
+  expect(screen.getByRole('button', { name: 'Install Laya-MLX' })).toBeDisabled();
+  expect(screen.getByRole('button', { name: 'Enable experiments' })).toBeDisabled();
+});
+
+it('updates from status events without polling and reconciles once on reconnect and tab show', async () => {
+  vi.useFakeTimers();
+  const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
+  const view = render(<LayaMlxPanel />);
+  await act(async () => {});
+  expect(screen.getByText(/Runtime: installed/)).toBeInTheDocument();
+  expect(mocks.status).toHaveBeenCalledTimes(1);
+  await act(async () => { await vi.advanceTimersByTimeAsync(20000); });
+  expect(mocks.status).toHaveBeenCalledTimes(1);
+  mocks.status.mockResolvedValue({ supported: true, installing: true, stage: 'model' });
+  await act(async () => { socket.emit('laya:status', {}); });
+  expect(screen.getByText('Runtime: installing (model). Experiments: enabled.')).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Installing…' })).toBeDisabled();
+  mocks.status.mockResolvedValue({ supported: true, installError: 'laya-install-model-failed' });
+  await act(async () => { socket.emit('laya:status', {}); });
+  expect(screen.getByRole('alert')).toHaveTextContent('pinned model download failed');
+  mocks.status.mockResolvedValue({ supported: true, ready: true });
+  await act(async () => { socket.emit('connect'); });
+  expect(mocks.status).toHaveBeenCalledTimes(4);
+  expect(screen.getByText(/Runtime: installed/)).toBeInTheDocument();
+  visibility.mockReturnValue('hidden');
+  act(() => document.dispatchEvent(new Event('visibilitychange')));
+  await act(async () => { socket.emit('laya:status', {}); socket.emit('connect'); });
+  expect(mocks.status).toHaveBeenCalledTimes(4);
+  visibility.mockReturnValue('visible');
+  await act(async () => document.dispatchEvent(new Event('visibilitychange')));
+  expect(mocks.status).toHaveBeenCalledTimes(5);
+  await act(async () => document.dispatchEvent(new Event('visibilitychange')));
+  expect(mocks.status).toHaveBeenCalledTimes(5);
+  view.unmount();
+  await act(async () => { socket.emit('laya:status', {}); socket.emit('connect'); });
+  expect(mocks.status).toHaveBeenCalledTimes(5);
+});
+it('reconciles completion that arrives before the install acceptance response', async () => {
+  let accept;
+  mocks.install.mockReturnValue(new Promise(resolve => { accept = resolve; }));
+  render(<LayaMlxPanel />);
+  await screen.findByText(/Runtime: installed/);
+  fireEvent.click(screen.getByRole('button', { name: 'Repair Laya-MLX' }));
+  await act(async () => { socket.emit('laya:status', {}); });
+  await act(async () => { accept({ ok: true, installing: true }); });
+  expect(screen.getByText(/Runtime: installed/)).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Repair Laya-MLX' })).toBeEnabled();
+  expect(mocks.status).toHaveBeenCalledTimes(3);
+});

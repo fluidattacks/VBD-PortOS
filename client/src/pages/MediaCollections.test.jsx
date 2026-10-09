@@ -1,0 +1,412 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { render, screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { MemoryRouter, Routes, Route, useLocation, useNavigate } from 'react-router';
+import { typeSettled } from '../test/settledInput';
+
+// ── Spy on the shared cancelable-debounce boundary ───────────────────────────
+// Wraps the REAL hook (not a stand-in) so its actual schedule/cancel
+// semantics stay in force — a spy that merely recorded a call, without also
+// exercising real cancellation, would pass even if `cancel()` were a no-op.
+// This lets a rendered test assert both that MediaCollections calls cancel
+// before navigating to a newly-created collection AND that doing so actually
+// stops the pending query→URL mirror from firing afterward (#8187) — a
+// stale write left free to fire after that navigation can land later and
+// clobber the detail route back to the list route.
+const { cancelQueryMirrorSpy } = vi.hoisted(() => ({ cancelQueryMirrorSpy: vi.fn() }));
+vi.mock('../hooks/useCancelableDebounce', async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    default: (...args) => {
+      const [schedule, cancel] = actual.default(...args);
+      return [schedule, (...cancelArgs) => { cancelQueryMirrorSpy(...cancelArgs); return cancel(...cancelArgs); }];
+    },
+  };
+});
+
+// ── Mock API calls ───────────────────────────────────────────────────────────
+vi.mock('../services/api', () => ({
+  listMediaCollections: vi.fn().mockResolvedValue([
+    { id: 'col-1', name: 'Alpha', items: [{ kind: 'image', ref: 'img1.png', addedAt: '2024-01-01' }] },
+    { id: 'col-2', name: 'Beta', items: [] },
+    {
+      id: 'col-3',
+      name: 'Creative Director: Nightly Surreal Landscapes — 2026-08-01',
+      description: 'Auto-created for project col-3',
+      items: [],
+    },
+  ]),
+  createMediaCollection: vi.fn(),
+  deleteMediaCollection: vi.fn(),
+  listVideoHistory: vi.fn().mockResolvedValue([]),
+  listGalleryCollectionSummaries: vi.fn(async () => [{ id: 'unsorted', total: mockUnsortedItems.length,
+    counts: { image: mockUnsortedItems.length, video: 0 }, cover: null }]),
+}));
+
+// ── Mock useSyncIntegrity ────────────────────────────────────────────────────
+const statusById = new Map([['col-1', 'in-parity'], ['col-2', 'diverged']]);
+vi.mock('../hooks/useSyncIntegrity', () => ({
+  useSyncIntegrity: () => ({
+    statusById,
+    noSyncingPeers: false,
+    integrityUnavailable: false,
+    loading: false,
+    error: null,
+    refresh: vi.fn(),
+    byPeer: new Map(),
+  }),
+  // Mirror the real precedence helper so badge-status assertions stay valid.
+  syncBadgeStatus: (sync, recordId) => (
+    sync.noSyncingPeers
+      ? 'not-syncing'
+      : (sync.statusById.get(recordId) ?? (sync.integrityUnavailable ? 'unknown' : undefined))
+  ),
+}));
+
+// ── Mock buildUnsortedCollection ─────────────────────────────────────────────
+// Read at call time (inside the factory's returned function), so a test can
+// empty it to simulate a fresh install with no media at all.
+let mockUnsortedItems = [{ kind: 'image', ref: 'loose.png', addedAt: '2024-01-02' }];
+vi.mock('../lib/unsorted', () => ({
+  buildUnsortedCollection: () => ({
+    id: '__unsorted__',
+    name: 'Unsorted',
+    items: mockUnsortedItems,
+    synthetic: true,
+  }),
+}));
+
+import MediaCollections from './MediaCollections';
+
+// Surfaces the live URL search string and lets a test drive an EXTERNAL
+// navigation (Back/Forward, a ⌘K deep-link) while the page stays mounted — the
+// only way to exercise the adopt-the-URL effect.
+function RouteProbe() {
+  const location = useLocation();
+  const navigate = useNavigate();
+  return (
+    <>
+      <div data-testid="search-string">{location.search}</div>
+      <div data-testid="pathname">{location.pathname}</div>
+      <button type="button" onClick={() => navigate('/media/collections?q=alpha')}>external nav</button>
+    </>
+  );
+}
+
+function renderPage(entry = '/media/collections') {
+  return render(
+    <MemoryRouter initialEntries={[entry]}>
+      <Routes>
+        <Route path="/media/collections" element={<MediaCollections />} />
+        <Route path="/media/collections/:id" element={<div>Collection detail</div>} />
+      </Routes>
+      <RouteProbe />
+    </MemoryRouter>,
+  );
+}
+
+describe('MediaCollections', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    cancelQueryMirrorSpy.mockClear();
+    // clearAllMocks resets calls, not implementations — restore the shared
+    // fixture so a test that emptied it can't leak into the next one.
+    mockUnsortedItems = [{ kind: 'image', ref: 'loose.png', addedAt: '2024-01-02' }];
+  });
+
+  it('renders non-empty collection names after loading', async () => {
+    renderPage();
+    await waitFor(() => {
+      expect(screen.getByText('Alpha')).toBeInTheDocument();
+    });
+  });
+
+  it('renders a SyncBadge per visible non-synthetic collection row', async () => {
+    renderPage('/media/collections?empty=1');
+    await waitFor(() => screen.getByText('Alpha'));
+    // 'in-parity' badge on col-1, 'diverged' on col-2
+    expect(screen.getByText('In sync')).toBeInTheDocument();
+    expect(screen.getByText('Diverged')).toBeInTheDocument();
+  });
+
+  it('does not render a SyncBadge for the synthetic Unsorted collection', async () => {
+    renderPage('/media/collections?empty=1');
+    await waitFor(() => screen.getByText('Alpha'));
+    // Unsorted is synthetic — only the real collections with a known sync
+    // status get a badge (col-1 in-parity, col-2 diverged; col-3 has none).
+    const badges = screen.getAllByRole('button', { name: /in sync|diverged|assets missing|local only|on peer only|not syncing/i });
+    expect(badges.length).toBe(2);
+  });
+
+  it('hides empty collections by default and says how many it hid', async () => {
+    renderPage();
+    await waitFor(() => screen.getByText('Alpha'));
+    expect(screen.queryByText('Beta')).not.toBeInTheDocument();
+    expect(screen.getByText(/2 empty collections hidden/)).toBeInTheDocument();
+  });
+
+  it('reveals the empty collections from the "Show" affordance', async () => {
+    const user = userEvent.setup();
+    renderPage();
+    await waitFor(() => screen.getByText('Alpha'));
+    await user.click(screen.getByRole('button', { name: 'Show' }));
+    expect(await screen.findByText('Beta')).toBeInTheDocument();
+  });
+
+  it('toggles empty collections back in from the Hide empty checkbox', async () => {
+    const user = userEvent.setup();
+    renderPage();
+    await waitFor(() => screen.getByText('Alpha'));
+    await user.click(screen.getByLabelText('Hide empty'));
+    expect(await screen.findByText('Beta')).toBeInTheDocument();
+  });
+
+  it('honours ?empty=1 so a shared filtered URL restores the view', async () => {
+    renderPage('/media/collections?empty=1');
+    expect(await screen.findByText('Beta')).toBeInTheDocument();
+  });
+
+  it('filters by the search box', async () => {
+    const user = userEvent.setup();
+    renderPage('/media/collections?empty=1');
+    await waitFor(() => screen.getByText('Alpha'));
+    await user.type(screen.getByLabelText('Search collections'), 'beta');
+    await waitFor(() => expect(screen.queryByText('Alpha')).not.toBeInTheDocument());
+    expect(screen.getByText('Beta')).toBeInTheDocument();
+  });
+
+  it('lifts the shared auto-creator prefix into a badge and keeps the name tail visible', async () => {
+    renderPage('/media/collections?empty=1');
+    await waitFor(() => screen.getByText('Alpha'));
+    expect(screen.getByText('Creative Director')).toBeInTheDocument();
+    // The trailing date survives — an end-clip would have eaten it.
+    expect(screen.getByText(/2026-08-01$/)).toBeInTheDocument();
+    // The full name is still available on hover.
+    expect(screen.getByTitle('Creative Director: Nightly Surreal Landscapes — 2026-08-01')).toBeInTheDocument();
+  });
+
+  it('hydrates the search box, sort, and empty toggle from the URL', async () => {
+    renderPage('/media/collections?q=a&sort=name&empty=1');
+    await waitFor(() => screen.getByText('Alpha'));
+    expect(screen.getByLabelText('Search collections')).toHaveValue('a');
+    expect(screen.getByLabelText('Sort collections')).toHaveValue('name');
+    expect(screen.getByLabelText('Hide empty')).not.toBeChecked();
+    // `q=a` matches Alpha and Beta but not Unsorted, and empty=1 keeps Beta.
+    expect(screen.getByText('Beta')).toBeInTheDocument();
+    expect(screen.queryByText('Unsorted')).not.toBeInTheDocument();
+  });
+
+  it('mirrors the typed query into the URL after the debounce', async () => {
+    const user = userEvent.setup();
+    renderPage();
+    await waitFor(() => screen.getByText('Alpha'));
+    await user.type(screen.getByLabelText('Search collections'), 'beta');
+    await waitFor(() => expect(screen.getByTestId('search-string')).toHaveTextContent('q=beta'));
+  });
+
+  it('writes the sort to the URL and drops the param at the default', async () => {
+    const user = userEvent.setup();
+    renderPage();
+    await waitFor(() => screen.getByText('Alpha'));
+    await user.selectOptions(screen.getByLabelText('Sort collections'), 'name');
+    await waitFor(() => expect(screen.getByTestId('search-string')).toHaveTextContent('sort=name'));
+    await user.selectOptions(screen.getByLabelText('Sort collections'), 'updated');
+    await waitFor(() => expect(screen.getByTestId('search-string')).not.toHaveTextContent('sort='));
+  });
+
+  it('adopts an externally-changed ?q= while the page stays mounted', async () => {
+    const user = userEvent.setup();
+    renderPage();
+    await waitFor(() => screen.getByText('Alpha'));
+    await user.click(screen.getByRole('button', { name: 'external nav' }));
+    await waitFor(() => expect(screen.getByLabelText('Search collections')).toHaveValue('alpha'));
+  });
+
+  it('says every match is empty rather than claiming there was no match', async () => {
+    // `beta` matches exactly one collection, which "Hide empty" then removes —
+    // reporting "no match" here would send the user hunting for a real record.
+    renderPage('/media/collections?q=beta');
+    await waitFor(() => screen.getByText(/1 empty collection hidden/));
+    expect(screen.getByText(/Every collection here is empty/)).toBeInTheDocument();
+    expect(screen.queryByText(/No collections match that search/)).not.toBeInTheDocument();
+  });
+
+  it('opens the new collection after creating it, even under an active search', async () => {
+    const { createMediaCollection } = await import('../services/api');
+    createMediaCollection.mockResolvedValueOnce({ id: 'col-4', name: 'Fresh Bucket', items: [] });
+    const user = userEvent.setup();
+    // `?q=alpha` is the hostile case: a brand-new collection is always empty
+    // AND doesn't match the search, so any grid-local feedback would be
+    // swallowed and the create would look like it failed.
+    renderPage('/media/collections?q=alpha');
+    await waitFor(() => screen.getByText('Alpha'));
+    await typeSettled(user, screen.getByLabelText('New collection name'), 'Fresh Bucket');
+    await user.click(screen.getByRole('button', { name: /create/i }));
+    // The mocked response fixes the id, so the navigation assertion alone would
+    // pass on a half-typed name — assert what was actually sent.
+    await waitFor(() => expect(createMediaCollection).toHaveBeenCalledWith({ name: 'Fresh Bucket' }, { silent: true }));
+    await waitFor(() => expect(screen.getByTestId('pathname')).toHaveTextContent('/media/collections/col-4'));
+  });
+
+  it('cancels the pending query-mirror write before navigating to a new collection', async () => {
+    // #8187 regression: the 300ms query→URL mirror is armed on mount (and
+    // re-armed on every keystroke) and is still pending — not yet fired —
+    // when create resolves. React's own unmount cleanup for that timer runs
+    // asynchronously relative to the `navigate()` call in `handleCreate`
+    // (it waits for the router to re-render and commit), so under load the
+    // stale write can still land AFTER the navigation and clobber the
+    // detail route back to the list route. Creating a collection must
+    // cancel the pending mirror synchronously, before navigating, rather
+    // than relying on that unmount race to resolve in its favor.
+    const { createMediaCollection } = await import('../services/api');
+    createMediaCollection.mockResolvedValueOnce({ id: 'col-4', name: 'Fresh Bucket', items: [] });
+    const user = userEvent.setup();
+    // An active search keeps the mirror's debounce genuinely armed (a
+    // change from the mounted `?q=alpha`) at the moment create fires.
+    renderPage('/media/collections?q=alpha');
+    await waitFor(() => screen.getByText('Alpha'));
+    expect(cancelQueryMirrorSpy).not.toHaveBeenCalled();
+    await typeSettled(user, screen.getByLabelText('New collection name'), 'Fresh Bucket');
+    await user.click(screen.getByRole('button', { name: /create/i }));
+    await waitFor(() => expect(screen.getByTestId('pathname')).toHaveTextContent('/media/collections/col-4'));
+    expect(cancelQueryMirrorSpy).toHaveBeenCalled();
+
+    // The cancel call is only meaningful if it actually stops the mirror
+    // from firing — wait past its 300ms delay (real timers; the mock above
+    // wraps the REAL hook) and confirm the detail route is still current
+    // rather than having been clobbered back to the list route.
+    await new Promise((resolve) => { setTimeout(resolve, 350); });
+    expect(screen.getByTestId('pathname')).toHaveTextContent('/media/collections/col-4');
+  });
+
+  it('preserves sibling URL params when one filter changes', async () => {
+    const user = userEvent.setup();
+    renderPage('/media/collections?q=beta&sort=name&empty=1');
+    await waitFor(() => screen.getByText('Beta'));
+    await user.selectOptions(screen.getByLabelText('Sort collections'), 'count');
+    await waitFor(() => expect(screen.getByTestId('search-string')).toHaveTextContent('sort=count'));
+    // A params merge built from a stale/blank snapshot would silently drop the
+    // search and the empty toggle the user set moments earlier.
+    expect(screen.getByTestId('search-string')).toHaveTextContent('q=beta');
+    expect(screen.getByTestId('search-string')).toHaveTextContent('empty=1');
+  });
+
+  it('shows the onboarding copy on a fresh install, not a hidden-empties notice', async () => {
+    const { listMediaCollections } = await import('../services/api');
+    listMediaCollections.mockResolvedValueOnce([]);
+    mockUnsortedItems = [];
+    renderPage();
+    expect(await screen.findByText(/No collections yet/)).toBeInTheDocument();
+    // The synthetic "Unsorted" entry is always prepended, so a gate on the
+    // enriched list would never fire this copy — and would instead tell a new
+    // user that 1 empty collection they never made is hidden.
+    expect(screen.queryByText(/empty collection/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Every collection here is empty/)).not.toBeInTheDocument();
+  });
+
+  it('gives the fresh-install empty state a call to action that focuses the create field', async () => {
+    const { listMediaCollections } = await import('../services/api');
+    listMediaCollections.mockResolvedValueOnce([]);
+    mockUnsortedItems = [];
+    renderPage();
+    const cta = await screen.findByRole('button', { name: 'Name your first collection' });
+    await userEvent.click(cta);
+    // Without the action the empty state is a dead end: the create form is
+    // above the list, so the button has to point back up at it.
+    expect(screen.getByLabelText('New collection name')).toHaveFocus();
+  });
+
+  it('reports a failed search as a failed search, not as a fresh install', async () => {
+    const { listMediaCollections } = await import('../services/api');
+    listMediaCollections.mockResolvedValueOnce([]);
+    // Loose media but no collections yet — the exact population the onboarding
+    // copy is for. With a query active, that copy would answer the search with
+    // "No collections yet" and give no sign a filter was even applied.
+    renderPage('/media/collections?q=zzzz');
+    expect(await screen.findByText(/No collections match that search/)).toBeInTheDocument();
+    expect(screen.queryByText(/No collections yet/)).not.toBeInTheDocument();
+  });
+
+  it('reports a failed collections fetch instead of claiming there are none', async () => {
+    const { listMediaCollections } = await import('../services/api');
+    listMediaCollections.mockRejectedValueOnce(new Error('Server error (500)'));
+    renderPage();
+    expect(await screen.findByText(/Couldn't load collections/)).toBeInTheDocument();
+    expect(screen.getByText('Server error (500)')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument();
+    // The onboarding copy would tell the user their collections never existed.
+    expect(screen.queryByText(/No collections yet/)).not.toBeInTheDocument();
+    // …and the synthetic bucket would hand them their whole library as unfiled.
+    expect(screen.queryByText('Unsorted')).not.toBeInTheDocument();
+    expect(screen.queryByText(/No collections match that search/)).not.toBeInTheDocument();
+  });
+
+  it('owns the failure UI, so the shared request() toast stays silent', async () => {
+    const { listMediaCollections } = await import('../services/api');
+    listMediaCollections.mockRejectedValueOnce(new Error('Server error (500)'));
+    renderPage();
+    await screen.findByRole('button', { name: 'Retry' });
+    expect(listMediaCollections).toHaveBeenCalledWith({ silent: true });
+  });
+
+  it('recovers the grid when Retry succeeds', async () => {
+    const { listMediaCollections } = await import('../services/api');
+    listMediaCollections.mockRejectedValueOnce(new Error('Server error (500)'));
+    const user = userEvent.setup();
+    renderPage('/media/collections?empty=1');
+    await user.click(await screen.findByRole('button', { name: 'Retry' }));
+    expect(await screen.findByText('Alpha')).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByText(/Couldn't load collections/)).not.toBeInTheDocument());
+  });
+
+  it('keeps the last good grid when a later refresh fails', async () => {
+    const { listMediaCollections, deleteMediaCollection } = await import('../services/api');
+    const user = userEvent.setup();
+    renderPage('/media/collections?empty=1');
+    await screen.findByText('Alpha');
+    // A failed delete calls refresh() — the recovery path that re-reads the
+    // list. If that read fails, the collections already on screen must survive
+    // rather than collapsing back into the sentinel and blanking the grid.
+    deleteMediaCollection.mockRejectedValueOnce(new Error('Delete failed'));
+    listMediaCollections.mockRejectedValueOnce(new Error('Server error (500)'));
+    // Scope to the Alpha card — every card renders the same delete label, and
+    // indexing a match list would silently target whichever row sorted first.
+    const alphaCard = screen.getByTitle('Alpha').closest('.bg-port-card');
+    await user.click(within(alphaCard).getByRole('button', { name: 'Delete collection' }));
+    expect(await screen.findByText(/Couldn't load collections/)).toBeInTheDocument();
+    expect(screen.getByText('Beta')).toBeInTheDocument();
+  });
+
+  it('offers the three sort options', async () => {
+    renderPage();
+    await waitFor(() => screen.getByText('Alpha'));
+    const select = screen.getByLabelText('Sort collections');
+    expect([...select.options].map((o) => o.textContent))
+      .toEqual(['Recently updated', 'Name', 'Item count']);
+  });
+
+  it('reveals newly unfiled images after deleting their only collection', async () => {
+    const { listMediaCollections, listGalleryCollectionSummaries, deleteMediaCollection } = await import('../services/api');
+    mockUnsortedItems = [];
+    listMediaCollections.mockResolvedValueOnce([
+      { id: 'col-1', name: 'Alpha', items: [{ kind: 'image', ref: 'img1.png' }] },
+    ]);
+    listGalleryCollectionSummaries.mockResolvedValueOnce([
+      { id: 'unsorted', total: 0, counts: { image: 0, video: 0 }, cover: null },
+      { id: 'col-1', total: 1, counts: { image: 1, video: 0 }, cover: '/data/images/img1.png' },
+    ]).mockResolvedValueOnce([
+      { id: 'unsorted', total: 1, counts: { image: 1, video: 0 }, cover: '/data/images/img1.png' },
+    ]);
+    deleteMediaCollection.mockResolvedValueOnce({ id: 'col-1' });
+    const user = userEvent.setup();
+    renderPage();
+    await screen.findByText('Alpha');
+    expect(screen.queryByText('Unsorted')).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Delete collection' }));
+    const unsorted = await screen.findByTitle('Unsorted');
+    expect(unsorted).toHaveAttribute('href', '/media/collections/unsorted');
+    expect(screen.queryByText('Alpha')).not.toBeInTheDocument();
+    expect(within(unsorted.closest('.bg-port-card')).getByText('1')).toBeInTheDocument();
+    expect(listMediaCollections).toHaveBeenCalledTimes(1);
+  });
+});

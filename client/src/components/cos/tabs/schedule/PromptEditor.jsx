@@ -1,0 +1,138 @@
+import { useState, useEffect } from 'react';
+import {
+  Shield, BadgeCheck, Hammer, Layers, GitBranch, FileText, Sparkles, Bot,
+  Cpu, Workflow, Boxes, ScanSearch, ListChecks, PenLine, Clapperboard, Rocket,
+  Shapes,
+} from 'lucide-react';
+import { pipelineStages } from './scheduleConstants';
+import TabPills from '../../../ui/TabPills';
+
+const STAGE_ICONS = [
+  Shield, BadgeCheck, Hammer, Layers, GitBranch, FileText, Sparkles, Bot,
+  Cpu, Workflow, Boxes, ScanSearch, ListChecks, PenLine, Clapperboard, Rocket,
+];
+
+// Stages are data-driven and unbounded, so the fixed icon table cannot cover
+// them all. A stage past the end of STAGE_ICONS must still render a glyph:
+// one iconless tab drops the whole `mobileCompact` bar to the `<select>`
+// fallback (see TabPills' `iconRow` gate).
+const FALLBACK_STAGE_ICON = Shapes;
+
+export default function PromptEditor({ config, promptValue, setPromptValue, editingPrompt, setEditingPrompt, handleSavePrompt, updating, activeApps }) {
+  const stages = pipelineStages(config);
+  const stagePrompts = config.stagePrompts;
+  const hasPipeline = stages?.length > 0 && stagePrompts?.length > 0;
+  const [activeTab, setActiveTab] = useState(0);
+
+  useEffect(() => {
+    if (activeTab >= (stages?.length || 1)) setActiveTab(0);
+  }, [stages?.length, activeTab]);
+
+  if (!hasPipeline) {
+    // A PROGRAMMATIC task has no prompt at all — PortOS performs the work
+    // itself. Distinct from 'runtime-generated' (a hook renders a real prompt
+    // for a real agent), so it must not offer to show one.
+    if (config.promptMode === 'programmatic') {
+      return (
+        <div className="space-y-2">
+          <div className="flex items-center gap-2">
+            <span className="text-sm text-gray-400">Task Prompt</span>
+            <span className="text-[10px] px-1.5 py-0.5 bg-port-accent/10 text-port-accent rounded">No prompt — PortOS runs this itself</span>
+          </div>
+          <div className="bg-port-bg border border-port-border rounded px-3 py-2 text-sm text-gray-400">
+            {config.promptDescription || 'This task is performed by PortOS directly, with no agent and no prompt.'}
+          </div>
+        </div>
+      );
+    }
+    if (config.promptMode === 'runtime-generated') {
+      return (
+        <div className="space-y-2">
+          <div className="flex items-center gap-2">
+            <span className="text-sm text-gray-400">Task Prompt</span>
+            <span className="text-[10px] px-1.5 py-0.5 bg-port-accent/10 text-port-accent rounded">Generated at run time</span>
+          </div>
+          <div className="bg-port-bg border border-port-border rounded px-3 py-2 text-sm text-gray-400">
+            {config.promptDescription || 'This task builds its prompt from fresh runtime context before each run.'}
+          </div>
+          <p className="text-xs text-gray-500">
+            There is no stored prompt template to edit; the task hook owns the runtime prompt.
+          </p>
+        </div>
+      );
+    }
+    // Standard single prompt editor
+    return (
+      <div>
+        <div className="flex items-center justify-between mb-2">
+          <span className="text-sm text-gray-400">Task Prompt</span>
+          {!editingPrompt && (
+            <button onClick={() => setEditingPrompt(true)} className="text-xs text-port-accent hover:text-port-accent/80">Edit</button>
+          )}
+        </div>
+        {editingPrompt ? (
+          <div className="space-y-2">
+            <textarea
+              aria-label="Task prompt"
+              value={promptValue}
+              onChange={(e) => setPromptValue(e.target.value)}
+              disabled={updating}
+              rows={12}
+              className="w-full bg-port-bg border border-port-border rounded px-3 py-2 text-white text-sm font-mono"
+              placeholder="Enter task prompt"
+            />
+            <div className="flex gap-2">
+              <button onClick={handleSavePrompt} disabled={updating} className="px-3 py-1.5 text-sm bg-port-accent hover:bg-port-accent/80 text-white rounded transition-colors">Save Prompt</button>
+              <button onClick={() => { setPromptValue(config.prompt || ''); setEditingPrompt(false); }} disabled={updating} className="px-3 py-1.5 text-sm bg-port-border hover:bg-port-border/80 text-white rounded transition-colors">Cancel</button>
+            </div>
+            {activeApps.length > 0 && (
+              <p className="text-xs text-gray-500">
+                Use <code className="bg-port-border px-1 rounded">{'{appName}'}</code> and <code className="bg-port-border px-1 rounded">{'{repoPath}'}</code> as placeholders.
+              </p>
+            )}
+          </div>
+        ) : (
+          <button
+            type="button"
+            className="block w-full bg-port-bg border border-port-border rounded text-xs text-gray-400 font-mono cursor-pointer hover:border-port-accent/50 text-left"
+            onClick={() => setEditingPrompt(true)}
+            title="Click to edit prompt"
+            aria-label="Edit prompt"
+          >
+            <pre className="max-h-32 overflow-y-auto px-3 py-2 whitespace-pre-wrap break-words">{promptValue || 'No prompt configured'}</pre>
+          </button>
+        )}
+      </div>
+    );
+  }
+
+  // Pipeline tabbed prompt viewer
+  return (
+    <div>
+      <span className="text-sm text-gray-400 block mb-2">Stage Prompts</span>
+      <div className="border border-port-border rounded-lg overflow-hidden">
+        <TabPills
+          tabs={stages.map((stage, i) => ({
+            id: String(i),
+            label: stage.name,
+            icon: STAGE_ICONS[i] ?? FALLBACK_STAGE_ICON,
+            trailing: stage.readOnly
+              ? <span className="text-[10px] text-gray-500">(read-only)</span>
+              : undefined,
+          }))}
+          activeTab={String(activeTab)}
+          onChange={(id) => setActiveTab(Number(id))}
+          variant="underline"
+          stretch
+          size="sm"
+          mobileCompact
+          ariaLabel="Stage prompts"
+        />
+        <div className="bg-port-bg px-3 py-2 text-xs text-gray-400 font-mono max-h-64 overflow-y-auto">
+          <pre className="whitespace-pre-wrap break-words">{stagePrompts[activeTab] || 'No prompt configured'}</pre>
+        </div>
+      </div>
+      <p className="text-xs text-gray-500 mt-2">Stage prompts use the default templates. Edit the main task prompt to override all stages with a single prompt.</p>
+    </div>
+  );
+}

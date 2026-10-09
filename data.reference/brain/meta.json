@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "confidenceThreshold": 0.6,
+  "dailyDigestTime": "09:00",
+  "weeklyReviewTime": "16:00",
+  "weeklyReviewDay": "sunday",
+  "defaultProvider": "claude-code",
+  "defaultModel": "haiku",
+  "lastDailyDigest": null,
+  "lastWeeklyReview": null
+}

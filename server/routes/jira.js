@@ -1,0 +1,438 @@
+/**
+ * JIRA API Routes
+ */
+
+import express from 'express';
+import { z } from 'zod';
+import * as jiraService from '../services/jira.js';
+import * as jiraReports from '../services/jiraReports.js';
+import { getAppById } from '../services/apps.js';
+import { asyncHandler, ServerError } from '../lib/errorHandler.js';
+import { validateRequest, jiraTicketKeySchema } from '../lib/validation.js';
+
+const validateTicketParam = (req, res, next, value) => {
+  const parsed = jiraTicketKeySchema.safeParse(value);
+  if (!parsed.success) {
+    return next(new ServerError('Invalid Jira ticket id', { status: 400, code: 'VALIDATION_ERROR' }));
+  }
+  next();
+};
+
+const jiraCommentSchema = z.object({ comment: z.string().min(1).max(32768) });
+const jiraTransitionSchema = z.object({
+  transitionId: z.union([z.string().min(1).max(64), z.number().int()])
+});
+
+const jiraInstanceSchema = z.object({
+  id: z.string().min(1),
+  name: z.string().min(1),
+  baseUrl: z.string().url(),
+  email: z.string().email(),
+  apiToken: z.string().min(1).optional(),
+});
+
+const jiraTicketCreateSchema = z.object({
+  projectKey: z.string().min(1),
+  summary: z.string().min(1),
+  description: z.string().optional(),
+  issueType: z.string().optional(),
+  priority: z.string().optional(),
+  labels: z.array(z.string()).optional(),
+  epicKey: z.string().optional(),
+  sprintId: z.union([z.string(), z.number()]).optional(),
+  storyPoints: z.number().optional(),
+  assignee: z.string().optional(),
+  components: z.array(z.string()).optional(),
+  customFields: z.record(z.unknown()).optional(),
+}).passthrough();
+
+// An update accepts every create key EXCEPT the two that name nothing writable on
+// an existing issue: a ticket cannot change project, and sprint membership moves
+// through POST /sprints/:sprintId/issues. Advertising them would accept a write
+// the service then silently drops and still answers 200.
+const jiraTicketUpdateSchema = jiraTicketCreateSchema.partial().omit({ projectKey: true, sprintId: true });
+
+// A write with an empty list is a no-op request, not a valid one — reject it at
+// the edge rather than issuing a JIRA call that changes nothing.
+const nonEmptyStringList = z.array(z.string().min(1)).min(1);
+
+const jiraLabelsSchema = z.object({ labels: nonEmptyStringList });
+const jiraSprintIssuesSchema = z.object({ issueKeys: nonEmptyStringList });
+
+const appIdSchema = z.string().regex(/^[A-Za-z0-9._-]+$/, 'appId contains invalid characters');
+
+const reportParamsSchema = z.object({
+  appId: appIdSchema,
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD')
+});
+
+const generateReportSchema = z.object({
+  appId: appIdSchema.optional()
+});
+
+const router = express.Router();
+router.param('ticketId', validateTicketParam);
+router.param('issueKey', validateTicketParam);
+
+/**
+ * GET /api/jira/instances
+ * Get all JIRA instances
+ */
+router.get('/instances', asyncHandler(async (req, res) => {
+  const config = await jiraService.getInstances();
+
+  // Don't send API tokens to client
+  const sanitized = {
+    instances: Object.fromEntries(
+      Object.entries(config.instances).map(([id, instance]) => [
+        id,
+        {
+          id: instance.id,
+          name: instance.name,
+          baseUrl: instance.baseUrl,
+          email: instance.email,
+          hasApiToken: !!instance.apiToken,
+          tokenUpdatedAt: instance.tokenUpdatedAt,
+          createdAt: instance.createdAt,
+          updatedAt: instance.updatedAt
+        }
+      ])
+    )
+  };
+
+  res.json(sanitized);
+}));
+
+/**
+ * POST /api/jira/instances
+ * Create or update JIRA instance
+ */
+router.post('/instances', asyncHandler(async (req, res) => {
+  const { id, name, baseUrl, email, apiToken } = validateRequest(jiraInstanceSchema, req.body);
+
+  if (!apiToken) {
+    const { instances } = await jiraService.getInstances();
+    if (!instances?.[id]?.apiToken) {
+      throw new ServerError('API token is required for a new JIRA instance', { status: 400, code: 'VALIDATION_ERROR' });
+    }
+  }
+
+  const instance = await jiraService.upsertInstance(id, {
+    name,
+    baseUrl,
+    email,
+    apiToken
+  });
+
+  // Don't send API token back
+  const sanitized = {
+    id: instance.id,
+    name: instance.name,
+    baseUrl: instance.baseUrl,
+    email: instance.email,
+    hasApiToken: true,
+    tokenUpdatedAt: instance.tokenUpdatedAt,
+    createdAt: instance.createdAt,
+    updatedAt: instance.updatedAt
+  };
+
+  res.json(sanitized);
+}));
+
+/**
+ * DELETE /api/jira/instances/:id
+ * Delete JIRA instance
+ */
+router.delete('/instances/:id', asyncHandler(async (req, res) => {
+  await jiraService.deleteInstance(req.params.id);
+  res.json({ success: true });
+}));
+
+/**
+ * POST /api/jira/instances/:id/test
+ * Test JIRA instance connection
+ */
+router.post('/instances/:id/test', asyncHandler(async (req, res) => {
+  const result = await jiraService.testConnection(req.params.id);
+  res.json(result);
+}));
+
+/**
+ * GET /api/jira/instances/:id/projects
+ * Get projects for JIRA instance
+ */
+router.get('/instances/:id/projects', asyncHandler(async (req, res) => {
+  const projects = await jiraService.getProjects(req.params.id);
+  res.json(projects);
+}));
+
+/**
+ * POST /api/jira/instances/:id/tickets
+ * Create JIRA ticket
+ */
+router.post('/instances/:id/tickets', asyncHandler(async (req, res) => {
+  const ticketData = validateRequest(jiraTicketCreateSchema, req.body);
+  const result = await jiraService.createTicket(req.params.id, ticketData);
+  res.json(result);
+}));
+
+/**
+ * GET /api/jira/instances/:instanceId/tickets/:ticketId
+ * GET /api/jira/instances/:instanceId/issues/:issueKey
+ *
+ * Read one ticket — labels, description, and the epic link. Two paths, one
+ * handler: `/issues/:issueKey` is what the app-config epic picker calls, and
+ * `/tickets/:ticketId` is the spelling every claim-flow prompt already uses.
+ */
+const readTicket = asyncHandler(async (req, res) => {
+  const issue = await jiraService.getIssue(
+    req.params.instanceId,
+    req.params.ticketId || req.params.issueKey
+  );
+  res.json(issue);
+});
+
+router.get('/instances/:instanceId/tickets/:ticketId', readTicket);
+
+/**
+ * POST /api/jira/instances/:instanceId/tickets/:ticketId/labels
+ * Add labels without disturbing the ticket's existing ones — this is how the
+ * claim flow stamps the `decomposed` marker on a parent epic. A PUT of
+ * `fields.labels` would REPLACE them.
+ */
+router.post('/instances/:instanceId/tickets/:ticketId/labels', asyncHandler(async (req, res) => {
+  const { labels } = validateRequest(jiraLabelsSchema, req.body);
+  const result = await jiraService.addLabels(
+    req.params.instanceId,
+    req.params.ticketId,
+    labels
+  );
+  res.json(result);
+}));
+
+/**
+ * PUT /api/jira/instances/:instanceId/tickets/:ticketId
+ * Update JIRA ticket
+ */
+router.put('/instances/:instanceId/tickets/:ticketId', asyncHandler(async (req, res) => {
+  const updates = validateRequest(jiraTicketUpdateSchema, req.body);
+  const result = await jiraService.updateTicket(
+    req.params.instanceId,
+    req.params.ticketId,
+    updates
+  );
+  res.json(result);
+}));
+
+/**
+ * POST /api/jira/instances/:instanceId/tickets/:ticketId/comments
+ * Add comment to JIRA ticket
+ */
+router.post('/instances/:instanceId/tickets/:ticketId/comments', asyncHandler(async (req, res) => {
+  const { comment } = validateRequest(jiraCommentSchema, req.body);
+
+  const result = await jiraService.addComment(
+    req.params.instanceId,
+    req.params.ticketId,
+    comment
+  );
+
+  res.json(result);
+}));
+
+/**
+ * GET /api/jira/instances/:instanceId/tickets/:ticketId/transitions
+ * Get available transitions for a ticket
+ */
+router.get('/instances/:instanceId/tickets/:ticketId/transitions', asyncHandler(async (req, res) => {
+  const transitions = await jiraService.getTransitions(
+    req.params.instanceId,
+    req.params.ticketId
+  );
+  res.json(transitions);
+}));
+
+/**
+ * POST /api/jira/instances/:instanceId/tickets/:ticketId/transition
+ * Transition JIRA ticket status
+ */
+router.post('/instances/:instanceId/tickets/:ticketId/transition', asyncHandler(async (req, res) => {
+  const { transitionId } = validateRequest(jiraTransitionSchema, req.body);
+
+  const result = await jiraService.transitionTicket(
+    req.params.instanceId,
+    req.params.ticketId,
+    transitionId
+  );
+
+  res.json(result);
+}));
+
+/**
+ * GET /api/jira/instances/:instanceId/my-sprint-tickets/:projectKey
+ * Get tickets assigned to current user in active sprint for a project
+ */
+router.get('/instances/:instanceId/my-sprint-tickets/:projectKey', asyncHandler(async (req, res) => {
+  // STRICT variant on purpose (#3437): the UI has to tell "the fetch failed"
+  // apart from "the sprint is empty", and the swallow-to-[] wrapper made that
+  // impossible — an unreachable instance rendered as "No tickets assigned to
+  // you" with no retry. Non-UI callers that genuinely prefer a soft failure
+  // (voice/character context) keep using getMyCurrentSprintTickets.
+  const tickets = await jiraService.fetchMyCurrentSprintTickets(
+    req.params.instanceId,
+    req.params.projectKey
+  ).catch(err => {
+    throw new ServerError(`JIRA sprint fetch failed: ${err.message}`, {
+      status: 502,
+      code: 'JIRA_FETCH_FAILED'
+    });
+  });
+  res.json(tickets);
+}));
+
+/**
+ * GET /api/jira/instances/:instanceId/board-columns/:projectKey?boardId=
+ * Resolve the ordered workflow columns (full lifecycle) for the Kanban board.
+ */
+router.get('/instances/:instanceId/board-columns/:projectKey', asyncHandler(async (req, res) => {
+  const result = await jiraService.getBoardColumns(
+    req.params.instanceId,
+    req.params.projectKey,
+    req.query.boardId
+  );
+  res.json(result);
+}));
+
+/**
+ * GET /api/jira/instances/:instanceId/boards/:boardId/sprints
+ * Get active sprints for a board
+ */
+router.get('/instances/:instanceId/boards/:boardId/sprints', asyncHandler(async (req, res) => {
+  const sprints = await jiraService.getActiveSprints(
+    req.params.instanceId,
+    req.params.boardId
+  );
+  res.json(sprints);
+}));
+
+/**
+ * POST /api/jira/instances/:instanceId/sprints/:sprintId/issues
+ * Move existing issues into a sprint. `createTicket` does this itself for a
+ * `sprintId` on create; this is the retry path for a child whose sprint move
+ * failed, which would otherwise be invisible to the next claim run.
+ */
+router.post('/instances/:instanceId/sprints/:sprintId/issues', asyncHandler(async (req, res) => {
+  const { issueKeys } = validateRequest(jiraSprintIssuesSchema, req.body);
+  const result = await jiraService.addIssuesToSprint(
+    req.params.instanceId,
+    req.params.sprintId,
+    issueKeys
+  );
+  res.json(result);
+}));
+
+/**
+ * GET /api/jira/instances/:instanceId/epics/:epicKey/children
+ * List an epic's child issues — what the claim flow reads before deciding an
+ * epic still needs decomposing.
+ */
+router.get('/instances/:instanceId/epics/:epicKey/children', asyncHandler(async (req, res) => {
+  const children = await jiraService.getEpicChildren(
+    req.params.instanceId,
+    req.params.epicKey
+  );
+  res.json(children);
+}));
+
+/**
+ * GET /api/jira/instances/:instanceId/projects/:projectKey/boards
+ * List agile boards (Scrum + Kanban) for a project — powers the app-config board picker.
+ */
+router.get('/instances/:instanceId/projects/:projectKey/boards', asyncHandler(async (req, res) => {
+  const boards = await jiraService.getBoards(
+    req.params.instanceId,
+    req.params.projectKey
+  );
+  res.json(boards);
+}));
+
+// Second path for the readTicket handler defined above — the app-config epic
+// picker calls this spelling, and dropping it would break a shipped client.
+router.get('/instances/:instanceId/issues/:issueKey', readTicket);
+
+/**
+ * GET /api/jira/instances/:instanceId/projects/:projectKey/epics?q=search
+ * Search for epics by name in a project
+ */
+router.get('/instances/:instanceId/projects/:projectKey/epics', asyncHandler(async (req, res) => {
+  const epics = await jiraService.searchEpics(
+    req.params.instanceId,
+    req.params.projectKey,
+    req.query.q || ''
+  );
+  res.json(epics);
+}));
+
+// ============================================================
+// JIRA Status Reports
+// ============================================================
+
+/**
+ * GET /api/jira/reports
+ * List all JIRA status reports, optionally filtered by appId
+ */
+router.get('/reports', asyncHandler(async (req, res) => {
+  const reports = await jiraReports.listReports(req.query.appId || null);
+  res.json(reports);
+}));
+
+/**
+ * POST /api/jira/reports/generate
+ * Generate status report for a specific app or all JIRA-enabled apps
+ */
+router.post('/reports/generate', asyncHandler(async (req, res) => {
+  const { appId } = validateRequest(generateReportSchema, req.body);
+
+  if (appId) {
+    const app = await getAppById(appId);
+    if (!app) {
+      throw new ServerError('App not found', { status: 404, code: 'NOT_FOUND' });
+    }
+    if (!app.jira?.enabled) {
+      throw new ServerError('JIRA is not enabled for this app', { status: 400, code: 'JIRA_NOT_ENABLED' });
+    }
+    const report = await jiraReports.generateReport(appId, app);
+    res.json(report);
+  } else {
+    const reports = await jiraReports.generateAllReports();
+    res.json(reports);
+  }
+}));
+
+/**
+ * GET /api/jira/reports/:appId/latest
+ * Get the latest report for an app
+ */
+router.get('/reports/:appId/latest', asyncHandler(async (req, res) => {
+  const { appId } = validateRequest(z.object({ appId: appIdSchema }), req.params);
+  const report = await jiraReports.getLatestReport(appId);
+  if (!report) {
+    throw new ServerError('No reports found for this app', { status: 404, code: 'NOT_FOUND' });
+  }
+  res.json(report);
+}));
+
+/**
+ * GET /api/jira/reports/:appId/:date
+ * Get a specific report by app and date
+ */
+router.get('/reports/:appId/:date', asyncHandler(async (req, res) => {
+  const { appId, date } = validateRequest(reportParamsSchema, req.params);
+  const report = await jiraReports.getReport(appId, date);
+  if (!report) {
+    throw new ServerError('Report not found', { status: 404, code: 'NOT_FOUND' });
+  }
+  res.json(report);
+}));
+
+export default router;

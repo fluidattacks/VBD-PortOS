@@ -1,0 +1,40 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+  # server/, client/ and autofixer/ each carry their own package.json +
+  # overrides and their own lockfile, so npm resolves each tree separately —
+  # without an entry per directory those trees are invisible to Dependabot (a
+  # critical node-tar advisory sat unreported). browser/ is deliberately absent:
+  # it has zero dependencies and its lockfile is gitignored.
+  - package-ecosystem: npm
+    directory: /server
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    ignore:
+      # 2.11.0's ESM build throws ERR_IMPORT_ATTRIBUTE_MISSING under Node — see
+      # #7371 and https://github.com/cantoo-scribe/pdf-lib/issues/155. Remove
+      # once a release fixes the JSON import-attribute regression. Scoped to
+      # 2.11.0 only so the fixing release (and later security patches) are
+      # still proposed.
+      - dependency-name: "@cantoo/pdf-lib"
+        versions: ["2.11.0"]
+  - package-ecosystem: npm
+    directory: /client
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+  - package-ecosystem: npm
+    directory: /autofixer
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5

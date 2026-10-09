@@ -1,0 +1,571 @@
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { rm } from 'fs/promises';
+import { join } from 'path';
+import { mockPathsDataRoot } from '../lib/mockPathsDataRoot.js';
+import { MAINTENANCE_SEQUENCE_TYPES, MAINTENANCE_TASK_ORDER } from '../lib/maintenanceSequence.js';
+
+const { tempRoot, makeProxy, cleanup } = mockPathsDataRoot({ prefix: 'portos-maintenance-run-' });
+vi.mock('../lib/fileUtils.js', async () => makeProxy(await vi.importActual('../lib/fileUtils.js')));
+
+const state = vi.hoisted(() => ({ tasks: [], requests: [], invoked: [], dispatch: null, probe: null, inapplicable: {} }));
+// Applicability is decided by the quota-burn resolver (covered in
+// quotaBurnInvoke.test.js); the invoke double below returns its not-applicable
+// verdict so these cases pin only the run's reaction to it.
+vi.mock('./cosState.js', () => ({ loadState: vi.fn(async () => ({ agents: {} })) }));
+vi.mock('./cosTaskStore.js', () => ({ getAllTasks: vi.fn(async () => ({ cos: { tasks: state.tasks }, user: { tasks: [] } })) }));
+vi.mock('./onDemandHandoff.js', () => ({ getOnDemandHandoffs: vi.fn(async () => ({})) }));
+vi.mock('./taskSchedule.js', () => ({ getOnDemandRequests: vi.fn(async () => state.requests) }));
+vi.mock('./apps.js', () => ({ getAppById: vi.fn(async (id) => (id === 'app-1' ? { id, name: 'Example App' } : null)) }));
+// The registry a run's provider gate resolves against. `opencode-tui` belongs to
+// no subscription family — the case #7416 is about — and `off-tui` is the
+// registered-but-disabled control.
+const PROVIDERS = [
+  { id: 'codex', type: 'cli', command: 'codex', enabled: true },
+  { id: 'claude', type: 'cli', command: 'claude', enabled: true },
+  { id: 'opencode-tui', type: 'tui', command: 'opencode', enabled: true },
+  { id: 'off-tui', type: 'tui', command: 'opencode', enabled: false },
+];
+vi.mock('./providers.js', () => ({
+  getProviderById: vi.fn(async (id) => PROVIDERS.find((provider) => provider.id === id) || null),
+  getAllProviders: vi.fn(async () => PROVIDERS),
+}));
+// The REAL resolver over that registry, not a hand-rolled stand-in: the whole
+// point of these cases is which pins the shared gate accepts, and a double would
+// only assert what the double was told.
+vi.mock('./scheduledHandlers/providerPick.js', async (importActual) => await importActual());
+vi.mock('./quotaBurnInvoke.js', () => ({
+  getQuotaBurnTaskCatalog: vi.fn(async () => ({ builtin: {}, custom: {} })),
+  invokeQuotaBurnStep: vi.fn(async (call) => {
+    const reason = state.inapplicable[call.step.taskRef.taskType];
+    if (reason && !call.step.overrides?.params?.runInapplicableAudit) return { dispatched: false, reason, code: 'not-applicable' };
+    state.invoked.push(call);
+    return state.dispatch || { dispatched: true, summary: `ran ${call.step.taskRef.taskType}`, awaiting: { requestId: `demand-${state.invoked.length}` } };
+  }),
+}));
+vi.mock('./quotaBurnSequence.js', async (importActual) => ({
+  ...(await importActual()),
+  probeSequenceDrain: vi.fn(async (job) => state.probe || { job }),
+}));
+// The independence claim, made checkable: the plan store is never consulted.
+vi.mock('./quotaBurnStore.js', () => ({ getQuotaBurnConfig: vi.fn(async () => { throw new Error('quota burn config must not be read'); }) }));
+
+const { getQuotaBurnConfig } = await import('./quotaBurnStore.js');
+const { invokeQuotaBurnStep } = await import('./quotaBurnInvoke.js');
+const {
+  setMaintenanceRunArchived, updateMaintenanceStep, startMaintenanceRun, stopMaintenanceRun, resumeMaintenanceRun, evaluateMaintenanceRun, getMaintenanceRun, listMaintenanceRuns,
+  __onMaintenanceAgentSpawned, __onMaintenanceAgentCompleted, __retryMaintenanceRuns, __resetMaintenanceRunScheduler,
+} = await import('./maintenanceRun.js');
+
+const start = () => startMaintenanceRun({ appId: 'app-1', providerId: 'codex', model: 'gpt-5', effort: 'high' });
+const agentFor = (run, index, success = true) => ({
+  id: `agent-${index}`,
+  taskId: `task-${index}`,
+  result: { success },
+  metadata: { taskQuotaBurnFamily: run.familyId, taskQuotaBurnStepId: run.steps[index].id, taskQuotaBurnMaintenanceRunId: run.id },
+});
+const dispatchedTypes = () => state.invoked.map((call) => call.step.taskRef.taskType);
+
+beforeEach(async () => {
+  vi.clearAllMocks();
+  __resetMaintenanceRunScheduler();
+  await rm(join(tempRoot, 'cos', 'maintenance-runs.json'), { force: true });
+  Object.assign(state, { tasks: [], requests: [], invoked: [], dispatch: null, probe: null, inapplicable: {} });
+});
+afterAll(cleanup);
+
+// Exercise the actual browser adapter's serialization before the route and
+// persisted run. Form tests replace this adapter, which hid a dropped policy.
+// Read it as source rather than importing client code into the server graph.
+it.each(['draft', 'inherit', undefined])('carries the browser delivery choice %s through HTTP into persisted dispatch', async prCompletion => {
+  const [{ readFile }, { parse }, { runInNewContext }, { default: express }, { request }, { default: routes }] = await Promise.all([
+    import('fs/promises'), import('@babel/parser'), import('node:vm'), import('express'),
+    import('../lib/testHelper.js'), import('../routes/cosScheduleRoutes.js'),
+  ]);
+  const source = await readFile(new URL('../../client/src/services/apiAgents.js', import.meta.url), 'utf8');
+  const ast = parse(source, { sourceType: 'module' });
+  const adapter = ast.program.body.flatMap(node => node.declaration?.declarations || [])
+    .find(node => node.id.name === 'startMaintenanceRun')?.init;
+  expect(adapter).toBeDefined();
+  const app = express();
+  app.use(express.json());
+  app.use('/cos', routes);
+  let wireBody;
+  const sendFromBrowser = runInNewContext(`(${source.slice(adapter.start, adapter.end)})`, {
+    request: (url, options) => {
+      expect(options.method).toBe('POST');
+      wireBody = JSON.parse(options.body);
+      return request(app).post(url).send(wireBody);
+    },
+  });
+  const response = await sendFromBrowser({
+    appId: 'app-1', providerId: 'codex', model: 'gpt-6-astra', effort: 'medium', mode: 'fix',
+    taskTypes: ['security'], auditDepth: 'deep', ...(prCompletion ? { prCompletion } : {}),
+  });
+  expect(wireBody.prCompletion).toBe(prCompletion);
+  expect(response.status).toBe(201);
+  const run = await getMaintenanceRun(response.body.run.id);
+  const expectedPolicy = prCompletion === 'inherit' ? null : 'draft';
+  expect(run).toMatchObject({ auditDepth: 'deep', auditWorkflow: 'extended-v1' });
+  expect(state.invoked[0].step.overrides.params.auditWorkflow).toBe('extended-v1');
+  expect(run.prCompletion).toBe(expectedPolicy);
+  expect(run.steps[0].overrides.params.prCompletion).toBe(expectedPolicy || undefined);
+  expect(state.invoked[0].step.overrides.params.prCompletion).toBe(expectedPolicy || undefined);
+});
+
+describe('manual maintenance run', () => {
+  it('runs a check the user chose by name even where it does not apply', async () => {
+    state.inapplicable = { 'mobile-responsive': 'no user interface found in this repository' };
+    const { run } = await startMaintenanceRun({ appId: 'app-1', providerId: 'codex', model: 'gpt-5', taskTypes: ['mobile-responsive'], explicitCheck: true });
+    expect(run.steps[0].overrides.params).toMatchObject({ runInapplicableAudit: true });
+    expect(dispatchedTypes()).toEqual(['mobile-responsive']);
+  });
+  // The regression: a refused request would leave the step pending, so the run
+  // re-dispatched an audit that could never apply on every evaluation.
+  it('completes an inapplicable audit as skipped without dispatching it, then moves on', async () => {
+    state.inapplicable = { 'mobile-responsive': 'no user interface found in this repository' };
+    const { run } = await startMaintenanceRun({ appId: 'app-1', providerId: 'codex', model: 'gpt-5', taskTypes: ['mobile-responsive', 'security'] });
+    expect(dispatchedTypes()).toEqual(['security']);
+    const stored = await getMaintenanceRun(run.id);
+    expect(stored.completed[run.steps[0].id]).toBeTruthy();
+    expect(stored.skipped).toEqual({ [run.steps[0].id]: 'no user interface found in this repository' });
+    await __onMaintenanceAgentCompleted(agentFor(run, 1));
+    expect(await getMaintenanceRun(run.id)).toMatchObject({
+      status: 'completed',
+      reason: 'maintenance sequence complete — skipped 1 check that does not apply to this repository',
+    });
+  });
+
+  it.each(['file-issues', 'fix'])('runs only selected quality checks in %s mode with pinned overrides', async (mode) => {
+    const { run } = await startMaintenanceRun({ appId: 'app-1', providerId: 'codex', model: 'gpt-5', effort: 'high', mode, taskTypes: ['security', 'documentation'] });
+    expect(run.steps.map(step => step.taskRef.taskType)).toEqual(['security', 'documentation']);
+    for (const step of run.steps) {
+      expect(step.drain).toBe(false);
+      expect(step.overrides).toMatchObject({ providerId: 'codex', model: 'gpt-5', effort: 'high', params: { fileIssues: mode === 'file-issues' } });
+    }
+    await __onMaintenanceAgentCompleted(agentFor(run, 0));
+    await __onMaintenanceAgentCompleted(agentFor(run, 1));
+    expect(dispatchedTypes()).toEqual(['security', 'documentation']);
+    expect((await getMaintenanceRun(run.id)).status).toBe('completed');
+  });
+
+  it('dispatches an edited stage through its own provider family', async () => {
+    const { run } = await start();
+    await updateMaintenanceStep(run.id, run.steps[1].id, { providerId: 'claude', model: 'example-model', effort: 'low' });
+    await __onMaintenanceAgentCompleted(agentFor(run, 0));
+    expect(state.invoked.at(-1)).toMatchObject({ family: { id: 'claude' }, step: { overrides: { providerId: 'claude', effort: 'low' } } });
+  });
+
+  it('persists pending stage settings and dispatches them without changing other stages', async () => {
+    const { run } = await start();
+    const settings = { providerId: 'codex', model: 'example-model', effort: null };
+    const updated = await updateMaintenanceStep(run.id, run.steps[1].id, settings);
+    expect(updated.steps[0]).toEqual(run.steps[0]);
+    expect((await getMaintenanceRun(run.id)).steps[1].overrides).toEqual({ ...run.steps[1].overrides, ...settings });
+    await __onMaintenanceAgentCompleted(agentFor(run, 0));
+    expect(state.invoked.at(-1).step.overrides).toMatchObject(settings);
+    await expect(updateMaintenanceStep(run.id, run.steps[0].id, settings)).rejects.toMatchObject({ status: 409 });
+    await expect(updateMaintenanceStep(run.id, run.steps[1].id, settings)).rejects.toMatchObject({ status: 409 });
+    await expect(updateMaintenanceStep(run.id, run.steps[2].id, { ...settings, providerId: 'missing' })).rejects.toMatchObject({ status: 400 });
+    await stopMaintenanceRun(run.id);
+    await expect(updateMaintenanceStep(run.id, run.steps[2].id, settings)).rejects.toMatchObject({ status: 409 });
+  });
+
+  it('walks the whole ladder to completion on agent completions and drain probes, never touching the burn plan', async () => {
+    const { run, result } = await start();
+    expect(result).toMatchObject({ dispatched: true, taskType: 'better-structural-drift' });
+    expect(run).toMatchObject({ status: 'running', familyId: 'codex', active: { stepId: run.steps[0].id, requestId: 'demand-1' } });
+    expect(run.steps.map((step) => step.taskRef.taskType)).toEqual(MAINTENANCE_SEQUENCE_TYPES);
+    expect(invokeQuotaBurnStep).toHaveBeenCalledWith(expect.objectContaining({
+      maintenanceRunId: run.id, family: { id: 'codex' },
+      step: expect.objectContaining({ runOnce: true, taskRef: { kind: 'builtin', taskType: 'better-structural-drift', appId: 'app-1' }, overrides: { providerId: 'codex', model: 'gpt-5', effort: 'high', params: { fileIssues: true } } }),
+    }));
+
+    // The audit finishes → the drain is probed → the backlog is actionable → a claim goes out.
+    await __onMaintenanceAgentCompleted(agentFor(run, 0));
+    expect(dispatchedTypes()).toEqual(['better-structural-drift', 'claim-issue']);
+    expect((await getMaintenanceRun(run.id)).completed).toHaveProperty(run.steps[0].id);
+    // The claim finishes with issues left → the drain repeats, ignoring the task that just finished.
+    await __onMaintenanceAgentCompleted(agentFor(run, 1));
+    expect(dispatchedTypes()).toEqual(['better-structural-drift', 'claim-issue', 'claim-issue']);
+    // Backlog empty → the drain is done and the next audit goes out in the same evaluation.
+    state.probe = { drained: true };
+    await __onMaintenanceAgentCompleted(agentFor(run, 1));
+    expect(dispatchedTypes().at(-1)).toBe('simplify');
+    expect((await getMaintenanceRun(run.id)).completed).toHaveProperty(run.steps[1].id);
+
+    // Finish every remaining audit; every drain reports empty.
+    for (let index = 2; index < run.steps.length; index += 2) await __onMaintenanceAgentCompleted(agentFor(run, index));
+    const finished = await getMaintenanceRun(run.id);
+    expect(finished).toMatchObject({ status: 'completed', reason: 'maintenance sequence complete', active: null });
+    expect(Object.keys(finished.completed)).toHaveLength(run.steps.length);
+    expect(dispatchedTypes().filter((type) => type !== 'claim-issue')).toEqual(MAINTENANCE_SEQUENCE_TYPES.filter((type) => type !== 'claim-issue'));
+    expect(getQuotaBurnConfig).not.toHaveBeenCalled();
+  });
+
+  it('holds on its own queued, running or blocked work and on a failed audit, then retries once the hold clears', async () => {
+    const { run } = await start();
+    state.requests = [{ id: 'demand-1', taskType: 'better-structural-drift', burn: { maintenanceRunId: run.id } }];
+    expect(await evaluateMaintenanceRun(run.id)).toMatchObject({ dispatched: false, reason: expect.stringContaining('demand-1') });
+    state.requests = [];
+    state.tasks = [{ id: 'task-0', status: 'in_progress', metadata: { quotaBurnFamily: 'codex', quotaBurnMaintenanceRunId: run.id } }];
+    expect(await evaluateMaintenanceRun(run.id)).toMatchObject({ dispatched: false, reason: 'waiting for in progress task task-0' });
+    // A failed audit completes nothing; its blocked task is the hold the user sees.
+    state.tasks[0].status = 'blocked';
+    await __onMaintenanceAgentCompleted(agentFor(run, 0, false));
+    expect((await getMaintenanceRun(run.id)).completed).toEqual({});
+    expect((await getMaintenanceRun(run.id)).reason).toBe('waiting for blocked task task-0');
+    expect(state.invoked).toHaveLength(1);
+    // Another run's task on the same family is not this run's business.
+    state.tasks = [{ id: 'other', status: 'in_progress', metadata: { quotaBurnFamily: 'codex' } }];
+    state.dispatch = { dispatched: false, reason: 'an on-demand run of "better-structural-drift" is already queued' };
+    await __retryMaintenanceRuns();
+    expect((await getMaintenanceRun(run.id)).reason).toMatch(/already queued/);
+    state.dispatch = null;
+    await __retryMaintenanceRuns();
+    expect(state.invoked).toHaveLength(3);
+    expect((await getMaintenanceRun(run.id)).active.stepId).toBe(run.steps[0].id);
+  });
+
+  it('a relaunched step neither completes nor settles the run', async () => {
+    // Relaunch retires the step's agent with `success: false` and requeues the
+    // SAME task on another provider, so the step is still in flight. Evaluating
+    // here would report it as a hold the user must retry or dismiss, for work that
+    // is already on its way back out. The continuation's own completion advances
+    // the run; `retryMaintenanceRuns` is the backstop if it never lands.
+    const { run } = await start();
+    const relaunched = {
+      ...agentFor(run, 0, false),
+      result: { success: false, resumed: true, resumedTaskId: 'task-0', error: 'Relaunched by user on codex' },
+    };
+
+    expect(await __onMaintenanceAgentCompleted(relaunched)).toBeNull();
+
+    const after = await getMaintenanceRun(run.id);
+    expect(after.completed).toEqual({});
+    expect(after.active.stepId).toBe(run.steps[0].id);
+    // Nothing new dispatched — only the step that was already running.
+    expect(state.invoked).toHaveLength(1);
+  });
+
+  it('re-evaluates the run immediately when a stranded pause is retired with no continuation queued (#7469)', async () => {
+    // `retireStrandedPausedAgents` (server/services/agentManagement.js) also
+    // stamps `resumed: true` — on a pause whose task is gone or moved on — but
+    // with NO `resumedTaskId`, because nothing was requeued. Reading that as a
+    // handoff the same way a relaunch is read made this listener return `null`
+    // and wait forever for a continuation that will never complete; the run
+    // advanced only once the `retryMaintenanceRuns` backstop eventually swept
+    // it. The step's underlying task is gone (not merely blocked), so a correct
+    // fix re-evaluates now and re-dispatches the step immediately.
+    const { run } = await start();
+    const stranded = {
+      ...agentFor(run, 0, false),
+      result: { success: false, resumed: true, error: 'Pause retired — its task task-0 no longer exists' },
+    };
+
+    await __onMaintenanceAgentCompleted(stranded);
+
+    expect(state.invoked).toHaveLength(2);
+  });
+
+  it('stops without recalling work, resumes from its ledger, and refuses a second run for the same app', async () => {
+    const { run } = await start();
+    await expect(start()).rejects.toMatchObject({ status: 409, code: 'MAINTENANCE_RUN_ACTIVE' });
+    await __onMaintenanceAgentCompleted(agentFor(run, 0));
+    const stopped = await stopMaintenanceRun(run.id);
+    expect(stopped).toMatchObject({ status: 'stopped', reason: 'stopped by the user' });
+    expect(await __onMaintenanceAgentCompleted(agentFor(run, 1))).toEqual({ skipped: 'stopped' });
+    expect(await __retryMaintenanceRuns()).toBeUndefined();
+    expect(state.invoked).toHaveLength(2);
+    const { run: resumed, result } = await resumeMaintenanceRun(run.id);
+    expect(resumed.status).toBe('running');
+    expect(resumed.completed).toHaveProperty(run.steps[0].id);
+    expect(result).toMatchObject({ dispatched: true, taskType: 'claim-issue' });
+    expect((await listMaintenanceRuns()).map((entry) => entry.id)).toEqual([run.id]);
+  });
+
+  it('lets a Stop or a completion that lands mid-evaluation win over the stale walk snapshot', async () => {
+    const { run } = await start();
+    // A completion arrives while a sweep is mid-walk holding on the in-flight task.
+    state.tasks = [{ id: 'task-0', status: 'in_progress', metadata: { quotaBurnFamily: 'codex', quotaBurnMaintenanceRunId: run.id } }];
+    const sweep = evaluateMaintenanceRun(run.id);
+    const completion = __onMaintenanceAgentCompleted(agentFor(run, 0));
+    await Promise.all([sweep, completion]);
+    const afterCompletion = await getMaintenanceRun(run.id);
+    expect(afterCompletion.completed).toHaveProperty(run.steps[0].id);
+    expect(dispatchedTypes()).toEqual(['better-structural-drift', 'claim-issue']);
+    // A Stop clicked while a dispatch is in flight sticks: the walk cannot write
+    // the snapshot status back over it.
+    state.tasks = [];
+    // Wait for the walk to actually reach its dispatch before issuing the Stop —
+    // the walk awaits several reads first, and how long those take is not ours.
+    let finishDispatch;
+    const dispatchStarted = new Promise((started) => {
+      invokeQuotaBurnStep.mockImplementationOnce(() => new Promise((resolve) => { finishDispatch = resolve; started(); }));
+    });
+    const walk = evaluateMaintenanceRun(run.id);
+    await dispatchStarted;
+    const stop = stopMaintenanceRun(run.id);
+    finishDispatch({ dispatched: true, summary: 'ran', awaiting: { requestId: 'demand-late' } });
+    await Promise.all([walk, stop]);
+    expect(await getMaintenanceRun(run.id)).toMatchObject({ status: 'stopped', active: { requestId: 'demand-late' } });
+    expect(await evaluateMaintenanceRun(run.id)).toEqual({ skipped: 'stopped' });
+  });
+
+  it('records a walk that throws as the hold reason instead of leaving a phantom running record', async () => {
+    invokeQuotaBurnStep.mockRejectedValueOnce(new Error('schedule unreadable'));
+    const { run, result } = await start();
+    expect(result).toEqual({ dispatched: false, reason: 'schedule unreadable' });
+    expect(run).toMatchObject({ status: 'running', reason: 'schedule unreadable' });
+  });
+
+  it('refuses an unknown app, and an unregistered or disabled provider, before writing anything', async () => {
+    await expect(startMaintenanceRun({ appId: 'nope', providerId: 'codex', model: 'gpt-5' })).rejects.toMatchObject({ status: 400, code: 'MAINTENANCE_RUN_APP_UNAVAILABLE' });
+    for (const providerId of ['not-registered', 'off-tui']) {
+      await expect(startMaintenanceRun({ appId: 'app-1', providerId, model: 'llama' })).rejects.toMatchObject({ status: 400, code: 'MAINTENANCE_RUN_PROVIDER_UNAVAILABLE' });
+    }
+    expect(await listMaintenanceRuns()).toEqual([]);
+    expect(state.invoked).toEqual([]);
+  });
+
+  // #7416. The picker offers every enabled process provider, but the dispatch
+  // path required a subscription family end to end, so "Run now" on an OpenCode
+  // TUI or a local-model wrapper failed with MAINTENANCE_RUN_PROVIDER_UNAVAILABLE.
+  describe('a provider outside every subscription family', () => {
+    it('starts a run and dispatches it unfamilied, crediting no window', async () => {
+      const { run, result } = await startMaintenanceRun({ appId: 'app-1', providerId: 'opencode-tui', model: 'local-model' });
+      expect(result).toMatchObject({ dispatched: true, taskType: 'better-structural-drift' });
+      expect(run).toMatchObject({ status: 'running', familyId: null, claimFamilyId: null });
+      expect(state.invoked.at(-1)).toMatchObject({
+        maintenanceRunId: run.id,
+        family: { id: null, unfamilied: true },
+        step: expect.objectContaining({ overrides: expect.objectContaining({ providerId: 'opencode-tui' }) }),
+      });
+    });
+
+    it('accepts a per-step edit onto one, without the step inheriting the run\'s family', async () => {
+      // The regression a truthiness fallback reintroduces: a step whose own
+      // family is legitimately null would read as "nothing recorded, inherit",
+      // pick up `codex`, and then be refused for not belonging to it.
+      const { run } = await start();
+      await updateMaintenanceStep(run.id, run.steps[1].id, { providerId: 'opencode-tui', model: 'local-model', effort: null });
+      await __onMaintenanceAgentCompleted(agentFor(run, 0));
+      expect(state.invoked.at(-1)).toMatchObject({
+        family: { id: null, unfamilied: true },
+        step: { overrides: { providerId: 'opencode-tui' } },
+      });
+    });
+
+    it('accepts it as the claim handler while the audits stay on their own family', async () => {
+      const { run } = await startMaintenanceRun({ appId: 'app-1', providerId: 'codex', model: 'gpt-5', claimHandler: { providerId: 'opencode-tui', model: 'local-model', effort: null } });
+      expect(run).toMatchObject({ familyId: 'codex', claimFamilyId: null });
+      expect(state.invoked.at(-1).family).toEqual({ id: 'codex' });
+      await __onMaintenanceAgentCompleted(agentFor(run, 0));
+      expect(state.invoked.at(-1)).toMatchObject({
+        family: { id: null, unfamilied: true },
+        step: { drain: true, overrides: expect.objectContaining({ providerId: 'opencode-tui' }) },
+      });
+    });
+  });
+});
+
+// Regression: queued maintenance must identify its real agent immediately and
+// publish persisted transitions, without waiting for the retry sweep.
+it('publishes queued, running, and completed progress with the active agent link identity', async () => {
+  const { cosEvents } = await import('./cosEvents.js');
+  const updates = [];
+  const listener = run => updates.push(run);
+  cosEvents.on('maintenance:updated', listener);
+  const { run } = await start();
+  expect(updates.at(-1).active.status).toBe('queued');
+  await __onMaintenanceAgentSpawned({ ...agentFor(run, 0), id: 'agent-example' });
+  expect(await getMaintenanceRun(run.id)).toMatchObject({ active: { agentId: 'agent-example', status: 'running' } });
+  expect(updates.at(-1).active.agentId).toBe('agent-example');
+  await __onMaintenanceAgentCompleted(agentFor(run, 0));
+  expect(updates.at(-1).completed).toHaveProperty(run.steps[0].id);
+  expect(updates.at(-1).active).not.toHaveProperty('agentId');
+  cosEvents.off('maintenance:updated', listener);
+});
+
+it('runs fixes consecutively and drains remaining issues only after documentation', async () => {
+  const { run } = await startMaintenanceRun({ appId: 'app-1', providerId: 'codex', model: 'gpt-5', mode: 'fix' });
+  expect(run.steps.map(step => step.taskRef.taskType)).toEqual([...MAINTENANCE_TASK_ORDER, 'claim-issue']);
+  for (let index = 0; index < MAINTENANCE_TASK_ORDER.length; index++) {
+    expect(state.invoked.at(-1).step.overrides.params).toEqual({ fileIssues: false, useWorktree: true, openPR: true });
+    await __onMaintenanceAgentCompleted(agentFor(run, index));
+  }
+  expect(dispatchedTypes()).toEqual([...MAINTENANCE_TASK_ORDER, 'claim-issue']);
+  await __onMaintenanceAgentCompleted(agentFor(run, MAINTENANCE_TASK_ORDER.length));
+  expect(dispatchedTypes().slice(-2)).toEqual(['claim-issue', 'claim-issue']);
+  state.probe = { drained: true };
+  await __onMaintenanceAgentCompleted(agentFor(run, MAINTENANCE_TASK_ORDER.length));
+  expect(await getMaintenanceRun(run.id)).toMatchObject({ status: 'completed' });
+});
+
+it('files findings consecutively and finishes without claiming when claims are disabled', async () => {
+  const { run } = await startMaintenanceRun({ appId: 'app-1', providerId: 'codex', model: 'gpt-5', mode: 'file-issues', claimBetweenAudits: false, claimHandler: { providerId: 'unavailable', model: 'example' } });
+  expect(run.steps.map(step => step.taskRef.taskType)).toEqual(MAINTENANCE_TASK_ORDER);
+  for (let index = 0; index < run.steps.length; index++) {
+    expect(state.invoked.at(-1).step.overrides.params.fileIssues).toBe(index < run.steps.length - 1);
+    await __onMaintenanceAgentCompleted(agentFor(run, index));
+  }
+  expect(dispatchedTypes()).toEqual(MAINTENANCE_TASK_ORDER);
+  expect(await getMaintenanceRun(run.id)).toMatchObject({ status: 'completed' });
+  expect((await listMaintenanceRuns())[0].steps).toHaveLength(7);
+});
+
+// A different subscription family must survive storage and dispatch, including
+// repeated claim passes, without changing the audit pins.
+it('dispatches claims with their own provider family, model and effort', async () => {
+  const claimHandler = { providerId: 'claude', model: 'sonnet', effort: 'low' };
+  const { run } = await startMaintenanceRun({ appId: 'app-1', providerId: 'codex', model: 'gpt-5', effort: 'high', claimHandler });
+  expect((await getMaintenanceRun(run.id)).steps[1].overrides).toEqual({ ...claimHandler, params: {} });
+  await evaluateMaintenanceRun(run.id, { completeStepId: run.steps[0].id });
+  await evaluateMaintenanceRun(run.id);
+  expect(state.invoked.slice(1)).toHaveLength(2);
+  for (const call of state.invoked.slice(1)) expect(call).toMatchObject({ family: { id: 'claude' }, step: { overrides: claimHandler } });
+  state.probe = { drained: true };
+  await evaluateMaintenanceRun(run.id);
+  expect(state.invoked.at(-1)).toMatchObject({ family: { id: 'codex' }, step: { overrides: { providerId: 'codex', model: 'gpt-5', effort: 'high' } } });
+});
+
+it('rejects an unavailable claim provider before starting any work', async () => {
+  await expect(startMaintenanceRun({ appId: 'app-1', providerId: 'codex', claimHandler: { providerId: 'unavailable', model: 'example' } })).rejects.toMatchObject({ code: 'MAINTENANCE_RUN_PROVIDER_UNAVAILABLE' });
+  expect(state.invoked).toEqual([]);
+});
+
+it('dispatches independent quality runs while another run is pending and resumes them independently', async () => {
+  const { run: ladder } = await start();
+  state.requests = [{ id: 'demand-1', burn: { maintenanceRunId: ladder.id } }];
+  const { run: security } = await startMaintenanceRun({ appId: 'app-1', providerId: 'codex', taskTypes: ['security'] });
+  const { run: performance } = await startMaintenanceRun({ appId: 'app-1', providerId: 'codex', taskTypes: ['performance'], mode: 'fix' });
+  expect(dispatchedTypes()).toEqual(['better-structural-drift', 'security', 'performance']);
+  await stopMaintenanceRun(security.id);
+  expect((await getMaintenanceRun(performance.id)).status).toBe('running');
+  expect((await resumeMaintenanceRun(security.id)).run.status).toBe('running');
+  await __onMaintenanceAgentCompleted(agentFor(performance, 0));
+  expect((await getMaintenanceRun(performance.id)).status).toBe('completed');
+  expect((await getMaintenanceRun(security.id)).status).toBe('running');
+  expect((await getMaintenanceRun(ladder.id)).completed).toEqual({});
+});
+
+it('preserves draft delivery across persisted resume, provider edits and step completion', async () => {
+  const { run } = await startMaintenanceRun({ appId: 'app-1', providerId: 'codex', model: 'gpt-6-astra', effort: 'medium', mode: 'fix', prCompletion: 'draft', taskTypes: ['security', 'documentation'] });
+  expect((await getMaintenanceRun(run.id)).prCompletion).toBe('draft');
+  await stopMaintenanceRun(run.id);
+  await resumeMaintenanceRun(run.id);
+  await updateMaintenanceStep(run.id, run.steps[1].id, { providerId: 'codex', model: 'gpt-6-astra', effort: 'medium' });
+  await __onMaintenanceAgentCompleted(agentFor(run, 0));
+  expect(state.invoked.at(-1).step.overrides).toMatchObject({ model: 'gpt-6-astra', effort: 'medium', params: { fileIssues: false, useWorktree: true, openPR: true, prCompletion: 'draft' } });
+  expect((await getMaintenanceRun(run.id)).steps.map(s => s.taskRef.taskType)).toEqual(['security', 'documentation']);
+});
+
+
+it('extended Deep completes a useful run without exhaustive receipts and preserves provider and delivery pins', async () => {
+  const { run } = await startMaintenanceRun({ appId: 'app-1', providerId: 'codex', model: 'gpt-6-astra', effort: 'medium', mode: 'fix', prCompletion: 'draft', taskTypes: ['security'], auditDepth: 'deep' });
+  expect(run).toMatchObject({ auditDepth: 'deep', auditWorkflow: 'extended-v1' });
+  expect(run.deepAudits).toBeUndefined();
+  expect(state.invoked[0].step.overrides).toMatchObject({ model: 'gpt-6-astra', effort: 'medium', params: { auditWorkflow: 'extended-v1', fileIssues: false, useWorktree: true, prCompletion: 'draft' } });
+  await __onMaintenanceAgentCompleted(agentFor(run, 0, true));
+  expect(await getMaintenanceRun(run.id)).toMatchObject({ status: 'completed' });
+  expect(state.invoked).toHaveLength(1);
+});
+
+it('retains historical incomplete evidence and refuses every legacy resume or scheduler dispatch', async () => {
+  const { writeFile, mkdir } = await import('fs/promises');
+  const legacy = { id: 'legacy', appId: 'app-1', status: 'stopped', auditDepth: 'deep', steps: [], completed: {}, deepAudits: { old: { complete: false, satisfiedPasses: 3, requiredPasses: 12 } } };
+  await mkdir(join(tempRoot, 'cos'), { recursive: true });
+  await writeFile(join(tempRoot, 'cos', 'maintenance-runs.json'), JSON.stringify({ runs: [legacy] }));
+  await expect(resumeMaintenanceRun('legacy')).rejects.toMatchObject({ code: 'DEEP_AUDIT_HISTORICAL' });
+  await evaluateMaintenanceRun('legacy');
+  expect(state.invoked).toHaveLength(0);
+  expect(await getMaintenanceRun('legacy')).toMatchObject({ status: 'stopped', deepAudits: legacy.deepAudits, completed: {} });
+});
+
+it('Deep successful delivery alone never certifies discovery and deep proof alone never certifies failed delivery', async () => {
+  const { run } = await startMaintenanceRun({ appId: 'app-1', providerId: 'codex', model: 'gpt-5', taskTypes: ['security'], auditDepth: 'deep' });
+  const agent = agentFor(run, 0, false);
+  agent.result.deepAudit = { complete: true, discoveryComplete: true, deliveryComplete: true };
+  await __onMaintenanceAgentCompleted(agent);
+  expect((await getMaintenanceRun(run.id)).completed).toEqual({});
+});
+
+
+it('makes concurrent and repeated resume calls idempotent while a request is preparing', async () => {
+  const { run } = await start();
+  await stopMaintenanceRun(run.id);
+  const before = state.invoked.length;
+  const results = await Promise.all([resumeMaintenanceRun(run.id), resumeMaintenanceRun(run.id)]);
+  expect(results.filter(result => result.result.dispatched)).toHaveLength(1);
+  expect(state.invoked).toHaveLength(before + 1);
+  expect((await resumeMaintenanceRun(run.id)).result.dispatched).toBe(false);
+  expect(state.invoked).toHaveLength(before + 1);
+});
+
+it('holds the scheduler during durable preparation, then stops on refusal until explicit resume', async () => {
+  const { getOnDemandHandoffs } = await import('./onDemandHandoff.js');
+  const { run } = await start();
+  const claim = { request: { id: run.active.requestId, burn: { maintenanceRunId: run.id } }, claimedAt: new Date().toISOString(), status: 'preparing' };
+  getOnDemandHandoffs.mockResolvedValue({ [claim.request.id]: claim });
+  const before = state.invoked.length;
+  expect((await evaluateMaintenanceRun(run.id)).dispatched).toBe(false);
+  expect(state.invoked).toHaveLength(before);
+  await stopMaintenanceRun(run.id);
+  expect((await resumeMaintenanceRun(run.id)).result.dispatched).toBe(false);
+  claim.status = 'interrupted'; claim.reason = 'Server restarted during preparation; resume explicitly.';
+  await evaluateMaintenanceRun(run.id);
+  expect((await getMaintenanceRun(run.id)).status).toBe('stopped');
+  await __retryMaintenanceRuns();
+  expect(state.invoked).toHaveLength(before);
+  expect((await resumeMaintenanceRun(run.id)).result.dispatched).toBe(true);
+  expect(state.invoked).toHaveLength(before + 1);
+  getOnDemandHandoffs.mockResolvedValue({});
+});
+
+
+it('acknowledges the exact active request when refusal timestamps tie', async () => {
+  const { getOnDemandHandoffs } = await import('./onDemandHandoff.js');
+  const { run } = await start();
+  const claimedAt = new Date().toISOString();
+  const makeReceipt = (id, reason) => ({ request: { id, burn: { maintenanceRunId: run.id } }, claimedAt, status: 'refused', reason });
+  getOnDemandHandoffs.mockResolvedValue({
+    'older-request': makeReceipt('older-request', 'Older refusal'),
+    [run.active.requestId]: makeReceipt(run.active.requestId, 'Active refusal'),
+  });
+  await evaluateMaintenanceRun(run.id);
+  expect(await getMaintenanceRun(run.id)).toMatchObject({ status: 'stopped', reason: 'Active refusal' });
+  const resumed = await resumeMaintenanceRun(run.id);
+  expect(resumed.run.acknowledgedRequestId).toBe(run.active.requestId);
+  expect(resumed.result.dispatched).toBe(true);
+  getOnDemandHandoffs.mockResolvedValue({});
+});
+
+it('scopes reversible history archiving and refuses active runs without changing evidence or dispatching', async () => {
+  const { default: express } = await import('express');
+  const { request } = await import('../lib/testHelper.js');
+  const { default: routes } = await import('../routes/cosScheduleRoutes.js');
+  const http = express(); http.use(express.json()); http.use('/cos', routes);
+  const { run } = await start();
+  const route = `/cos/schedule/maintenance-runs/${run.id}/archive`;
+  expect((await request(http).patch(route).send({ appId: 'wrong-app', archived: true })).status).toBe(404);
+  expect((await request(http).patch(route).send({ appId: run.appId, archived: true })).status).toBe(409);
+  await stopMaintenanceRun(run.id);
+  state.tasks = [{ id: 'still-working', status: 'in_progress', metadata: { quotaBurnMaintenanceRunId: run.id } }];
+  expect((await request(http).patch(route).send({ appId: run.appId, archived: true })).status).toBe(409);
+  state.tasks = [];
+  const before = await getMaintenanceRun(run.id);
+  const { readFile, writeFile } = await import('fs/promises');
+  const file = join(tempRoot, 'cos', 'maintenance-runs.json');
+  const stored = JSON.parse(await readFile(file, 'utf8'));
+  stored.runs.unshift(...Array.from({ length: 25 }, (_, i) => ({ id: `history-${i}`, appId: run.appId, status: 'completed' })));
+  await writeFile(file, JSON.stringify(stored));
+  const calls = state.invoked.length;
+  const archived = await request(http).patch(route).send({ appId: run.appId, archived: true });
+  expect(archived.status).toBe(200);
+  expect(archived.body.run.archivedAt).toBeTruthy();
+  expect(await setMaintenanceRunArchived(run.id, { appId: run.appId, archived: true })).toEqual(archived.body.run);
+  await expect(resumeMaintenanceRun(run.id)).rejects.toMatchObject({ code: 'MAINTENANCE_RUN_ARCHIVED' });
+  const restored = await request(http).patch(route).send({ appId: run.appId, archived: false });
+  expect(restored.status).toBe(200);
+  expect(restored.body.run).toMatchObject({ ...before, archivedAt: null, historyRetained: true, updatedAt: expect.any(String) });
+  expect(state.invoked).toHaveLength(calls);
+});

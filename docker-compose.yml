@@ -1,0 +1,34 @@
+# PortOS Docker Services
+# PostgreSQL + pgvector for scalable memory storage
+#
+# Usage:
+#   docker compose up -d        # Start services
+#   docker compose down         # Stop services
+#   docker compose logs -f db   # View database logs
+
+services:
+  db:
+    image: pgvector/pgvector:pg17@sha256:ac08538c6f8b9904c33c8224c5e5706dbe760aca29db1d096972b4052c22a75d
+    container_name: portos-db
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${PGPORT_DOCKER:-5561}:5432"
+    environment:
+      POSTGRES_DB: ${PGDATABASE:-portos}
+      POSTGRES_USER: ${PGUSER:-portos}
+      POSTGRES_PASSWORD: ${PGPASSWORD:-portos}
+    volumes:
+      - portos-pgdata:/var/lib/postgresql/data
+      - ./server/scripts/init-db.sql:/docker-entrypoint-initdb.d/01-init.sql
+    healthcheck:
+      # $$ escapes Compose's own ${...} interpolation so the shell inside the
+      # container substitutes it from POSTGRES_USER (set above, in the
+      # container's own env) instead — keeping the probe's user in sync with
+      # whatever POSTGRES_USER actually provisioned.
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-portos}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  portos-pgdata:

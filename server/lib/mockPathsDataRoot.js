@@ -1,0 +1,395 @@
+/**
+ * Shared `vi.mock` factory for the "PATHS.data → temp dir" pattern.
+ *
+ * Eight (and growing) test files duplicated the same Proxy-over-fileUtils
+ * mock to redirect `PATHS.data` at a per-test temp directory:
+ *
+ *     vi.mock('../../lib/fileUtils.js', async () => {
+ *       const actual = await vi.importActual('../../lib/fileUtils.js');
+ *       return new Proxy(actual, {
+ *         get(target, prop) {
+ *           if (prop === 'PATHS') return { ...actual.PATHS, data: tempRoot };
+ *           return target[prop];
+ *         },
+ *       });
+ *     });
+ *
+ * This module gives the same behavior via a single helper. The relative path
+ * to `fileUtils.js` stays at each call site because `vi.mock` is hoisted to
+ * module top before any test code runs — Vitest must see a string literal to
+ * a real file from the *test's* directory. The helper computes the temp dir
+ * and exposes a Proxy factory; the caller still writes the one-liner
+ * `vi.mock(...)` so Vitest's hoister can find it. See `mockPathsDataRoot()`
+ * below for the canonical usage example.
+ *
+ * To keep the call site short and avoid forcing every test to write the Proxy
+ * block, this module exports:
+ *
+ *   - `makePathsProxy(actual, { dataRoot, extraOverrides? })` — used inside
+ *     the test's own `vi.mock` factory. Returns the Proxy.
+ *   - `createTempDataRoot()` — returns `{ tempRoot }` allocated under os.tmpdir().
+ *   - `mockNoPeers(actual?, overrides?)` — shared `instances.js` mock guard
+ *     for record-creating tests that should never auto-subscribe to live peers.
+ *   - `mockTestIdentity(overrides?)` — shared `instanceIdentity.js` mock guard
+ *     with deterministic self-identity values (id/name), for suites that
+ *     double the federation identity leaf instead of the real data file.
+ *   - `mockNoPeerSync(actual?, overrides?)` — shared `peerSync.js` mock guard
+ *     that makes fire-and-forget record auto-subscribe a clean no-op in tests.
+ *   - `ownTestBodies(it)` — owns each test body until it settles so teardown
+ *     can drain a fail-fast-cancelled body before removing its temp root.
+ *
+ * Every `PATHS` member that lives under the real `data/` is re-rooted at the
+ * temp dir automatically, so a suite that only wants the standard layout
+ * (`cos`, `brain`, `digitalTwin`, `images`, …) needs no `extraOverrides` at
+ * all. Pass `extraOverrides` (object or function) only when a member needs a
+ * target the default re-rooting wouldn't produce — it merges last.
+ */
+
+import { appendFileSync, mkdtempSync, readdirSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import { basename, isAbsolute, join, relative, sep } from 'path';
+
+/**
+ * Allocate a unique temp dir suitable for use as `PATHS.data` in a test file.
+ * Caller is responsible for cleanup (`rmSync` in afterAll) when needed.
+ */
+export function createTempDataRoot(prefix = 'portos-test-') {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  recordTempRootOwner(dir);
+  return dir;
+}
+
+/**
+ * Sidecar the run-wide leak guard (`scripts/vitestTempRootSetup.js`) reads so a
+ * leaked `<prefix>XXXXXX` directory is reported with the test file that minted
+ * it. A random-suffixed name alone cannot identify its creator (#10404).
+ * Best-effort and basename-only: diagnostics must never fail a fixture or put a
+ * checkout path in a log.
+ */
+const TEMP_ROOT_OWNERS_FILE = '.leak-owners';
+function recordTempRootOwner(dir) {
+  try {
+    const runRoot = process.env.PORTOS_TEST_TEMP_ROOT;
+    const owner = globalThis.__vitest_worker__?.filepath;
+    if (!runRoot || !owner) return;
+    appendFileSync(join(runRoot, TEMP_ROOT_OWNERS_FILE), `${basename(dir)}\t${basename(owner)}\n`);
+  } catch { /* diagnostics only */ }
+}
+
+/**
+ * A temp data root allocated on FIRST USE and memoized per prefix.
+ *
+ * `vi.mock` is hoisted above every `const` in the file, so a suite whose SUT is
+ * reached through a static `import` trips the mock factory while a
+ * `const TEST_DATA_ROOT = createTempDataRoot(...)` is still in its temporal dead
+ * zone — a `ReferenceError` at collection time. Passing this function as
+ * `makePathsProxy`'s `dataRoot` sidesteps that: the root is created the first
+ * time the Proxy reads `PATHS`, which is always after module evaluation.
+ *
+ * Memoized per prefix so every read in one file gets the SAME root (a fresh dir
+ * per read would scatter a suite's writes across directories), and so two
+ * suites naming different prefixes never share one.
+ *
+ * Pair with `afterAll(cleanupTempDataRoots)`.
+ *
+ *     vi.mock('../lib/fileUtils.js', async (importOriginal) =>
+ *       makePathsProxy(await importOriginal(), { dataRoot: () => lazyTempDataRoot('portos-foo-') }));
+ *     afterAll(cleanupTempDataRoots);
+ *
+ * @param {string} prefix - mkdtemp prefix, also the memo key
+ * @returns {string} absolute path to this prefix's temp root
+ */
+const lazyRoots = new Map();
+export function lazyTempDataRoot(prefix = 'portos-test-') {
+  let root = lazyRoots.get(prefix);
+  if (!root) {
+    root = createTempDataRoot(prefix);
+    lazyRoots.set(prefix, root);
+  }
+  return root;
+}
+
+/** Remove every root `lazyTempDataRoot` handed out in this worker. */
+export function cleanupTempDataRoots() {
+  // Retries cover ENOTEMPTY/EBUSY from a just-killed child (a test Chrome's
+  // helpers) still flushing into the root while it is being removed.
+  for (const root of lazyRoots.values()) rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  lazyRoots.clear();
+}
+
+/**
+ * Belt-and-suspenders for a suite whose real (unmocked) child work — ffmpeg,
+ * a headless browser over CDP — can still be settling when `afterAll` runs:
+ * remove every real `os.tmpdir()` entry matching `prefix`, not just the one
+ * root `cleanupTempDataRoots()` tracked in memory (#9032). A lingering
+ * renderer/ffprobe handle on a file inside a `lazyTempDataRoot` root can make
+ * that function's own `rmSync` throw before the tree is fully gone, or an
+ * un-awaited background job can call `lazyTempDataRoot(prefix)` again AFTER
+ * `cleanupTempDataRoots()` already cleared it, minting a brand new root
+ * nothing else ever cleans. Call this LAST in the suite's `afterAll`, after
+ * `cleanupTempDataRoots()`, to narrow (not eliminate — a genuinely still-
+ * running background job can still recreate the prefix afterward) that race.
+ * `server/services/musicVideo/compositionRender.test.js` and
+ * `server/routes/musicVideoVocalStem.test.js` are the worked examples.
+ *
+ * Runs the sweep twice, ~300ms apart: a single pass right after
+ * `cleanupTempDataRoots()` can still race a background job that has not
+ * started writing yet (observed on CI's slower/more contended runners, not
+ * reproduced in ~10 local runs) — the second pass catches what the first
+ * one was too early for. `await` this call as the LAST statement of the
+ * suite's `afterAll`.
+ */
+export async function sweepStrayTempRoots(prefix) {
+  const sweepOnce = () => {
+    const root = tmpdir();
+    let entries;
+    try {
+      entries = readdirSync(root);
+    } catch {
+      return;
+    }
+    for (const name of entries) {
+      if (name.startsWith(prefix)) rmSync(join(root, name), { recursive: true, force: true });
+    }
+  };
+  sweepOnce();
+  await new Promise((resolve) => { setTimeout(resolve, 300); });
+  sweepOnce();
+}
+
+/**
+ * Own every test body until it settles, so fixture teardown cannot run under it.
+ *
+ * Vitest's fail-fast cancellation (`--bail`, triggered by a failure in ANOTHER
+ * worker) settles a running test's wrapper while its async body keeps going. A
+ * suite whose `afterAll`/`afterEach` removes a temp data root then deletes the
+ * directory underneath that body, and the body's next store write recreates it
+ * — the run-level guard reports it as `test temp leak:` (#9497, #9622, #9635).
+ *
+ * Pass vitest's `it`; use the returned `it` for every test that writes into the
+ * fixture, and `await drain()` in teardown BEFORE removing it. A body that
+ * failed after cancellation (vitest is no longer listening) is rethrown from
+ * `drain()` rather than dropped; a failure vitest already reported is not.
+ * A test TIMEOUT leaves its body running the same way, so a suite whose cases
+ * share external state also awaits `drain()` in `beforeEach` (#10272,
+ * `services/backup.db.test.js`).
+ *
+ *     const owned = ownTestBodies(vitestIt);
+ *     const it = owned.it;
+ *     afterAll(async () => {
+ *       try { await owned.drain(); } finally { rmSync(root, { recursive: true, force: true }); }
+ *     });
+ *
+ * @param {Function} it - vitest's `it`/`test`
+ * @returns {{ it: Function, drain: () => Promise<void> }}
+ */
+export function ownTestBodies(it) {
+  const pending = new Set();
+  const orphanedFailures = [];
+  const ownedIt = (name, body, ...rest) => it(name, (context) => {
+    const run = Promise.resolve().then(() => body(context));
+    const settled = run.then(() => {}, (error) => { if (context.signal.aborted) orphanedFailures.push(error); });
+    pending.add(settled);
+    settled.then(() => pending.delete(settled));
+    return run;
+  }, ...rest);
+  const drain = async () => {
+    while (pending.size) await Promise.all(pending);
+    if (orphanedFailures.length) {
+      const failures = orphanedFailures.splice(0);
+      throw new AggregateError(failures, 'Cancelled test body failed after cancellation');
+    }
+  };
+  return { it: ownedIt, drain };
+}
+
+/**
+ * Build the Proxy returned from a `vi.mock('../lib/fileUtils.js', ...)`
+ * factory. Pass the already-resolved `actual` (from `vi.importActual`) and
+ * the `dataRoot` you want `PATHS.data` to point at.
+ *
+ * `dataRoot` accepts either:
+ *   - a string — captured by value at construction time, or
+ *   - a function `() => string` — resolved lazily on each PATHS read. Use
+ *     the function form when the test allocates a fresh temp dir per test
+ *     (a `let tempRoot` that the per-test setup reassigns). The Proxy reads
+ *     it through the getter so it always sees the current value.
+ *
+ * EVERY `PATHS` member that lives under the real `data/` directory is re-rooted
+ * at `dataRoot`, preserving its relative layout (`PATHS.cos` →
+ * `<dataRoot>/cos`, `PATHS.cosAgents` → `<dataRoot>/cos/agents`, and so on).
+ * 45 of the 49 members are `join(INSTALL_ROOT, 'data/…')`, so redirecting only
+ * `data` left almost every disk-touching suite pointed at the live install —
+ * see #3683 / #3687. The members outside `data/` (`root`, `installRoot`,
+ * `slashdo`, `browserDownloads`) are untouched by construction.
+ *
+ * `extraOverrides` is either:
+ *   - a plain object — merged over the re-rooted PATHS, or
+ *   - a function `(dataRoot) => overridesObject` — for cases where the
+ *     extra keys are derived (e.g. `images: join(dataRoot, 'images')`).
+ *
+ * Extras still merge LAST, so they remain the escape hatch for a member that
+ * needs a target the default re-rooting wouldn't produce — either a different
+ * temp location, or the real seeded directory pinned back in place.
+ */
+export function makePathsProxy(actual, { dataRoot, extraOverrides = null, overrides = null } = {}) {
+  const resolveRoot = typeof dataRoot === 'function' ? dataRoot : () => dataRoot;
+  const buildOverrides = () => {
+    const root = resolveRoot();
+    const extras = typeof extraOverrides === 'function'
+      ? extraOverrides(root)
+      : (extraOverrides || {});
+    const realData = actual.PATHS.data;
+    // Containment via `relative()` rather than a `startsWith(realData + sep)`
+    // prefix test: it normalizes a trailing separator on `realData` and mixed
+    // separators, and it rejects a sibling that merely shares the prefix
+    // (`data-archive` → `../data-archive`) instead of matching it.
+    const relIfInside = (v) => {
+      if (typeof v !== 'string') return null;
+      const rel = relative(realData, v);
+      if (rel === '') return '.';
+      return !rel.startsWith(`..${sep}`) && rel !== '..' && !isAbsolute(rel) ? rel : null;
+    };
+    const rebased = Object.fromEntries(
+      Object.entries(actual.PATHS)
+        .map(([k, v]) => [k, relIfInside(v)])
+        .filter(([, rel]) => rel !== null)
+        .map(([k, rel]) => [k, join(root, rel)]),
+    );
+    return { ...actual.PATHS, ...rebased, data: root, ...extras };
+  };
+  return new Proxy(actual, {
+    get(target, prop) {
+      if (prop === 'PATHS') return buildOverrides();
+      // Top-level export overrides (e.g. a delegating spy for atomicWrite).
+      // Served through the get trap so callers never vi.spyOn a read-only
+      // ESM namespace export — see mockPathsDataRoot's wrapExports option.
+      if (overrides && prop in overrides) return overrides[prop];
+      return target[prop];
+    },
+  });
+}
+
+/**
+ * Build an `instances.js` mock that disables peer auto-subscribe fan-out.
+ *
+ * `createUniverse` / `createSeries` fire a non-awaited peerSync import after
+ * record creation. In tests, that background path can outlive local fileUtils
+ * mocks and read the real peer registry unless `getPeers` is explicitly
+ * guarded. Pass the real module as `actual` when a suite needs the other
+ * exports, and pass `overrides` for test-specific peer exports.
+ *
+ * Identity (`getInstanceId`, `UNKNOWN_INSTANCE_ID`, …) is NOT this helper's
+ * concern since #6836 split it into `services/instanceIdentity.js` — use
+ * `mockTestIdentity()` below for a suite that needs to double identity too.
+ */
+export function mockNoPeers(actual = {}, overrides = {}) {
+  return {
+    ...actual,
+    getPeers: () => Promise.resolve([]),
+    ...overrides,
+  };
+}
+
+/**
+ * Build an `instanceIdentity.js` mock with deterministic test values.
+ *
+ * Sibling to `mockNoPeers()` — this install's federation identity moved to
+ * its own leaf module (#6836) so a caller that only needs an id read no
+ * longer statically loads the peer-orchestration closure. A suite that
+ * doubles `services/instances.js` AND relies on identity values from that
+ * double (directly, or via `mockNoPeers(actual, overrides)`'s old identity
+ * defaults) must add a sibling `vi.mock('.../instanceIdentity.js', () =>
+ * mockTestIdentity({ ...the identity overrides it used... }))` — see
+ * `server/AGENTS.md` "Narrowing an import must not step around a barrel a
+ * suite mocks."
+ */
+export function mockTestIdentity(overrides = {}) {
+  return {
+    UNKNOWN_INSTANCE_ID: 'unknown',
+    getInstanceId: () => Promise.resolve('test-instance'),
+    ensureInstanceId: () => Promise.resolve('test-instance'),
+    getSelf: () => Promise.resolve({ instanceId: 'test-instance', name: 'test-instance' }),
+    ensureSelf: () => Promise.resolve({ instanceId: 'test-instance', name: 'test-instance' }),
+    updateSelf: () => Promise.resolve({ instanceId: 'test-instance', name: 'test-instance' }),
+    ...overrides,
+  };
+}
+
+/**
+ * Build a `sharing/peerSync.js` mock that disables peer fan-out for suites
+ * that load the peer-sync module graph (directly or via sharing/index.js).
+ *
+ * NOTE: record CREATE paths no longer need this — they reach peer-sync only
+ * through the `recordEvents.js` subscription adapter, a silent no-op until
+ * peerSync.js registers itself at module load. A suite that never loads
+ * peerSync gets no fan-out without mocking anything. Keep this helper for
+ * suites that DO import peerSync (its module-load registration would
+ * otherwise wire live fan-out into the adapter).
+ *
+ * Intentionally separate from `mockNoPeers`: stubbing `getPeers → []`
+ * prevents live registry reads once `peerSync.js` loads; this helper prevents
+ * the real module (and its registration side effect) from loading at all.
+ */
+export function mockNoPeerSync(actual = {}, overrides = {}) {
+  return {
+    ...actual,
+    autoSubscribeRecordToAllPeers: () => Promise.resolve([]),
+    unsubscribeAllForRecord: () => Promise.resolve({ removed: [], failed: [] }),
+    ...overrides,
+  };
+}
+
+/**
+ * Convenience wrapper for the most-common case: a single per-file temp dir
+ * plus a Proxy factory. Returns `{ tempRoot, makeProxy, cleanup }` where
+ * `makeProxy(actual)` is called from the test's `vi.mock` factory.
+ *
+ * Example:
+ *
+ *     import { mockPathsDataRoot } from '../lib/mockPathsDataRoot.js';
+ *     const { tempRoot, makeProxy, cleanup } = mockPathsDataRoot();
+ *     vi.mock('../lib/fileUtils.js', async () => {
+ *       const actual = await vi.importActual('../lib/fileUtils.js');
+ *       return makeProxy(actual);
+ *     });
+ *     afterAll(cleanup);
+ *
+ * To inspect call counts on a fileUtils export (e.g. atomicWrite) WITHOUT
+ * `vi.spyOn`-ing a read-only ESM namespace export, pass `wrapExports` plus
+ * `makeSpy: vi.fn` (the test owns vitest; this module stays vitest-free since
+ * it's barrel-exported and runtime-loaded). The wrapped exports are exposed
+ * on the returned `spies` map, each a vi.fn delegating to the real impl:
+ *
+ *     const { makeProxy, spies, cleanup } = mockPathsDataRoot({
+ *       wrapExports: ['atomicWrite'], makeSpy: vi.fn,
+ *     });
+ *     // ...later: spies.atomicWrite.mock.calls
+ */
+export function mockPathsDataRoot({
+  prefix = 'portos-test-',
+  extraOverrides = null,
+  wrapExports = [],
+  makeSpy = null,
+} = {}) {
+  const tempRoot = createTempDataRoot(prefix);
+  const spies = {};
+  return {
+    tempRoot,
+    spies,
+    makeProxy: (actual) => {
+      const overrides = {};
+      if (wrapExports.length) {
+        if (typeof makeSpy !== 'function') {
+          throw new Error('mockPathsDataRoot: wrapExports requires a makeSpy (pass vi.fn)');
+        }
+        for (const name of wrapExports) {
+          spies[name] = makeSpy((...args) => actual[name](...args));
+          overrides[name] = spies[name];
+        }
+      }
+      return makePathsProxy(actual, { dataRoot: tempRoot, extraOverrides, overrides });
+    },
+    cleanup: () => rmSync(tempRoot, { recursive: true, force: true }),
+  };
+}

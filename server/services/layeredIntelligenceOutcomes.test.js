@@ -1,0 +1,855 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtemp, rm, mkdir, writeFile } from 'fs/promises';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { createCollectionStore } from '../lib/collectionStore.js';
+import {
+  sanitizeOutcomeRecord,
+  recordFiledProposal,
+  recordProposalExecution,
+  listOutcomes,
+  listOutcomesResult,
+  reconcileOutcomes,
+  OUTCOME_RETENTION_MS,
+  LI_OUTCOMES_SCHEMA_VERSION
+} from './layeredIntelligenceOutcomes.js';
+import { computeExecutionByDomain } from './layeredIntelligence.js';
+
+// The suite's frozen "today". The reconcile fixtures below close their issues on
+// absolute dates (`closedAt: '2026-07-01T00:00:00Z'` and friends), while the
+// assertions read them back through `listOutcomes()` with no explicit `now` — so
+// the GC measures those fixtures against the real wall clock. That is a time
+// bomb: OUTCOME_RETENTION_MS is 30 days, so on 2026-07-31 every fixture closed on
+// 2026-07-01 aged out mid-suite and 20 tests began failing on a tree nobody had
+// touched. Freezing Date pins the fixtures inside the retention window forever.
+// Only Date is faked — the store's write queue runs on real timers.
+const SUITE_NOW = '2026-07-20T00:00:00Z';
+
+// Build an isolated store over a temp dir so the suite never touches the real
+// data/cos/li-outcomes collection. The store functions all take an injectable
+// `store` param exactly so tests can drive them without PATHS.cos.
+let dir;
+let store;
+beforeEach(async () => {
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(new Date(SUITE_NOW));
+  dir = await mkdtemp(join(tmpdir(), 'li-outcomes-'));
+  store = createCollectionStore({
+    dir,
+    type: 'li-outcomes',
+    schemaVersion: LI_OUTCOMES_SCHEMA_VERSION,
+    sanitizeRecord: sanitizeOutcomeRecord
+  });
+});
+afterEach(async () => {
+  vi.useRealTimers();
+  await rm(dir, { recursive: true, force: true });
+});
+
+describe('sanitizeOutcomeRecord', () => {
+  it('drops rows without a usable appId + slug', () => {
+    expect(sanitizeOutcomeRecord(null)).toBeNull();
+    expect(sanitizeOutcomeRecord({ slug: 'x' })).toBeNull();
+    expect(sanitizeOutcomeRecord({ appId: 'a' })).toBeNull();
+  });
+
+  it('normalizes the slug and coerces an unknown outcome to null', () => {
+    const r = sanitizeOutcomeRecord({ appId: 'app-1', slug: 'Add Metrics', outcome: 'bogus' });
+    expect(r.slug).toBe('add-metrics');
+    expect(r.outcome).toBeNull();
+  });
+
+  it('keeps outcome metadata only alongside a valid outcome', () => {
+    const resolved = sanitizeOutcomeRecord({ appId: 'a', slug: 's', outcome: 'merged', outcomeAt: 'x', outcomeReason: 'y' });
+    expect(resolved.outcome).toBe('merged');
+    expect(resolved.outcomeAt).toBe('x');
+    const unresolved = sanitizeOutcomeRecord({ appId: 'a', slug: 's', outcome: null, outcomeAt: 'x', outcomeReason: 'y' });
+    expect(unresolved.outcomeAt).toBeNull();
+    expect(unresolved.outcomeReason).toBeNull();
+  });
+
+  describe('implementingPr (#2748, deliverable 2)', () => {
+    it('keeps a positive integer PR ref and null-defaults everything else', () => {
+      expect(sanitizeOutcomeRecord({ appId: 'a', slug: 's', implementingPr: 902 }).implementingPr).toBe(902);
+      // Additive/null default: absent, non-int, zero, or negative all coerce to null.
+      expect(sanitizeOutcomeRecord({ appId: 'a', slug: 's' }).implementingPr).toBeNull();
+      expect(sanitizeOutcomeRecord({ appId: 'a', slug: 's', implementingPr: '902' }).implementingPr).toBeNull();
+      expect(sanitizeOutcomeRecord({ appId: 'a', slug: 's', implementingPr: 0 }).implementingPr).toBeNull();
+      expect(sanitizeOutcomeRecord({ appId: 'a', slug: 's', implementingPr: -1 }).implementingPr).toBeNull();
+    });
+
+    it('is preserved regardless of outcome (a fact about the proposal, not the rejection)', () => {
+      expect(sanitizeOutcomeRecord({ appId: 'a', slug: 's', outcome: 'merged', implementingPr: 903 }).implementingPr).toBe(903);
+    });
+  });
+
+  describe('rejectionReason (#2689)', () => {
+    const sanitize = (over) => sanitizeOutcomeRecord({ appId: 'a', slug: 's', ...over });
+
+    it('keeps a valid taxonomy token on a non-merged record', () => {
+      expect(sanitize({ outcome: 'rejected', rejectionReason: 'duplicate' }).rejectionReason).toBe('duplicate');
+      expect(sanitize({ outcome: 'abandoned', rejectionReason: 'unknown-reason' }).rejectionReason).toBe('unknown-reason');
+    });
+
+    it('strips a rejection reason from a merged or unresolved record', () => {
+      // A merged proposal has no rejection to explain; a stray token would inflate
+      // the rejection tally.
+      expect(sanitize({ outcome: 'merged', rejectionReason: 'duplicate' }).rejectionReason).toBeNull();
+      expect(sanitize({ outcome: null, rejectionReason: 'duplicate' }).rejectionReason).toBeNull();
+    });
+
+    it('coerces an unrecognized token to null (unclassified), NOT to unknown-reason', () => {
+      // null re-classifies on the next reconcile; laundering it into the sentinel
+      // would freeze a bogus "we looked and found nothing" in place.
+      expect(sanitize({ outcome: 'rejected', rejectionReason: 'bogus' }).rejectionReason).toBeNull();
+      expect(sanitize({ outcome: 'rejected', rejectionReason: 42 }).rejectionReason).toBeNull();
+    });
+
+    it('defaults a pre-taxonomy record to null rather than inventing a reason', () => {
+      expect(sanitize({ outcome: 'rejected' }).rejectionReason).toBeNull();
+    });
+  });
+
+  describe('executionOutcome (#2765)', () => {
+    const sanitize = (over) => sanitizeOutcomeRecord({ appId: 'a', slug: 's', ...over });
+
+    it('keeps a recognized execution outcome + its timestamp', () => {
+      const r = sanitize({ executionOutcome: 'success', executionAt: '2026-01-01T00:00:00.000Z' });
+      expect(r.executionOutcome).toBe('success');
+      expect(r.executionAt).toBe('2026-01-01T00:00:00.000Z');
+      expect(sanitize({ executionOutcome: 'failure', executionAt: 'x' }).executionOutcome).toBe('failure');
+    });
+
+    it('coerces an unrecognized execution outcome to null and drops its timestamp', () => {
+      const r = sanitize({ executionOutcome: 'bogus', executionAt: 'x' });
+      expect(r.executionOutcome).toBeNull();
+      expect(r.executionAt).toBeNull();
+    });
+
+    it('defaults a record with no execution field to null (never executed)', () => {
+      const r = sanitize({ outcome: 'merged' });
+      expect(r.executionOutcome).toBeNull();
+      expect(r.executionAt).toBeNull();
+    });
+  });
+
+  describe('failureCategory + failureSignal (#2764 §1)', () => {
+    const sanitize = (over) => sanitizeOutcomeRecord({ appId: 'a', slug: 's', ...over });
+
+    it('keeps a recognized failure category + signal on a FAILED execution', () => {
+      const r = sanitize({ executionOutcome: 'failure', executionAt: 'x', failureCategory: 'testing', failureSignal: 'test-failure' });
+      expect(r.failureCategory).toBe('testing');
+      expect(r.failureSignal).toBe('test-failure');
+    });
+
+    it('keeps the unknown-failure sentinel', () => {
+      expect(sanitize({ executionOutcome: 'failure', executionAt: 'x', failureCategory: 'unknown-failure' }).failureCategory).toBe('unknown-failure');
+    });
+
+    it('coerces an unrecognized/future category to null (re-derivable), not the sentinel', () => {
+      expect(sanitize({ executionOutcome: 'failure', executionAt: 'x', failureCategory: 'bogus' }).failureCategory).toBeNull();
+    });
+
+    it('drops the diagnosis on a SUCCESS — a success has nothing to explain', () => {
+      const r = sanitize({ executionOutcome: 'success', executionAt: 'x', failureCategory: 'testing', failureSignal: 'test-failure' });
+      expect(r.failureCategory).toBeNull();
+      expect(r.failureSignal).toBeNull();
+    });
+
+    it('defaults both fields to null on a record that never executed', () => {
+      const r = sanitize({ outcome: 'merged' });
+      expect(r.failureCategory).toBeNull();
+      expect(r.failureSignal).toBeNull();
+    });
+
+    it('bounds a hand-edited over-long failure signal', () => {
+      const r = sanitize({ executionOutcome: 'failure', executionAt: 'x', failureSignal: 'z'.repeat(500) });
+      expect(r.failureSignal.length).toBe(64);
+    });
+  });
+});
+
+describe('recordFiledProposal + listOutcomes', () => {
+  it('records a filed proposal with a null (unresolved) outcome', async () => {
+    const ok = await recordFiledProposal({ appId: 'app-1', slug: 'add-metrics', tracker: 'github', issueRef: '#42', scope: 'app-data-gap' }, store);
+    expect(ok).toBe(true);
+    const rows = await listOutcomes({ appId: 'app-1' }, store);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ appId: 'app-1', slug: 'add-metrics', tracker: 'github', issueRef: '#42', scope: 'app-data-gap', outcome: null });
+    expect(rows[0].filedAt).toBeTruthy();
+  });
+
+  it('refuses a record with no appId or slug', async () => {
+    expect(await recordFiledProposal({ slug: 's' }, store)).toBe(false);
+    expect(await recordFiledProposal({ appId: 'a' }, store)).toBe(false);
+  });
+
+  it('scopes listOutcomes to one app', async () => {
+    await recordFiledProposal({ appId: 'app-1', slug: 's1', scope: 'app-improvement' }, store);
+    await recordFiledProposal({ appId: 'app-2', slug: 's2', scope: 'app-improvement' }, store);
+    expect(await listOutcomes({ appId: 'app-1' }, store)).toHaveLength(1);
+    expect(await listOutcomes({ appId: 'app-2' }, store)).toHaveLength(1);
+  });
+
+  it('retains an unresolved record past the window (like an open issue)', async () => {
+    const now = Date.now();
+    await recordFiledProposal({ appId: 'app-1', slug: 'still-open', scope: 'app-improvement', now: now - OUTCOME_RETENTION_MS - 10000 }, store);
+    const rows = await listOutcomes({ appId: 'app-1', now }, store);
+    expect(rows.map(r => r.slug)).toEqual(['still-open']);
+  });
+
+  it('GC-drops a resolved record once the window elapses from its outcomeAt (not filedAt)', async () => {
+    const now = Date.now();
+    // Filed recently, but resolved with an old closedAt → measured from outcomeAt, it's stale.
+    await recordFiledProposal({ appId: 'app-1', slug: 'old-merged', scope: 'app-improvement', now: now - 1000 }, store);
+    const oldClosed = new Date(now - OUTCOME_RETENTION_MS - 1000).toISOString();
+    await reconcileOutcomes({ appId: 'app-1', existingIssues: [{ slug: 'old-merged', state: 'closed', stateReason: 'completed', closedAt: oldClosed }], now }, store);
+    expect(await listOutcomes({ appId: 'app-1', now }, store)).toEqual([]);
+
+    // A record resolved within the window survives.
+    await recordFiledProposal({ appId: 'app-1', slug: 'fresh-merged', scope: 'app-improvement', now }, store);
+    await reconcileOutcomes({ appId: 'app-1', existingIssues: [{ slug: 'fresh-merged', state: 'closed', stateReason: 'completed', closedAt: new Date(now).toISOString() }], now }, store);
+    const kept = await listOutcomes({ appId: 'app-1', now }, store);
+    expect(kept.map(r => r.slug)).toEqual(['fresh-merged']);
+  });
+
+  it('stamps the type-level schemaVersion on the first record (so a future bump is detectable)', async () => {
+    // Fresh store: the boot verifier sees no index.json.
+    expect((await store.verifySchemaVersion()).onDisk).toBeNull();
+    await recordFiledProposal({ appId: 'app-1', slug: 's', scope: 'app-improvement' }, store);
+    expect((await store.verifySchemaVersion()).onDisk).toBe(LI_OUTCOMES_SCHEMA_VERSION);
+  });
+});
+
+describe('reconcileOutcomes', () => {
+  it('resolves unresolved records from the fresh tracker state', async () => {
+    await recordFiledProposal({ appId: 'app-1', slug: 'merged-one', scope: 'app-data-gap' }, store);
+    await recordFiledProposal({ appId: 'app-1', slug: 'rejected-one', scope: 'app-improvement' }, store);
+    await recordFiledProposal({ appId: 'app-1', slug: 'abandoned-one', scope: 'app-improvement' }, store);
+    await recordFiledProposal({ appId: 'app-1', slug: 'still-open', scope: 'app-improvement' }, store);
+
+    const existingIssues = [
+      { slug: 'merged-one', state: 'closed', stateReason: 'completed', closedAt: '2026-07-01T00:00:00Z' },
+      { slug: 'rejected-one', state: 'closed', stateReason: 'not_planned' },
+      { slug: 'abandoned-one', state: 'closed', stateReason: 'duplicate', closedAt: '2026-07-02T00:00:00Z' },
+      { slug: 'still-open', state: 'open' }
+    ];
+    const updated = await reconcileOutcomes({ appId: 'app-1', existingIssues }, store);
+    expect(updated).toBe(3);
+
+    const byslug = Object.fromEntries((await listOutcomes({ appId: 'app-1' }, store)).map(r => [r.slug, r]));
+    expect(byslug['merged-one'].outcome).toBe('merged');
+    expect(byslug['merged-one'].outcomeAt).toBe('2026-07-01T00:00:00Z');
+    expect(byslug['rejected-one'].outcome).toBe('rejected');
+    // A close with an unrecognized present reason persists as abandoned (#2620) —
+    // it must not inflate the merged count the reasoner calibrates against.
+    expect(byslug['abandoned-one'].outcome).toBe('abandoned');
+    expect(byslug['abandoned-one'].outcomeReason).toBe('duplicate');
+    expect(byslug['still-open'].outcome).toBeNull();
+  });
+
+  it('stamps outcomeAt provenance so a synthesized decision date is distinguishable (#3120)', async () => {
+    await recordFiledProposal({ appId: 'app-1', slug: 'has-closed-at', scope: 'app-improvement' }, store);
+    // A `plan`-tracker close: the filer reports no closedAt at all, so reconcile has to
+    // synthesize the timestamp from its own clock.
+    await recordFiledProposal({ appId: 'app-1', slug: 'no-closed-at', scope: 'app-improvement' }, store);
+
+    const now = Date.parse('2026-07-20T00:00:00Z');
+    await reconcileOutcomes({
+      appId: 'app-1',
+      now,
+      existingIssues: [
+        { slug: 'has-closed-at', state: 'closed', stateReason: 'completed', closedAt: '2026-07-01T00:00:00Z' },
+        { slug: 'no-closed-at', state: 'closed' }
+      ]
+    }, store);
+
+    const bySlug = Object.fromEntries((await listOutcomes({ appId: 'app-1', now }, store)).map(r => [r.slug, r]));
+    // A tracker-reported close time is authoritative — the funnel may date the decision.
+    expect(bySlug['has-closed-at'].outcomeAtSource).toBe('tracker');
+    // A synthesized one is only a lower bound, so it is marked and excluded downstream.
+    expect(bySlug['no-closed-at'].outcomeAtSource).toBe('observed');
+    expect(bySlug['no-closed-at'].outcomeAt).toBe(new Date(now).toISOString());
+  });
+
+  it('does not re-resolve an already-resolved record', async () => {
+    await recordFiledProposal({ appId: 'app-1', slug: 's', scope: 'app-improvement' }, store);
+    await reconcileOutcomes({ appId: 'app-1', existingIssues: [{ slug: 's', state: 'closed', stateReason: 'completed' }] }, store);
+    // Second pass with the issue now reported open should NOT flip it back.
+    const updated = await reconcileOutcomes({ appId: 'app-1', existingIssues: [{ slug: 's', state: 'open' }] }, store);
+    expect(updated).toBe(0);
+    // And a pass with the SAME closed state is a no-op write.
+    const same = await reconcileOutcomes({ appId: 'app-1', existingIssues: [{ slug: 's', state: 'closed', stateReason: 'completed' }] }, store);
+    expect(same).toBe(0);
+    const rows = await listOutcomes({ appId: 'app-1' }, store);
+    expect(rows[0].outcome).toBe('merged');
+  });
+
+  it('refreshes outcomeAt when a proposal re-closes to the same outcome with a newer close time (#2620)', async () => {
+    // closed → reopened → re-closed completed: the derived outcome is unchanged,
+    // but retention/GC keys on outcomeAt, so it must advance to the latest close.
+    await recordFiledProposal({ appId: 'app-1', slug: 'recycled', scope: 'app-improvement' }, store);
+    await reconcileOutcomes({
+      appId: 'app-1',
+      existingIssues: [{ slug: 'recycled', state: 'closed', stateReason: 'completed', closedAt: '2026-07-01T00:00:00Z' }]
+    }, store);
+    const updated = await reconcileOutcomes({
+      appId: 'app-1',
+      existingIssues: [{ slug: 'recycled', state: 'closed', stateReason: 'completed', closedAt: '2026-07-10T00:00:00Z' }]
+    }, store);
+    expect(updated).toBe(1);
+    const rows = await listOutcomes({ appId: 'app-1' }, store);
+    expect(rows[0].outcome).toBe('merged');
+    expect(rows[0].outcomeAt).toBe('2026-07-10T00:00:00Z');
+  });
+
+  it('reclassifies a record persisted under the old any-close-is-merged mapping (#2620)', async () => {
+    // Simulate an install upgrading: a duplicate-closed issue was reconciled as
+    // `merged` by the pre-#2620 mapping. The next reconcile against the same
+    // live tracker state must self-heal it to `abandoned` instead of letting it
+    // inflate the merge rate until the record expires.
+    await recordFiledProposal({ appId: 'app-1', slug: 'legacy', scope: 'app-improvement' }, store);
+    const legacy = (await listOutcomes({ appId: 'app-1' }, store))[0];
+    await store.saveOne('app-1--legacy', {
+      ...legacy, outcome: 'merged', outcomeAt: '2026-07-01T00:00:00Z', outcomeReason: 'duplicate'
+    });
+    const updated = await reconcileOutcomes({
+      appId: 'app-1',
+      existingIssues: [{ slug: 'legacy', state: 'closed', stateReason: 'duplicate', closedAt: '2026-07-01T00:00:00Z' }]
+    }, store);
+    expect(updated).toBe(1);
+    const rows = await listOutcomes({ appId: 'app-1' }, store);
+    expect(rows[0].outcome).toBe('abandoned');
+    expect(rows[0].outcomeAt).toBe('2026-07-01T00:00:00Z');
+  });
+
+  it('is a no-op with no existing issues', async () => {
+    await recordFiledProposal({ appId: 'app-1', slug: 's', scope: 'app-improvement' }, store);
+    expect(await reconcileOutcomes({ appId: 'app-1', existingIssues: [] }, store)).toBe(0);
+  });
+
+  describe('rejection classification (#2689)', () => {
+    const rowsBySlug = async () =>
+      Object.fromEntries((await listOutcomes({ appId: 'app-1' }, store)).map(r => [r.slug, r]));
+
+    it('classifies each non-merged proposal from the tracker state it already has', async () => {
+      await recordFiledProposal({ appId: 'app-1', slug: 'merged-one' }, store);
+      await recordFiledProposal({ appId: 'app-1', slug: 'declined' }, store);
+      await recordFiledProposal({ appId: 'app-1', slug: 'dupe' }, store);
+      await recordFiledProposal({ appId: 'app-1', slug: 'labelled' }, store);
+      await recordFiledProposal({ appId: 'app-1', slug: 'mystery' }, store);
+
+      await reconcileOutcomes({
+        appId: 'app-1',
+        existingIssues: [
+          { slug: 'merged-one', state: 'closed', stateReason: 'completed' },
+          { slug: 'declined', state: 'closed', stateReason: 'not_planned' },
+          { slug: 'dupe', state: 'closed', stateReason: 'duplicate' },
+          { slug: 'labelled', state: 'closed', stateReason: 'not_planned', labels: ['out-of-scope'] },
+          { slug: 'mystery', state: 'closed', stateReason: 'reopened' }
+        ]
+      }, store);
+
+      const rows = await rowsBySlug();
+      // A merged proposal is never given a rejection reason — the load-bearing case
+      // for jira/plan, whose trackers report no stateReason at all.
+      expect(rows['merged-one'].rejectionReason).toBeNull();
+      expect(rows['declined'].rejectionReason).toBe('user-rejected');
+      expect(rows['dupe'].rejectionReason).toBe('duplicate');
+      // A label outranks the generic not_planned.
+      expect(rows['labelled'].rejectionReason).toBe('scope-mismatch');
+      // No signal ⇒ the explicit sentinel, never a fabricated diagnosis.
+      expect(rows['mystery'].rejectionReason).toBe('unknown-reason');
+    });
+
+    it('backfills a record resolved before the taxonomy existed', async () => {
+      // Pre-#2689 installs hold resolved records with no rejectionReason. The
+      // outcome is unchanged, so only the classification diff can trigger the
+      // rewrite that fills them in.
+      await recordFiledProposal({ appId: 'app-1', slug: 'legacy' }, store);
+      const legacy = (await listOutcomes({ appId: 'app-1' }, store))[0];
+      await store.saveOne('app-1--legacy', {
+        ...legacy, outcome: 'rejected', outcomeAt: '2026-07-01T00:00:00Z', outcomeReason: 'not_planned'
+      });
+      expect((await rowsBySlug())['legacy'].rejectionReason).toBeNull();
+
+      const updated = await reconcileOutcomes({
+        appId: 'app-1',
+        existingIssues: [{ slug: 'legacy', state: 'closed', stateReason: 'not_planned', closedAt: '2026-07-01T00:00:00Z' }]
+      }, store);
+      expect(updated).toBe(1);
+      const row = (await rowsBySlug())['legacy'];
+      expect(row.rejectionReason).toBe('user-rejected');
+      expect(row.outcome).toBe('rejected');
+      // Backfilling the diagnosis must not disturb the retention clock.
+      expect(row.outcomeAt).toBe('2026-07-01T00:00:00Z');
+    });
+
+    it('re-diagnoses an unknown-reason record once the issue is finally labelled', async () => {
+      await recordFiledProposal({ appId: 'app-1', slug: 'mystery' }, store);
+      const closed = { slug: 'mystery', state: 'closed', stateReason: 'reopened', closedAt: '2026-07-01T00:00:00Z' };
+      await reconcileOutcomes({ appId: 'app-1', existingIssues: [closed] }, store);
+      expect((await rowsBySlug())['mystery'].rejectionReason).toBe('unknown-reason');
+
+      const updated = await reconcileOutcomes({
+        appId: 'app-1',
+        existingIssues: [{ ...closed, labels: ['duplicate'] }]
+      }, store);
+      expect(updated).toBe(1);
+      expect((await rowsBySlug())['mystery'].rejectionReason).toBe('duplicate');
+    });
+
+    it('lets a specific close reason outrank a conflicting closing comment (#2748)', async () => {
+      // A SPECIFIC close reason (duplicate) wins over prose that would otherwise say
+      // scope-mismatch — free text is the noisier signal.
+      await recordFiledProposal({ appId: 'app-1', slug: 'prose-dupe' }, store);
+      const updated = await reconcileOutcomes({
+        appId: 'app-1',
+        existingIssues: [{
+          slug: 'prose-dupe',
+          state: 'closed',
+          stateReason: 'duplicate',
+          closingComment: 'Appreciate it, but this is out of scope for the app.',
+          closedAt: '2026-07-01T00:00:00Z'
+        }]
+      }, store);
+      expect(updated).toBe(1);
+      expect((await rowsBySlug())['prose-dupe'].rejectionReason).toBe('duplicate');
+    });
+
+    it('refines a generic not_planned decline from the closing comment (#2748)', async () => {
+      // The primary reachable case: deriveOutcome hands a GitHub rejection a
+      // not_planned reason (→ rejected, user-rejected), and the comment sharpens
+      // the WHY. The outcome stays rejected, so the merge rate is unaffected.
+      await recordFiledProposal({ appId: 'app-1', slug: 'refine-me' }, store);
+      const updated = await reconcileOutcomes({
+        appId: 'app-1',
+        existingIssues: [{
+          slug: 'refine-me',
+          state: 'closed',
+          stateReason: 'not_planned',
+          closingComment: 'Appreciate it, but this is out of scope for the app.',
+          closedAt: '2026-07-01T00:00:00Z'
+        }]
+      }, store);
+      expect(updated).toBe(1);
+      const row = (await rowsBySlug())['refine-me'];
+      expect(row.outcome).toBe('rejected');
+      expect(row.rejectionReason).toBe('scope-mismatch');
+    });
+
+    it('lets the closing comment diagnose a close that carries no other signal (#2748)', async () => {
+      await recordFiledProposal({ appId: 'app-1', slug: 'prose-only' }, store);
+      const updated = await reconcileOutcomes({
+        appId: 'app-1',
+        existingIssues: [{
+          slug: 'prose-only',
+          state: 'closed',
+          // reopened ⇒ deriveOutcome abandons it; no stateReason/label the classifier
+          // recognizes, so the comment is the sole diagnostic signal.
+          stateReason: 'reopened',
+          closingComment: "Closing — can't reproduce and the report is too vague.",
+          closedAt: '2026-07-01T00:00:00Z'
+        }]
+      }, store);
+      expect(updated).toBe(1);
+      expect((await rowsBySlug())['prose-only'].rejectionReason).toBe('missing-context');
+    });
+
+    it('leaves a label-only closure on a reason-less tracker unclassified (known limitation)', async () => {
+      // glab/jira never report a stateReason, so deriveOutcome reads a bare close as
+      // `merged` and classification never runs — the `wontfix` signal is wasted.
+      // Pinned so the gap is explicit, not accidental. Letting labels override the
+      // merged fallback is NOT a safe fix: a stale `blocked` label on a genuinely
+      // completed issue would flip it to rejected and corrupt the merge rate the
+      // other way. Needs a disposition/state label split + a deriveOutcome change
+      // (#2620's semantics) — see the module header.
+      await recordFiledProposal({ appId: 'app-1', slug: 'glab-wontfix' }, store);
+      await reconcileOutcomes({
+        appId: 'app-1',
+        existingIssues: [{ slug: 'glab-wontfix', state: 'closed', stateReason: null, labels: ['wontfix'], closedAt: '2026-07-01T00:00:00Z' }]
+      }, store);
+      const row = (await rowsBySlug())['glab-wontfix'];
+      expect(row.outcome).toBe('merged');
+      expect(row.rejectionReason).toBeNull();
+    });
+
+    it('clears a stale rejection reason when a proposal is reopened and then merged', async () => {
+      // rejected → reopened → closed completed. The write side must drop the old
+      // diagnosis, not just rely on the sanitizer stripping it on read.
+      await recordFiledProposal({ appId: 'app-1', slug: 'revived' }, store);
+      await reconcileOutcomes({
+        appId: 'app-1',
+        existingIssues: [{ slug: 'revived', state: 'closed', stateReason: 'not_planned', closedAt: '2026-07-01T00:00:00Z' }]
+      }, store);
+      expect((await rowsBySlug())['revived'].rejectionReason).toBe('user-rejected');
+
+      const updated = await reconcileOutcomes({
+        appId: 'app-1',
+        existingIssues: [{ slug: 'revived', state: 'closed', stateReason: 'completed', closedAt: '2026-07-09T00:00:00Z' }]
+      }, store);
+      expect(updated).toBe(1);
+      const row = (await rowsBySlug())['revived'];
+      expect(row.outcome).toBe('merged');
+      expect(row.rejectionReason).toBeNull();
+    });
+
+    it('does not churn a settled record whose classification is unchanged', async () => {
+      await recordFiledProposal({ appId: 'app-1', slug: 's' }, store);
+      const issue = { slug: 's', state: 'closed', stateReason: 'not_planned', closedAt: '2026-07-01T00:00:00Z' };
+      expect(await reconcileOutcomes({ appId: 'app-1', existingIssues: [issue] }, store)).toBe(1);
+      expect(await reconcileOutcomes({ appId: 'app-1', existingIssues: [issue] }, store)).toBe(0);
+    });
+  });
+
+  describe('implementing-PR failure classification (#2748, deliverable 2)', () => {
+    const rowsBySlug = async () =>
+      Object.fromEntries((await listOutcomes({ appId: 'app-1' }, store)).map(r => [r.slug, r]));
+
+    it('refines a generic decline to validation-failed from the implementing PR checks', async () => {
+      await recordFiledProposal({ appId: 'app-1', slug: 'ci-failed' }, store);
+      const readPrState = vi.fn().mockResolvedValue({ state: 'CLOSED', mergeStateStatus: 'UNKNOWN', statusCheckRollup: [{ conclusion: 'FAILURE' }] });
+      const updated = await reconcileOutcomes({
+        appId: 'app-1', cli: 'gh', cwd: '/x', readPrState,
+        existingIssues: [{ slug: 'ci-failed', state: 'closed', stateReason: 'not_planned', implementingPr: 900, closedAt: '2026-07-01T00:00:00Z' }]
+      }, store);
+      expect(updated).toBe(1);
+      expect(readPrState).toHaveBeenCalledWith({ cli: 'gh', cwd: '/x', env: undefined, number: 900 });
+      const row = (await rowsBySlug())['ci-failed'];
+      expect(row.rejectionReason).toBe('validation-failed');
+      // The implementing-PR ref is persisted (additive field).
+      expect(row.implementingPr).toBe(900);
+    });
+
+    it('refines an otherwise-unknown close to merge-conflict from the PR merge state', async () => {
+      await recordFiledProposal({ appId: 'app-1', slug: 'dirty-branch' }, store);
+      const readPrState = vi.fn().mockResolvedValue({ state: 'OPEN', mergeStateStatus: 'DIRTY', statusCheckRollup: [] });
+      await reconcileOutcomes({
+        appId: 'app-1', cli: 'gh', readPrState,
+        existingIssues: [{ slug: 'dirty-branch', state: 'closed', stateReason: 'reopened', implementingPr: 901, closedAt: '2026-07-01T00:00:00Z' }]
+      }, store);
+      expect((await rowsBySlug())['dirty-branch'].rejectionReason).toBe('merge-conflict');
+    });
+
+    it('does NOT read the PR when a more authoritative signal already diagnosed the close', async () => {
+      // A human label wins; the bounded fetch is skipped entirely.
+      await recordFiledProposal({ appId: 'app-1', slug: 'labelled' }, store);
+      const readPrState = vi.fn();
+      await reconcileOutcomes({
+        appId: 'app-1', cli: 'gh', readPrState,
+        existingIssues: [{ slug: 'labelled', state: 'closed', stateReason: 'not_planned', labels: ['duplicate'], implementingPr: 902, closedAt: '2026-07-01T00:00:00Z' }]
+      }, store);
+      expect(readPrState).not.toHaveBeenCalled();
+      expect((await rowsBySlug())['labelled'].rejectionReason).toBe('duplicate');
+      // But the PR ref is still persisted so it's available if the label is later removed.
+      expect((await rowsBySlug())['labelled'].implementingPr).toBe(902);
+    });
+
+    it('does NOT read the PR when there is no implementing ref or no forge handle', async () => {
+      await recordFiledProposal({ appId: 'app-1', slug: 'no-pr' }, store);
+      await recordFiledProposal({ appId: 'app-1', slug: 'no-cli' }, store);
+      const readPrState = vi.fn();
+      await reconcileOutcomes({
+        appId: 'app-1', cli: 'gh', readPrState,
+        existingIssues: [{ slug: 'no-pr', state: 'closed', stateReason: 'not_planned', closedAt: '2026-07-01T00:00:00Z' }]
+      }, store);
+      // No cli (plan/jira path) — even with a ref there's no PR to read.
+      await reconcileOutcomes({
+        appId: 'app-1', readPrState,
+        existingIssues: [{ slug: 'no-cli', state: 'closed', stateReason: 'not_planned', implementingPr: 903, closedAt: '2026-07-01T00:00:00Z' }]
+      }, store);
+      expect(readPrState).not.toHaveBeenCalled();
+      const rows = await rowsBySlug();
+      expect(rows['no-pr'].rejectionReason).toBe('user-rejected');
+      expect(rows['no-cli'].rejectionReason).toBe('user-rejected');
+    });
+
+    it('falls back to the free-signal reason when the PR read is inconclusive', async () => {
+      await recordFiledProposal({ appId: 'app-1', slug: 'clean-pr' }, store);
+      // PR merged / clean → classifyPrFailure returns null → keep the generic decline.
+      const readPrState = vi.fn().mockResolvedValue({ state: 'CLOSED', mergeStateStatus: 'CLEAN', statusCheckRollup: [{ conclusion: 'SUCCESS' }] });
+      await reconcileOutcomes({
+        appId: 'app-1', cli: 'gh', readPrState,
+        existingIssues: [{ slug: 'clean-pr', state: 'closed', stateReason: 'not_planned', implementingPr: 904, closedAt: '2026-07-01T00:00:00Z' }]
+      }, store);
+      expect((await rowsBySlug())['clean-pr'].rejectionReason).toBe('user-rejected');
+    });
+
+    it('survives a throwing PR read, keeping the free-signal reason (never throws)', async () => {
+      await recordFiledProposal({ appId: 'app-1', slug: 'boom' }, store);
+      const readPrState = vi.fn().mockRejectedValue(new Error('gh exploded'));
+      const updated = await reconcileOutcomes({
+        appId: 'app-1', cli: 'gh', readPrState,
+        existingIssues: [{ slug: 'boom', state: 'closed', stateReason: 'not_planned', implementingPr: 905, closedAt: '2026-07-01T00:00:00Z' }]
+      }, store);
+      expect(updated).toBe(1);
+      expect((await rowsBySlug())['boom'].rejectionReason).toBe('user-rejected');
+    });
+
+    it('does NOT re-read the PR once a record is already settled to a PR-failure token (codex P2)', async () => {
+      await recordFiledProposal({ appId: 'app-1', slug: 'settled' }, store);
+      const issue = { slug: 'settled', state: 'closed', stateReason: 'not_planned', implementingPr: 910, closedAt: '2026-07-01T00:00:00Z' };
+      // First tick: the generic decline is refined to validation-failed via the PR read.
+      const firstRead = vi.fn().mockResolvedValue({ state: 'CLOSED', statusCheckRollup: [{ conclusion: 'FAILURE' }] });
+      await reconcileOutcomes({ appId: 'app-1', cli: 'gh', readPrState: firstRead, existingIssues: [issue] }, store);
+      expect(firstRead).toHaveBeenCalledTimes(1);
+      expect((await rowsBySlug())['settled'].rejectionReason).toBe('validation-failed');
+
+      // Second tick (same generic free signal, same ref): the settled PR diagnosis is
+      // kept WITHOUT re-spawning gh pr view, and the record is not rewritten/downgraded.
+      const secondRead = vi.fn().mockResolvedValue({ state: 'CLOSED', statusCheckRollup: [{ conclusion: 'FAILURE' }] });
+      const updated = await reconcileOutcomes({ appId: 'app-1', cli: 'gh', readPrState: secondRead, existingIssues: [issue] }, store);
+      expect(secondRead).not.toHaveBeenCalled();
+      expect(updated).toBe(0);
+      expect((await rowsBySlug())['settled'].rejectionReason).toBe('validation-failed');
+    });
+
+    it('re-reads the replacement PR when the issue is re-linked to a different PR (codex P2 follow-up)', async () => {
+      await recordFiledProposal({ appId: 'app-1', slug: 'relinked' }, store);
+      // Settle on PR 920 as merge-conflict.
+      const readA = vi.fn().mockResolvedValue({ state: 'OPEN', mergeStateStatus: 'DIRTY' });
+      await reconcileOutcomes({
+        appId: 'app-1', cli: 'gh', readPrState: readA,
+        existingIssues: [{ slug: 'relinked', state: 'closed', stateReason: 'not_planned', implementingPr: 920, closedAt: '2026-07-01T00:00:00Z' }]
+      }, store);
+      expect((await rowsBySlug())['relinked'].rejectionReason).toBe('merge-conflict');
+
+      // Re-linked to PR 921 (CI-failed): the stale merge-conflict must NOT be inherited —
+      // the new PR is read and re-diagnosed, and the stored ref advances.
+      const readB = vi.fn().mockResolvedValue({ state: 'CLOSED', statusCheckRollup: [{ conclusion: 'FAILURE' }] });
+      const updated = await reconcileOutcomes({
+        appId: 'app-1', cli: 'gh', readPrState: readB,
+        existingIssues: [{ slug: 'relinked', state: 'closed', stateReason: 'not_planned', implementingPr: 921, closedAt: '2026-07-01T00:00:00Z' }]
+      }, store);
+      expect(readB).toHaveBeenCalledWith({ cli: 'gh', cwd: null, env: undefined, number: 921 });
+      expect(updated).toBe(1);
+      const row = (await rowsBySlug())['relinked'];
+      expect(row.rejectionReason).toBe('validation-failed');
+      expect(row.implementingPr).toBe(921);
+    });
+
+    it('lets a newly-added authoritative label supersede a settled PR-failure token', async () => {
+      await recordFiledProposal({ appId: 'app-1', slug: 'relabelled' }, store);
+      const firstRead = vi.fn().mockResolvedValue({ state: 'OPEN', mergeStateStatus: 'DIRTY' });
+      await reconcileOutcomes({
+        appId: 'app-1', cli: 'gh', readPrState: firstRead,
+        existingIssues: [{ slug: 'relabelled', state: 'closed', stateReason: 'not_planned', implementingPr: 911, closedAt: '2026-07-01T00:00:00Z' }]
+      }, store);
+      expect((await rowsBySlug())['relabelled'].rejectionReason).toBe('merge-conflict');
+
+      // A human later adds a `duplicate` label: the free classification is now specific
+      // (not refinable), so the PR read is skipped and the label wins over the PR token.
+      const secondRead = vi.fn();
+      const updated = await reconcileOutcomes({
+        appId: 'app-1', cli: 'gh', readPrState: secondRead,
+        existingIssues: [{ slug: 'relabelled', state: 'closed', stateReason: 'not_planned', labels: ['duplicate'], implementingPr: 911, closedAt: '2026-07-01T00:00:00Z' }]
+      }, store);
+      expect(secondRead).not.toHaveBeenCalled();
+      expect(updated).toBe(1);
+      expect((await rowsBySlug())['relabelled'].rejectionReason).toBe('duplicate');
+    });
+
+    it('backfills the implementing-PR ref on an already-settled record without changing its reason', async () => {
+      await recordFiledProposal({ appId: 'app-1', slug: 'backfill' }, store);
+      // First pass: a duplicate close with no PR ref yet.
+      await reconcileOutcomes({
+        appId: 'app-1',
+        existingIssues: [{ slug: 'backfill', state: 'closed', stateReason: 'duplicate', closedAt: '2026-07-01T00:00:00Z' }]
+      }, store);
+      expect((await rowsBySlug())['backfill'].implementingPr).toBeNull();
+      // Second pass: the ref is now known. Reason is unchanged (duplicate wins), but
+      // learning the ref is itself a reason to rewrite.
+      const readPrState = vi.fn();
+      const updated = await reconcileOutcomes({
+        appId: 'app-1', cli: 'gh', readPrState,
+        existingIssues: [{ slug: 'backfill', state: 'closed', stateReason: 'duplicate', implementingPr: 906, closedAt: '2026-07-01T00:00:00Z' }]
+      }, store);
+      expect(updated).toBe(1);
+      expect(readPrState).not.toHaveBeenCalled(); // duplicate is not refinable → no fetch
+      const row = (await rowsBySlug())['backfill'];
+      expect(row.rejectionReason).toBe('duplicate');
+      expect(row.implementingPr).toBe(906);
+    });
+  });
+});
+
+describe('listOutcomesResult read sentinel (#2700)', () => {
+  it('reports read:true with the records on a successful read', async () => {
+    await recordFiledProposal({ appId: 'app-1', slug: 'add-metrics', tracker: 'github', issueRef: '#42' }, store);
+    const res = await listOutcomesResult({ appId: 'app-1' }, store);
+    expect(res.read).toBe(true);
+    expect(res.outcomes).toHaveLength(1);
+  });
+
+  it('reports read:true with [] when the store is readable but this app filed nothing', async () => {
+    // "Nothing filed" is a real, trustworthy answer — distinct from a failed read.
+    expect(await listOutcomesResult({ appId: 'app-1' }, store)).toEqual({ read: true, outcomes: [] });
+  });
+
+  it('reports read:false when the store read throws — never a fabricated empty history', async () => {
+    const broken = { loadAllResult: () => Promise.reject(new Error('disk on fire')), deleteOne: () => Promise.resolve() };
+    expect(await listOutcomesResult({ appId: 'app-1' }, broken)).toEqual({ read: false, outcomes: [] });
+  });
+
+  it('reports read:false when the store returns a non-array', async () => {
+    const broken = { loadAllResult: () => Promise.resolve(null), deleteOne: () => Promise.resolve() };
+    expect(await listOutcomesResult({ appId: 'app-1' }, broken)).toEqual({ read: false, outcomes: [] });
+  });
+
+  it('reports read:false + partial + failedIds when a record fails to load (#2728)', async () => {
+    // One clean record for this app plus a corrupt record dir the store can't parse —
+    // the surviving list is an undercount, so the read must NOT report as clean.
+    await recordFiledProposal({ appId: 'app-1', slug: 'add-metrics', tracker: 'github', issueRef: '#42' }, store);
+    await mkdir(join(dir, 'app-1--broken-slug'), { recursive: true });
+    await writeFile(join(dir, 'app-1--broken-slug', 'index.json'), '{not valid json');
+    const res = await listOutcomesResult({ appId: 'app-1' }, store);
+    expect(res.read).toBe(false);
+    expect(res.partial).toBe(true);
+    expect(res.failedIds).toEqual(['app-1--broken-slug']);
+    // The record that DID load is still returned for the best-effort flatten path.
+    expect(res.outcomes.map(r => r.slug)).toEqual(['add-metrics']);
+  });
+
+  it('treats a missing appId as an empty successful read, not a store failure', async () => {
+    expect(await listOutcomesResult({}, store)).toEqual({ read: true, outcomes: [] });
+  });
+
+  it('listOutcomes still flattens to the bare array for back-compat', async () => {
+    await recordFiledProposal({ appId: 'app-1', slug: 'add-metrics', tracker: 'github', issueRef: '#42' }, store);
+    expect(await listOutcomes({ appId: 'app-1' }, store)).toHaveLength(1);
+    const broken = { loadAllResult: () => Promise.reject(new Error('nope')), deleteOne: () => Promise.resolve() };
+    expect(await listOutcomes({ appId: 'app-1' }, broken)).toEqual([]);
+  });
+});
+
+describe('recordProposalExecution (#2765)', () => {
+  it('stamps execution success onto an existing filed record, preserving its scope + filing outcome', async () => {
+    await recordFiledProposal({ appId: 'app-1', slug: 'tidy-thing', tracker: 'github', issueRef: '#7', scope: 'loop-meta' }, store);
+    const ok = await recordProposalExecution({ appId: 'app-1', slug: 'tidy-thing', success: true }, store);
+    expect(ok).toBe(true);
+    const [row] = await listOutcomes({ appId: 'app-1' }, store);
+    expect(row).toMatchObject({ slug: 'tidy-thing', scope: 'loop-meta', executionOutcome: 'success' });
+    expect(row.executionAt).toBeTruthy();
+    // The filed identity is untouched — execution is orthogonal to the filing fate.
+    expect(row.issueRef).toBe('#7');
+    expect(row.outcome).toBeNull();
+  });
+
+  it('records a failure and normalizes the slug', async () => {
+    await recordFiledProposal({ appId: 'app-1', slug: 'flaky-fix', scope: 'app-improvement' }, store);
+    await recordProposalExecution({ appId: 'app-1', slug: 'Flaky Fix', success: false }, store);
+    const [row] = await listOutcomes({ appId: 'app-1' }, store);
+    expect(row.executionOutcome).toBe('failure');
+  });
+
+  it('classifies + persists the failure taxonomy from the run signal (#2764 §1)', async () => {
+    await recordFiledProposal({ appId: 'app-1', slug: 'regressed', scope: 'loop-meta' }, store);
+    await recordProposalExecution({ appId: 'app-1', slug: 'regressed', success: false, errorCategory: 'test-failure' }, store);
+    const [row] = await listOutcomes({ appId: 'app-1' }, store);
+    expect(row).toMatchObject({ executionOutcome: 'failure', failureCategory: 'testing', failureSignal: 'test-failure' });
+  });
+
+  it('classifies a clean-exit validation miss as testing even with no error category (#2764 §1)', async () => {
+    await recordProposalExecution({ appId: 'app-1', slug: 'missed', scope: 'loop-meta', success: false, errorCategory: null, validationPassed: false }, store);
+    const [row] = await listOutcomes({ appId: 'app-1' }, store);
+    expect(row.failureCategory).toBe('testing');
+    expect(row.failureSignal).toBeNull(); // no raw category to keep
+  });
+
+  it('leaves the diagnosis null on a SUCCESS, and clears a prior failure on a passing re-run (#2764 §1)', async () => {
+    await recordProposalExecution({ appId: 'app-1', slug: 'retry', scope: 'loop-meta', success: false, errorCategory: 'git-conflict' }, store);
+    let [row] = await listOutcomes({ appId: 'app-1' }, store);
+    expect(row.failureCategory).toBe('execution');
+    // A later passing re-run must overwrite the stale failure diagnosis.
+    await recordProposalExecution({ appId: 'app-1', slug: 'retry', scope: 'loop-meta', success: true }, store);
+    [row] = await listOutcomes({ appId: 'app-1' }, store);
+    expect(row.executionOutcome).toBe('success');
+    expect(row.failureCategory).toBeNull();
+    expect(row.failureSignal).toBeNull();
+  });
+
+  it('stores an unmapped failure signal as unknown-failure but keeps the raw signal (#2764 §1)', async () => {
+    await recordProposalExecution({ appId: 'app-1', slug: 'mystery', scope: 'loop-meta', success: false, errorCategory: 'weird-new-category' }, store);
+    const [row] = await listOutcomes({ appId: 'app-1' }, store);
+    expect(row.failureCategory).toBe('unknown-failure');
+    expect(row.failureSignal).toBe('weird-new-category');
+  });
+
+  it('creates a minimal record (adopting the passed scope) when the filed record is missing', async () => {
+    // GC'd or a filing-write miss — the execution signal must not be silently lost.
+    const ok = await recordProposalExecution({ appId: 'app-2', slug: 'orphan', scope: 'portos-self', success: true }, store);
+    expect(ok).toBe(true);
+    const [row] = await listOutcomes({ appId: 'app-2' }, store);
+    expect(row).toMatchObject({ appId: 'app-2', slug: 'orphan', scope: 'portos-self', executionOutcome: 'success' });
+  });
+
+  it('rejects a non-boolean success / missing identity without writing', async () => {
+    expect(await recordProposalExecution({ appId: 'app-1', slug: 's', success: 'yes' }, store)).toBe(false);
+    expect(await recordProposalExecution({ appId: 'app-1', success: true }, store)).toBe(false);
+    expect(await recordProposalExecution({ slug: 's', success: true }, store)).toBe(false);
+    expect(await listOutcomes({ appId: 'app-1' }, store)).toHaveLength(0);
+  });
+
+  it('acceptance (#2765): filing + executing a proposal moves ONLY that domain’s bucket', async () => {
+    // Two proposals in different domains; execute only the loop-meta one.
+    await recordFiledProposal({ appId: 'app-1', slug: 'meta-one', scope: 'loop-meta' }, store);
+    await recordFiledProposal({ appId: 'app-1', slug: 'improve-one', scope: 'app-improvement' }, store);
+    await recordProposalExecution({ appId: 'app-1', slug: 'meta-one', success: true }, store);
+
+    const byDomain = computeExecutionByDomain(await listOutcomes({ appId: 'app-1' }, store));
+    expect(byDomain['loop-meta']).toEqual({
+      completed: 1, succeeded: 1, successRate: 100,
+      failureSummary: { entries: [], unknown: 0, unclassified: 0, diagnosed: 0, total: 0 } // no failed hand-off (#2764 §3)
+    });
+    // The un-executed proposal's domain never appears — no executionOutcome to count.
+    expect(byDomain['app-improvement']).toBeUndefined();
+  });
+
+  it('reconcile preserves executionOutcome when it later stamps the filing outcome (#2765 field-preservation)', async () => {
+    // The reverse-race guard: execution is recorded first, then reconcile marks the
+    // issue merged. The fenced re-read must carry executionOutcome through, not clobber
+    // it with a stale pre-execution record.
+    await recordFiledProposal({ appId: 'app-1', slug: 'both', scope: 'loop-meta' }, store);
+    await recordProposalExecution({ appId: 'app-1', slug: 'both', success: true }, store);
+    await reconcileOutcomes({
+      appId: 'app-1',
+      existingIssues: [{ slug: 'both', state: 'closed', stateReason: 'completed', closedAt: new Date().toISOString() }]
+    }, store);
+    const [row] = await listOutcomes({ appId: 'app-1' }, store);
+    expect(row.outcome).toBe('merged');           // reconcile applied the filing outcome
+    expect(row.executionOutcome).toBe('success'); // …without dropping the execution signal
+  });
+
+  it('reconcile preserves the failure diagnosis when it later stamps the filing outcome (#2764 §1)', async () => {
+    // A failed hand-off later gets its issue closed-as-rejected. Reconcile applies the
+    // filing outcome via a fenced re-read that spreads the fresh record — the
+    // execution-failure fields must ride through untouched.
+    await recordFiledProposal({ appId: 'app-1', slug: 'diag', scope: 'loop-meta' }, store);
+    await recordProposalExecution({ appId: 'app-1', slug: 'diag', success: false, errorCategory: 'git-conflict' }, store);
+    await reconcileOutcomes({
+      appId: 'app-1',
+      existingIssues: [{ slug: 'diag', state: 'closed', stateReason: 'not_planned', closedAt: new Date().toISOString() }]
+    }, store);
+    const [row] = await listOutcomes({ appId: 'app-1' }, store);
+    expect(row.outcome).toBe('rejected');          // reconcile applied the filing outcome
+    expect(row.executionOutcome).toBe('failure');  // …preserving the execution signal
+    expect(row.failureCategory).toBe('execution'); // …and the failure diagnosis
+    expect(row.failureSignal).toBe('git-conflict');
+  });
+
+  it('aggregates a domain’s success rate across multiple executions', async () => {
+    await recordFiledProposal({ appId: 'app-1', slug: 'a', scope: 'loop-meta' }, store);
+    await recordFiledProposal({ appId: 'app-1', slug: 'b', scope: 'loop-meta' }, store);
+    await recordFiledProposal({ appId: 'app-1', slug: 'c', scope: 'loop-meta' }, store);
+    await recordProposalExecution({ appId: 'app-1', slug: 'a', success: true }, store);
+    await recordProposalExecution({ appId: 'app-1', slug: 'b', success: true }, store);
+    await recordProposalExecution({ appId: 'app-1', slug: 'c', success: false }, store);
+    const byDomain = computeExecutionByDomain(await listOutcomes({ appId: 'app-1' }, store));
+    expect(byDomain['loop-meta']).toEqual({
+      completed: 3, succeeded: 2, successRate: 67,
+      // The one failed hand-off carried no errorCategory, so it classifies as
+      // unknown-failure (a measured gap), not a diagnosis (#2764 §3).
+      failureSummary: { entries: [], unknown: 1, unclassified: 0, diagnosed: 0, total: 1 }
+    });
+  });
+});

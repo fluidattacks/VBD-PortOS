@@ -1,0 +1,148 @@
+// Server-pushed voice output for the Chief of Staff.
+//
+// Normal voice turns are user-initiated: the user speaks/types, the LLM
+// streams a reply, TTS goes back over the socket. Proactive speech lets the
+// CoS speak FIRST — alerts, briefings, reminders — without a user turn.
+//
+// Three things make this non-trivial:
+//   1. Quiet hours. Users don't want the bot piping up at 2am.
+//   2. Barge-in. If the user is mid-utterance the proactive line yields.
+//   3. Delivery channel. It uses the same Socket.IO `voice:speak` event the
+//      client already plays back from the TTS pipeline, so the existing
+//      barge-in path (voice:interrupt → stopPlayback) cancels proactive
+//      audio for free.
+//
+// Pure-function quiet-hour / barge-in helpers are exported separately so
+// they can be unit-tested without spinning up a server.
+
+import { synthesize } from './tts.js';
+import { getVoiceConfig } from './config.js';
+import { rememberTtsForAllSockets } from './echo.js';
+import { emitVoiceOutput } from './voiceOutput.js';
+import { getLocalParts, isWithinTimeWindow } from '../../lib/timezone.js';
+import { getUserTimezone } from '../userTimezone.js';
+import { VOICE_TEXT_MAX_CHARS } from '../../lib/apiContractSchemas.js';
+
+// HH:MM helpers live in server/lib/timezone.js (single source of truth shared
+// with the dashboard's time-window validator). Re-exported here so the
+// route-level Zod schema in `routes/voice.js` validates the same lenient
+// HH:MM shape and tests can exercise the parser directly.
+export { HHMM_RE, parseHHMM } from '../../lib/timezone.js';
+
+// Maximum spoken-text length for proactive lines. The /api/voice/speak Zod
+// schema already caps HTTP payloads at 4000 chars, but `speakProactive` is
+// also called directly by internal subsystems (CoS, scheduler, etc.) that
+// bypass the route validator. Enforce the same bound here so a runaway
+// caller can't trigger multi-minute synthesis and a multi-megabyte socket
+// payload. Exposed so the route can import the same constant if it ever
+// needs to.
+export const MAX_PROACTIVE_TEXT_LEN = VOICE_TEXT_MAX_CHARS;
+
+// Quiet-hours inclusion is exactly the generic time-window predicate — a
+// half-open [start, end) window with overnight wrap (same-value start/end =
+// empty window, so proactive speech is always allowed). Kept as a domain-named
+// alias so callers and tests read clearly.
+export const isWithinQuietHours = isWithinTimeWindow;
+
+// Pull the user's current local minutes-from-midnight via Intl. Server runs
+// TZ=UTC, so a naive `new Date().getHours()` would compare quiet hours
+// against UTC and silently let the bot speak during the user's bedtime.
+export const getLocalMinutes = async () => {
+  const tz = await getUserTimezone();
+  const parts = getLocalParts(new Date(), tz);
+  return parts.hour * 60 + parts.minute;
+};
+
+// Pure decision helper — given a config snapshot + current local minutes,
+// should this proactive speech go out? Tested directly without time mocking.
+//
+// `solicited` marks a line the user explicitly asked for (e.g. the completion
+// of a coding task they dispatched by voice). Such lines skip the
+// proactive-enabled gate — the user opted in by issuing the request — but
+// still honor voice-disabled and quiet hours (no piping up at 3am, PR or not).
+export const shouldSpeak = (cfg, nowMinutes, { solicited = false } = {}) => {
+  if (!cfg?.enabled) return { ok: false, reason: 'voice-disabled' };
+  const proactive = cfg.llm?.proactive;
+  if (!solicited && !proactive?.enabled) return { ok: false, reason: 'proactive-disabled' };
+  if (proactive?.quietHours?.enabled) {
+    if (isWithinQuietHours({
+      start: proactive.quietHours.start,
+      end: proactive.quietHours.end,
+      nowMinutes,
+    })) {
+      return { ok: false, reason: 'quiet-hours' };
+    }
+  }
+  return { ok: true };
+};
+
+// Speak a line to the single designated voice-output tab. `io` is the Socket.IO
+// server passed from socket.js (no global stash so tests can inject a fake).
+// Proactive audio is NOT broadcast — `emitVoiceOutput` (voiceOutput.js) routes
+// it to the one tab currently claiming output, so a reminder/briefing plays on
+// exactly one browser tab / machine instead of all of them at once.
+//
+// `priority` is informational for now — clients can decide whether to
+// surface a toast for high-priority lines or just speak. Reserved field;
+// keep the API surface ready for it.
+//
+// Returns { ok, reason?, latencyMs? } so callers know whether the line
+// went out or was suppressed.
+export const speakProactive = async ({ io, text, priority = 'normal', source = 'cos', solicited = false }) => {
+  if (!io) return { ok: false, reason: 'no-io' };
+  const trimmed = (text || '').trim();
+  if (!trimmed) return { ok: false, reason: 'empty' };
+  if (trimmed.length > MAX_PROACTIVE_TEXT_LEN) {
+    console.warn(`🔕 voice: proactive too-long (${trimmed.length} > ${MAX_PROACTIVE_TEXT_LEN}) "${trimmed.slice(0, 60)}…"`);
+    return { ok: false, reason: 'too-long', chars: trimmed.length, maxChars: MAX_PROACTIVE_TEXT_LEN };
+  }
+
+  const cfg = await getVoiceConfig();
+  // Only resolve the user's local time when the decision actually depends on
+  // it. getLocalMinutes() reads settings via getUserTimezone() and is the
+  // only async work in the suppression path; skipping it when quiet hours
+  // are disabled keeps proactive sends cheap (one fewer fs read + Intl call
+  // per line) and removes an avoidable async failure surface.
+  const nowMinutes = cfg?.llm?.proactive?.quietHours?.enabled
+    ? await getLocalMinutes()
+    : 0;
+  const decision = shouldSpeak(cfg, nowMinutes, { solicited });
+  if (!decision.ok) {
+    // Voice off, or proactive speech off, is the install's steady configuration.
+    // Logging it on every task dequeue drowns the server log in lines that
+    // describe a choice already made. Quiet hours and oversized text are events.
+    if (decision.reason !== 'voice-disabled' && decision.reason !== 'proactive-disabled') {
+      console.log(`🔕 voice: proactive suppressed (${decision.reason}) "${trimmed.slice(0, 60)}"`);
+    }
+    return decision;
+  }
+
+  const { wav, latencyMs } = await synthesize(trimmed);
+  // `voice:speak` is the proactive-speech channel — distinct from per-turn
+  // `voice:tts:audio` so the client can render a different visual cue
+  // (subtle pill instead of full conversation entry) and skip recording
+  // it as part of the dialogue history. Routed to the single voice-output tab
+  // (not io.emit) so it doesn't play on every connected tab/machine at once.
+  const delivery = emitVoiceOutput(io, 'voice:speak', {
+    sentence: trimmed,
+    wav,
+    latencyMs,
+    priority,
+    source,
+    ts: Date.now(),
+  });
+  // Mirror the per-turn `state.recentTts` write so a proactive line bleeding
+  // from speakers back into the mic gets dropped as echo on the next turn.
+  // Deliberately remembered on EVERY socket, not just the recipient: only the
+  // recipient tab plays the audio, but a *sibling tab on the same machine* that
+  // is hands-free listening hears it through the shared speakers/mic, and must
+  // also suppress it or the bot answers its own voice in a feedback loop. The
+  // cost is that a different device speaking a 4+ word phrase closely matching
+  // the line within the 8s window could be falsely dropped — a rare, transient
+  // miss, strictly safer than re-opening the feedback loop echo suppression
+  // exists to prevent.
+  rememberTtsForAllSockets(trimmed);
+  const dest = delivery.broadcast ? 'broadcast' : (delivery.socketId ?? 'none');
+  console.log(`🔔 voice: proactive sent (${priority}) → ${dest} "${trimmed.slice(0, 80)}" (${latencyMs}ms synth)`);
+  return { ok: true, latencyMs };
+};

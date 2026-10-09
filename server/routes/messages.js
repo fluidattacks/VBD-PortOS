@@ -1,0 +1,515 @@
+import { messageInboxRead, messageDetailRead, messageParamsSchema } from './messageInboxRead.js';
+import express from 'express';
+import { z } from 'zod';
+import { asyncHandler, ServerError } from '../lib/errorHandler.js';
+import {
+  validateRequest, MESSAGE_TOKEN_PROVIDERS, messageSyncBodySchema, messageFetchFullBodySchema,
+  messageActionBodySchema, messageTokenProviderBodySchema,
+} from '../lib/validation.js';
+import { UUID_RE } from '../lib/fileUtils.js';
+import { MESSAGE_ACCOUNT_TRANSPORT, sendViaForAccountType } from '../lib/messageTransport.js';
+import * as messageAccounts from '../services/messageAccounts.js';
+import * as messageSync from '../services/messageSync.js';
+import * as messageDrafts from '../services/messageDrafts.js';
+import * as messageSender from '../services/messageSender.js';
+import { getSelectors, updateSelectors, testSelectors, launchProvider } from '../services/messagePlaywrightSync.js';
+import { evaluateMessages, generateReplyBody } from '../services/messageEvaluator.js';
+import { executeAction } from '../services/messageActions.js';
+import { listRules, deleteRule } from '../services/messageTriageRules.js';
+import { getToken, getTokenStatus, testApi, clearTokenCache } from '../services/messageTokenExtractor.js';
+
+const router = express.Router();
+
+// Maximum number of messages fetched for a full-body refresh pass.
+// When the result set hits this cap the response includes truncated:true so
+// callers know there may be un-refreshed messages beyond the limit.
+const FULL_BODY_REFRESH_LIMIT = 1000;
+
+// === Validation Schemas ===
+const createAccountSchema = z.object({
+  name: z.string().min(1),
+  type: z.enum(['gmail', 'outlook', 'teams']),
+  email: z.union([z.string().email(), z.literal('')]).optional().default(''),
+  syncConfig: z.object({
+    maxAge: z.string().optional(),
+    maxMessages: z.number().int().positive().optional(),
+    syncInterval: z.number().int().positive().optional(),
+    // Per-account reply-detection ingestion (Gmail sent mail → timeline). #2796.
+    ingestSent: z.boolean().optional()
+  }).optional()
+});
+
+const updateAccountSchema = z.object({
+  name: z.string().min(1).optional(),
+  email: z.union([z.string().email(), z.literal('')]).optional(),
+  enabled: z.boolean().optional(),
+  // Gmail send-as aliases (#2831). Server-populated on sync, not typically set by the
+  // client; accepted here for schema parity so a round-tripped account payload validates.
+  sendAsAliases: z.array(z.string()).optional(),
+  syncConfig: z.object({
+    maxAge: z.string().optional(),
+    maxMessages: z.number().int().positive().optional(),
+    syncInterval: z.number().int().positive().optional(),
+    // Per-account reply-detection ingestion (Gmail sent mail → timeline). #2796.
+    ingestSent: z.boolean().optional()
+  }).optional()
+});
+
+const createDraftSchema = z.object({
+  accountId: z.string().guid(),
+  replyToMessageId: z.string().nullish(),
+  threadId: z.string().nullish(),
+  to: z.array(z.string()).optional().default([]),
+  cc: z.array(z.string()).optional().default([]),
+  subject: z.string().optional().default(''),
+  body: z.string().optional().default(''),
+  generatedBy: z.enum(['ai', 'manual']).optional().default('manual'),
+  sendVia: z.enum(['api', 'playwright']).optional()
+});
+
+const updateDraftSchema = z.object({
+  to: z.array(z.string()).optional(),
+  cc: z.array(z.string()).optional(),
+  subject: z.string().optional(),
+  body: z.string().optional(),
+  status: z.enum(['draft', 'pending_review', 'approved']).optional()
+});
+
+const reconcileDraftSchema = z.object({
+  attemptId: z.string().guid(),
+  outcome: z.enum(['sent', 'not_sent'])
+});
+
+const generateDraftSchema = z.object({
+  accountId: z.string().guid(),
+  replyToMessageId: z.string().nullish(),
+  threadId: z.string().nullish(),
+  context: z.string().optional().default(''),
+  instructions: z.string().optional().default(''),
+  useVoice: z.boolean().optional()
+});
+
+const evaluateMessagesSchema = z.object({
+  accountId: z.string().guid().optional(),
+  messageIds: z.array(z.string().trim().min(1).max(1024)).min(1).max(100).optional()
+});
+
+const updateSelectorsSchema = z.object({
+  selectors: z.record(z.string())
+});
+
+// === Account Routes ===
+router.get('/accounts', asyncHandler(async (req, res) => {
+  const accounts = await messageAccounts.listAccounts();
+  res.json(accounts);
+}));
+
+router.post('/accounts', asyncHandler(async (req, res) => {
+  const data = validateRequest(createAccountSchema, req.body);
+  const account = await messageAccounts.createAccount(data);
+  req.app.get('io')?.emit('messages:changed', {});
+  res.status(201).json(account);
+}));
+
+router.put('/accounts/:id', asyncHandler(async (req, res) => {
+  if (!UUID_RE.test(req.params.id)) {
+    throw new ServerError('Invalid account ID format', { status: 400 });
+  }
+  const updates = validateRequest(updateAccountSchema, req.body);
+  const account = await messageAccounts.updateAccount(req.params.id, updates);
+  if (!account) throw new ServerError('Account not found', { status: 404 });
+  req.app.get('io')?.emit('messages:changed', {});
+  res.json(account);
+}));
+
+router.delete('/accounts/:id', asyncHandler(async (req, res) => {
+  if (!UUID_RE.test(req.params.id)) {
+    throw new ServerError('Invalid account ID format', { status: 400 });
+  }
+  // Stop scheduled ingestion, retaining the account for retry if cleanup fails.
+  // Missing accounts still need cleanup: older deletions may have left orphans.
+  await messageAccounts.updateAccount(req.params.id, { enabled: false });
+  await messageSync.deleteCache(req.params.id);
+  await messageDrafts.deleteDraftsByAccountId(req.params.id);
+  await messageAccounts.deleteAccount(req.params.id);
+  req.app.get('io')?.emit('messages:changed', {});
+  res.status(204).send();
+}));
+
+// === Sync Routes ===
+router.post('/sync/:accountId', asyncHandler(async (req, res) => {
+  if (!UUID_RE.test(req.params.accountId)) {
+    throw new ServerError('Invalid account ID format', { status: 400 });
+  }
+  // An omitted mode stays undefined so syncAccount selects the account's supported
+  // default; an explicit one is validated against the account there.
+  const { mode } = validateRequest(messageSyncBodySchema, req.body ?? {});
+  const io = req.app.get('io');
+  const result = await messageSync.syncAccount(req.params.accountId, io, { mode });
+  if (result.error) throw new ServerError(result.error, { status: result.status || 404 });
+  res.json(result);
+}));
+
+router.get('/sync/:accountId/status', asyncHandler(async (req, res) => {
+  if (!UUID_RE.test(req.params.accountId)) {
+    throw new ServerError('Invalid account ID format', { status: 400 });
+  }
+  const status = await messageSync.getSyncStatus(req.params.accountId);
+  if (!status) throw new ServerError('Account not found', { status: 404 });
+  res.json(status);
+}));
+
+// === Inbox Routes ===
+router.get('/inbox', messageInboxRead);
+
+// === Triage Rules Routes ===
+router.get('/triage-rules', asyncHandler(async (req, res) => {
+  const rules = await listRules();
+  res.json({ rules });
+}));
+
+router.delete('/triage-rules/:index', asyncHandler(async (req, res) => {
+  const index = parseInt(req.params.index, 10);
+  if (Number.isNaN(index) || index < 0) throw new ServerError('Invalid rule index', { status: 400 });
+  const deleted = await deleteRule(index);
+  if (!deleted) throw new ServerError('Rule not found', { status: 404 });
+  res.status(204).send();
+}));
+
+// === Evaluate Route ===
+router.post('/evaluate', asyncHandler(async (req, res) => {
+  const { accountId, messageIds } = validateRequest(evaluateMessagesSchema, req.body ?? {});
+  const { messages } = await messageSync.getMessages({
+    accountId,
+    messageIds,
+    unevaluatedOnly: !messageIds,
+    limit: messageIds ? 100 : 20
+  });
+  // Explicit requests report IDs absent from the selected account(s), including
+  // when none exist. Existing requested messages can still be evaluated.
+  const foundIds = new Set(messages.map(message => message.id));
+  const missingMessageIds = messageIds ? [...new Set(messageIds)].filter(id => !foundIds.has(id)) : [];
+  if (!messages.length) return res.json({ evaluations: {}, missingMessageIds });
+
+  const result = await evaluateMessages(messages);
+
+  // Store evaluations back on cached messages
+  await messageSync.updateMessageEvaluations(result.evaluations);
+
+  res.json({ ...result, missingMessageIds });
+}));
+
+// === Draft Routes ===
+router.get('/drafts', asyncHandler(async (req, res) => {
+  const { accountId, status } = req.query;
+  if (accountId && !UUID_RE.test(accountId)) {
+    throw new ServerError('Invalid accountId format', { status: 400 });
+  }
+  const drafts = await messageDrafts.listDrafts({ accountId, status });
+  res.json(drafts);
+}));
+
+router.post('/drafts', asyncHandler(async (req, res) => {
+  const data = validateRequest(createDraftSchema, req.body);
+  const account = await messageAccounts.getAccount(data.accountId);
+  if (!account) throw new ServerError('Account not found', { status: 404 });
+  const derivedSendVia = sendViaForAccountType(account.type) ?? 'playwright';
+  if (data.sendVia && data.sendVia !== derivedSendVia) {
+    throw new ServerError(`sendVia "${data.sendVia}" conflicts with account type "${account.type}" (expected "${derivedSendVia}")`, { status: 400 });
+  }
+  data.sendVia = derivedSendVia;
+  const draft = await messageDrafts.createDraft(data);
+  req.app.get('io')?.emit('messages:draft:created', { draftId: draft.id });
+  res.status(201).json(draft);
+}));
+
+const replySubject = (subject) => {
+  const trimmed = String(subject ?? '').trim();
+  return /^re:/i.test(trimmed) ? trimmed : `Re: ${trimmed}`.trim();
+};
+
+router.post('/drafts/generate', asyncHandler(async (req, res) => {
+  const data = validateRequest(generateDraftSchema, req.body);
+  const account = await messageAccounts.getAccount(data.accountId);
+  if (!account) throw new ServerError('Account not found', { status: 404 });
+
+  // Fetch the original message to build AI reply
+  let replyBody = '';
+  let to = [];
+  let subject = '';
+  if (data.replyToMessageId) {
+    const originalMsg = await messageSync.getMessage(data.accountId, data.replyToMessageId);
+    if (!originalMsg) throw new ServerError('The message being replied to was not found', { status: 404, code: 'REPLY_ORIGINAL_NOT_FOUND' });
+    // Email replies need explicit delivery fields; Teams/browser chats target a conversation, not a mailbox.
+    if (MESSAGE_ACCOUNT_TRANSPORT[account.type]?.email) {
+      const sender = originalMsg.from?.email;
+      if (!sender) throw new ServerError('The original message has no sender address to reply to', { status: 422, code: 'REPLY_TARGET_UNAVAILABLE' });
+      to = [sender];
+      subject = replySubject(originalMsg.subject);
+    }
+    // Load thread context if available
+    let threadMessages = null;
+    if (data.threadId) {
+      threadMessages = await messageSync.getThread(data.accountId, data.threadId).catch(() => null);
+    }
+    const aiResult = await generateReplyBody(originalMsg, data.instructions, {
+      useVoice: data.useVoice,
+      threadMessages
+    });
+    if (!aiResult?.body?.trim()) throw new ServerError('The selected model did not produce a reply draft. Check Models > LLMs > Abuse Guard.', { status: 422, code: 'UNTRUSTED_REPLY_UNAVAILABLE' });
+    replyBody = aiResult.body;
+  }
+  if (!replyBody) {
+    replyBody = `[No original message found]\n\nContext: ${data.context}\nInstructions: ${data.instructions}`;
+  }
+
+  const draft = await messageDrafts.createDraft({
+    accountId: data.accountId,
+    replyToMessageId: data.replyToMessageId,
+    threadId: data.threadId,
+    to,
+    subject,
+    body: replyBody,
+    generatedBy: 'ai',
+    sendVia: sendViaForAccountType(account.type) ?? 'playwright'
+  });
+  req.app.get('io')?.emit('messages:draft:created', { draftId: draft.id });
+  res.status(201).json(draft);
+}));
+
+router.put('/drafts/:id', asyncHandler(async (req, res) => {
+  if (!UUID_RE.test(req.params.id)) {
+    throw new ServerError('Invalid draft ID format', { status: 400 });
+  }
+  const updates = validateRequest(updateDraftSchema, req.body);
+  const draft = await messageDrafts.updateDraft(req.params.id, updates);
+  if (!draft) throw new ServerError('Draft not found', { status: 404 });
+  res.json(draft);
+}));
+
+router.post('/drafts/:id/approve', asyncHandler(async (req, res) => {
+  if (!UUID_RE.test(req.params.id)) {
+    throw new ServerError('Invalid draft ID format', { status: 400 });
+  }
+  const draft = await messageDrafts.approveDraft(req.params.id);
+  if (!draft) throw new ServerError('Draft not found', { status: 404 });
+  res.json(draft);
+}));
+
+router.post('/drafts/:id/reconcile', asyncHandler(async (req, res) => {
+  if (!UUID_RE.test(req.params.id)) {
+    throw new ServerError('Invalid draft ID format', { status: 400 });
+  }
+  const data = validateRequest(reconcileDraftSchema, req.body);
+  const draft = await messageDrafts.reconcileDraftSend(req.params.id, data);
+  req.app.get('io')?.emit('messages:changed', {});
+  res.json(draft);
+}));
+
+router.post('/drafts/:id/send', asyncHandler(async (req, res) => {
+  if (!UUID_RE.test(req.params.id)) {
+    throw new ServerError('Invalid draft ID format', { status: 400 });
+  }
+  const io = req.app.get('io');
+  const result = await messageSender.sendDraft(req.params.id, io);
+  if (!result.success) {
+    throw new ServerError(result.error, { status: result.status || 500, code: result.code });
+  }
+  res.json(result);
+}));
+
+router.delete('/drafts/:id', asyncHandler(async (req, res) => {
+  if (!UUID_RE.test(req.params.id)) {
+    throw new ServerError('Invalid draft ID format', { status: 400 });
+  }
+  const deleted = await messageDrafts.deleteDraft(req.params.id);
+  if (!deleted) throw new ServerError('Draft not found', { status: 404 });
+  res.status(204).send();
+}));
+
+// === Browser Launch Route ===
+router.post('/launch/:accountId', asyncHandler(async (req, res) => {
+  if (!UUID_RE.test(req.params.accountId)) {
+    throw new ServerError('Invalid account ID format', { status: 400 });
+  }
+  const account = await messageAccounts.getAccount(req.params.accountId);
+  if (!account) throw new ServerError('Account not found', { status: 404 });
+  if (account.type === 'gmail') throw new ServerError('Gmail uses the Google API, not browser automation', { status: 400 });
+  const result = await launchProvider(account.type);
+  if (!result.success) throw new ServerError(result.error, { status: 503 });
+  res.json(result);
+}));
+
+// === Gmail API Enable Route ===
+router.post('/gmail/enable-api', asyncHandler(async (req, res) => {
+  const { getCredentials } = await import('../services/googleAuth.js');
+  const credentials = await getCredentials();
+
+  // Try to detect the project ID from the stored client ID
+  const clientId = credentials?.clientId || '';
+  const projectMatch = clientId.match(/^(\d+)-/);
+  const projectId = projectMatch ? projectMatch[1] : '';
+  const projectParam = projectId ? `?project=${projectId}` : '';
+  const enableUrl = `https://console.cloud.google.com/apis/library/gmail.googleapis.com${projectParam}`;
+
+  // Try to open in browser
+  const { navigateToUrl } = await import('../services/browserService.js');
+  const opened = await navigateToUrl(enableUrl).catch(() => null);
+
+  res.json({
+    success: !!opened,
+    url: enableUrl,
+    message: opened
+      ? 'Opened Gmail API page in browser. Click "Enable" if not already enabled.'
+      : 'Could not open browser. Visit the URL manually to enable the Gmail API.'
+  });
+}));
+
+// === Selector Routes ===
+router.get('/selectors', asyncHandler(async (req, res) => {
+  const selectors = await getSelectors();
+  res.json(selectors);
+}));
+
+const ALLOWED_PROVIDERS = ['outlook', 'teams'];
+
+router.put('/selectors/:provider', asyncHandler(async (req, res) => {
+  if (!ALLOWED_PROVIDERS.includes(req.params.provider)) {
+    throw new ServerError('Invalid provider', { status: 400 });
+  }
+  const { selectors } = validateRequest(updateSelectorsSchema, req.body);
+  const updated = await updateSelectors(req.params.provider, selectors);
+  res.json(updated);
+}));
+
+router.post('/selectors/:provider/test', asyncHandler(async (req, res) => {
+  if (!ALLOWED_PROVIDERS.includes(req.params.provider)) {
+    throw new ServerError('Invalid provider', { status: 400 });
+  }
+  const result = await testSelectors(req.params.provider);
+  res.json(result);
+}));
+
+// === Thread Route ===
+router.get('/thread/:accountId/:threadId', asyncHandler(async (req, res) => {
+  if (!UUID_RE.test(req.params.accountId)) {
+    throw new ServerError('Invalid accountId format', { status: 400 });
+  }
+  if (!req.params.threadId) throw new ServerError('threadId is required', { status: 400 });
+  const messages = await messageSync.getThread(req.params.accountId, req.params.threadId);
+  res.json({ messages });
+}));
+
+// === Message params schema (shared by detail + refresh routes) ===
+// === Per-message refresh ===
+router.post('/:accountId/:messageId/refresh', asyncHandler(async (req, res) => {
+  const parsed = messageParamsSchema.safeParse(req.params);
+  if (!parsed.success) throw new ServerError('Invalid accountId or messageId format', { status: 400 });
+  const { accountId, messageId } = parsed.data;
+  const message = await messageSync.getMessage(accountId, messageId);
+  if (!message) throw new ServerError('Message not found', { status: 404 });
+  const result = await messageSync.refreshMessage(accountId, messageId);
+  if (result?.error) {
+    const status = result.error === 'no-browser' || result.error === 'auth-required' ? 503 : 502;
+    throw new ServerError(result.message || result.error, { status });
+  }
+  req.app.get('io')?.emit('messages:changed', {});
+  res.json(result);
+}));
+
+// === Fetch full content for preview-only messages ===
+router.post('/fetch-full/:accountId', asyncHandler(async (req, res) => {
+  if (!UUID_RE.test(req.params.accountId)) {
+    throw new ServerError('Invalid account ID format', { status: 400 });
+  }
+  const { accountId } = req.params;
+  const account = await messageAccounts.getAccount(accountId);
+  if (!account) throw new ServerError('Account not found', { status: 404 });
+  if (account.type !== 'outlook') return res.json({ updated: 0, total: 0 });
+
+  const { force } = validateRequest(messageFetchFullBodySchema, req.body ?? {});
+  const allResult = await messageSync.getMessages({ accountId, limit: FULL_BODY_REFRESH_LIMIT });
+  const truncated = allResult.messages.length >= FULL_BODY_REFRESH_LIMIT;
+  const toRefresh = force ? allResult.messages : allResult.messages.filter(m => m.bodyFull === false);
+  const { updated } = await messageSync.refreshMessages(accountId, toRefresh.map(msg => msg.id));
+
+  if (updated > 0) req.app.get('io')?.emit('messages:changed', {});
+  res.json({ updated, total: toRefresh.length, truncated });
+}));
+
+// === Clear account cache ===
+router.post('/accounts/:id/cache/clear', asyncHandler(async (req, res) => {
+  if (!UUID_RE.test(req.params.id)) {
+    throw new ServerError('Invalid account ID format', { status: 400 });
+  }
+  await messageSync.deleteCache(req.params.id);
+  req.app.get('io')?.emit('messages:changed', {});
+  res.status(204).send();
+}));
+
+// === Message Action Route (archive/delete) ===
+router.post('/:accountId/:messageId/action', asyncHandler(async (req, res) => {
+  const parsed = messageParamsSchema.safeParse(req.params);
+  if (!parsed.success) throw new ServerError('Invalid accountId or messageId format', { status: 400 });
+  const { accountId, messageId } = parsed.data;
+  const { action } = validateRequest(messageActionBodySchema, req.body);
+  const result = await executeAction(accountId, messageId, action);
+  req.app.get('io')?.emit('messages:changed', {});
+  res.json(result);
+}));
+
+// === Debug: Token Extraction & API Testing ===
+const ALLOWED_TOKEN_PROVIDERS = MESSAGE_TOKEN_PROVIDERS;
+
+router.get('/debug/token-status', asyncHandler(async (req, res) => {
+  const statuses = ALLOWED_TOKEN_PROVIDERS.map(p => getTokenStatus(p));
+  res.json({ providers: statuses });
+}));
+
+router.post('/debug/test-token', asyncHandler(async (req, res) => {
+  const { provider = 'outlook' } = validateRequest(messageTokenProviderBodySchema, req.body ?? {});
+  const tokenResult = await getToken(provider);
+  if (tokenResult.error) {
+    throw new ServerError(tokenResult.message || tokenResult.error, {
+      status: 503,
+      context: { reason: tokenResult.error, provider: tokenResult.provider }
+    });
+  }
+
+  const decoded = tokenResult.decoded || {};
+  const tokenInfo = {
+    provider,
+    fresh: tokenResult.fresh,
+    length: tokenResult.token.length,
+    expires: decoded.exp ? new Date(decoded.exp * 1000).toISOString() : 'unknown',
+    audience: decoded.aud || 'unknown',
+    scopes: decoded.scp || decoded.roles || 'unknown'
+  };
+
+  const apiResult = await testApi(provider, tokenResult.token, parseInt(req.query?.top, 10) || 5);
+
+  // Trim the raw Graph/Outlook response to a status summary — message bodies and
+  // recipient lists have no business in a token-connectivity check response.
+  res.json({
+    token: tokenInfo,
+    api: {
+      success: apiResult.success === true,
+      ...(apiResult.status !== undefined && { status: apiResult.status }),
+      ...(apiResult.error !== undefined && { error: apiResult.error }),
+      ...(apiResult.count !== undefined && { count: apiResult.count }),
+      ...(apiResult.note !== undefined && { note: apiResult.note })
+    }
+  });
+}));
+
+router.post('/debug/clear-token', asyncHandler(async (req, res) => {
+  const { provider = null } = validateRequest(messageTokenProviderBodySchema, req.body ?? {});
+  clearTokenCache(provider);
+  res.json({ cleared: true, provider: provider || 'all' });
+}));
+
+// === Message Detail Route (last to avoid capturing /launch, /selectors paths) ===
+
+router.get('/:accountId/:messageId', messageDetailRead);
+
+export default router;

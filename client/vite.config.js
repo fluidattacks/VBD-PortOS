@@ -1,0 +1,306 @@
+import { defineConfig, loadEnv } from 'vite';
+import react from '@vitejs/plugin-react';
+import { visualizer } from 'rollup-plugin-visualizer';
+import { readFileSync, existsSync } from 'fs';
+import { execFileSync } from 'child_process';
+import { resolve } from 'path';
+
+import { resolveBundleNodeEnv } from './vite.buildEnv.js';
+import { CHUNK_GROUPS } from './vite.chunkGroups.js';
+import { DEV_PROXY_CLIENT_ADDRESS_HEADER, devProxyForwardedOrigin } from '../lib/portosAuthCore.js';
+import {
+  EIDOVERSE_HOST_PATH_PREFIX,
+  EIDOVERSE_ROOT_EXACT_PATHS,
+  EIDOVERSE_ROOT_PREFIX_PATHS,
+} from '../server/lib/eidoverseProxyRoutes.js';
+
+const ANALYZE_BUNDLE = process.env.ANALYZE === 'true';
+const CONFIG_DIR = import.meta.dirname;
+const BUILD_OUT_DIR = process.env.PORTOS_CLIENT_BUILD_OUT_DIR || resolve(CONFIG_DIR, 'dist');
+
+const rootPkg = JSON.parse(readFileSync(resolve(CONFIG_DIR, '../package.json'), 'utf-8'));
+
+// Which commit this BUNDLE was built from (#4694). package.json's version cannot
+// answer that — by project rule it reflects the last RELEASE and is identical
+// across every development commit — so a dist/ built three days ago looks exactly
+// like one built this minute. Full rationale: server/lib/buildIdentity.js.
+//
+// Fail-soft: a source-tarball build has no .git and must still build, so every
+// probe degrades to `null` — the SAME absent sentinel the server sends, so the
+// client comparison has one vocabulary to understand rather than two. Never `''`
+// and never a placeholder string: a blank commit compares unequal to every real
+// commit, and a branch literally named "unknown" would be swallowed as absent.
+function gitStamp(args) {
+  try {
+    const out = execFileSync('git', args, {
+      cwd: CONFIG_DIR,
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 5000
+    });
+    return out.trim() || null;
+  } catch {
+    // No git, no repo, or a timeout.
+    return null;
+  }
+}
+
+// Separate from `gitStamp` on purpose: `status --porcelain` prints NOTHING for
+// a clean tree, so that helper's `|| null` would make clean and failed
+// identical — and reading a failure as clean is exactly what lets the panel
+// claim an agreement it never verified. Here the empty string IS the answer,
+// and only a throw means "could not check".
+//
+// Returns true (dirty) / false (clean) / null (unknown).
+function gitDirty() {
+  try {
+    const out = execFileSync('git', ['status', '--porcelain', '--', '.'], {
+      cwd: CONFIG_DIR,
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 5000
+    });
+    return out.trim() !== '';
+  } catch {
+    return null;
+  }
+}
+
+function buildStamp() {
+  const head = gitStamp(['rev-parse', '--abbrev-ref', 'HEAD']);
+  // Were the CLIENT sources uncommitted when this bundle was built? Scoped to
+  // this directory (`-- .`) on purpose: a dirty server file says nothing about
+  // what went into the bundle, and repo-wide would mark every dist dirty during
+  // ordinary server work. Without this the commit id alone is not enough — a
+  // dist built from an edited tree carries its parent's clean commit, and the
+  // panel would assert full agreement for code that was never committed.
+  return {
+    commit: gitStamp(['rev-parse', '--short=7', 'HEAD']),
+    // `rev-parse --abbrev-ref` prints the literal string `HEAD` on a detached
+    // checkout, which is not a branch name. (git refuses to CREATE a branch
+    // named HEAD, so this is never a real branch.)
+    branch: head === 'HEAD' ? null : head,
+    // null = we could not check, distinct from false = checked and clean.
+    dirty: gitDirty(),
+    // Commit / branch / dirty / timestamp only. No paths (they embed the OS
+    // username), no hostname — this ships to every browser that loads the app.
+    builtAt: new Date().toISOString()
+  };
+}
+
+// Dev proxy target: probe for the self-signed/LE cert under data/certs/. If the
+// server is running HTTPS, the dev proxy must target HTTPS too (or requests
+// through Vite return "socket hang up"). `secure: false` accepts the cert
+// whether it's the trusted LE one or the self-signed fallback.
+const CERT_PATH = resolve(CONFIG_DIR, '..', 'data', 'certs', 'cert.pem');
+const API_SCHEME = existsSync(CERT_PATH) ? 'https' : 'http';
+
+// The API sees Vite's loopback connection, not the browser's. Replace
+// caller-supplied provenance, including duplicate headers; unknown socket
+// peers must never become an implicit local caller. `proxyReqWs` covers a
+// websocket upgrade, which never fires `proxyReq`.
+function markProxyClientAddress(proxy) {
+  const mark = (proxyReq, req) => {
+    proxyReq.setHeader(DEV_PROXY_CLIENT_ADDRESS_HEADER, req.socket?.remoteAddress || 'unknown');
+  };
+  proxy.on('proxyReq', mark);
+  proxy.on('proxyReqWs', mark);
+}
+
+// The API's browser-relay guard compares Origin with Host in both auth modes;
+// changeOrigin rewrites Host to the target, so re-stamp a same-origin Origin
+// to match (a foreign one is forwarded as-is and refused). Covers the HTTP
+// hop and the websocket upgrade.
+function forwardSameOrigin(target) {
+  const stamp = (proxyReq, req) => {
+    const origin = devProxyForwardedOrigin(req, target);
+    if (origin) proxyReq.setHeader('origin', origin);
+  };
+  return (proxy) => {
+    proxy.on('proxyReq', stamp);
+    proxy.on('proxyReqWs', stamp);
+  };
+}
+
+// Dev proxies for the same-origin Eidoverse iframe. Root routes only forward
+// while the API host is active; `/node_modules/` + `/shared/` keep a Referer
+// bypass so Vite's own dependency graph is not stolen.
+function eidoverseDevProxies(target) {
+  const entries = {
+    [`^${EIDOVERSE_HOST_PATH_PREFIX}(?:/|$)`]: {
+      target,
+      changeOrigin: true,
+      ws: true,
+      secure: false,
+      configure: forwardSameOrigin(target),
+    },
+  };
+  for (const exact of EIDOVERSE_ROOT_EXACT_PATHS) {
+    entries[`^${exact}$`] = {
+      target,
+      changeOrigin: true,
+      ws: exact === '/ws',
+      secure: false,
+      configure: forwardSameOrigin(target),
+    };
+  }
+  for (const prefix of EIDOVERSE_ROOT_PREFIX_PATHS) {
+    entries[`^${prefix}`] = {
+      target,
+      changeOrigin: true,
+      secure: false,
+      configure: forwardSameOrigin(target),
+      bypass(req) {
+        if (prefix !== '/node_modules/' && prefix !== '/shared/') return undefined;
+        const referer = String(req.headers.referer || '');
+        if (!referer.includes(EIDOVERSE_HOST_PATH_PREFIX)) return req.url;
+        return undefined;
+      },
+    };
+  }
+  return entries;
+}
+
+
+export default defineConfig(({ command, mode }) => {
+  // Pin the build's NODE_ENV before Vite reads it. resolveConfig() only defaults
+  // it to 'production' when it is UNSET, and PortOS reaches this build from
+  // inside a PM2 tree carrying NODE_ENV=development — which Vite would then
+  // inline, shipping the DEVELOPMENT react/react-dom to every user. The config
+  // file is loaded BEFORE Vite derives `isProduction`, its
+  // `process.env.NODE_ENV` define, and the plugin JSX runtime, so all three
+  // agree on the value set here. See client/vite.buildEnv.js.
+  process.env.NODE_ENV = resolveBundleNodeEnv(command, process.env.NODE_ENV);
+
+  const env = loadEnv(mode, process.cwd(), 'VITE_');
+  const API_HOST = env.VITE_API_HOST || 'localhost';
+  const API_TARGET = `${API_SCHEME}://${API_HOST}:5555`;
+
+  return {
+    define: {
+      __APP_VERSION__: JSON.stringify(rootPkg.version),
+      __BUILD_STAMP__: JSON.stringify(buildStamp())
+    },
+    plugins: [
+      react(),
+      ANALYZE_BUNDLE && visualizer({
+        filename: resolve(BUILD_OUT_DIR, 'bundle-report.html'),
+        gzipSize: true,
+        brotliSize: true,
+        template: 'treemap',
+      }),
+    ].filter(Boolean),
+    resolve: {
+      // Share Three.js without bypassing its package exports with a directory alias.
+      dedupe: ['three'],
+    },
+    // Recharts is imported by lazy-loaded pages. Its published ESM files use
+    // bare es-toolkit/compat/* imports, so prebundle it before a lazy tab can
+    // expose those specifiers directly to the browser.
+    optimizeDeps: {
+      include: ['recharts']
+    },
+    server: {
+      host: '0.0.0.0',
+      port: 5554,
+      // Fail loudly if 5554 is taken instead of auto-incrementing. Without this,
+      // Vite walks up to the next free port and can land on a reserved PortOS
+      // port (5555 API, 5556 browser CDP) — squatting on the CDP port makes the
+      // browser keep-alive read Vite's HTML index and spam JSON-parse errors.
+      strictPort: true,
+      open: false,
+      allowedHosts: ['.ts.net', 'localhost'],
+      proxy: {
+        // Anchor the API namespace so client routes such as `/api-reference`
+        // stay on Vite. A plain `/api` context uses `startsWith` and would
+        // steal every client page whose first segment begins with those
+        // characters.
+        '^/api(?:/|$)': {
+          target: API_TARGET,
+          changeOrigin: true,
+          secure: false,
+          configure(proxy) {
+            markProxyClientAddress(proxy);
+            forwardSameOrigin(API_TARGET)(proxy);
+          }
+        },
+        // Every `/data/**` asset mount at once, instead of a hand-maintained
+        // list that silently fell behind the server's (see docs/PORTS.md:
+        // an unproxied `/data` path is answered by Vite's SPA fallback with
+        // index.html and a 200, so a binary loader parses HTML). Anchored as a
+        // regex on purpose: Vite matches a plain context with a bare
+        // `url.startsWith`, so a `'/data'` key would also swallow the `/data`
+        // (Data Manager) and `/datadog` client routes and hand them the API's
+        // stale built index.html. `scripts/dev-proxy-drift.test.js` holds both
+        // halves of that — mounts covered, client routes untouched.
+        '^/data/': {
+          target: API_TARGET,
+          changeOrigin: true,
+          secure: false,
+          configure: forwardSameOrigin(API_TARGET)
+        },
+        // The socket carries host-control events (shell, iTerm2, app updates)
+        // gated on a local caller, so its handshake needs the same marker —
+        // on both the polling requests and the websocket upgrade (#8708).
+        '/socket.io': {
+          target: API_TARGET,
+          changeOrigin: true,
+          ws: true,
+          secure: false,
+          configure(proxy) {
+            markProxyClientAddress(proxy);
+            forwardSameOrigin(API_TARGET)(proxy);
+          }
+        },
+        ...eidoverseDevProxies(API_TARGET),
+      }
+    },
+    build: {
+      rolldownOptions: {
+        output: {
+          // Vite 8 ships the rolldown bundler, whose canonical chunking API is
+          // `output.codeSplitting.groups` — each group captures the modules whose
+          // id matches `test` into a named chunk. This replaces the legacy
+          // `rollupOptions.output.manualChunks` function (still accepted via
+          // rolldown's compat layer, but slated to drop in a future Vite). The
+          // groups themselves are declared as package names in
+          // `vite.chunkGroups.js`, so a group naming an uninstalled package fails
+          // a test instead of silently grouping nothing.
+          codeSplitting: {
+            // Pass every rolldown-recognized field through — not just
+            // `name`/`test`. A narrower destructure here silently drops group
+            // options like `includeDependenciesRecursively` before rolldown
+            // ever sees them (#8146): the config value looks right when you
+            // print `CHUNK_GROUPS`, but the build behaves as if it were never
+            // set. `packages` is `vite.chunkGroups.js`'s own bookkeeping (used
+            // to derive `test` and by its installed-package test), not a
+            // rolldown option, so it's the one field left out here.
+            groups: CHUNK_GROUPS.map(({ packages, ...group }) => group)
+          },
+          // `vendor-three-loaders` disables recursive dependency capture to
+          // keep the loaders out of the main three chunk. Rolldown warns that
+          // this can create invalid execution order across chunks; preserve
+          // source module order so lazy routes don't evaluate against missing
+          // runtime exports.
+          strictExecutionOrder: true,
+        }
+      },
+      // Enable source maps for debugging in production
+      sourcemap: false,
+      // Chunk size warning budget (#8146). `vendor-three` — three.js core plus
+      // @react-three/fiber and drei's own runtime (troika text rendering,
+      // camera-controls, meshline, zustand, …), all lazy-loaded and shared by
+      // every 3D page (Model Detail, Brain/Memory graph, Goals tree, CoS
+      // avatars) — measures ~1.08 MB minified / ~300 KB gzip. That floor is
+      // three.js's own footprint, not something PortOS's imports control: the
+      // GLTF/DRACO/KTX2/HDR loaders and the USDZ exporter are already split
+      // into their own `vendor-three-loaders` chunk (~114 KB / ~35 KB gzip)
+      // that only pages actually loading an asset pay for, and drei's helper
+      // runtime is deliberately kept IN `vendor-three` rather than
+      // re-duplicated into each page's own chunk (see `vite.chunkGroups.js`).
+      // 1200 KB gives `vendor-three` headroom without silencing every other
+      // chunk's real regression budget.
+      chunkSizeWarningLimit: 1200
+    }
+  };
+});

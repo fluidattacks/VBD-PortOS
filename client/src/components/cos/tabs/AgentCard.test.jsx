@@ -1,0 +1,1346 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { MemoryRouter } from 'react-router';
+import { typeSettled } from '../../../test/settledInput';
+
+const socket = vi.hoisted(() => {
+  const handlers = new Map();
+  return {
+    on: (event, handler) => {
+      if (!handlers.has(event)) handlers.set(event, new Set());
+      handlers.get(event).add(handler);
+    },
+    off: (event, handler) => handlers.get(event)?.delete(handler),
+    emit: vi.fn(),
+    receive: (event, payload) => handlers.get(event)?.forEach(handler => handler(payload)),
+  };
+});
+vi.mock('../../../services/socket', () => ({ default: socket }));
+
+vi.mock('../../../services/api', () => ({
+  normalizeBrainScanReportPath: path => path,
+  submitCosAgentFeedback: vi.fn(),
+  sendCosAgentBtw: vi.fn(),
+  getCosAgent: vi.fn(),
+  getCosAgentPrompt: vi.fn(),
+  getCosAgentStats: vi.fn(() => new Promise(() => {})),
+  addCosTask: vi.fn(),
+  hydrateCosAgentDescription: vi.fn(async (a) => a),
+}));
+
+vi.mock('../../ui/Toast', () => ({
+  default: { success: vi.fn(), error: vi.fn() },
+}));
+
+const copyToClipboard = vi.fn();
+vi.mock('../../../lib/clipboard', () => ({
+  copyToClipboard: (...args) => copyToClipboard(...args),
+}));
+
+import * as api from '../../../services/api';
+import AgentCard from './AgentCard';
+
+const agent = {
+  id: 'agent-example',
+  taskId: 'task-example',
+  status: 'completed',
+  startedAt: '2026-07-13T09:00:00.000Z',
+  completedAt: '2026-07-13T10:00:00.000Z',
+  metadata: { taskDescription: 'Example task', taskType: 'user' },
+  result: { success: true, duration: 3600000 },
+};
+
+beforeEach(() => {
+  vi.clearAllMocks();
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+describe('AgentCard runtime presentation', () => {
+  const now = new Date('2026-07-13T10:00:00.000Z');
+  const runningAt = (elapsedMs, metadata = {}) => ({
+    ...agent,
+    status: 'running',
+    startedAt: new Date(now.getTime() - elapsedMs).toISOString(),
+    completedAt: null,
+    metadata: { ...agent.metadata, ...metadata },
+    result: null,
+  });
+  const durationHistory = {
+    'user-task': { avgDurationMs: 45_000, p80DurationMs: 60_000, completed: 8 },
+    _overall: { avgDurationMs: 90_000, p80DurationMs: 120_000, completed: 20 },
+  };
+
+  it.each([
+    ['before the estimate', 30_000, '50% complete', '~30s left', 'ETA: ~30s'],
+    ['exactly at the estimate', 60_000, '99% complete', '+0s', '+0s over estimate'],
+    ['after the estimate', 75_000, '99% complete', '+15s', '+15s over estimate'],
+  ])('renders distinct inline and footer ETA text %s', (_label, elapsedMs, progress, inlineEta, footerEta) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+
+    render(
+      <MemoryRouter>
+        <AgentCard agent={runningAt(elapsedMs)} durations={durationHistory} />
+      </MemoryRouter>
+    );
+
+    expect(screen.getByText(progress)).toBeInTheDocument();
+    expect(screen.getByText(inlineEta)).toHaveClass('font-mono');
+    expect(screen.getByText(footerEta)).toHaveClass('font-medium');
+  });
+
+  it('renders elapsed time without ETA or progress when duration history is absent', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+
+    render(<MemoryRouter><AgentCard agent={runningAt(30_000)} /></MemoryRouter>);
+
+    expect(screen.getByText('30s')).toBeInTheDocument();
+    expect(screen.queryByText(/complete$/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/left$/)).not.toBeInTheDocument();
+  });
+
+  // The run this card is for, and the execution-scoped history that describes it
+  // (#8001). Same task type as `durationHistory` above, but four times slower —
+  // so a card that fell back to the task-type average would show the wrong ETA.
+  const SLOW_RUN = { providerId: 'ollama', model: 'local-coder', effort: 'low' };
+  const executionHistory = {
+    ...durationHistory,
+    _byExecution: { 'user-task|ollama|local-coder|low': { avgDurationMs: 180_000, p80DurationMs: 240_000, completed: 6 } },
+    _byExecutionProviderModel: { 'user-task|ollama|local-coder': { avgDurationMs: 180_000, p80DurationMs: 240_000, completed: 6 } },
+  };
+
+  it.each([
+    ['this provider/model/effort', 120_000, executionHistory, SLOW_RUN, '50% complete', /Based on 6 completed user-task runs on this provider, model and effort \(avg: 3m 0s, est: 4m 0s\)/],
+    ['type P80', 30_000, durationHistory, {}, '50% complete', /Based on 8 completed user-task runs across all providers \(avg: 45s, est: 1m 0s\)/],
+    ['type average', 60_000, { 'user-task': { avgDurationMs: 60_000, completed: 3 } }, {}, '99% complete', /Based on 3 completed user-task runs across all providers \(avg: 1m 0s, est: 1m 0s\)/],
+    // A run whose provider/model IS named still falls back to the task type when
+    // the execution history is another model's.
+    ['type average for an unlearned model', 30_000, executionHistory, { providerId: 'claude', model: 'opus', effort: 'low' }, '50% complete', /Based on 8 completed user-task runs across all providers \(avg: 45s, est: 1m 0s\)/],
+    ['overall P80', 60_000, { _overall: durationHistory._overall }, {}, '50% complete', /Based on 20 completed runs across all tasks \(avg: 1m 30s, est: 2m 0s\)/],
+  ])('uses the %s duration bucket', (_label, elapsedMs, durations, metadata, progress, title) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+
+    render(
+      <MemoryRouter>
+        <AgentCard agent={runningAt(elapsedMs, metadata)} durations={durations} />
+      </MemoryRouter>
+    );
+
+    expect(screen.getByText(progress)).toBeInTheDocument();
+    expect(screen.getByTitle(title)).toBeInTheDocument();
+  });
+
+  it('preserves duration and completion visibility across running, paused, and completed states', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    const runningAgent = runningAt(30_000);
+    const { rerender } = render(
+      <MemoryRouter><AgentCard agent={runningAgent} durations={durationHistory} /></MemoryRouter>
+    );
+    expect(screen.getByText('50% complete')).toBeInTheDocument();
+    expect(screen.getByText('Working')).toBeInTheDocument();
+
+    rerender(
+      <MemoryRouter><AgentCard agent={{ ...runningAgent, status: 'paused' }} paused durations={durationHistory} /></MemoryRouter>
+    );
+    expect(screen.getByText('Paused')).toBeInTheDocument();
+    expect(screen.queryByText(/complete$/)).not.toBeInTheDocument();
+    expect(screen.getByText('30s')).toBeInTheDocument();
+
+    rerender(
+      <MemoryRouter><AgentCard agent={agent} completed durations={durationHistory} /></MemoryRouter>
+    );
+    expect(screen.getByText('1h 0m')).toBeInTheDocument();
+    expect(screen.queryByText(/complete$/)).not.toBeInTheDocument();
+    expect(screen.getByTitle((value) => value.includes('2026'))).toBeInTheDocument();
+  });
+
+  it('suppresses prompt access for remote cards while preserving the live shell destination', () => {
+    render(
+      <MemoryRouter>
+        <AgentCard
+          agent={runningAt(30_000, { executionMode: 'tui', tuiSessionId: 'sess-abcdef123' })}
+          remote
+        />
+      </MemoryRouter>
+    );
+
+    expect(screen.queryByRole('button', { name: 'Prompt' })).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /Open Shell/ })).toHaveAttribute('href', '/shell?session=sess-abcdef123');
+  });
+
+  it('keeps effort beside the worktree and PR configuration badges', () => {
+    render(
+      <MemoryRouter>
+        <AgentCard
+          agent={{
+            ...agent,
+            metadata: {
+              ...agent.metadata,
+              effort: 'medium',
+              configUseWorktree: true,
+              configOpenPR: true,
+            },
+          }}
+          completed
+        />
+      </MemoryRouter>
+    );
+
+    const effort = screen.getByText('Effort: medium');
+    expect(effort).toHaveClass('text-[11px]');
+    expect(effort.closest('div')).toHaveTextContent('Worktree');
+    expect(effort.closest('div')).toHaveTextContent('PR');
+  });
+
+  it('distinguishes a live process, a zombie, and missing process stats', async () => {
+    const runningAgent = { ...runningAt(30_000), pid: 4242 };
+    api.getCosAgentStats.mockResolvedValueOnce({ active: true, pid: 4242, state: 'running', cpu: 12.3, memoryMb: 64 });
+    const { unmount } = render(<MemoryRouter><AgentCard agent={runningAgent} initiallyExpanded /></MemoryRouter>);
+    expect(await screen.findByText('12.3%')).toBeInTheDocument();
+    expect(screen.getByText('64MB')).toBeInTheDocument();
+    expect(screen.queryByText('ZOMBIE')).not.toBeInTheDocument();
+    unmount();
+
+    api.getCosAgentStats.mockResolvedValueOnce({ active: false, pid: 4242 });
+    const zombie = render(<MemoryRouter><AgentCard agent={runningAgent} initiallyExpanded /></MemoryRouter>);
+    expect(await screen.findByText('ZOMBIE')).toBeInTheDocument();
+    zombie.unmount();
+
+    api.getCosAgentStats.mockResolvedValueOnce(null);
+    render(<MemoryRouter><AgentCard agent={runningAgent} initiallyExpanded /></MemoryRouter>);
+    await waitFor(() => expect(api.getCosAgentStats).toHaveBeenCalledTimes(3));
+    expect(screen.queryByText('ZOMBIE')).not.toBeInTheDocument();
+    expect(screen.queryByText(/PID 4242/)).not.toBeInTheDocument();
+  });
+});
+
+describe('AgentCard relaunch handoff', () => {
+  // What Relaunch leaves behind. The pause/requeue path reuses the completion
+  // shape, so the retired record carries `success: false` with the swap summary
+  // in `error` — which the card used to paint red as a failed run, for something
+  // the user did deliberately when a provider hit its usage limit.
+  const handoffAgent = {
+    ...agent,
+    result: {
+      success: false,
+      duration: 3600000,
+      resumed: true,
+      resumedTaskId: 'task-example',
+      error: 'Relaunched by user on codex / gpt-5',
+    },
+  };
+
+  it('presents a relaunched run as a handoff rather than a failure', () => {
+    render(
+      <MemoryRouter>
+        <AgentCard agent={handoffAgent} completed />
+      </MemoryRouter>
+    );
+
+    const summary = screen.getByText('Relaunched by user on codex / gpt-5');
+    expect(summary).toBeInTheDocument();
+    // The color is the message here: red says the run broke.
+    expect(summary.closest('div').className).toContain('text-port-accent');
+    expect(summary.closest('div').className).not.toContain('text-port-error');
+  });
+
+  it('names what the user changed, not where the task went', () => {
+    // `result.error` on these records is the RESUME summary ("task … requeued on
+    // <branch>"), which answers a question nobody asked while looking at the run
+    // they just relaunched. The pause reason is the one that says "on codex".
+    render(
+      <MemoryRouter>
+        <AgentCard
+          agent={{
+            ...handoffAgent,
+            metadata: { ...handoffAgent.metadata, pauseReason: 'Relaunched by user on codex / gpt-5' },
+            result: { ...handoffAgent.result, error: 'Resumed agent agent-example — task task-example requeued on cos/task-example/agent-example' },
+          }}
+          completed
+        />
+      </MemoryRouter>
+    );
+
+    expect(screen.getByText('Relaunched by user on codex / gpt-5')).toBeInTheDocument();
+  });
+
+  it('does not ask for a rating on a run that never reached a result', () => {
+    render(
+      <MemoryRouter>
+        <AgentCard agent={handoffAgent} completed />
+      </MemoryRouter>
+    );
+
+    expect(screen.queryByText('Was this helpful?')).not.toBeInTheDocument();
+  });
+
+  it('still shows a genuine failure in red, with its rating buttons', () => {
+    // The bypass probe: a card that softened EVERY unsuccessful run would pass
+    // both assertions above while hiding real failures.
+    const failed = { ...agent, result: { success: false, duration: 3600000, error: 'exit code 1' } };
+
+    render(
+      <MemoryRouter>
+        <AgentCard agent={failed} completed />
+      </MemoryRouter>
+    );
+
+    expect(screen.getByText('exit code 1').closest('div').className).toContain('text-port-error');
+    expect(screen.getByText('Was this helpful?')).toBeInTheDocument();
+  });
+
+  it('links a continuation back to the run it took over', () => {
+    // The other half of the pair. Without it the two cards read as one run that
+    // mysteriously stopped and a second that appeared from nowhere.
+    const continuation = {
+      ...agent,
+      id: 'agent-continuation',
+      metadata: { ...agent.metadata, resumedFromAgentId: 'agent-example' },
+    };
+
+    render(
+      <MemoryRouter>
+        <AgentCard agent={continuation} completed />
+      </MemoryRouter>
+    );
+
+    const link = screen.getByTitle('Continues agent agent-example');
+    expect(link).toHaveAttribute('href', '/cos/agents/agent-example');
+  });
+});
+
+describe('AgentCard feedback', () => {
+  it('hides the rating UI for a completed scheduled/autopilot agent (taskType internal)', () => {
+    const internalAgent = {
+      ...agent,
+      metadata: { ...agent.metadata, taskType: 'internal' },
+    };
+
+    render(
+      <MemoryRouter>
+        <AgentCard agent={internalAgent} completed />
+      </MemoryRouter>
+    );
+
+    expect(screen.queryByText('Was this helpful?')).not.toBeInTheDocument();
+  });
+
+  it('uses the archived scheduled type for a running agent ETA', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-13T10:00:00.000Z'));
+    const runningAgent = {
+      ...agent,
+      status: 'running',
+      startedAt: '2026-07-13T09:59:00.000Z',
+      completedAt: null,
+      metadata: {
+        taskDescription: 'Fix the security configuration',
+        taskType: 'internal',
+        taskAnalysisType: 'security',
+      },
+    };
+    const durations = {
+      'self-improve:security': { avgDurationMs: 600000, p80DurationMs: 600000, completed: 5 },
+      _overall: { avgDurationMs: 1000, p80DurationMs: 1000, completed: 20 },
+    };
+
+    render(
+      <MemoryRouter>
+        <AgentCard agent={runningAgent} durations={durations} />
+      </MemoryRouter>
+    );
+
+    expect(screen.getByText('10% complete')).toBeInTheDocument();
+  });
+
+  it('returns the updated agent to its parent after a successful rating', async () => {
+    const user = userEvent.setup();
+    const updatedAgent = {
+      ...agent,
+      feedback: { rating: 'positive', submittedAt: '2026-07-13T12:00:00.000Z' },
+    };
+    const onFeedbackChange = vi.fn();
+    api.submitCosAgentFeedback.mockResolvedValue({ success: true, agent: updatedAgent });
+
+    render(
+      <MemoryRouter>
+        <AgentCard agent={agent} completed onFeedbackChange={onFeedbackChange} />
+      </MemoryRouter>
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Mark as helpful' }));
+
+    expect(api.submitCosAgentFeedback).toHaveBeenCalledWith(
+      agent.id,
+      { rating: 'positive', comment: undefined },
+      { silent: true }
+    );
+    await waitFor(() => expect(onFeedbackChange).toHaveBeenCalledWith(updatedAgent, agent));
+  });
+
+  it('records a negative rating with the detail needed to improve future work', async () => {
+    const user = userEvent.setup();
+    const updatedAgent = {
+      ...agent,
+      feedback: {
+        rating: 'negative',
+        comment: 'The implementation did not include tests.',
+        submittedAt: '2026-07-13T12:00:00.000Z'
+      }
+    };
+    api.submitCosAgentFeedback.mockResolvedValue({ success: true, agent: updatedAgent });
+
+    render(
+      <MemoryRouter>
+        <AgentCard agent={agent} completed />
+      </MemoryRouter>
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Add feedback comment' }));
+    await typeSettled(user, screen.getByPlaceholderText('What made this work well or poorly?'), updatedAgent.feedback.comment);
+    await user.click(screen.getByRole('button', { name: 'Needs work' }));
+
+    expect(api.submitCosAgentFeedback).toHaveBeenCalledWith(
+      agent.id,
+      { rating: 'negative', comment: updatedAgent.feedback.comment },
+      { silent: true }
+    );
+  });
+
+  it('lets a quick rating receive a follow-up detail', async () => {
+    const user = userEvent.setup();
+    const ratedAgent = {
+      ...agent,
+      feedback: { rating: 'positive', submittedAt: '2026-07-13T12:00:00.000Z' }
+    };
+    const detailedAgent = {
+      ...ratedAgent,
+      feedback: { ...ratedAgent.feedback, comment: 'The focused test coverage was useful.' }
+    };
+    api.submitCosAgentFeedback.mockResolvedValue({ success: true, agent: detailedAgent });
+
+    render(
+      <MemoryRouter>
+        <AgentCard agent={ratedAgent} completed />
+      </MemoryRouter>
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Add feedback detail' }));
+    await typeSettled(user, screen.getByPlaceholderText('What made this work well or poorly?'), detailedAgent.feedback.comment);
+    await user.click(screen.getByRole('button', { name: 'Save detail' }));
+
+    expect(api.submitCosAgentFeedback).toHaveBeenCalledWith(
+      agent.id,
+      { rating: 'positive', comment: detailedAgent.feedback.comment },
+      { silent: true }
+    );
+  });
+});
+
+describe('AgentCard finish action', () => {
+  it('sends the finish-and-sentinel message from an active Claude TUI card', async () => {
+    const user = userEvent.setup();
+    const runningAgent = {
+      ...agent,
+      status: 'running',
+      completedAt: null,
+      metadata: { ...agent.metadata, executionMode: 'tui', tuiKind: 'claude' },
+    };
+    api.sendCosAgentBtw.mockResolvedValue({ success: true });
+
+    render(
+      <MemoryRouter>
+        <AgentCard agent={runningAgent} />
+      </MemoryRouter>
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Finish work and write sentinel' }));
+
+    expect(api.sendCosAgentBtw).toHaveBeenCalledWith(
+      runningAgent.id,
+      'Finish work and write sentinel.',
+      { silent: true }
+    );
+  });
+
+  it('does not show the finish action for inactive cards', () => {
+    render(
+      <MemoryRouter>
+        <AgentCard agent={agent} completed />
+      </MemoryRouter>
+    );
+
+    expect(screen.queryByRole('button', { name: 'Finish work and write sentinel' })).not.toBeInTheDocument();
+  });
+});
+
+describe('AgentCard agent ID', () => {
+  it.each([
+    ['active', { ...agent, status: 'running', completedAt: null }],
+    ['historical', agent],
+  ])('copies the full ID from the %s card', async (_label, cardAgent) => {
+    const user = userEvent.setup();
+
+    render(
+      <MemoryRouter>
+        <AgentCard agent={cardAgent} completed={cardAgent.status === 'completed'} />
+      </MemoryRouter>
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Copy agent ID' }));
+
+    expect(copyToClipboard).toHaveBeenCalledWith(cardAgent.id, 'Agent ID copied to clipboard');
+  });
+});
+
+describe('AgentCard responsive header', () => {
+  it('keeps the identity and actions rails flexible on narrow cards', () => {
+    const onDelete = vi.fn();
+    const onResume = vi.fn();
+
+    render(
+      <MemoryRouter>
+        <AgentCard agent={agent} completed onDelete={onDelete} onResume={onResume} />
+      </MemoryRouter>
+    );
+
+    const actions = screen.getByRole('button', { name: 'Show' }).parentElement;
+    const identity = actions.previousElementSibling;
+
+    expect(identity).toHaveClass('basis-0', 'sm:basis-64');
+    expect(screen.getByText(agent.id)).toHaveClass('min-w-0');
+    expect(actions).toHaveClass('ml-0', 'sm:ml-auto');
+  });
+
+  it('shows the effort used alongside the model on active and completed cards', () => {
+    for (const cardAgent of [
+      { ...agent, status: 'running', completedAt: null },
+      agent,
+    ]) {
+      render(
+        <MemoryRouter>
+          <AgentCard
+            agent={{
+              ...cardAgent,
+              metadata: { ...cardAgent.metadata, model: 'example-model', effort: 'low' },
+            }}
+            completed={cardAgent.status === 'completed'}
+          />
+        </MemoryRouter>
+      );
+      expect(screen.getByText('Effort: low')).toBeInTheDocument();
+      cleanup();
+    }
+  });
+
+  it('shows provider route provenance on active and completed cards', () => {
+    const routeMetadata = {
+      providerId: 'claude-ollama',
+      providerName: 'Claude Ollama',
+      providerType: 'cli',
+      providerMethod: 'cli',
+      providerCommand: 'claude',
+      harnessId: 'claude',
+      serviceId: 'ollama',
+      servicePlan: 'local',
+      providerCredentialBootstrapId: 'example-auth',
+      executionMode: 'runner',
+      useRunner: true,
+      modelTier: 'heavy',
+      leanMode: true,
+      providerHasCredentialBootstrap: true,
+    };
+
+    for (const [cardAgent, isCompleted] of [
+      [{ ...agent, status: 'running', completedAt: null, metadata: { ...agent.metadata, ...routeMetadata } }, false],
+      [{ ...agent, metadata: { ...agent.metadata, ...routeMetadata } }, true],
+    ]) {
+      render(
+        <MemoryRouter>
+          <AgentCard agent={cardAgent} completed={isCompleted} />
+        </MemoryRouter>
+      );
+
+      expect(screen.getByText('Provider: Claude Ollama')).toBeInTheDocument();
+      expect(screen.getByText('Harness: Claude Code')).toBeInTheDocument();
+      expect(screen.getByText('Service: ollama')).toBeInTheDocument();
+      expect(screen.getByText('Plan: local')).toBeInTheDocument();
+      expect(screen.getByText('Route: cli')).toBeInTheDocument();
+      expect(screen.getByText('Command: claude')).toBeInTheDocument();
+      expect(screen.getByText('Execution: runner')).toBeInTheDocument();
+      expect(screen.getByText('Dispatch: Runner')).toBeInTheDocument();
+      expect(screen.getByText('Tier: heavy')).toBeInTheDocument();
+      expect(screen.getByText('Prompt: lean')).toBeInTheDocument();
+      expect(screen.getByText('Auth: example-auth')).toBeInTheDocument();
+      cleanup();
+    }
+  });
+
+  it('flags a learning-downgraded model tier distinctly from an ordinary tier badge (#8148)', () => {
+    render(
+      <MemoryRouter>
+        <AgentCard
+          agent={{
+            ...agent,
+            metadata: {
+              ...agent.metadata,
+              modelTier: 'medium',
+              model: 'claude-sonnet-5',
+              modelReason: 'learning-suggested',
+              modelDowngradedFromDefault: true,
+              modelConfiguredDefault: 'claude-opus-5-5',
+            },
+          }}
+          completed
+        />
+      </MemoryRouter>
+    );
+    const badge = screen.getByText('Tier (downgraded): medium');
+    expect(badge).toBeInTheDocument();
+    expect(badge.getAttribute('title')).toContain('claude-opus-5-5');
+  });
+
+  it('derives a known harness for legacy provider metadata', () => {
+    render(
+      <MemoryRouter>
+        <AgentCard
+          agent={{
+            ...agent,
+            metadata: {
+              ...agent.metadata,
+              providerId: 'claude-ollama',
+              providerType: 'cli',
+              providerCommand: 'claude',
+            },
+          }}
+          completed
+        />
+      </MemoryRouter>
+    );
+
+    expect(screen.getByText('Harness: Claude Code')).toBeInTheDocument();
+  });
+});
+
+describe('AgentCard transcript truncation (#3498)', () => {
+  it('says the transcript was clipped when the server returns a capped tail', async () => {
+    const user = userEvent.setup();
+    api.getCosAgent.mockResolvedValue({
+      ...agent,
+      output: [{ line: 'last line', timestamp: agent.completedAt }],
+      outputTruncated: true,
+      outputTotalBytes: 12 * 1024 * 1024,
+    });
+
+    render(
+      <MemoryRouter>
+        <AgentCard agent={agent} completed />
+      </MemoryRouter>
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Show' }));
+
+    await user.click(screen.getByRole('button', { name: 'Show full transcript' }));
+    expect(await screen.findByText(/Showing the last 1 line —/)).toBeInTheDocument();
+    expect(screen.getByText(/12 MB/)).toBeInTheDocument();
+  });
+
+  it('still reports the clip when the tail window yielded no renderable lines', async () => {
+    const user = userEvent.setup();
+    api.getCosAgent.mockResolvedValue({
+      ...agent,
+      output: [],
+      outputTruncated: true,
+      outputTotalBytes: 8 * 1024 * 1024,
+    });
+
+    render(
+      <MemoryRouter>
+        <AgentCard agent={agent} completed />
+      </MemoryRouter>
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Show' }));
+
+    await user.click(screen.getByRole('button', { name: 'Show full transcript' }));
+    // "No output captured" would call a multi-MB log empty.
+    expect(await screen.findByText(/no readable lines/)).toBeInTheDocument();
+    expect(screen.queryByText('No output captured')).not.toBeInTheDocument();
+  });
+
+  it('stays quiet when the whole transcript fit under the cap', async () => {
+    const user = userEvent.setup();
+    api.getCosAgent.mockResolvedValue({
+      ...agent,
+      output: [{ line: 'only line', timestamp: agent.completedAt }],
+      outputTruncated: false,
+      outputTotalBytes: 10,
+    });
+
+    render(
+      <MemoryRouter>
+        <AgentCard agent={agent} completed />
+      </MemoryRouter>
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Show' }));
+
+    await waitFor(() => expect(api.getCosAgent).toHaveBeenCalledWith(agent.id));
+    expect(screen.queryByText(/Showing the last/)).not.toBeInTheDocument();
+  });
+});
+
+describe('AgentCard kill confirmation (#4034)', () => {
+  it('requires confirmation before calling onKill', async () => {
+    const user = userEvent.setup();
+    const onKill = vi.fn().mockResolvedValue(true);
+    const runningAgent = {
+      ...agent,
+      status: 'running',
+      completedAt: null,
+    };
+
+    render(
+      <MemoryRouter>
+        <AgentCard agent={runningAgent} onKill={onKill} />
+      </MemoryRouter>
+    );
+
+    // Clicking Kill should show confirmation prompt and NOT call onKill immediately
+    await user.click(screen.getByRole('button', { name: 'Force kill agent (SIGKILL)' }));
+    expect(onKill).not.toHaveBeenCalled();
+    expect(screen.getByText('Kill?')).toBeInTheDocument();
+
+    // Clicking Cancel disarms confirmation state
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(onKill).not.toHaveBeenCalled();
+    expect(screen.queryByText('Kill?')).not.toBeInTheDocument();
+
+    // Re-arm and click Confirm
+    await user.click(screen.getByRole('button', { name: 'Force kill agent (SIGKILL)' }));
+    await user.click(screen.getByRole('button', { name: 'Confirm' }));
+    expect(onKill).toHaveBeenCalledWith(runningAgent.id);
+  });
+});
+
+
+describe('AgentCard task description (#4170)', () => {
+  // jsdom reports 0 for both scrollHeight and clientHeight, so nothing measures
+  // as overflowing unless we force it.
+  const forceOverflow = () =>
+    vi.spyOn(HTMLElement.prototype, 'scrollHeight', 'get').mockReturnValue(500);
+
+  afterEach(() => vi.restoreAllMocks());
+
+  it('caps a long description behind an accessible Show more toggle', async () => {
+    const user = userEvent.setup();
+    forceOverflow();
+
+    render(
+      <MemoryRouter>
+        <AgentCard agent={agent} completed />
+      </MemoryRouter>
+    );
+
+    const box = document.getElementById(`agent-desc-${agent.id}`);
+    expect(box).toHaveClass('overflow-hidden');
+
+    // The bespoke implementation this replaced carried no aria wiring at all.
+    const toggle = screen.getByRole('button', { name: /Show more/ });
+    expect(toggle).toHaveAttribute('aria-controls', `agent-desc-${agent.id}`);
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+
+    await user.click(toggle);
+    expect(box).not.toHaveClass('overflow-hidden');
+    expect(screen.getByRole('button', { name: /Show less/ })).toHaveAttribute('aria-expanded', 'true');
+  });
+
+  it('offers no toggle for a description that fits', () => {
+    // The replaced implementation gated on `text.length > 200`, so a 201-char
+    // description that fit in the cap still rendered a no-op "Show more".
+    render(
+      <MemoryRouter>
+        <AgentCard agent={{ ...agent, metadata: { ...agent.metadata, taskDescription: 'x'.repeat(300) } }} completed />
+      </MemoryRouter>
+    );
+
+    expect(screen.queryByRole('button', { name: /Show more/ })).not.toBeInTheDocument();
+  });
+});
+
+describe('AgentCard missing shell explanation', () => {
+  const running = (metadata) => ({
+    ...agent,
+    status: 'running',
+    completedAt: null,
+    metadata: { ...agent.metadata, ...metadata },
+  });
+
+  const renderCard = (a) => render(
+    <MemoryRouter>
+      <AgentCard agent={a} />
+    </MemoryRouter>
+  );
+
+  it('says why a public-review stage has no shell instead of leaving the card silent', () => {
+    // A tool-free stage — or an actions stage on a provider with no attachable
+    // sandbox recipe — runs headless even on a TUI provider, so the "Open
+    // Shell" link never appears. Silence made a slow run look wedged with
+    // nowhere to look.
+    renderCard(running({ publicReviewPosture: 'sandboxed-actions', executionMode: 'direct' }));
+
+    expect(screen.queryByText('Open Shell')).not.toBeInTheDocument();
+    expect(screen.getByText('No shell')).toBeInTheDocument();
+    expect(screen.getByTitle(/this public-review stage runs headless/)).toBeInTheDocument();
+  });
+
+  it('keeps the shell link on an attachable sandboxed-actions run', () => {
+    // Stage 3 on a TUI provider whose vendor declares an attachable recipe DOES
+    // get a PTY (#6062) — the chip above must not fire on it, or the card would
+    // claim there is no shell while linking to one.
+    renderCard(running({
+      publicReviewPosture: 'sandboxed-actions',
+      executionMode: 'tui',
+      tuiSessionId: 'sess-6062',
+    }));
+
+    expect(screen.queryByText('No shell')).not.toBeInTheDocument();
+  });
+
+  it('stays silent on an attachable public-review run that has not registered its session yet', () => {
+    // The startup window an attachable Stage 3 now passes through: `executionMode`
+    // is already 'tui' but `tuiSessionId` has not landed. Gating on the session id
+    // alone made the card assert the stage runs headless for those seconds, then
+    // swap the claim for an "Open Shell" link — a false diagnostic, and a worse
+    // one if the PTY is merely slow to attach.
+    renderCard(running({
+      publicReviewPosture: 'sandboxed-actions',
+      executionMode: 'tui',
+      phase: 'initializing',
+    }));
+
+    expect(screen.queryByText('No shell')).not.toBeInTheDocument();
+  });
+
+  it('stays silent on a TUI run that has not registered its session yet', () => {
+    // `executionMode` is stamped at registration but `tuiSessionId` only lands
+    // once the PTY attaches, so every healthy TUI spawn passes through this
+    // state — a chip here would put the "looks wedged" noise straight back.
+    renderCard(running({ executionMode: 'tui', phase: 'initializing' }));
+
+    expect(screen.queryByText('No shell')).not.toBeInTheDocument();
+  });
+
+  it('adds no chip to an ordinary headless CLI agent — none was ever expected', () => {
+    renderCard(running({ executionMode: 'direct' }));
+
+    expect(screen.queryByText('No shell')).not.toBeInTheDocument();
+  });
+
+  it('links to the live shell, with no explanation chip, once a session exists', () => {
+    renderCard(running({ executionMode: 'tui', tuiSessionId: 'sess-abcdef123' }));
+
+    expect(screen.getByText('Open Shell')).toBeInTheDocument();
+    expect(screen.queryByText('No shell')).not.toBeInTheDocument();
+  });
+
+  // #6117: a ~100K-token public-review envelope aimed at a model server on this
+  // box spends minutes in prefill before the child emits its first line. The
+  // card showed a running agent with no output and no reason for it.
+  it('explains a long silent prefill and names the raised run estimate', () => {
+    renderCard(running({
+      executionMode: 'direct',
+      localPromptBudget: {
+        endpoint: 'localhost:18020',
+        promptTokens: 100_000,
+        prefillMs: 9 * 60_000,
+        baseDurationMs: 13 * 60_000,
+        expectedDurationMs: 22 * 60_000,
+        longPrefill: true,
+      },
+    }));
+
+    expect(screen.getByText(/Long prefill/)).toBeInTheDocument();
+    expect(screen.getByTitle(/100,000 tokens/)).toBeInTheDocument();
+    expect(screen.getByTitle(/duration estimate was raised/)).toBeInTheDocument();
+  });
+
+  it('stays silent when the prefill is short or the run is not on a local endpoint', () => {
+    // An absent budget is "no estimate" (a cloud run, or a record written before
+    // the stamp existed) — never "instant". Neither may render the chip.
+    renderCard(running({
+      executionMode: 'direct',
+      localPromptBudget: { endpoint: 'localhost:11434', promptTokens: 2_000, prefillMs: 16_667, longPrefill: false },
+    }));
+    expect(screen.queryByText(/Long prefill/)).not.toBeInTheDocument();
+
+    cleanup();
+    renderCard(running({ executionMode: 'direct' }));
+    expect(screen.queryByText(/Long prefill/)).not.toBeInTheDocument();
+  });
+});
+
+// #5994: the goal-fidelity verdict — whether the run built what the task asked
+// for, which no quality reviewer can answer because none of them see the request.
+describe('AgentCard goal fidelity', () => {
+  const withReview = (goalFidelity) => ({ ...agent, result: { ...agent.result, goalFidelity } });
+
+  // A merge-shaped objective is settled by forge state, not by a model reading a
+  // diff — so the card must not leave a reader assuming a local model said so.
+  it('names the forge as the source of a verdict no model produced', () => {
+    render(<MemoryRouter><AgentCard agent={withReview({
+      verdict: 'ship', source: 'forge-outcome', evidence: 'The forge reports #7653 MERGED', missing: [], unrequested: [],
+    })} completed /></MemoryRouter>);
+    expect(screen.getByText(/forge-verified/)).toBeInTheDocument();
+    expect(screen.getByText('Goal fidelity:', { exact: false })).toHaveTextContent('Delivers the objective');
+    expect(screen.queryByRole('button', { name: 'Investigate findings' })).not.toBeInTheDocument();
+  });
+
+  it('queues an isolated investigation with the original prompt and app, then links to the task', async () => {
+    api.getCosAgentPrompt.mockResolvedValue({ prompt: 'Resolve issue #123 acceptance criteria' });
+    api.addCosTask.mockResolvedValue({ id: 'task-investigation', approvalRequired: false });
+    render(<MemoryRouter><AgentCard agent={{ ...withReview({ verdict: 'rethink', missing: ['Example gap'] }),
+      metadata: { ...agent.metadata, taskApp: 'example-app' } }} completed /></MemoryRouter>);
+    await userEvent.click(screen.getByRole('button', { name: 'Investigate findings' }));
+    await waitFor(() => expect(api.addCosTask).toHaveBeenCalledWith(expect.objectContaining({
+      app: 'example-app', type: 'user', isInvestigation: true,
+      prompt: expect.stringContaining('Resolve issue #123 acceptance criteria'),
+    }), { silent: true }));
+    expect(api.addCosTask.mock.calls[0][0].prompt).toContain('Example gap');
+    expect(await screen.findByRole('link', { name: 'View queued investigation' })).toHaveAttribute('href', '/cos/tasks?task=task-investigation&source=user');
+    expect(screen.queryByRole('button', { name: 'Investigate findings' })).not.toBeInTheDocument();
+  });
+
+  it('keeps prompt retrieval failures visible and permits retry without queuing incomplete context', async () => {
+    api.getCosAgentPrompt.mockRejectedValue(new Error('Prompt unavailable'));
+    render(<MemoryRouter><AgentCard agent={withReview({ verdict: 'fix-first' })} completed /></MemoryRouter>);
+    await userEvent.click(screen.getByRole('button', { name: 'Investigate findings' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Prompt unavailable');
+    expect(api.addCosTask).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: 'Investigate findings' })).toBeEnabled();
+  });
+
+  it('does not dispatch remote findings into the local repository', () => {
+    render(<MemoryRouter><AgentCard agent={withReview({ verdict: 'rethink' })} completed remote /></MemoryRouter>);
+    expect(screen.queryByRole('button', { name: 'Investigate findings' })).not.toBeInTheDocument();
+  });
+
+  it('names the missing and unrequested work behind a rethink verdict', () => {
+    render(
+      <MemoryRouter>
+        <AgentCard agent={withReview({
+          verdict: 'rethink',
+          missing: ['the retry backoff'],
+          unrequested: ['an unrelated logging refactor'],
+          evidence: 'no tests were run',
+          model: 'example-model',
+        })} completed />
+      </MemoryRouter>
+    );
+
+    expect(screen.getByText(/Does not deliver the objective/)).toBeInTheDocument();
+    expect(screen.getByText('the retry backoff')).toBeInTheDocument();
+    expect(screen.getByText('an unrelated logging refactor')).toBeInTheDocument();
+    expect(screen.getByText('no tests were run')).toBeInTheDocument();
+  });
+
+  it('shows an overturned verdict with its context gap and hides the investigation action', () => {
+    render(
+      <MemoryRouter>
+        <AgentCard agent={withReview({
+          verdict: 'rethink',
+          missing: ['the retry backoff'],
+          overturned: {
+            gap: 'work-outside-diff',
+            calibrationTaskId: 'calib-1',
+            at: '2026-09-19T10:00:00.000Z',
+          },
+        })} completed />
+      </MemoryRouter>
+    );
+
+    expect(screen.getByText('Goal fidelity:', { exact: false })).toHaveTextContent('Overturned');
+    expect(screen.getByText(/context gap: work-outside-diff/)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Investigate findings' })).not.toBeInTheDocument();
+  });
+
+  // #7690: the automatic follow-up — the finding's durable half. What it did
+  // belongs beside the verdict, or a filed issue is unreachable from the card
+  // that reported the problem.
+  it('links the issue the follow-up filed and the task it queued', () => {
+    render(
+      <MemoryRouter>
+        <AgentCard agent={withReview({
+          verdict: 'rethink',
+          followUp: { issue: { number: 42, url: 'https://example.com/issues/42', duplicate: false }, taskId: 'cos-9' },
+        })} completed />
+      </MemoryRouter>
+    );
+    expect(screen.getByRole('link', { name: 'Filed as #42' })).toHaveAttribute('href', 'https://example.com/issues/42');
+    expect(screen.getByRole('link', { name: 'View the queued follow-up task' }))
+      .toHaveAttribute('href', '/cos/tasks?task=cos-9&source=internal');
+  });
+
+  it('says an existing issue already tracks the finding rather than implying it filed one', () => {
+    render(
+      <MemoryRouter>
+        <AgentCard agent={withReview({
+          verdict: 'rethink',
+          followUp: { issue: { number: 5, url: 'https://example.com/issues/5', duplicate: true } },
+        })} completed />
+      </MemoryRouter>
+    );
+    expect(screen.getByRole('link', { name: 'Already tracked as #5' })).toBeInTheDocument();
+  });
+
+  // Silence here would read as the follow-up having found nothing to do, on a
+  // card whose whole point is that something does need doing.
+  it('names why an arm could not run', () => {
+    render(
+      <MemoryRouter>
+        <AgentCard agent={withReview({
+          verdict: 'rethink',
+          followUp: { issueError: 'could not read the github issue list', taskError: 'the follow-up task could not be queued' },
+        })} completed />
+      </MemoryRouter>
+    );
+    expect(screen.getByText(/could not read the github issue list/)).toBeInTheDocument();
+    expect(screen.getByText(/could not be queued/)).toBeInTheDocument();
+  });
+
+// "Queued" is wrong for a task the loop policy held for the user: nothing
+  // will pick it up until they approve it, and the card is where they find out.
+  it('names a held follow-up task as awaiting approval, not queued', () => {
+    render(
+      <MemoryRouter>
+        <AgentCard agent={withReview({
+          verdict: 'rethink',
+          followUp: { taskId: 'cos-9', taskApprovalRequired: true },
+        })} completed />
+      </MemoryRouter>
+    );
+    expect(screen.getByRole('link', { name: 'Follow-up task awaiting your approval' })).toBeInTheDocument();
+    // Still no manual button: the answer is to approve the task that exists,
+    // not to queue an unheld duplicate beside it.
+    expect(screen.queryByRole('button', { name: 'Investigate findings' })).not.toBeInTheDocument();
+  });
+
+  it('names a folded duplicate task as folded, not freshly queued', () => {
+    render(
+      <MemoryRouter>
+        <AgentCard agent={withReview({
+          verdict: 'rethink',
+          followUp: { taskId: 'cos-9', taskDuplicate: true },
+        })} completed />
+      </MemoryRouter>
+    );
+    expect(screen.getByRole('link', { name: 'Folded into the follow-up task already open' })).toBeInTheDocument();
+  });
+
+  // Offering the manual button after the automation already queued a task would
+  // put two agents on one finding.
+  it('withdraws the manual button once the follow-up queued a task, and keeps it otherwise', () => {
+    const { unmount } = render(
+      <MemoryRouter>
+        <AgentCard agent={withReview({ verdict: 'rethink', followUp: { taskId: 'cos-9' } })} completed />
+      </MemoryRouter>
+    );
+    expect(screen.queryByRole('button', { name: 'Investigate findings' })).not.toBeInTheDocument();
+    unmount();
+
+    render(
+      <MemoryRouter>
+        <AgentCard agent={withReview({ verdict: 'rethink', followUp: { issue: { number: 42, url: 'u' } } })} completed />
+      </MemoryRouter>
+    );
+    expect(screen.getByRole('button', { name: 'Investigate findings' })).toBeInTheDocument();
+  });
+
+  it('shows a clean ship verdict, and renders nothing at all for a run the gate never judged', () => {
+    const { unmount } = render(
+      <MemoryRouter>
+        <AgentCard agent={withReview({ verdict: 'ship', missing: [], unrequested: [], evidence: '' })} completed />
+      </MemoryRouter>
+    );
+    expect(screen.getByText(/Delivers the objective/)).toBeInTheDocument();
+    unmount();
+
+    render(
+      <MemoryRouter>
+        <AgentCard agent={agent} completed />
+      </MemoryRouter>
+    );
+    expect(screen.queryByText(/Goal fidelity/)).not.toBeInTheDocument();
+  });
+});
+
+// A claim run works in a `claim/<item>` worktree that the claim command creates
+// itself; CoS keeps useWorktree/openPR off only so it does not nest a second
+// worktree around it. Reading that false/false as "coding on main" made every
+// issue claim from the app Issues page badge itself `main` while it was in fact
+// on an isolated branch.
+describe('AgentCard branch posture badges', () => {
+  const renderWithMetadata = (metadata) => render(
+    <MemoryRouter>
+      <AgentCard agent={{ ...agent, metadata: { ...agent.metadata, ...metadata } }} completed />
+    </MemoryRouter>
+  );
+
+  // The load-bearing case for already-archived runs: every claim agent spawned
+  // before the server projection was corrected has BOTH flags frozen true in its
+  // metadata, so the card has to settle the contradiction on read or those cards
+  // wear two conflicting branch badges at once.
+  it('suppresses the main badge on a claim run whose stored metadata still says it', () => {
+    renderWithMetadata({ configClaimFlow: true, configUseWorktree: false, configCodingOnMain: true });
+
+    expect(screen.getByText('Claim WT')).toBeInTheDocument();
+    expect(screen.queryByText('main')).not.toBeInTheDocument();
+  });
+
+  // Same stale-record problem, other non-committing posture: a read-only run is
+  // denied a worktree on purpose and commits nothing, so the warning is false.
+  it('badges a read-only run as read-only rather than as coding on main', () => {
+    renderWithMetadata({ configReadOnly: true, configUseWorktree: false, configCodingOnMain: true });
+
+    expect(screen.getByText('Read-only')).toBeInTheDocument();
+    expect(screen.queryByText('main')).not.toBeInTheDocument();
+  });
+
+  // The control. Without it every assertion above is satisfied by deleting the
+  // main badge outright.
+  it('still badges a genuine commit-to-main run as main', () => {
+    renderWithMetadata({ configClaimFlow: false, configUseWorktree: false, configCodingOnMain: true });
+
+    expect(screen.getByText('main')).toBeInTheDocument();
+    expect(screen.queryByText('Claim WT')).not.toBeInTheDocument();
+    expect(screen.queryByText('Read-only')).not.toBeInTheDocument();
+  });
+});
+
+// The listing bounds `metadata.taskDescription` — see server/lib/cosAgentListProjection.js.
+// The card must still be able to show the whole thing, without every row paying
+// for it on load.
+describe('AgentCard truncated task description', () => {
+  const longAgent = {
+    ...agent,
+    metadata: {
+      ...agent.metadata,
+      taskDescription: 'The preview the listing carried',
+      taskDescriptionTruncated: true,
+      taskDescriptionLength: 54000,
+    },
+  };
+
+  it('renders the preview without fetching, then hydrates the rest on expand', async () => {
+    const user = userEvent.setup();
+    api.hydrateCosAgentDescription.mockResolvedValue({
+      ...longAgent,
+      metadata: { ...longAgent.metadata, taskDescription: 'The preview the listing carried, and the rest of it', taskDescriptionTruncated: false },
+    });
+
+    render(<MemoryRouter><AgentCard agent={longAgent} liveOutputs={{}} /></MemoryRouter>);
+
+    expect(screen.getByText('The preview the listing carried')).toBeInTheDocument();
+    expect(api.hydrateCosAgentDescription).not.toHaveBeenCalled();
+
+    await user.click(screen.getAllByRole('button', { name: /Show more/ })[0]);
+
+    await waitFor(() => {
+      expect(screen.getByText('The preview the listing carried, and the rest of it')).toBeInTheDocument();
+    });
+    expect(api.hydrateCosAgentDescription).toHaveBeenCalledTimes(1);
+  });
+
+  // The control: an untruncated description must never cost a round trip, which
+  // is the whole point of the flag.
+  it('never fetches for a description the listing carried whole', async () => {
+    const user = userEvent.setup();
+    const whole = { ...agent, metadata: { ...agent.metadata, taskDescription: 'Example task '.repeat(40) } };
+
+    render(<MemoryRouter><AgentCard agent={whole} liveOutputs={{}} /></MemoryRouter>);
+
+    const toggle = screen.queryAllByRole('button', { name: /Show more/ })[0];
+    if (toggle) await user.click(toggle);
+
+    expect(api.hydrateCosAgentDescription).not.toHaveBeenCalled();
+  });
+});
+
+// End-to-end for #7676: the run record carries its tracker, so a bare `#N` the
+// agent wrote in its own sentinel summary is followable from the card. The
+// pattern lives in lib/issueRefs.test.js — this pins the WIRING, the half that
+// silently regresses when a prop is dropped in a refactor.
+it('links a task-summary issue reference at the tracker the run was stamped with', async () => {
+  api.getCosAgent.mockResolvedValue({ ...agent, output: [] });
+  render(
+    <MemoryRouter>
+      <AgentCard
+        agent={{ ...agent, metadata: {
+          ...agent.metadata,
+          taskSummary: 'Closes #7640.',
+          repoIssueUrl: 'https://github.com/atomantic/PortOS/issues',
+        } }}
+        completed
+      />
+    </MemoryRouter>
+  );
+  await userEvent.click(screen.getByRole('button', { name: 'Show', exact: true }));
+  expect(screen.getByRole('link', { name: '#7640' }))
+    .toHaveAttribute('href', 'https://github.com/atomantic/PortOS/issues/7640');
+});
+
+
+it('loads process stats only after opening an active agent with no output', async () => {
+  api.getCosAgentStats.mockResolvedValue({ active: true, pid: 4242, state: 'running', cpu: 12.3, memoryMb: 64 });
+  render(<MemoryRouter><AgentCard agent={{ ...agent, status: 'running', completedAt: null, result: null, output: [] }} /></MemoryRouter>);
+  expect(api.getCosAgentStats).not.toHaveBeenCalled();
+  await userEvent.click(screen.getByRole('button', { name: 'Show', exact: true }));
+  expect(await screen.findByText('12.3%')).toBeInTheDocument();
+});
+
+
+it('loads a clipped summary only when the reader asks for the detail', async () => {
+  api.getCosAgent.mockResolvedValue({ ...agent, metadata: { ...agent.metadata, taskSummary: 'The full summary with its conclusion.' }, output: [] });
+  render(<MemoryRouter><AgentCard agent={{ ...agent, metadata: { ...agent.metadata, taskSummary: 'The preview', taskSummaryTruncated: true } }} completed /></MemoryRouter>);
+  expect(screen.queryByText('The preview')).not.toBeInTheDocument();
+  expect(api.getCosAgent).not.toHaveBeenCalled();
+  await userEvent.click(screen.getByRole('button', { name: 'Show', exact: true }));
+  expect(await screen.findByText('The full summary with its conclusion.')).toBeInTheDocument();
+  expect(screen.queryByText('Summary preview.')).not.toBeInTheDocument();
+});
+
+it('refreshes expanded local stats on matching events without polling and reconciles missed events', async () => {
+  vi.useFakeTimers();
+  const running = { ...agent, status: 'running', completedAt: null, result: null };
+  api.getCosAgentStats.mockResolvedValue({ active: true, cpu: 12.3, memoryMb: 64 });
+  const view = render(<MemoryRouter><AgentCard agent={running} initiallyExpanded /></MemoryRouter>);
+  await act(async () => {});
+  expect(screen.getByText('12.3%')).toBeInTheDocument();
+  await act(async () => { await vi.advanceTimersByTimeAsync(15000); });
+  expect(api.getCosAgentStats).toHaveBeenCalledTimes(1);
+  await act(async () => socket.receive('cos:agent:output', { agentId: 'another-agent' }));
+  expect(api.getCosAgentStats).toHaveBeenCalledTimes(1);
+  api.getCosAgentStats.mockResolvedValue({ active: true, cpu: 24.6, memoryMb: 128 });
+  await act(async () => socket.receive('cos:agent:output', { agentId: agent.id }));
+  expect(screen.getByText('24.6%')).toBeInTheDocument();
+  await act(async () => socket.receive('cos:agent:updated', { id: agent.id }));
+  expect(api.getCosAgentStats).toHaveBeenCalledTimes(3);
+  await act(async () => socket.receive('connect'));
+  expect(api.getCosAgentStats).toHaveBeenCalledTimes(4);
+  await act(async () => {
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+  await act(async () => {
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
+    document.dispatchEvent(new Event('visibilitychange'));
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+  expect(api.getCosAgentStats).toHaveBeenCalledTimes(5);
+  view.unmount();
+  await act(async () => socket.receive('connect'));
+  await act(async () => socket.receive('cos:agent:output', { agentId: agent.id }));
+  expect(api.getCosAgentStats).toHaveBeenCalledTimes(5);
+  api.getCosAgentStats.mockImplementation(() => new Promise(() => {}));
+});
+
+it.each([{ remote: true }, { completed: true }, { paused: true }])('does not read stats for an ineligible expanded card %j', async props => {
+  render(<MemoryRouter><AgentCard agent={agent} initiallyExpanded {...props} /></MemoryRouter>);
+  await act(async () => socket.receive('cos:agent:output', { agentId: agent.id }));
+  await act(async () => socket.receive('connect'));
+  expect(api.getCosAgentStats).not.toHaveBeenCalled();
+});
+
+it('drops an outstanding stats response when collapsed and reads afresh on reopening', async () => {
+  let resolveStats;
+  api.getCosAgentStats.mockReturnValueOnce(new Promise(resolve => { resolveStats = resolve; }));
+  const running = { ...agent, status: 'running', completedAt: null, result: null };
+  render(<MemoryRouter><AgentCard agent={running} initiallyExpanded /></MemoryRouter>);
+  await act(async () => {});
+  fireEvent.click(screen.getByRole('button', { name: 'Hide', exact: true }));
+  await act(async () => resolveStats({ active: true, cpu: 99.9 }));
+  await act(async () => socket.receive('cos:agent:output', { agentId: agent.id }));
+  expect(api.getCosAgentStats).toHaveBeenCalledTimes(1);
+  api.getCosAgentStats.mockResolvedValueOnce({ active: true, cpu: 11.1 });
+  fireEvent.click(screen.getByRole('button', { name: 'Show', exact: true }));
+  expect(await screen.findByText('11.1%')).toBeInTheDocument();
+  expect(screen.queryByText('99.9%')).not.toBeInTheDocument();
+  api.getCosAgentStats.mockRejectedValueOnce(new Error('Temporary failure'));
+  await act(async () => socket.receive('cos:agent:updated', { id: agent.id }));
+  expect(screen.getByText('11.1%')).toBeInTheDocument();
+});
+
+
+it.each([false, true])('keeps a completed summary behind Show and its duplicate transcript behind a separate disclosure (remote=%s)', async (remote) => {
+  const summary = 'Completed the example task.';
+  const record = { ...agent, metadata: { ...agent.metadata, taskSummary: summary }, output: [{ type: 'stdout', line: summary }] };
+  api.getCosAgent.mockResolvedValue(record);
+  render(<MemoryRouter><AgentCard agent={record} completed remote={remote} /></MemoryRouter>);
+  expect(screen.queryByText(summary)).not.toBeInTheDocument();
+  await userEvent.click(screen.getByRole('button', { name: 'Show', exact: true }));
+  expect(await screen.findByText(summary)).toBeInTheDocument();
+  await userEvent.click(screen.getByRole('button', { name: 'Show full transcript' }));
+  expect(screen.getAllByText(summary)).toHaveLength(2);
+  await userEvent.click(screen.getByRole('button', { name: 'Hide full transcript' }));
+  expect(screen.getAllByText(summary)).toHaveLength(1);
+  await userEvent.click(screen.getByRole('button', { name: 'Hide', exact: true }));
+  expect(screen.queryByText(summary)).not.toBeInTheDocument();
+});
+
+
+it('retries a clipped summary after the expanded detail request fails', async () => {
+  api.getCosAgent.mockRejectedValueOnce(new Error('Temporary failure'))
+    .mockResolvedValueOnce({ ...agent, metadata: { ...agent.metadata, taskSummary: 'Recovered full summary.' }, output: [] });
+  render(<MemoryRouter><AgentCard agent={{ ...agent, metadata: { ...agent.metadata, taskSummary: 'Clipped preview', taskSummaryTruncated: true } }} completed /></MemoryRouter>);
+  await userEvent.click(screen.getByRole('button', { name: 'Show', exact: true }));
+  const retry = await screen.findByRole('button', { name: 'Load full summary' });
+  await waitFor(() => expect(retry).toBeEnabled());
+  await userEvent.click(retry);
+  expect(await screen.findByText('Recovered full summary.')).toBeInTheDocument();
+  expect(api.getCosAgent).toHaveBeenCalledTimes(2);
+});
+
+
+it('keeps a dangerous scan report visible while the summary is collapsed', () => {
+  render(<MemoryRouter><AgentCard agent={{ ...agent, metadata: {
+    ...agent.metadata, taskSummary: 'Example scan summary',
+    malwareScan: { verdict: 'DANGEROUS', reportUrl: '/example-report' },
+  } }} completed /></MemoryRouter>);
+  expect(screen.getByRole('link', { name: 'View scan report (DANGEROUS)' })).toHaveAttribute('href', '/example-report');
+  expect(screen.queryByText('Example scan summary')).not.toBeInTheDocument();
+});
+
+
+it('loads prior pipeline stage output through the full transcript disclosure', async () => {
+  const record = { ...agent, metadata: { ...agent.metadata, taskSummary: 'Pipeline complete', pipeline: {
+    stages: [{ name: 'Plan' }, { name: 'Implement' }], currentStage: 1,
+    stageResults: [{ stage: 0, agentId: 'prior-stage', success: true }],
+  } }, output: [{ line: 'Implementation transcript' }] };
+  api.getCosAgent.mockImplementation(async id => id === 'prior-stage'
+    ? { output: [{ line: 'Prior planning transcript' }] } : record);
+  render(<MemoryRouter><AgentCard agent={record} completed /></MemoryRouter>);
+  await userEvent.click(screen.getByRole('button', { name: 'Show', exact: true }));
+  await userEvent.click(screen.getByRole('button', { name: 'Show full transcript' }));
+  expect(await screen.findByText('Implementation transcript')).toBeInTheDocument();
+  await userEvent.click(screen.getByRole('button', { name: /Plan/ }));
+  expect(await screen.findByText('Prior planning transcript')).toBeInTheDocument();
+});
+
+
+it('keeps the runner transcript separate when no completion summary was saved', async () => {
+  const completedAgent = { ...agent, metadata: {}, output: [{ line: 'exec: example tool output' }] };
+  api.getCosAgent.mockResolvedValue(completedAgent);
+  render(<MemoryRouter><AgentCard agent={completedAgent} completed /></MemoryRouter>);
+  await userEvent.click(screen.getByRole('button', { name: 'Show', exact: true }));
+  expect(await screen.findByText('No completion summary was saved. The runner transcript is available separately.')).toBeInTheDocument();
+  expect(screen.queryByText('exec: example tool output')).not.toBeInTheDocument();
+  await userEvent.click(screen.getByRole('button', { name: 'Show full transcript' }));
+  expect(screen.getByText('exec: example tool output')).toBeInTheDocument();
+});

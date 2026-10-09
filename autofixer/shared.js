@@ -1,0 +1,76 @@
+// Plumbing shared by the autofixer's two PM2-managed processes — `server.js`
+// (the repair loop) and `ui.js` (the dashboard). Kept package-local and
+// dependency-light (node builtins only): PortOS's own `server/services/pm2.js`
+// has an equivalent `execPm2`, but importing it here would drag the whole
+// server dependency graph into a package whose package.json declares only
+// express. `server/lib/pm2Jlist.js` is the one exception: a pure, zero-import
+// leaf, so importing it costs nothing this package needs to stay light about.
+import { spawn } from 'child_process';
+import { existsSync } from 'fs';
+import { readFile } from 'fs/promises';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
+import { createRequire } from 'module';
+import { parsePm2JlistStdout } from '../server/lib/pm2Jlist.js';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+// Resolve PM2 binary to avoid pm2.cmd on Windows (creates visible CMD windows)
+const require = createRequire(import.meta.url);
+export const PM2_BIN = join(dirname(require.resolve('pm2/package.json')), 'bin', 'pm2');
+
+/** Execute a PM2 CLI command via node (bypasses pm2.cmd) */
+export function execPm2(pm2Args) {
+  return new Promise((resolve, reject) => {
+    // node_modules/pm2 can go stale (e.g. a dangling symlink left by a reaped
+    // worktree install) without require.resolve('pm2/package.json') noticing,
+    // since that only resolves the package dir, not this bin file. Catch it
+    // here with a one-line message instead of spawning node against a missing
+    // path, which surfaces as an opaque multi-line MODULE_NOT_FOUND dump.
+    if (!existsSync(PM2_BIN)) {
+      reject(new Error(`PM2 binary not found at ${PM2_BIN} — run "npm install" in the repo root`));
+      return;
+    }
+    const child = spawn(process.execPath, [PM2_BIN, ...pm2Args], { windowsHide: true });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (d) => { stdout += d.toString(); });
+    child.stderr.on('data', (d) => { stderr += d.toString(); });
+    child.on('close', (code) => {
+      if (code !== 0) return reject(new Error(stderr || `pm2 exited with code ${code}`));
+      resolve({ stdout, stderr });
+    });
+    child.on('error', reject);
+  });
+}
+
+/**
+ * Strict PM2 process list: the one non-test reader both `server.js` and
+ * `ui.js` share, so a failed read never masquerades as zero processes.
+ *
+ * `null` = the read FAILED (spawn/exit failure, or stdout with no real array
+ * literal — see `parsePm2JlistStdout`); an array (incl. `[]`) = a successful
+ * read. Callers must not collapse `null` into `[]`: the repair daemon skips
+ * its cycle instead of reporting "no PM2 processes found", and the dashboard
+ * API answers 503 instead of an empty list (issue #8164).
+ *
+ * @returns {Promise<Array|null>}
+ */
+export async function listProcessesStrict() {
+  const { stdout } = await execPm2(['jlist']).catch(() => ({ stdout: '' }));
+  return parsePm2JlistStdout(stdout);
+}
+
+// Paths. Resolved from THIS module's location (both consumers are siblings in
+// `autofixer/`), so every process agrees on one `data/` directory.
+export const DATA_DIR = join(__dirname, '../data');
+export const APPS_FILE = join(DATA_DIR, 'apps.json');
+export const AUTOFIXER_DIR = join(DATA_DIR, 'autofixer');
+export const INDEX_FILE = join(AUTOFIXER_DIR, 'index.json');
+
+// Load apps from PortOS
+export async function loadApps() {
+  const data = await readFile(APPS_FILE, 'utf8').catch(() => '{"apps":{}}');
+  const parsed = JSON.parse(data);
+  return Object.entries(parsed.apps || {}).map(([id, app]) => ({ id, ...app }));
+}

@@ -1,0 +1,111 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { act, render, screen, fireEvent } from '@testing-library/react';
+import { createMemoryRouter, RouterProvider } from 'react-router';
+import PipelineSeries from './PipelineSeries';
+import { LOGLINE_MAX, PREMISE_MAX, STYLE_NOTES_MAX } from '../../../server/lib/universeBibleLimits.js';
+
+const getPipelineSeries = vi.fn();
+const listPipelineIssues = vi.fn();
+const listUniverses = vi.fn();
+let mockBibleDirty = false;
+
+vi.mock('../services/api', () => ({
+  getPipelineSeries: (...args) => getPipelineSeries(...args),
+  updatePipelineSeries: vi.fn(),
+  listPipelineIssues: (...args) => listPipelineIssues(...args),
+  listUniverses: (...args) => listUniverses(...args),
+  generateSeriesTitleLogo: vi.fn(),
+  discoverSeriesVoice: vi.fn(),
+  SERIES_TITLE_LOGO_MAX: 1_000,
+}));
+
+vi.mock('../hooks/useArcCanvasSync', () => ({
+  useArcCanvasSync: () => ({
+    updateSeriesFromServer: vi.fn(),
+    handleIssuesUpdate: vi.fn(),
+    flushPending: vi.fn(async () => false),
+    isDirty: mockBibleDirty,
+  }),
+}));
+vi.mock('../hooks/useLocalStorageBool', () => ({ useLocalStorageBool: () => [false, vi.fn()] }));
+vi.mock('../components/pipeline/ArcCanvas', () => ({ default: () => <div>arc canvas</div> }));
+vi.mock('../components/pipeline/AutopilotPanel', () => ({ default: () => <div>autopilot</div> }));
+vi.mock('../components/pipeline/SeriesReviewPanel', () => ({ default: () => <div>series review</div> }));
+vi.mock('../components/pipeline/SeriesLoomsPanel', () => ({ default: () => <div>branching narratives</div> }));
+vi.mock('../components/CatalogCastPanel', () => ({ default: () => <div>cast</div> }));
+vi.mock('../components/pipeline/AuthorPicker', () => ({ default: () => <div>author</div> }));
+vi.mock('../components/VoiceExemplarEditor', () => ({ default: () => <div>voice exemplars</div>, VOICE_EXEMPLARS_MAX: 5 }));
+vi.mock('../components/imageGen/RecordRenderPinRow', () => ({ default: () => <div>render backend</div> }));
+vi.mock('../components/ui/Toast', () => ({ default: { success: vi.fn(), error: vi.fn() } }));
+
+function renderPage() {
+  const router = createMemoryRouter(
+    [{ path: '/pipeline/series/:seriesId', element: <PipelineSeries /> }],
+    { initialEntries: ['/pipeline/series/series-1'] },
+  );
+  return { router, ...render(<RouterProvider router={router} />) };
+}
+
+describe('Pipeline series detail — mobile layout', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockBibleDirty = false;
+    getPipelineSeries.mockResolvedValue({ id: 'series-1', name: 'Example Series' });
+    listPipelineIssues.mockResolvedValue([]);
+    listUniverses.mockResolvedValue([]);
+  });
+
+  it('opens on issues, exposes direct destinations, and keeps inactive panels mounted', async () => {
+    listPipelineIssues.mockResolvedValue([{ id: 'issue-1', number: 1 }]);
+    getPipelineSeries.mockResolvedValue({ id: 'series-1', name: 'Example Series', universeId: 'universe-1' });
+    renderPage();
+    expect(await screen.findByRole('link', { name: /open first issue/i })).toHaveAttribute('href', '/pipeline/issues/issue-1');
+    expect(screen.getByRole('link', { name: /universe bible/i })).toHaveAttribute('href', '/universes/universe-1');
+    expect(screen.getByRole('tabpanel')).toHaveAttribute('id', 'series-editor-issues');
+    fireEvent.click(screen.getByRole('tab', { name: 'Autopilot' }));
+    expect(screen.getByRole('tabpanel')).toHaveAttribute('id', 'series-editor-autopilot');
+    expect(screen.getByText('arc canvas')).toBeInTheDocument();
+    expect(screen.getByText('arc canvas').closest('[role="tabpanel"]')).toHaveAttribute('hidden');
+  });
+
+  it('owns a page scroll region below lg after the bible reflows above the canvas', async () => {
+    renderPage();
+
+    const page = (await screen.findByRole('heading', { name: 'Example Series' })).closest('.h-full');
+    expect(page).toHaveClass('overflow-y-auto');
+    expect(page).toHaveClass('lg:overflow-hidden');
+  });
+
+  it('caps premise, logline and style notes at the server limits (#9140)', async () => {
+    getPipelineSeries.mockResolvedValue({ id: 'series-1', name: 'Example Series', premise: 'x'.repeat(12_000) });
+    renderPage();
+    await screen.findByRole('heading', { name: 'Example Series' });
+    const premise = screen.getByPlaceholderText(/Longer free-form premise/);
+    expect(premise).toHaveAttribute('maxlength', String(PREMISE_MAX));
+    expect(premise.value).toHaveLength(12_000);
+    expect(screen.getByPlaceholderText(/moebius linework/)).toHaveAttribute('maxlength', String(STYLE_NOTES_MAX));
+    expect(document.querySelector(`[maxlength="${LOGLINE_MAX}"]`)).not.toBeNull();
+  });
+});
+
+describe('Pipeline series detail — unsaved bible edits (#8423)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockBibleDirty = true;
+    getPipelineSeries.mockResolvedValue({ id: 'series-1', name: 'Example Series' });
+    listPipelineIssues.mockResolvedValue([]);
+    listUniverses.mockResolvedValue([]);
+  });
+
+  it('parks a switch to another series behind the discard prompt', async () => {
+    const { router } = renderPage();
+    await screen.findByRole('heading', { name: 'Example Series' });
+
+    await act(async () => { router.navigate('/pipeline/series/series-2'); });
+    expect(screen.getByText('Discard your unsaved series bible changes?')).toBeInTheDocument();
+    expect(router.state.location.pathname).toBe('/pipeline/series/series-1');
+
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Discard' })); });
+    expect(router.state.location.pathname).toBe('/pipeline/series/series-2');
+  });
+});

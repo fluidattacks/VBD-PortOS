@@ -1,0 +1,125 @@
+{
+  "records": {
+    "song-seed-hotrs-guitar": {
+      "title": "House of the Rising Sun",
+      "artist": "Traditional",
+      "instrument": "guitar",
+      "stage": "new",
+      "tags": [
+        "folk",
+        "traditional",
+        "public-domain"
+      ],
+      "key": "Am",
+      "capo": 0,
+      "tuning": "EADGBE standard",
+      "sourceUrl": "",
+      "content": {
+        "format": "tab",
+        "text": "[Verse 1]\nAm        C         D         F\nThere is a house in New Orleans\nAm        C     E\nThey call the Rising Sun\nAm            C       D             F\nAnd it's been the ruin of many a poor boy\nAm       E        Am\nAnd God, I know I'm one\n\n[Verse 2]\nAm       C         D          F\nMy mother was a tailor\nAm           C          E\nShe sewed my new blue jeans\nAm       C       D           F\nMy father was a gambling man\nAm       E       Am\nDown in New Orleans\n\n[Verse 3]\nAm         C          D        F\nOh mother, tell your children\nAm        C           E\nNot to do what I have done\nAm          C        D          F\nSpend your lives in sin and misery\nAm           E          Am\nIn the house of the Rising Sun"
+      },
+      "notes": "Arpeggiated 6/8 — the classic pattern. Traditional song, public domain.",
+      "attachments": [],
+      "createdAt": "2026-07-15T00:00:00.000Z",
+      "updatedAt": "2026-07-15T00:00:00.000Z",
+      "originInstanceId": "seed"
+    },
+    "song-seed-hotrs-piano": {
+      "title": "House of the Rising Sun",
+      "artist": "Traditional",
+      "instrument": "piano",
+      "stage": "new",
+      "tags": [
+        "folk",
+        "traditional",
+        "public-domain"
+      ],
+      "key": "Am",
+      "capo": 0,
+      "tuning": "",
+      "sourceUrl": "",
+      "content": {
+        "format": "tab",
+        "text": "[Verse 1]\nAm        C         D         F\nThere is a house in New Orleans\nAm        C     E\nThey call the Rising Sun\nAm            C       D             F\nAnd it's been the ruin of many a poor boy\nAm       E        Am\nAnd God, I know I'm one\n\n[Verse 2]\nAm       C         D          F\nMy mother was a tailor\nAm           C          E\nShe sewed my new blue jeans\nAm       C       D           F\nMy father was a gambling man\nAm       E       Am\nDown in New Orleans\n\n[Verse 3]\nAm         C          D        F\nOh mother, tell your children\nAm        C           E\nNot to do what I have done\nAm          C        D          F\nSpend your lives in sin and misery\nAm           E          Am\nIn the house of the Rising Sun"
+      },
+      "notes": "Roll the chords in 6/8; melody sits on top of Am–C–D–F. Traditional song, public domain.",
+      "attachments": [],
+      "createdAt": "2026-07-15T00:00:00.000Z",
+      "updatedAt": "2026-07-15T00:00:00.000Z",
+      "originInstanceId": "seed"
+    },
+    "song-seed-hotrs-ukulele": {
+      "title": "House of the Rising Sun",
+      "artist": "Traditional",
+      "instrument": "ukulele",
+      "stage": "new",
+      "tags": [
+        "folk",
+        "traditional",
+        "public-domain"
+      ],
+      "key": "Am",
+      "capo": 0,
+      "tuning": "GCEA",
+      "sourceUrl": "",
+      "content": {
+        "format": "tab",
+        "text": "[Verse 1]\nAm        C         D         F\nThere is a house in New Orleans\nAm        C     E\nThey call the Rising Sun\nAm            C       D             F\nAnd it's been the ruin of many a poor boy\nAm       E        Am\nAnd God, I know I'm one\n\n[Verse 2]\nAm       C         D          F\nMy mother was a tailor\nAm           C          E\nShe sewed my new blue jeans\nAm       C       D           F\nMy father was a gambling man\nAm       E       Am\nDown in New Orleans\n\n[Verse 3]\nAm         C          D        F\nOh mother, tell your children\nAm        C           E\nNot to do what I have done\nAm          C        D          F\nSpend your lives in sin and misery\nAm           E          Am\nIn the house of the Rising Sun"
+      },
+      "notes": "Same shapes as guitar — Am, C, D, F, E are all first-position on uke. Traditional song, public domain.",
+      "attachments": [],
+      "createdAt": "2026-07-15T00:00:00.000Z",
+      "updatedAt": "2026-07-15T00:00:00.000Z",
+      "originInstanceId": "seed"
+    },
+    "song-seed-hotrs-drums": {
+      "title": "House of the Rising Sun",
+      "artist": "Traditional",
+      "instrument": "drums",
+      "stage": "new",
+      "tags": [
+        "folk",
+        "traditional",
+        "public-domain",
+        "drums"
+      ],
+      "key": "Am",
+      "capo": 0,
+      "tuning": "",
+      "sourceUrl": "",
+      "content": {
+        "format": "drum",
+        "text": "time: 6/8\ntempo: 228\nsubdivision: 1\n\n# Intro - guitar alone; keep the 6/8 pulse with the hi-hat foot x7\nHF: x - - x - -\n\n# Pickup fill - drums enter on the last intro bar\nT1: - - - o - -\nT2: - - - - o -\nS:  - - - - - o\nK:  o - - - - -\n\n# Verse groove - hats on every eighth, kick on 1, snare on 4 x7\nHH: x x x x x x\nS:  - - - o - -\nK:  o - - - - -\n\n# Verse turnaround - an extra kick pushes into the next section\nHH: x x x x x x\nS:  - - - o - g\nK:  o - - - o -\n\n# Organ break - move to the ride, kick on both pulses x7\nRD: x x x x x x\nS:  - - - o - -\nK:  o - - o - -\n\n# Break fill - walk down the toms\nS:  o - o - - -\nT1: - - - o - -\nT2: - - - - o -\nFT: - - - - - o\nK:  o - - - - -\n\n# Last verse - crash in and accent the backbeat\nCR: X - - - - -\nRD: x x x x x x\nS:  - - - X - -\nK:  o - - o - o\n\n# ...and hold that groove x6\nRD: x x x x x x\nS:  - - - X - -\nK:  o - - o - o\n\n# Ending - flam the last backbeat and let the crash ring\nCR: X - - - - -\nS:  - - - f - -\nK:  o - - - - -"
+      },
+      "notes": "Drum part for the SongBook's canonical song, so the guitar/piano/ukulele seeds have something to play against. 6/8 throughout — one cell per eighth, counted 1-2-3 4-5-6, with the kick on 1 and the snare on 4. The written 228 is the EIGHTH note (dotted quarter ~76), so start at 50-75% with the BPM control and work up. Drums sit out the 8-bar intro (hi-hat foot keeps the pulse), enter on the pickup fill, then verse groove on hats, organ break on the ride, and a flam into the final crash. 32 bars = four times through the 8-bar Am-C-D-F-Am-C-E-E progression. Traditional song, public domain.",
+      "attachments": [],
+      "createdAt": "2026-07-29T00:00:00.000Z",
+      "updatedAt": "2026-07-29T00:00:00.000Z",
+      "originInstanceId": "seed"
+    },
+    "song-seed-example-rock-beat": {
+      "title": "Example Rock Beat",
+      "artist": "The Placeholders",
+      "instrument": "drums",
+      "stage": "new",
+      "tags": [
+        "drums",
+        "groove",
+        "example"
+      ],
+      "key": "",
+      "capo": 0,
+      "tuning": "",
+      "sourceUrl": "",
+      "content": {
+        "format": "drum",
+        "text": "time: 4/4\ntempo: 96\nsubdivision: 2\n\n# Basic rock beat x2\nHH: x x x x x x x x\nS:  - - - - o - - -\nK:  o - - - - - o -\n\n# Open hats and a ghost\nHH: x - o - x - o -\nS:  - - - - o - - g\nK:  o - - o - - o -\n\n# Fill down the toms\nS:  x - x - X - - -\nT1: - - - - - x - -\nT2: - - - - - - x -\nFT: - - - - - - - x\nK:  o - - - o - - -\n\n# Crash and out\nCR: X - - - - - - -\nK:  o - - - - - - -"
+      },
+      "notes": "Worked example of the PortOS drum-grid format: two bars of a basic rock beat, a bar with open hi-hats and a ghost snare, a fill down the toms, and a crash. Practice it slower with the BPM control, then loop the fill bar.",
+      "attachments": [],
+      "createdAt": "2026-07-26T00:00:00.000Z",
+      "updatedAt": "2026-07-26T00:00:00.000Z",
+      "originInstanceId": "seed"
+    }
+  }
+}

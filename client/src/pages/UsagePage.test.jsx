@@ -1,0 +1,658 @@
+import socket from '../services/socket';
+vi.mock('../services/socket', async () => {
+  const { EventEmitter } = await import('events');
+  return { default: new EventEmitter() };
+});
+afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { MemoryRouter } from 'react-router';
+
+const api = vi.hoisted(() => ({
+  getClaudeCodeModelUsage: vi.fn(() => Promise.resolve({ filesScanned: 0, models: [], totals: {} })),
+  getProviderUsage: vi.fn(),
+  getUsage: vi.fn(),
+  getUsageBackfillStatus: vi.fn(),
+  startUsageBackfill: vi.fn(),
+  updateSubscriptionCosts: vi.fn()
+}));
+
+vi.mock('../services/api', () => api);
+
+const UsagePageModule = await import('./UsagePage');
+const UsagePage = UsagePageModule.default;
+const { arrangeQuotaCells } = UsagePageModule;
+
+const usage = {
+  totalSessions: 1,
+  totalMessages: 1,
+  totalTokens: { input: 10, output: 5 },
+  last7Days: [],
+  hourlyActivity: Array(24).fill(0),
+  topProviders: [],
+  topModels: [],
+  report: {
+    pricingAsOf: '2026-07-01',
+    providers: [],
+    totals: { estimatedCost: 0, source: 'estimate' }
+  }
+};
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  api.getProviderUsage.mockResolvedValue({ providers: [] });
+  api.getUsage.mockResolvedValue(usage);
+  api.getUsageBackfillStatus.mockResolvedValue({ status: 'idle' });
+  api.startUsageBackfill.mockResolvedValue({ status: 'complete', corrected: 2 });
+  api.updateSubscriptionCosts.mockResolvedValue({ costs: { claude: 200 } });
+});
+
+describe('UsagePage subscription savings', () => {
+  it('updates quota cards on completion without recurring fetches', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(<MemoryRouter><UsagePage /></MemoryRouter>);
+    await waitFor(() => expect(api.getProviderUsage).toHaveBeenCalledTimes(1));
+    await act(async () => { await vi.advanceTimersByTimeAsync(12_000); });
+    expect(api.getProviderUsage).toHaveBeenCalledTimes(1);
+    api.getProviderUsage.mockResolvedValue({ providers: [{
+      family: 'claude', label: 'Claude Code', supported: true,
+      limits: [{ key: 'week', label: 'Updated window', percentUsed: 73, percentRemaining: 27 }],
+    }] });
+    await act(async () => { socket.emit('provider-quota:updated', {}); });
+    expect(await screen.findByText('Updated window')).toBeInTheDocument();
+    expect(api.getProviderUsage).toHaveBeenCalledTimes(2);
+    expect(api.getProviderUsage).toHaveBeenLastCalledWith({ refresh: false });
+  });
+
+  const savings = {
+    range: { start: '2026-02-01', end: '2026-02-07', days: 7 },
+    configured: false,
+    unmatchedApiCost: 0,
+    families: [{
+      family: 'claude', label: 'Claude Code', enabled: true, monthlyCost: 0, configured: false,
+      periodCost: 0, apiCost: 30, savings: 0, multiplier: null
+    }],
+    totals: { monthlyCost: 0, periodCost: 0, apiCost: 0, savings: 0, savingsPercent: null, multiplier: null }
+  };
+
+  it('renders the savings editor from the report payload', async () => {
+    api.getUsage.mockResolvedValue({ ...usage, subscriptionSavings: savings });
+    render(<MemoryRouter><UsagePage /></MemoryRouter>);
+    expect(screen.getByRole('tab', { name: 'Usage' })).toHaveAttribute('aria-selected', 'true');
+    expect(await screen.findByText('Subscription vs. API Cost')).toBeInTheDocument();
+  });
+
+  // A new plan price changes every derived figure in the report, so saving one
+  // has to pull the whole report back down — not just the prices.
+  it('refetches the report after a price is saved', async () => {
+    api.getUsage.mockResolvedValue({ ...usage, subscriptionSavings: savings });
+    render(<MemoryRouter><UsagePage /></MemoryRouter>);
+
+    const inputs = await screen.findAllByLabelText('Monthly cost for Claude Code');
+    fireEvent.change(inputs[0], { target: { value: '200' } });
+    const calls = api.getUsage.mock.calls.length;
+    fireEvent.click(screen.getByRole('button', { name: /Save costs/ }));
+
+    await waitFor(() => expect(api.updateSubscriptionCosts).toHaveBeenCalledWith({ claude: 200 }, { silent: true }));
+    await waitFor(() => expect(api.getUsage.mock.calls.length).toBeGreaterThan(calls));
+  });
+});
+
+describe('UsagePage historical reconciliation', () => {
+  it('renders backfill events without polling and reconciles missed updates', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    api.getUsageBackfillStatus.mockResolvedValue({ status: 'running', processed: 1, total: 5 });
+    render(<MemoryRouter><UsagePage /></MemoryRouter>);
+    expect(await screen.findByText('Processing 1 of 5 runs…')).toBeInTheDocument();
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+    expect(api.getUsageBackfillStatus).toHaveBeenCalledTimes(1);
+    api.getUsageBackfillStatus.mockResolvedValue({ status: 'running', processed: 3, total: 5 });
+    await act(async () => { socket.emit('usage-backfill:updated', {}); });
+    expect(await screen.findByText('Processing 3 of 5 runs…')).toBeInTheDocument();
+    expect(api.getUsageBackfillStatus).toHaveBeenCalledTimes(2);
+    const usageReads = api.getUsage.mock.calls.length;
+    api.getUsageBackfillStatus.mockResolvedValue({ status: 'complete', corrected: 4 });
+    await act(async () => { socket.emit('usage-backfill:updated', {}); });
+    expect(await screen.findByText('Corrected 4 runs.')).toBeInTheDocument();
+    expect(api.getUsage.mock.calls.length).toBe(usageReads + 1);
+    await act(async () => { socket.emit('connect'); });
+    expect(api.getUsageBackfillStatus).toHaveBeenCalledTimes(4);
+    const visibility = vi.spyOn(document, 'visibilityState', 'get');
+    visibility.mockReturnValue('hidden');
+    act(() => document.dispatchEvent(new Event('visibilitychange')));
+    api.getUsageBackfillStatus.mockResolvedValue({ status: 'error', error: 'Example scan failed' });
+    visibility.mockReturnValue('visible');
+    await act(async () => document.dispatchEvent(new Event('visibilitychange')));
+    expect(api.getUsageBackfillStatus).toHaveBeenCalledTimes(5);
+    expect(await screen.findByText('Example scan failed')).toBeInTheDocument();
+  });
+
+  it('reconciles a completion that beats the start response', async () => {
+    api.startUsageBackfill.mockResolvedValue({ status: 'running' });
+    render(<MemoryRouter><UsagePage /></MemoryRouter>);
+    const button = await screen.findByRole('button', { name: 'Reconcile now' });
+    api.getUsageBackfillStatus.mockResolvedValue({ status: 'complete', corrected: 3 });
+    fireEvent.click(button);
+    expect(await screen.findByText('Corrected 3 runs.')).toBeInTheDocument();
+    expect(api.startUsageBackfill).toHaveBeenCalledTimes(1);
+  });
+
+  it('starts only from the explicit user action and reports completion', async () => {
+    render(<MemoryRouter><UsagePage /></MemoryRouter>);
+
+    const button = await screen.findByRole('button', { name: 'Reconcile now' });
+    expect(api.startUsageBackfill).not.toHaveBeenCalled();
+
+    fireEvent.click(button);
+    await waitFor(() => expect(api.startUsageBackfill).toHaveBeenCalledWith({ silent: true }));
+    expect(await screen.findByText('Corrected 2 runs.')).toBeInTheDocument();
+  });
+});
+
+describe('UsagePage breakdown visualization and responsiveness', () => {
+  it('renders top providers and top models with visual percentage badges and cost metrics', async () => {
+    const richUsage = {
+      ...usage,
+      topProviders: [
+        { id: 'claude', name: 'Claude Code', sessions: 10, tokens: 8000 }
+      ],
+      topModels: [
+        { model: 'claude-3-7-sonnet', sessions: 10, tokens: 8000 }
+      ],
+      report: {
+        pricingAsOf: '2026-07-01',
+        providers: [
+          {
+            id: 'claude',
+            name: 'Claude Code',
+            sessions: 10,
+            tokensIn: 5000,
+            tokensOut: 3000,
+            cacheReadTokens: 1000,
+            cacheWriteTokens: 200,
+            estimatedCost: 1.5,
+            source: 'measured',
+            models: [
+              {
+                model: 'claude-3-7-sonnet',
+                sessions: 10,
+                tokensIn: 5000,
+                tokensOut: 3000,
+                cacheReadTokens: 1000,
+                cacheWriteTokens: 200,
+                estimatedCost: 1.5
+              }
+            ]
+          }
+        ],
+        totals: { estimatedCost: 1.5, source: 'measured' }
+      }
+    };
+    api.getUsage.mockResolvedValue(richUsage);
+
+    render(<MemoryRouter><UsagePage /></MemoryRouter>);
+
+    expect(await screen.findByText('Top Providers')).toBeInTheDocument();
+    expect(screen.getByText('Top Models')).toBeInTheDocument();
+
+    // Check percentage share badges and cost
+    const percentBadges = screen.getAllByText('100%');
+    expect(percentBadges.length).toBeGreaterThan(0);
+
+    const costDisplays = screen.getAllByText('$1.50');
+    expect(costDisplays.length).toBeGreaterThan(0);
+  });
+});
+
+describe('UsagePage per-provider refresh', () => {
+  const card = (family, label, percentUsed) => ({
+    family,
+    label,
+    supported: true,
+    limits: [{ key: 'week', label: 'Weekly', percentUsed, percentRemaining: 100 - percentUsed }],
+    activity: [],
+    approximate: true,
+    fetchedAt: new Date().toISOString()
+  });
+
+  beforeEach(() => {
+    api.getProviderUsage.mockResolvedValue({ providers: [card('claude', 'Claude Code', 10), card('grok', 'Grok', 20)] });
+  });
+
+  it('re-reads only the clicked provider and swaps that card in', async () => {
+    render(<MemoryRouter><UsagePage /></MemoryRouter>);
+
+    await screen.findByText('Grok');
+    expect(await screen.findByText('20% used')).toBeInTheDocument();
+
+    api.getProviderUsage.mockResolvedValueOnce({ providers: [card('grok', 'Grok', 77)] });
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh Grok usage' }));
+
+    await waitFor(() => expect(api.getProviderUsage).toHaveBeenCalledWith({ refresh: true, family: 'grok', silent: false }));
+    // The refreshed card updates; the untouched Claude card keeps its reading.
+    expect(await screen.findByText('77% used')).toBeInTheDocument();
+    expect(screen.getByText('10% used')).toBeInTheDocument();
+  });
+
+  // The per-card control was a bare 12-14px icon (#8779): a finger that missed
+  // it fell back on Refresh all, which respawns every family's scrape.
+  it('gives both refresh controls a 44px touch target and blocks a duplicate per-card request', async () => {
+    render(<MemoryRouter><UsagePage /></MemoryRouter>);
+    const grokRefresh = await screen.findByRole('button', { name: 'Refresh Grok usage' });
+    const refreshAll = screen.getByRole('button', { name: /Refresh all/ });
+    for (const button of [grokRefresh, refreshAll]) {
+      expect(button.className.split(/\s+/)).toEqual(expect.arrayContaining(['min-w-11', 'min-h-11']));
+    }
+
+    let settle;
+    api.getProviderUsage.mockClear();
+    api.getProviderUsage.mockReturnValueOnce(new Promise((resolve) => { settle = resolve; }));
+    fireEvent.click(grokRefresh);
+    await waitFor(() => expect(grokRefresh).toBeDisabled());
+    fireEvent.click(grokRefresh);
+    expect(api.getProviderUsage).toHaveBeenCalledTimes(1);
+    expect(api.getProviderUsage).toHaveBeenCalledWith({ refresh: true, family: 'grok', silent: false });
+    // The untouched card stays tappable while Grok's scrape is in flight.
+    expect(screen.getByRole('button', { name: 'Refresh Claude Code usage' })).toBeEnabled();
+
+    settle({ providers: [card('grok', 'Grok', 50)] });
+    expect(await screen.findByText('50% used')).toBeInTheDocument();
+    expect(grokRefresh).toBeEnabled();
+  });
+
+  it('keeps the four provider cards in a compact mobile grid', async () => {
+    api.getProviderUsage.mockResolvedValue({
+      providers: ['claude', 'agy', 'codex', 'grok'].map((family) => card(family, family, 20))
+    });
+    render(<MemoryRouter><UsagePage /></MemoryRouter>);
+
+    const providerGrid = await screen.findByLabelText('Subscription provider usage');
+    expect(providerGrid.className.split(/\s+/)).toEqual(
+      expect.arrayContaining(['grid-cols-2', 'sm:grid-cols-1', 'lg:grid-cols-2'])
+    );
+    expect(within(providerGrid).getAllByRole('heading')).toHaveLength(4);
+  });
+
+  it('drops a card whose provider is no longer enabled', async () => {
+    render(<MemoryRouter><UsagePage /></MemoryRouter>);
+    await screen.findByText('Grok');
+
+    api.getProviderUsage.mockResolvedValueOnce({ providers: [] });
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh Grok usage' }));
+
+    await waitFor(() => expect(screen.queryByText('Grok')).not.toBeInTheDocument());
+    expect(screen.getByText('Claude Code')).toBeInTheDocument();
+  });
+});
+
+describe('UsagePage federated quota readings', () => {
+  const fleetCard = {
+    family: 'claude',
+    label: 'Claude Code',
+    supported: true,
+    limits: [{ key: 'week', label: 'Weekly', percentUsed: 65, percentRemaining: 35 }],
+    activity: [],
+    approximate: true,
+    fetchedAt: '2026-09-03T11:00:00.000Z',
+    note: 'Across 2 federated instances (this machine, Example Box) — meters show the freshest reading across them.',
+    fleet: {
+      count: 2,
+      instances: [
+        { instanceId: 'inst-self', name: null, self: true, fetchedAt: '2026-09-03T10:00:00.000Z' },
+        { instanceId: 'inst-peer', name: 'Example Box', self: false, fetchedAt: '2026-09-03T11:00:00.000Z' },
+      ],
+    },
+  };
+
+  it('shows the subscription plan name on the quota card when the reading named a tier', async () => {
+    api.getProviderUsage.mockResolvedValue({
+      providers: [{
+        family: 'grok',
+        label: 'Grok',
+        supported: true,
+        plan: 'SuperGrok',
+        limits: [{ key: 'week', label: 'Weekly', percentUsed: 8, percentRemaining: 92 }],
+        activity: [],
+        approximate: true,
+        fetchedAt: '2026-09-03T11:00:00.000Z',
+      }],
+    });
+    render(<MemoryRouter><UsagePage /></MemoryRouter>);
+    expect(await screen.findByText('SuperGrok')).toBeInTheDocument();
+  });
+
+  it('says the card spans instances and names which ones', async () => {
+    api.getProviderUsage.mockResolvedValue({ providers: [fleetCard] });
+    render(<MemoryRouter><UsagePage /></MemoryRouter>);
+
+    const pill = await screen.findByText('2 instances');
+    expect(pill.closest('[title]').getAttribute('title')).toContain('Example Box');
+    expect(screen.getByText(fleetCard.note)).toBeInTheDocument();
+  });
+
+  it('shows no fleet pill on a single-machine install', async () => {
+    api.getProviderUsage.mockResolvedValue({ providers: [{ ...fleetCard, fleet: undefined, note: 'This machine only — other federated instances have not reported a reading yet.' }] });
+    render(<MemoryRouter><UsagePage /></MemoryRouter>);
+
+    await screen.findByText('Claude Code');
+    expect(screen.queryByText(/^\d+ instances$/)).not.toBeInTheDocument();
+  });
+
+  // A federated card can be filled by a peer while this machine's own scrape is
+  // still running. The meters are worth showing meanwhile, but the card must
+  // keep saying it is still reading — that flag is what keeps the page polling
+  // until the local reading lands, instead of settling on a stand-in.
+  it('shows a peer reading while this machine is still scraping, without hiding that it is still reading', async () => {
+    api.getProviderUsage.mockResolvedValue({ providers: [{ ...fleetCard, pending: true }] });
+    render(<MemoryRouter><UsagePage /></MemoryRouter>);
+
+    // Both, not either: the meters are the best number available right now, and
+    // the spinner is what says a better one is coming (and what the page's
+    // pending poll keys on, so the local reading actually swaps in).
+    expect(await screen.findByText('65% used')).toBeInTheDocument();
+    expect(screen.getByText("Reading this machine's usage…")).toBeInTheDocument();
+  });
+
+  it("attributes a meter standing on another machine's older reading", async () => {
+    const hoursAgo = (h) => new Date(Date.now() - h * 60 * 60 * 1000).toISOString();
+    // `stale` is now a server-computed verdict (period-relative, see
+    // server/lib/quotaWindows.js) — this fixture stands in for what the API
+    // would have stamped: the 50h-old weekly reading is well past its window's
+    // threshold, the moment-old session reading is not.
+    api.getProviderUsage.mockResolvedValue({ providers: [{
+      ...fleetCard,
+      limits: [
+        { key: 'week', label: 'Weekly', percentUsed: 12, percentRemaining: 88, readAt: hoursAgo(50), readBy: 'inst-peer', readByName: 'Example Box', stale: true },
+        { key: 'session', label: 'Session', percentUsed: 30, percentRemaining: 70, readAt: hoursAgo(0), readBy: null, readByName: null, stale: false },
+      ],
+    }] });
+    render(<MemoryRouter><UsagePage /></MemoryRouter>);
+
+    // The stand-in says whose reading it is and how old — a 12% weekly figure
+    // read two days ago must not read as this moment's.
+    expect(await screen.findByText(/read 2d ago on Example Box/)).toBeInTheDocument();
+    // This machine's own reading carries no such caption.
+    expect(screen.getByText('30% used')).toBeInTheDocument();
+  });
+});
+
+describe('UsagePage mobile provider-card layout', () => {
+  const metricsCard = {
+    family: 'image_gen',
+    label: 'Image Gen',
+    supported: true,
+    plan: 'pro',
+    limits: [],
+    activity: [],
+    metrics: [
+      { key: 'codex', label: 'Codex · image_gen', value: 'No renders · 24h', detail: 'quota not reported by this CLI' },
+      { key: 'grok', label: 'Grok · image_gen', value: 'No renders · 24h', detail: 'quota not reported by this CLI' },
+    ],
+    fleet: {
+      count: 2,
+      instances: [
+        { instanceId: 'inst-self', name: null, self: true, fetchedAt: '2026-09-03T10:00:00.000Z' },
+        { instanceId: 'inst-peer', name: 'Example Box', self: false, fetchedAt: '2026-09-03T11:00:00.000Z' },
+      ],
+    },
+  };
+
+  // Two cards share the row at phone width, so the header badges are
+  // desktop-only and the observed-count tiles stack. Both were regressions the
+  // class strings alone did not deliver: `Pill` used to re-assert its own
+  // `inline-flex` over the caller's `hidden` (see OWN_DISPLAY in Pill.jsx), and
+  // two columns of tiles inside a half-width card wrapped every label onto four
+  // lines.
+  it('hides the header badges and stacks the count tiles at phone width', async () => {
+    api.getProviderUsage.mockResolvedValue({ providers: [metricsCard] });
+    render(<MemoryRouter><UsagePage /></MemoryRouter>);
+
+    await screen.findByRole('heading', { name: 'Image Gen' });
+    for (const badge of [screen.getByText('pro'), screen.getByText('2 instances')]) {
+      const tokens = badge.className.split(/\s+/);
+      expect(tokens).toContain('hidden');
+      expect(tokens).not.toContain('inline-flex');
+    }
+
+    const tileGrid = screen.getByText('Codex · image_gen').closest('.grid');
+    expect(tileGrid.className.split(/\s+/)).toEqual(
+      expect.arrayContaining(['grid-cols-1', 'sm:grid-cols-2'])
+    );
+  });
+});
+
+describe('arrangeQuotaCells', () => {
+  const q = (family) => ({ family, label: family });
+
+  it('orders Claude, Antigravity, then a shared Codex+Grok cell, then the rest', () => {
+    // Server order deliberately differs from display order.
+    const cells = arrangeQuotaCells(['claude', 'codex', 'agy', 'grok', 'imagegen'].map(q));
+    expect(cells.map((c) => c.cards.map((card) => card.family))).toEqual([
+      ['claude'], ['agy'], ['codex', 'grok'], ['imagegen']
+    ]);
+  });
+
+  it('collapses a shared cell to the one family of the pair that is enabled', () => {
+    const cells = arrangeQuotaCells([q('grok'), q('claude')]);
+    expect(cells.map((c) => c.key)).toEqual(['claude', 'grok']);
+  });
+
+  it('renders a family it has no display preference for exactly once, in server order', () => {
+    const cells = arrangeQuotaCells([q('imagegen'), q('newthing')]);
+    expect(cells.map((c) => c.cards.map((card) => card.family))).toEqual([['imagegen'], ['newthing']]);
+  });
+});
+
+describe('UsagePage provider reset times', () => {
+  it('localizes an ISO reset and adds the relative countdown', async () => {
+    // A minute past the 3h mark, so the floor in `timeUntil` can't round to 2h.
+    const resetsAt = new Date(Date.now() + 3 * 60 * 60 * 1000 + 60_000).toISOString();
+    api.getProviderUsage.mockResolvedValue({
+      providers: [{
+        family: 'claude',
+        label: 'Claude',
+        supported: true,
+        limits: [{ key: 'week', label: 'Weekly', percentUsed: 40, percentRemaining: 60, resetsAt, timezone: 'UTC' }],
+        activity: [],
+        approximate: true,
+        fetchedAt: new Date().toISOString()
+      }]
+    });
+
+    render(<MemoryRouter><UsagePage /></MemoryRouter>);
+
+    // Every adapter emits ISO now, so the card must never show a CLI's own
+    // wording — it shows a localized instant plus "in 3h".
+    const reset = await screen.findByText(/resets .*\(in 3h\)/);
+    expect(reset).toBeInTheDocument();
+    expect(reset.className.split(/\s+/)).not.toContain('hidden');
+    expect(reset.textContent).not.toContain(resetsAt);
+  });
+
+  it('gives the Grok weekly reset its own full-width row on the cramped mobile card', async () => {
+    // Grok shares a mobile grid cell with Codex, so its card is the narrowest —
+    // the reset row must stack under "% used" (flex-col) rather than squeeze
+    // onto the same line (flex-row), which was clipping/overlapping it.
+    const resetsAt = new Date(Date.now() + 2 * 24 * 60 * 60 * 1000 + 60_000).toISOString();
+    api.getProviderUsage.mockResolvedValue({
+      providers: [{
+        family: 'grok',
+        label: 'Grok',
+        supported: true,
+        limits: [{ key: 'weekly', label: 'Weekly', percentUsed: 8, percentRemaining: 92, resetsAt }],
+        activity: [],
+        approximate: true,
+        fetchedAt: new Date().toISOString()
+      }]
+    });
+
+    render(<MemoryRouter><UsagePage /></MemoryRouter>);
+
+    const reset = await screen.findByText(/resets .*\(in 2d\)/);
+    expect(reset.className.split(/\s+/)).not.toContain('hidden');
+    const row = reset.parentElement;
+    expect(row.className.split(/\s+/)).toEqual(expect.arrayContaining(['flex-col', 'sm:flex-row']));
+  });
+});
+
+// The provider-quota section reads every provider on mount, well after the page
+// shell has painted. A centered spinner there let the whole page below it jump
+// by the card grid's height once the reading landed (#4147).
+describe('UsagePage provider-quota loading state (#4147)', () => {
+  it('reserves the quota card grid instead of centering a spinner', async () => {
+    // Never resolves — hold the section on its loading branch.
+    api.getProviderUsage.mockReturnValue(new Promise(() => {}));
+
+    render(<MemoryRouter><UsagePage /></MemoryRouter>);
+
+    const region = await screen.findByRole('status', { name: 'Reading provider usage' });
+    expect(region).toHaveAttribute('aria-busy', 'true');
+    expect(region.querySelectorAll('.animate-pulse').length).toBeGreaterThan(0);
+    // Mirrors the loaded grid so the cards land where the placeholders were.
+    expect(region.innerHTML).toContain('lg:grid-cols-2');
+  });
+});
+
+describe('UsagePage free-tier section (#7408)', () => {
+  const freeTier = {
+    basis: 'ledger',
+    providers: [{
+      id: 'opencode-zen-cli',
+      name: 'OpenCode Zen CLI',
+      free: true,
+      sessions: 3,
+      messages: 5,
+      tokensIn: 1200,
+      tokensOut: 3400,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      source: 'mixed',
+      estimatedCost: 0,
+      rateMatch: 'free',
+      models: [{
+        model: 'opencode/big-pickle',
+        sessions: 3,
+        messages: 5,
+        tokensIn: 1200,
+        tokensOut: 3400,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        source: 'mixed',
+        estimatedCost: 0,
+        rateMatch: 'free'
+      }]
+    }],
+    blocks: [{
+      providerId: 'opencode-zen-cli',
+      model: null,
+      category: 'usage-limit',
+      message: 'hit your usage limit',
+      resetHint: '2 hours',
+      at: Date.now() - 60_000,
+      volumeSince: { sessions: 1, messages: 2, tokensIn: 100, tokensOut: 200 }
+    }]
+  };
+
+  it('renders free-tier queries, tokens, and the observed block from the report payload', async () => {
+    api.getUsage.mockResolvedValue({ ...usage, freeTier });
+    render(<MemoryRouter><UsagePage /></MemoryRouter>);
+
+    expect(await screen.findByText('Free-tier usage')).toBeInTheDocument();
+    expect(screen.getByText('OpenCode Zen CLI')).toBeInTheDocument();
+    expect(screen.getByText('opencode/big-pickle')).toBeInTheDocument();
+    // Observed block with its reset hint and since-volume.
+    expect(screen.getByText(/provider said: 2 hours/)).toBeInTheDocument();
+    expect(screen.getByText(/out since/)).toBeInTheDocument();
+  });
+
+  it('renders an empty state when no free-tier usage exists yet', async () => {
+    api.getUsage.mockResolvedValue({ ...usage, freeTier: { basis: 'ledger', providers: [], blocks: [] } });
+    render(<MemoryRouter><UsagePage /></MemoryRouter>);
+
+    expect(await screen.findByText('No free-tier usage recorded in this period.')).toBeInTheDocument();
+  });
+});
+
+describe('UsagePage custom date range inputs', () => {
+  it('keeps a half-typed date instead of resetting it, and commits once complete', async () => {
+    api.getUsage.mockResolvedValue(usage);
+    render(<MemoryRouter><UsagePage /></MemoryRouter>);
+    // Settle mount-time fetches before interacting with the form. ClaudeCodeModelTokensCard
+    // calls getClaudeCodeModelUsage on mount; waiting here ensures all mount effects complete
+    // before we read the input value, avoiding act warnings from deferred state updates.
+    await act(async () => {});
+    const from = await screen.findByLabelText('From date');
+    const callsBefore = api.getUsage.mock.calls.length;
+
+    // Partially typed segments surface as value "" (happy-dom lacks badInput, so
+    // assert the complete-date path plus that a stray year-0002 date never commits).
+    fireEvent.change(from, { target: { value: '0002-09-29' } });
+    expect(from.value).toBe('0002-09-29');
+    expect(api.getUsage.mock.calls.length).toBe(callsBefore);
+
+    // The commit has no debounce: it updates the URL param, and an effect then refetches.
+    // Awaiting act flushes that whole chain, so the assertion never races a wall-clock timeout.
+    await act(async () => { fireEvent.change(from, { target: { value: '2026-09-29' } }); });
+    expect(api.getUsage.mock.calls.length).toBeGreaterThan(callsBefore);
+    expect(from.value).toBe('2026-09-29');
+  });
+});
+
+describe('UsagePage report range freshness (#10687)', () => {
+  const pricedUsage = (estimatedCost) => ({ ...usage, report: { ...usage.report, totals: { estimatedCost } } });
+
+  it('labels retained figures during a pending and failed replacement, then clears the error on retry', async () => {
+    api.getUsage.mockResolvedValueOnce(pricedUsage(123.45));
+    render(<MemoryRouter><UsagePage /></MemoryRouter>);
+    expect(await screen.findByText('$123.45')).toBeInTheDocument();
+    let rejectRange;
+    api.getUsage.mockReturnValueOnce(new Promise((_resolve, reject) => { rejectRange = reject; }));
+    fireEvent.click(screen.getByRole('button', { name: '30 days' }));
+    expect(await screen.findByText('Loading selected usage range…')).toBeInTheDocument();
+    expect(screen.getByText('Showing usage for 7 days. Retained figures may be stale.')).toBeInTheDocument();
+    expect(screen.getByText('$123.45')).toBeInTheDocument();
+    await act(async () => rejectRange(new Error('Example unavailable')));
+    expect(screen.getByRole('alert')).toHaveTextContent('Usage unavailable for the selected range.');
+    expect(screen.getByText('Showing usage for 7 days. Retained figures may be stale.')).toBeInTheDocument();
+    api.getUsage.mockResolvedValueOnce(pricedUsage(456.78));
+    fireEvent.click(screen.getByRole('button', { name: 'Retry usage' }));
+    expect(await screen.findByText('$456.78')).toBeInTheDocument();
+    expect(screen.getByText('Showing usage for 30 days.')).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(api.getUsage).toHaveBeenLastCalledWith({ period: '30d' }, { silent: true });
+  });
+
+  it('keeps controls and retry available after an initial invalid custom-range failure', async () => {
+    api.getUsage.mockRejectedValueOnce(new Error('Example invalid range'));
+    render(<MemoryRouter initialEntries={['/?from=2026-09-30&to=2026-09-01']}><UsagePage /></MemoryRouter>);
+    expect(await screen.findByRole('alert')).toHaveTextContent('Usage unavailable');
+    expect(screen.queryByText('No usage data available')).not.toBeInTheDocument();
+    const from = screen.getByLabelText('From date');
+    expect(from).toHaveValue('2026-09-30');
+    expect(screen.getByRole('button', { name: 'Retry usage' })).toBeEnabled();
+    api.getUsage.mockResolvedValueOnce(pricedUsage(12.34));
+    fireEvent.change(from, { target: { value: '2026-08-01' } });
+    expect(await screen.findByText('$12.34')).toBeInTheDocument();
+    expect(screen.getByText('Showing usage for 2026-08-01 to 2026-09-01.')).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('ignores a superseded failure without clearing the latest pending request or successful report', async () => {
+    render(<MemoryRouter><UsagePage /></MemoryRouter>);
+    await screen.findByText('Showing usage for 7 days.');
+    let rejectOlder;
+    let resolveLatest;
+    api.getUsage.mockReturnValueOnce(new Promise((_resolve, reject) => { rejectOlder = reject; }));
+    fireEvent.click(screen.getByRole('button', { name: '30 days' }));
+    api.getUsage.mockReturnValueOnce(new Promise((resolve) => { resolveLatest = resolve; }));
+    fireEvent.click(screen.getByRole('button', { name: '90 days' }));
+    await act(async () => rejectOlder(new Error('Example stale failure')));
+    expect(screen.getByText('Loading selected usage range…')).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    await act(async () => resolveLatest(pricedUsage(90)));
+    expect(screen.getByText('Showing usage for 90 days.')).toBeInTheDocument();
+    expect(screen.getByText('$90.00')).toBeInTheDocument();
+    expect(screen.queryByText('Loading selected usage range…')).not.toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+});

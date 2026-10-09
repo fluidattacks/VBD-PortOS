@@ -1,0 +1,1281 @@
+import { describe, it, expect, vi, beforeEach, beforeAll, afterAll } from 'vitest';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync } from 'fs';
+import { join } from 'path';
+import { tmpdir } from 'os';
+import { EventEmitter } from 'node:events';
+
+const admissionFault = vi.hoisted(() => ({ error: null }));
+vi.mock('../../lib/backupSnapshotBoundary.js', async original => {
+  const actual = await original();
+  return { ...actual, withBackupAssetPublication: (...args) => {
+    if (admissionFault.error) return Promise.reject(admissionFault.error);
+    return actual.withBackupAssetPublication(...args);
+  } };
+});
+
+// These lifecycle tests drive the child directly; preview watchers are unrelated.
+vi.mock('fs', async original => ({ ...await original(), watch: vi.fn(() => ({ close() {} })) }));
+
+const mockSpawn = vi.fn();
+vi.mock('../../lib/childProcess.js', async (original) => ({ ...await original(), spawn: (...args) => mockSpawn(...args) }));
+const releaseClaim = vi.fn(async () => {});
+vi.mock('../../lib/heavyJobClaim.js', () => ({ claimHeavyLocalJob: async () => ({ ok: true, release: releaseClaim }) }));
+vi.mock('../localMemory.js', () => ({ gpuBlockersMessage: vi.fn(), prepareLocalMemory: async () => ({ blockers: [], unloaded: [] }) }));
+vi.mock('../hfToken.js', () => ({ hfChildEnv: async () => ({}) }));
+vi.mock('../../lib/fileUtils.js', async (original) => ({ ...await original(), ensureDir: vi.fn() }));
+
+// Lets a test force the post-render degenerate-frame check to throw, without
+// touching the real frame-guard implementation the other suites exercise.
+const mockRejectDegenerateFrame = vi.fn(async () => null);
+vi.mock('./frameGuard.js', () => ({ rejectDegenerateFrame: (...args) => mockRejectDegenerateFrame(...args) }));
+
+// FLUX.2 venv resolution mock — flip between "installed" and "missing" with
+// the .returnValue setter on each test.
+const mockResolveFlux2Python = vi.fn();
+// Health is a SEPARATE probe from resolution: a half-installed venv still has
+// its python binary, which is exactly the state generateImage now refuses.
+const mockIsFlux2VenvHealthy = vi.fn(async () => true);
+vi.mock('../../lib/pythonSetup.js', () => ({
+  resolveFlux2Python: () => mockResolveFlux2Python(),
+  isFlux2VenvHealthy: (...args) => mockIsFlux2VenvHealthy(...args),
+  invalidateFlux2Health: vi.fn(),
+  FLUX2_VENV_DEFAULT: '/fake/home/.portos/venv-flux2/bin/python3',
+}));
+
+// Point the registry at a temp dir. local.js itself no longer calls
+// getImageModels() at module load — but any test that exercises a code path
+// invoking the registry (e.g. generateImage → loadMediaModels → seedIfMissing)
+// would still write to the repo's data/media-models.json without this. Save +
+// restore the prior env value and call vi.resetModules() so a previously
+// cached mediaModels.js inside the same vitest worker doesn't stick to the
+// wrong file. Pattern matches server/lib/mediaModels.test.js.
+let tmpRegistryDir;
+let priorRegistryEnv;
+let buildArgs;
+let generateImage;
+let buildSidecarMeta;
+let resolveOutputPlacement;
+let parseImageExecutionMarker;
+let PATHS;
+
+beforeAll(async () => {
+  tmpRegistryDir = mkdtempSync(join(tmpdir(), 'portos-imagegen-local-test-'));
+  priorRegistryEnv = process.env.PORTOS_MEDIA_MODELS_FILE;
+  process.env.PORTOS_MEDIA_MODELS_FILE = join(tmpRegistryDir, 'media-models.json');
+  vi.resetModules();
+  ({ buildArgs, buildSidecarMeta, resolveOutputPlacement, parseImageExecutionMarker, generateImage } = await import('./local.js'));
+  ({ PATHS } = await import('../../lib/fileUtils.js'));
+  PATHS.images = join(tmpRegistryDir, 'images');
+  mkdirSync(PATHS.images);
+});
+
+describe('imageGen local.parseImageExecutionMarker', () => {
+  const marker = (value) => `IMAGE_EXECUTION:${JSON.stringify(value)}`;
+  const confirmed = {
+    version: 1,
+    state: 'confirmed',
+    requestedDevice: 'auto',
+    effectiveDevice: 'cuda',
+    placement: 'cuda+offload',
+    cpuFallback: false,
+    runtime: { runtime: 'diffusers-image', versions: { torch: '2.7.0', prompt: 'must not persist' } },
+  };
+
+  it('accepts only the bounded runtime evidence after marker chunks are reassembled', () => {
+    expect(parseImageExecutionMarker(marker(confirmed))).toEqual({
+      ...confirmed,
+      runtime: { runtime: 'diffusers-image', versions: { torch: '2.7.0' } },
+    });
+  });
+
+  it('keeps malformed and absent markers distinct from confirmed execution', () => {
+    expect(parseImageExecutionMarker('IMAGE_EXECUTION:{not-json}')).toEqual({ state: 'malformed' });
+    expect(parseImageExecutionMarker(marker({ ...confirmed, cpuFallback: true }))).toEqual({ state: 'malformed' });
+    expect(parseImageExecutionMarker('RUNTIME:{"runtime":"diffusers-image"}')).toBeNull();
+  });
+
+  it('marks an explicit CPU path as degraded rather than accelerator-confirmed', () => {
+    expect(parseImageExecutionMarker(marker({
+      ...confirmed,
+      state: 'degraded',
+      requestedDevice: 'cuda',
+      effectiveDevice: 'cpu',
+      placement: 'cpu',
+      cpuFallback: true,
+    }))).toMatchObject({ state: 'degraded', effectiveDevice: 'cpu', cpuFallback: true });
+  });
+});
+
+afterAll(() => {
+  if (priorRegistryEnv === undefined) delete process.env.PORTOS_MEDIA_MODELS_FILE;
+  else process.env.PORTOS_MEDIA_MODELS_FILE = priorRegistryEnv;
+  rmSync(tmpRegistryDir, { recursive: true, force: true });
+});
+
+describe('imageGen local.buildArgs flux2 dispatch', () => {
+  beforeEach(() => {
+    mockResolveFlux2Python.mockReset();
+  });
+
+  const baseInput = {
+    pythonPath: '/usr/bin/python3', // unused for flux2 but kept in shape
+    prompt: 'a red cube',
+    negativePrompt: '',
+    width: 512,
+    height: 512,
+    steps: 8,
+    guidance: 3.5,
+    seed: 42,
+    quantize: '8',
+    outputPath: '/tmp/out.png',
+    loraPaths: [],
+    loraScales: [],
+    stepwiseDir: '/tmp/stepwise',
+    initImagePath: null,
+    initImageStrength: null,
+  };
+
+  it('passes Qwen references in order and enforces the combined ten-image cap', () => {
+    mockResolveFlux2Python.mockReturnValue('/fake/venv-flux2/bin/python3');
+    const input = { ...baseInput, model: { id: 'qwen-image-2.1', runner: 'qwen', repo: 'Qwen/Qwen-Image-2.1', pipelineClass: 'QwenImage21Pipeline' },
+      referenceImagePaths: Array.from({ length: 10 }, (_, i) => `/tmp/ref-${i}.png`) };
+    const { args } = buildArgs(input);
+    expect(args.slice(args.indexOf('--reference-images') + 1, args.indexOf('--reference-images') + 11)).toEqual(input.referenceImagePaths);
+    expect(() => buildArgs({ ...input, initImagePath: '/tmp/init.png' })).toThrow('at most 10');
+  });
+
+  it('routes SDNQ flux2 models to the flux2 venv + flux2_macos.py', () => {
+    mockResolveFlux2Python.mockReturnValue('/fake/venv-flux2/bin/python3');
+    const { bin, args } = buildArgs({
+      ...baseInput,
+      model: {
+        id: 'flux2-klein-4b',
+        runner: 'flux2',
+        quantization: 'sdnq',
+        repo: 'Disty0/FLUX.2-klein-4B-SDNQ-4bit-dynamic',
+        tokenizerRepo: 'black-forest-labs/FLUX.2-klein-4B',
+      },
+    });
+    expect(bin).toBe('/fake/venv-flux2/bin/python3');
+    // First arg is the script path
+    expect(args[0]).toMatch(/scripts[/\\]flux2_macos\.py$/);
+    // Required CLI fields land in the args list (order isn't important here,
+    // but we want presence + the exact repo/tokenizer values).
+    expect(args).toContain('--quantization');
+    expect(args[args.indexOf('--quantization') + 1]).toBe('sdnq');
+    expect(args).toContain('--repo');
+    expect(args[args.indexOf('--repo') + 1]).toBe('Disty0/FLUX.2-klein-4B-SDNQ-4bit-dynamic');
+    expect(args).toContain('--tokenizer-repo');
+    expect(args[args.indexOf('--tokenizer-repo') + 1]).toBe('black-forest-labs/FLUX.2-klein-4B');
+    expect(args).toContain('--prompt');
+    expect(args).toContain('a red cube');
+    expect(args).toContain('--seed');
+    expect(args[args.indexOf('--seed') + 1]).toBe('42');
+    // No --metadata flag: local.js writes the canonical sidecar itself.
+    expect(args).not.toContain('--metadata');
+    // Stepwise dir threads through so live preview frames land where local.js's watcher reads.
+    expect(args).toContain('--stepwise-image-output-dir');
+    expect(args[args.indexOf('--stepwise-image-output-dir') + 1]).toBe('/tmp/stepwise');
+  });
+
+  it('routes Int8 flux2 models with the base pipeline repo flag', () => {
+    mockResolveFlux2Python.mockReturnValue('/fake/venv-flux2/bin/python3');
+    const { args } = buildArgs({
+      ...baseInput,
+      model: {
+        id: 'flux2-klein-4b-int8',
+        runner: 'flux2',
+        quantization: 'int8',
+        repo: 'aydin99/FLUX.2-klein-4B-int8',
+        basePipelineRepo: 'black-forest-labs/FLUX.2-klein-4B',
+      },
+    });
+    expect(args[args.indexOf('--quantization') + 1]).toBe('int8');
+    expect(args[args.indexOf('--repo') + 1]).toBe('aydin99/FLUX.2-klein-4B-int8');
+    expect(args).toContain('--base-pipeline-repo');
+    expect(args[args.indexOf('--base-pipeline-repo') + 1]).toBe('black-forest-labs/FLUX.2-klein-4B');
+    // SDNQ-only flag must NOT appear when the model didn't supply tokenizerRepo.
+    expect(args).not.toContain('--tokenizer-repo');
+  });
+
+  it('routes a LoRA render off the SDNQ repo onto the bf16 base (PEFT can\'t load onto quantized weights)', () => {
+    mockResolveFlux2Python.mockReturnValue('/fake/venv-flux2/bin/python3');
+    const { args } = buildArgs({
+      ...baseInput,
+      loraPaths: ['/data/loras/example-style.safetensors'],
+      loraScales: [1.0],
+      model: {
+        id: 'flux2-klein-4b',
+        runner: 'flux2',
+        quantization: 'sdnq',
+        repo: 'Disty0/FLUX.2-klein-4B-SDNQ-4bit-dynamic',
+        tokenizerRepo: 'black-forest-labs/FLUX.2-klein-4B',
+      },
+    });
+    // Quantization forced to none + repo swapped to the gated bf16 base.
+    expect(args[args.indexOf('--quantization') + 1]).toBe('none');
+    expect(args[args.indexOf('--repo') + 1]).toBe('black-forest-labs/FLUX.2-klein-4B');
+    // SDNQ tokenizer-repo flag dropped — bf16 reads the tokenizer from the base repo.
+    expect(args).not.toContain('--tokenizer-repo');
+    // The LoRA still threads through to the runner.
+    expect(args).toContain('--lora-paths');
+    expect(args[args.indexOf('--lora-paths') + 1]).toBe('/data/loras/example-style.safetensors');
+  });
+
+  it('drops reference images when a LoRA forces the bf16 route (no kv pipeline)', () => {
+    mockResolveFlux2Python.mockReturnValue('/fake/venv-flux2/bin/python3');
+    const { args } = buildArgs({
+      ...baseInput,
+      loraPaths: ['/data/loras/x.safetensors'],
+      loraScales: [1.0],
+      referenceImagePaths: ['/data/images/ref1.png', '/data/images/ref2.png'],
+      referenceImageStrengths: [1.0, 0.8],
+      model: {
+        id: 'flux2-klein-4b',
+        runner: 'flux2',
+        quantization: 'sdnq',
+        repo: 'Disty0/FLUX.2-klein-4B-SDNQ-4bit-dynamic',
+        tokenizerRepo: 'black-forest-labs/FLUX.2-klein-4B',
+      },
+    });
+    // bf16 route taken, and the multi-ref args are dropped so the runner
+    // doesn't hard-fail on the missing kv pipeline.
+    expect(args[args.indexOf('--quantization') + 1]).toBe('none');
+    expect(args).not.toContain('--reference-images');
+    expect(args).not.toContain('--reference-strengths');
+    expect(args).not.toContain('--kv-repo');
+    // The LoRA itself still threads through.
+    expect(args).toContain('--lora-paths');
+  });
+
+  it('leaves a LoRA render on a bf16 model untouched (already unquantized)', () => {
+    mockResolveFlux2Python.mockReturnValue('/fake/venv-flux2/bin/python3');
+    const { args } = buildArgs({
+      ...baseInput,
+      loraPaths: ['/data/loras/x.safetensors'],
+      loraScales: [1.0],
+      model: {
+        id: 'flux2-klein-9b-bf16',
+        runner: 'flux2',
+        quantization: 'none',
+        repo: 'black-forest-labs/FLUX.2-klein-9B',
+      },
+    });
+    expect(args[args.indexOf('--quantization') + 1]).toBe('none');
+    expect(args[args.indexOf('--repo') + 1]).toBe('black-forest-labs/FLUX.2-klein-9B');
+  });
+
+  it('keeps a no-LoRA SDNQ render on the quantized repo', () => {
+    mockResolveFlux2Python.mockReturnValue('/fake/venv-flux2/bin/python3');
+    const { args } = buildArgs({
+      ...baseInput,
+      loraPaths: [],
+      model: {
+        id: 'flux2-klein-4b',
+        runner: 'flux2',
+        quantization: 'sdnq',
+        repo: 'Disty0/FLUX.2-klein-4B-SDNQ-4bit-dynamic',
+        tokenizerRepo: 'black-forest-labs/FLUX.2-klein-4B',
+      },
+    });
+    expect(args[args.indexOf('--quantization') + 1]).toBe('sdnq');
+    expect(args[args.indexOf('--repo') + 1]).toBe('Disty0/FLUX.2-klein-4B-SDNQ-4bit-dynamic');
+  });
+
+  it('throws a setup hint when the flux2 venv is missing', () => {
+    mockResolveFlux2Python.mockReturnValue(null);
+    expect(() => buildArgs({
+      ...baseInput,
+      model: {
+        id: 'flux2-klein-4b',
+        runner: 'flux2',
+        quantization: 'sdnq',
+        repo: 'Disty0/FLUX.2-klein-4B-SDNQ-4bit-dynamic',
+        tokenizerRepo: 'black-forest-labs/FLUX.2-klein-4B',
+      },
+    })).toThrow(/INSTALL_FLUX2=1/);
+  });
+
+  it('throws when an SDNQ flux2 model is missing tokenizerRepo', () => {
+    mockResolveFlux2Python.mockReturnValue('/fake/venv-flux2/bin/python3');
+    expect(() => buildArgs({
+      ...baseInput,
+      model: {
+        id: 'flux2-klein-4b',
+        runner: 'flux2',
+        quantization: 'sdnq',
+        repo: 'Disty0/FLUX.2-klein-4B-SDNQ-4bit-dynamic',
+        // tokenizerRepo missing — registry was edited badly
+      },
+    })).toThrow(/tokenizerRepo/);
+  });
+
+  it('throws when an Int8 flux2 model is missing basePipelineRepo', () => {
+    mockResolveFlux2Python.mockReturnValue('/fake/venv-flux2/bin/python3');
+    expect(() => buildArgs({
+      ...baseInput,
+      model: {
+        id: 'flux2-klein-4b-int8',
+        runner: 'flux2',
+        quantization: 'int8',
+        repo: 'aydin99/FLUX.2-klein-4B-int8',
+      },
+    })).toThrow(/basePipelineRepo/);
+  });
+
+  it('throws when a flux2 model is missing repo entirely', () => {
+    mockResolveFlux2Python.mockReturnValue('/fake/venv-flux2/bin/python3');
+    expect(() => buildArgs({
+      ...baseInput,
+      model: { id: 'flux2-broken', runner: 'flux2', quantization: 'sdnq' },
+    })).toThrow(/missing the 'repo' field/);
+  });
+
+  it('passes init-image args for flux2 i2i', () => {
+    mockResolveFlux2Python.mockReturnValue('/fake/venv-flux2/bin/python3');
+    const { args } = buildArgs({
+      ...baseInput,
+      initImagePath: '/safe/path/init.png',
+      initImageStrength: 0.7,
+      model: {
+        id: 'flux2-klein-4b',
+        runner: 'flux2',
+        quantization: 'sdnq',
+        repo: 'Disty0/FLUX.2-klein-4B-SDNQ-4bit-dynamic',
+        tokenizerRepo: 'black-forest-labs/FLUX.2-klein-4B',
+      },
+    });
+    expect(args).toContain('--image-path');
+    expect(args[args.indexOf('--image-path') + 1]).toBe('/safe/path/init.png');
+    expect(args).toContain('--image-strength');
+    expect(args[args.indexOf('--image-strength') + 1]).toBe('0.7');
+  });
+
+  it('emits --reference-images + --reference-strengths for flux2 multi-ref edits', () => {
+    mockResolveFlux2Python.mockReturnValue('/fake/venv-flux2/bin/python3');
+    const { args } = buildArgs({
+      ...baseInput,
+      referenceImagePaths: ['/safe/path/ref-a.png', '/safe/path/ref-b.jpg'],
+      referenceImageStrengths: [0.85, 0.5],
+      model: {
+        id: 'flux2-klein-9b',
+        runner: 'flux2',
+        quantization: 'sdnq',
+        repo: 'Disty0/FLUX.2-klein-9B-SDNQ-4bit-dynamic-svd-r32',
+        tokenizerRepo: 'black-forest-labs/FLUX.2-klein-9B',
+      },
+    });
+    const refIdx = args.indexOf('--reference-images');
+    expect(refIdx).toBeGreaterThan(-1);
+    // Both paths land immediately after the flag, in submit order.
+    expect(args[refIdx + 1]).toBe('/safe/path/ref-a.png');
+    expect(args[refIdx + 2]).toBe('/safe/path/ref-b.jpg');
+    const strIdx = args.indexOf('--reference-strengths');
+    expect(strIdx).toBeGreaterThan(-1);
+    expect(args[strIdx + 1]).toBe('0.85');
+    expect(args[strIdx + 2]).toBe('0.5');
+  });
+
+  it('threads --kv-repo for the bf16 model so reference editing loads the kv sibling repo', () => {
+    mockResolveFlux2Python.mockReturnValue('/fake/venv-flux2/bin/python3');
+    const { args } = buildArgs({
+      ...baseInput,
+      referenceImagePaths: ['/safe/path/ref-a.png'],
+      referenceImageStrengths: [1.0],
+      model: {
+        id: 'flux2-klein-9b-bf16',
+        runner: 'flux2',
+        quantization: 'none',
+        repo: 'black-forest-labs/FLUX.2-klein-9B',
+        kvRepo: 'black-forest-labs/FLUX.2-klein-9B-kv',
+      },
+    });
+    // --repo stays the base bf16 repo; --kv-repo carries the kv sibling so the
+    // runner can swap only for the reference-editing path.
+    expect(args[args.indexOf('--repo') + 1]).toBe('black-forest-labs/FLUX.2-klein-9B');
+    expect(args).toContain('--kv-repo');
+    expect(args[args.indexOf('--kv-repo') + 1]).toBe('black-forest-labs/FLUX.2-klein-9B-kv');
+    expect(args).toContain('--reference-images');
+  });
+
+  it('omits --kv-repo when the model has no kvRepo field', () => {
+    mockResolveFlux2Python.mockReturnValue('/fake/venv-flux2/bin/python3');
+    const { args } = buildArgs({
+      ...baseInput,
+      model: {
+        id: 'flux2-klein-4b',
+        runner: 'flux2',
+        quantization: 'sdnq',
+        repo: 'Disty0/FLUX.2-klein-4B-SDNQ-4bit-dynamic',
+        tokenizerRepo: 'black-forest-labs/FLUX.2-klein-4B',
+      },
+    });
+    expect(args).not.toContain('--kv-repo');
+  });
+
+  it('omits --reference-images entirely when no reference paths are supplied', () => {
+    mockResolveFlux2Python.mockReturnValue('/fake/venv-flux2/bin/python3');
+    const { args } = buildArgs({
+      ...baseInput,
+      model: {
+        id: 'flux2-klein-4b',
+        runner: 'flux2',
+        quantization: 'sdnq',
+        repo: 'Disty0/FLUX.2-klein-4B-SDNQ-4bit-dynamic',
+        tokenizerRepo: 'black-forest-labs/FLUX.2-klein-4B',
+      },
+    });
+    expect(args).not.toContain('--reference-images');
+    expect(args).not.toContain('--reference-strengths');
+  });
+
+  it('skips --reference-strengths when paths are supplied without strengths', () => {
+    mockResolveFlux2Python.mockReturnValue('/fake/venv-flux2/bin/python3');
+    const { args } = buildArgs({
+      ...baseInput,
+      referenceImagePaths: ['/safe/path/ref-only.png'],
+      referenceImageStrengths: [],
+      model: {
+        id: 'flux2-klein-4b',
+        runner: 'flux2',
+        quantization: 'sdnq',
+        repo: 'Disty0/FLUX.2-klein-4B-SDNQ-4bit-dynamic',
+        tokenizerRepo: 'black-forest-labs/FLUX.2-klein-4B',
+      },
+    });
+    expect(args).toContain('--reference-images');
+    expect(args).not.toContain('--reference-strengths');
+  });
+
+  // Templates land at /data/templates/, not /data/images/ — the runner-side
+  // resolver (generateImage) accepts them via resolveImageInputPath (covered
+  // in fileUtils.test.js). Pin that buildArgs emits the validated absolute
+  // path verbatim so a future refactor can't silently drop the template anchor.
+  it('emits --image-path verbatim for a pre-validated template path', () => {
+    mockResolveFlux2Python.mockReturnValue('/fake/venv-flux2/bin/python3');
+    const { args } = buildArgs({
+      ...baseInput,
+      initImagePath: '/data/templates/character-reference-sheet.png',
+      initImageStrength: 0.25,
+      model: {
+        id: 'flux2-klein-9b',
+        runner: 'flux2',
+        quantization: 'sdnq',
+        repo: 'Disty0/FLUX.2-klein-9B-SDNQ-4bit-dynamic-svd-r32',
+        tokenizerRepo: 'black-forest-labs/FLUX.2-klein-9B',
+      },
+    });
+    expect(args).toContain('--image-path');
+    expect(args[args.indexOf('--image-path') + 1]).toBe('/data/templates/character-reference-sheet.png');
+    expect(args).toContain('--image-strength');
+    expect(args[args.indexOf('--image-strength') + 1]).toBe('0.25');
+  });
+
+  it.skipIf(process.platform === 'win32')('falls back to mflux dispatch for non-flux2 models on macOS', () => {
+    // No flux2 mock needed — the branch shouldn't be taken at all.
+    mockResolveFlux2Python.mockReturnValue(null);
+    const { bin, args } = buildArgs({
+      ...baseInput,
+      model: { id: 'dev', steps: 20, guidance: 3.5 },
+    });
+    // mflux-generate sits next to the python binary in the venv.
+    expect(bin).toMatch(/mflux-generate$/);
+    expect(args).toContain('--model');
+    expect(args[args.indexOf('--model') + 1]).toBe('dev');
+    expect(args).toContain('--quantize');
+  });
+});
+
+describe('imageGen local.buildArgs z-image dispatch', () => {
+  beforeEach(() => {
+    mockResolveFlux2Python.mockReset();
+  });
+
+  const baseInput = {
+    pythonPath: '/usr/bin/python3', // unused for z-image but kept in shape
+    prompt: 'a green dragon',
+    negativePrompt: '',
+    width: 1024,
+    height: 1024,
+    steps: 8,
+    guidance: 1.0,
+    seed: 99,
+    quantize: '8',
+    outputPath: '/tmp/out.png',
+    loraPaths: [],
+    loraScales: [],
+    stepwiseDir: '/tmp/stepwise',
+    initImagePath: null,
+    initImageStrength: null,
+  };
+
+  it('routes z-image models to the FLUX.2 venv + z_image_turbo.py', () => {
+    mockResolveFlux2Python.mockReturnValue('/fake/venv-flux2/bin/python3');
+    const { bin, args } = buildArgs({
+      ...baseInput,
+      model: {
+        id: 'z-image-turbo-bf16',
+        runner: 'z-image',
+        repo: 'Tongyi-MAI/Z-Image-Turbo',
+      },
+    });
+    expect(bin).toBe('/fake/venv-flux2/bin/python3');
+    expect(args[0]).toMatch(/scripts[/\\]z_image_turbo\.py$/);
+    expect(args).toContain('--repo');
+    expect(args[args.indexOf('--repo') + 1]).toBe('Tongyi-MAI/Z-Image-Turbo');
+    expect(args).toContain('--prompt');
+    expect(args[args.indexOf('--prompt') + 1]).toBe('a green dragon');
+    expect(args).toContain('--guidance');
+    expect(args[args.indexOf('--guidance') + 1]).toBe('1');
+    // No --metadata flag: local.js writes the canonical sidecar itself.
+    expect(args).not.toContain('--metadata');
+    // Stepwise dir threads through.
+    expect(args).toContain('--stepwise-image-output-dir');
+    expect(args[args.indexOf('--stepwise-image-output-dir') + 1]).toBe('/tmp/stepwise');
+    // Z-Image doesn't take FLUX.2's quantization/tokenizer/base flags.
+    expect(args).not.toContain('--quantization');
+    expect(args).not.toContain('--tokenizer-repo');
+    expect(args).not.toContain('--base-pipeline-repo');
+  });
+
+  it('throws a setup hint when the FLUX.2 venv is missing for z-image', () => {
+    mockResolveFlux2Python.mockReturnValue(null);
+    expect(() => buildArgs({
+      ...baseInput,
+      model: { id: 'z-image-turbo-bf16', runner: 'z-image', repo: 'Tongyi-MAI/Z-Image-Turbo' },
+    })).toThrow(/INSTALL_FLUX2=1/);
+  });
+
+  it('throws when a z-image model is missing repo', () => {
+    mockResolveFlux2Python.mockReturnValue('/fake/venv-flux2/bin/python3');
+    expect(() => buildArgs({
+      ...baseInput,
+      model: { id: 'z-image-broken', runner: 'z-image' },
+    })).toThrow(/missing the 'repo' field/);
+  });
+
+  it('throws when a z-image model has empty repo string', () => {
+    mockResolveFlux2Python.mockReturnValue('/fake/venv-flux2/bin/python3');
+    expect(() => buildArgs({
+      ...baseInput,
+      model: { id: 'z-image-quant', runner: 'z-image', repo: '' },
+    })).toThrow(/missing the 'repo' field/);
+  });
+
+  it('passes init-image args for z-image i2i', () => {
+    mockResolveFlux2Python.mockReturnValue('/fake/venv-flux2/bin/python3');
+    const { args } = buildArgs({
+      ...baseInput,
+      initImagePath: '/safe/path/init.png',
+      initImageStrength: 0.6,
+      model: {
+        id: 'z-image-turbo-bf16',
+        runner: 'z-image',
+        repo: 'Tongyi-MAI/Z-Image-Turbo',
+      },
+    });
+    expect(args).toContain('--image-path');
+    expect(args[args.indexOf('--image-path') + 1]).toBe('/safe/path/init.png');
+    expect(args).toContain('--image-strength');
+    expect(args[args.indexOf('--image-strength') + 1]).toBe('0.6');
+  });
+
+  it('passes negative prompt only when non-empty', () => {
+    mockResolveFlux2Python.mockReturnValue('/fake/venv-flux2/bin/python3');
+    const { args: withoutNeg } = buildArgs({
+      ...baseInput,
+      model: { id: 'z-image-turbo-bf16', runner: 'z-image', repo: 'Tongyi-MAI/Z-Image-Turbo' },
+    });
+    expect(withoutNeg).not.toContain('--negative-prompt');
+    const { args: withNeg } = buildArgs({
+      ...baseInput,
+      negativePrompt: 'blurry',
+      model: { id: 'z-image-turbo-bf16', runner: 'z-image', repo: 'Tongyi-MAI/Z-Image-Turbo' },
+    });
+    expect(withNeg).toContain('--negative-prompt');
+    expect(withNeg[withNeg.indexOf('--negative-prompt') + 1]).toBe('blurry');
+  });
+
+  it('routes ERNIE models through the same script with --pipeline-class + --use-pe', () => {
+    mockResolveFlux2Python.mockReturnValue('/fake/venv-flux2/bin/python3');
+    const { bin, args } = buildArgs({
+      ...baseInput,
+      model: {
+        id: 'ernie-image',
+        runner: 'ernie',
+        repo: 'baidu/ERNIE-Image',
+        pipelineClass: 'ErnieImagePipeline',
+        usePromptEnhancer: true,
+      },
+    });
+    expect(bin).toBe('/fake/venv-flux2/bin/python3');
+    expect(args[0]).toMatch(/scripts[/\\]z_image_turbo\.py$/);
+    expect(args).toContain('--pipeline-class');
+    expect(args[args.indexOf('--pipeline-class') + 1]).toBe('ErnieImagePipeline');
+    expect(args).toContain('--use-pe');
+    expect(args[args.indexOf('--repo') + 1]).toBe('baidu/ERNIE-Image');
+  });
+
+  it('omits --pipeline-class and --use-pe when the registry entry doesn\'t set them', () => {
+    mockResolveFlux2Python.mockReturnValue('/fake/venv-flux2/bin/python3');
+    const { args } = buildArgs({
+      ...baseInput,
+      model: { id: 'z-image-turbo-bf16', runner: 'z-image', repo: 'Tongyi-MAI/Z-Image-Turbo' },
+    });
+    expect(args).not.toContain('--pipeline-class');
+    expect(args).not.toContain('--use-pe');
+  });
+});
+
+describe('imageGen local.buildSidecarMeta', () => {
+  // Pull the real PATHS.loras prefix so LoRA candidates the meta-builder joins
+  // against it pass its resolve+prefix check. Existence is faked via the
+  // injected `loraExists` so the test never touches the filesystem.
+  let LORAS_ROOT;
+  let join_;
+  beforeAll(async () => {
+    ({ PATHS: { loras: LORAS_ROOT } } = await import('../../lib/fileUtils.js'));
+    ({ join: join_ } = await import('path'));
+  });
+
+  // Default injectable deps: resolveInputPath echoes any path it's given (i.e.
+  // every supplied path is "valid"), loraExists always true, fixed timestamp.
+  const ECHO = (p) => p;
+  const ALWAYS = () => true;
+  const FIXED_NOW = () => '2024-01-01T00:00:00.000Z';
+
+  const baseMetaInput = {
+    jobId: 'job-1234-5678',
+    model: { id: 'flux2-klein-9b', steps: 8, guidance: 0 },
+    prompt: 'a red cube',
+    negativePrompt: '',
+    modelId: 'flux2-klein-9b',
+    width: 1024,
+    height: 768,
+    steps: 8,
+    guidance: 0,
+    seed: 42,
+    quantize: 'sdnq',
+    resolveInputPath: ECHO,
+    loraExists: ALWAYS,
+    now: FIXED_NOW,
+  };
+
+  it('builds the canonical sidecar meta shape with reference fields populated', () => {
+    const refA = '/data/images/ref-a.png';
+    const refB = '/data/image-refs/ref-b.jpg';
+    const { meta } = buildSidecarMeta({
+      ...baseMetaInput,
+      referenceImagePaths: [refA, refB],
+      referenceImageStrengths: [0.85, 0.5],
+    });
+    expect(meta).toMatchObject({
+      id: 'job-1234-5678',
+      prompt: 'a red cube',
+      negativePrompt: '',
+      modelId: 'flux2-klein-9b',
+      seed: 42,
+      width: 1024,
+      height: 768,
+      steps: 8,
+      guidance: 0,
+      quantize: 'sdnq',
+      filename: 'job-1234-5678.png',
+      createdAt: '2024-01-01T00:00:00.000Z',
+    });
+    // referenceImageFilenames stores basenames, parallel to the strengths array.
+    expect(meta.referenceImageFilenames).toEqual(['ref-a.png', 'ref-b.jpg']);
+    expect(meta.referenceImageStrengths).toEqual([0.85, 0.5]);
+  });
+
+  it('stamps model+LoRA provenance at finalize and never guesses a license', () => {
+    const { meta } = buildSidecarMeta({
+      ...baseMetaInput,
+      model: { id: 'flux2-klein-9b', name: 'FLUX.2 Klein 9B', repo: 'org/flux2', steps: 8, guidance: 0 },
+      loraFilenames: ['style.safetensors'],
+      loraLicenses: { 'style.safetensors': { license: 'openrail', sourceUrl: 'https://civitai.com/models/1', name: 'Style' } },
+    });
+    expect(meta.provenance.schemaVersion).toBe(1);
+    expect(meta.provenance.capturedAt).toBe('2024-01-01T00:00:00.000Z');
+    expect(meta.provenance.sources).toEqual([
+      {
+        kind: 'model',
+        id: 'flux2-klein-9b',
+        name: 'FLUX.2 Klein 9B',
+        license: null,
+        sourceUrl: 'https://huggingface.co/org/flux2',
+      },
+      {
+        kind: 'lora',
+        id: 'style.safetensors',
+        name: 'Style',
+        license: 'openrail',
+        sourceUrl: 'https://civitai.com/models/1',
+      },
+    ]);
+  });
+
+  it('persists FableLoom visual-conditioning provenance without rewriting it', () => {
+    const visualConditioning = {
+      version: 1, compilerVersion: '1.0.0', status: 'locked', assets: [{ role: 'character-neutral', filename: 'aria.png' }],
+    };
+    const { meta } = buildSidecarMeta({ ...baseMetaInput, visualConditioning });
+    expect(meta.visualConditioning).toBe(visualConditioning);
+  });
+
+  it('stamps regen lineage (cleanedFrom + regen* fields) when regenOf is set', () => {
+    const { meta } = buildSidecarMeta({
+      ...baseMetaInput,
+      initImagePath: '/data/images/source.png',
+      initImageStrength: 0.4,
+      regenOf: 'source.png',
+    });
+    // cleanedFrom mirrors the source so computeImageVariantGroup groups it.
+    expect(meta.cleanedFrom).toBe('source.png');
+    expect(meta.regenerated).toBe(true);
+    // regen* mirror the RESOLVED render params, not the raw inputs.
+    expect(meta.regenStrength).toBe(0.4);
+    expect(meta.regenSteps).toBe(8);
+    expect(meta.regenModelId).toBe('flux2-klein-9b');
+  });
+
+  it('omits regen lineage entirely for a normal (non-regen) render', () => {
+    const { meta } = buildSidecarMeta({ ...baseMetaInput });
+    expect(meta.cleanedFrom).toBeUndefined();
+    expect(meta.regenerated).toBeUndefined();
+    expect(meta.regenStrength).toBeUndefined();
+  });
+
+  it('does NOT stamp regen lineage when the init image fails to resolve (no false claim)', () => {
+    const { meta } = buildSidecarMeta({
+      ...baseMetaInput,
+      initImagePath: '/data/images/gone.png',
+      initImageStrength: 0.4,
+      regenOf: 'gone.png',
+      resolveInputPath: () => null, // source path rejected → degraded to txt2img
+    });
+    expect(meta.regenerated).toBeUndefined();
+    expect(meta.cleanedFrom).toBeUndefined();
+  });
+
+  it('defaults each missing reference strength to 1.0 (full influence)', () => {
+    const { meta } = buildSidecarMeta({
+      ...baseMetaInput,
+      referenceImagePaths: ['/data/images/r1.png', '/data/images/r2.png'],
+      referenceImageStrengths: [0.3], // only the first supplied
+    });
+    expect(meta.referenceImageFilenames).toEqual(['r1.png', 'r2.png']);
+    expect(meta.referenceImageStrengths).toEqual([0.3, 1.0]);
+  });
+
+  it('clamps reference strengths to 0..1 and falls back to 1.0 on non-finite', () => {
+    const { meta } = buildSidecarMeta({
+      ...baseMetaInput,
+      referenceImagePaths: ['/data/images/lo.png', '/data/images/hi.png', '/data/images/bad.png'],
+      referenceImageStrengths: [-2, 5, Number('nope')],
+    });
+    expect(meta.referenceImageStrengths).toEqual([0, 1, 1.0]);
+  });
+
+  it('drops a rejected reference path WITHOUT shifting the surviving strength', () => {
+    // resolveInputPath rejects the second path; the third must keep ITS own
+    // strength (0.9), not inherit the dropped slot's (0.2). This pins the
+    // "pair before filter" invariant the meta-builder relies on.
+    const resolveInputPath = (p) => (p.includes('reject') ? null : p);
+    const { meta, validReferenceImagePaths } = buildSidecarMeta({
+      ...baseMetaInput,
+      resolveInputPath,
+      referenceImagePaths: ['/data/images/keep.png', '/data/images/reject.png', '/data/images/also-keep.png'],
+      referenceImageStrengths: [0.4, 0.2, 0.9],
+    });
+    expect(validReferenceImagePaths).toEqual(['/data/images/keep.png', '/data/images/also-keep.png']);
+    expect(meta.referenceImageFilenames).toEqual(['keep.png', 'also-keep.png']);
+    expect(meta.referenceImageStrengths).toEqual([0.4, 0.9]);
+  });
+
+  it('emits empty reference arrays when no references are supplied', () => {
+    const { meta } = buildSidecarMeta({ ...baseMetaInput });
+    expect(meta.referenceImageFilenames).toEqual([]);
+    expect(meta.referenceImageStrengths).toEqual([]);
+  });
+
+  it('tolerates a non-array referenceImagePaths (sidecar replay corruption)', () => {
+    const { meta } = buildSidecarMeta({
+      ...baseMetaInput,
+      referenceImagePaths: null,
+      referenceImageStrengths: null,
+    });
+    expect(meta.referenceImageFilenames).toEqual([]);
+    expect(meta.referenceImageStrengths).toEqual([]);
+  });
+
+  it('records initImageFilename + clamped strength for i2i', () => {
+    const { meta } = buildSidecarMeta({
+      ...baseMetaInput,
+      initImagePath: '/data/images/init.png',
+      initImageStrength: 0.7,
+    });
+    expect(meta.initImageFilename).toBe('init.png');
+    expect(meta.initImageStrength).toBe(0.7);
+  });
+
+  it('leaves init strength null when no init image survives resolution', () => {
+    const { meta } = buildSidecarMeta({
+      ...baseMetaInput,
+      resolveInputPath: () => null, // init path rejected
+      initImagePath: '/somewhere/outside.png',
+      initImageStrength: 0.7,
+    });
+    expect(meta.initImageFilename).toBeNull();
+    expect(meta.initImageStrength).toBeNull();
+  });
+
+  it('keeps only LoRA basenames that exist, storing both filenames + paths', () => {
+    const loraFilenames = ['lora-good.safetensors', 'lora-missing.safetensors'];
+    const loraExists = (abs) => abs.endsWith('lora-good.safetensors');
+    const { meta } = buildSidecarMeta({
+      ...baseMetaInput,
+      loraFilenames,
+      loraScales: [1.0],
+      loraExists,
+    });
+    expect(meta.loraFilenames).toEqual(['lora-good.safetensors']);
+    expect(meta.loraPaths).toEqual([join_(LORAS_ROOT, 'lora-good.safetensors')]);
+    // loraScales passes through verbatim (the runner pairs them positionally).
+    expect(meta.loraScales).toEqual([1.0]);
+  });
+
+  it('rejects a LoRA path outside the loras root (sidecar replay traversal)', () => {
+    const { meta } = buildSidecarMeta({
+      ...baseMetaInput,
+      loraPaths: ['/etc/evil.safetensors'],
+      loraExists: ALWAYS, // would exist, but prefix-check must reject it first
+    });
+    expect(meta.loraFilenames).toEqual([]);
+    expect(meta.loraPaths).toEqual([]);
+  });
+
+  it('falls back to model defaults for steps and guidance when unset', () => {
+    const { meta } = buildSidecarMeta({
+      ...baseMetaInput,
+      model: { id: 'm', steps: 28, guidance: 3.5 },
+      steps: undefined,
+      guidance: undefined,
+    });
+    expect(meta.steps).toBe(28);
+    expect(meta.guidance).toBe(3.5);
+  });
+
+  it('clamps guidance to <=1.0 for cfgDisabled models, leaving sub-1.0 untouched', () => {
+    const high = buildSidecarMeta({
+      ...baseMetaInput,
+      model: { id: 'm', steps: 8, cfgDisabled: true },
+      guidance: 7.5,
+    }).meta;
+    expect(high.guidance).toBe(1.0);
+    const low = buildSidecarMeta({
+      ...baseMetaInput,
+      model: { id: 'm', steps: 8, cfgDisabled: true },
+      guidance: 0,
+    }).meta;
+    expect(low.guidance).toBe(0);
+  });
+
+  it('generates a random seed in range when none is supplied', () => {
+    const { meta } = buildSidecarMeta({ ...baseMetaInput, seed: undefined });
+    expect(Number.isInteger(meta.seed)).toBe(true);
+    expect(meta.seed).toBeGreaterThanOrEqual(0);
+    expect(meta.seed).toBeLessThan(2147483647);
+  });
+
+  // --- LoRA trigger-word weaving (#4665) ---------------------------------
+  // `loraTriggerWords` is the sidecar map generateImage reads before calling
+  // in; the LoRA candidates go through the same prefix-check as every other
+  // test here (LORAS_ROOT + injected `loraExists`).
+
+  it('weaves a selected LoRA trigger word into the render prompt, keeping meta.prompt the user text', () => {
+    const { meta, renderPrompt, addedTriggerWords } = buildSidecarMeta({
+      ...baseMetaInput,
+      loraFilenames: ['aria.safetensors'],
+      loraTriggerWords: { 'aria.safetensors': ['aria_tok', 'portrait'] },
+    });
+    // What the runner renders.
+    expect(renderPrompt).toBe('a red cube, aria_tok');
+    expect(addedTriggerWords).toEqual(['aria_tok']);
+    // Provenance: the user's own text is what a Remix reads back.
+    expect(meta.prompt).toBe('a red cube');
+    expect(meta.renderPrompt).toBe('a red cube, aria_tok');
+    expect(meta.addedTriggerWords).toEqual(['aria_tok']);
+  });
+
+  it('uses only the FIRST trigger word of each LoRA, in selection order', () => {
+    const { renderPrompt } = buildSidecarMeta({
+      ...baseMetaInput,
+      loraFilenames: ['aria.safetensors', 'grain.safetensors'],
+      loraTriggerWords: {
+        'aria.safetensors': ['aria_tok', 'portrait', 'closeup'],
+        'grain.safetensors': ['rstgrm', 'film grain'],
+      },
+    });
+    expect(renderPrompt).toBe('a red cube, aria_tok, rstgrm');
+  });
+
+  it('does not weave a word the prompt already contains', () => {
+    const { meta, renderPrompt, addedTriggerWords } = buildSidecarMeta({
+      ...baseMetaInput,
+      prompt: 'aria_tok holding a red cube',
+      loraFilenames: ['aria.safetensors'],
+      loraTriggerWords: { 'aria.safetensors': ['aria_tok'] },
+    });
+    expect(renderPrompt).toBe('aria_tok holding a red cube');
+    expect(addedTriggerWords).toEqual([]);
+    // No provenance fields when nothing was woven — the sidecar stays
+    // byte-identical to every one written before this feature.
+    expect(meta.renderPrompt).toBeUndefined();
+    expect(meta.addedTriggerWords).toBeUndefined();
+  });
+
+  it('is a no-op when the render selected no LoRAs', () => {
+    const { meta, renderPrompt, addedTriggerWords } = buildSidecarMeta({ ...baseMetaInput });
+    expect(renderPrompt).toBe('a red cube');
+    expect(addedTriggerWords).toEqual([]);
+    expect(meta.renderPrompt).toBeUndefined();
+  });
+
+  it('skips a LoRA whose sidecar carries no trigger words (legacy / pre-Civitai)', () => {
+    const { renderPrompt, addedTriggerWords } = buildSidecarMeta({
+      ...baseMetaInput,
+      loraFilenames: ['legacy.safetensors', 'aria.safetensors'],
+      loraTriggerWords: { 'legacy.safetensors': [], 'aria.safetensors': ['aria_tok'] },
+    });
+    expect(renderPrompt).toBe('a red cube, aria_tok');
+    expect(addedTriggerWords).toEqual(['aria_tok']);
+  });
+
+  it('never weaves a trigger for a LoRA that failed the prefix/existence check', () => {
+    const { renderPrompt, addedTriggerWords } = buildSidecarMeta({
+      ...baseMetaInput,
+      loraFilenames: ['aria.safetensors'],
+      loraTriggerWords: { 'aria.safetensors': ['aria_tok'] },
+      loraExists: () => false,
+    });
+    expect(renderPrompt).toBe('a red cube');
+    expect(addedTriggerWords).toEqual([]);
+  });
+
+  it('adds nothing to a pipeline prompt that already carries the trigger in its own clause', () => {
+    // The comic/visual pipeline weaves its own "<Name> (<trigger>): <desc>" /
+    // "Featuring <Name> (<trigger>)" clause before enqueueing, using the SAME
+    // first-trigger-word token. Idempotence is what lets those renders share
+    // this weave instead of opting out — and opting out is what would have
+    // left a description-less character's LoRA inert, since comicPages drops
+    // any character with no description from its clause.
+    const { meta, renderPrompt, addedTriggerWords } = buildSidecarMeta({
+      ...baseMetaInput,
+      prompt: 'Aria (aria_tok): a tall figure in a red coat. A rooftop at dusk.',
+      loraFilenames: ['aria.safetensors'],
+      loraTriggerWords: { 'aria.safetensors': ['aria_tok'] },
+    });
+    expect(renderPrompt).toBe('Aria (aria_tok): a tall figure in a red coat. A rooftop at dusk.');
+    expect(addedTriggerWords).toEqual([]);
+    expect(meta.renderPrompt).toBeUndefined();
+  });
+
+});
+
+describe('imageGen local.resolveOutputPlacement (issue #2264 non-gallery render seam)', () => {
+  it('defaults to the gallery dir WITH a sidecar when no outputTarget is given', () => {
+    // The lightbox/regenerate/generate path — must be untouched.
+    const p = resolveOutputPlacement(null);
+    expect(p.outputDir).toBe(PATHS.images);
+    expect(p.isGallery).toBe(true);
+    expect(p.skipSidecar).toBe(false);
+  });
+
+  it('renders to a temp dir with NO sidecar when a non-gallery target is given', () => {
+    const p = resolveOutputPlacement({ dir: PATHS.imageCleanTmp, skipSidecar: true });
+    expect(p.outputDir).toBe(PATHS.imageCleanTmp);
+    expect(p.isGallery).toBe(false);
+    expect(p.skipSidecar).toBe(true);
+  });
+
+  it('defaults a non-gallery target to skipSidecar even when the flag is omitted', () => {
+    const p = resolveOutputPlacement({ dir: PATHS.imageCleanTmp });
+    expect(p.skipSidecar).toBe(true);
+  });
+
+  it('always writes a sidecar for a gallery-dir target, even if skipSidecar was passed', () => {
+    // A gallery citizen without a sidecar would be an un-remixable orphan.
+    const p = resolveOutputPlacement({ dir: PATHS.images, skipSidecar: true });
+    expect(p.outputDir).toBe(PATHS.images);
+    expect(p.skipSidecar).toBe(false);
+  });
+
+  it('ignores a malformed outputTarget (non-object / missing dir) → gallery default', () => {
+    expect(resolveOutputPlacement('nope').outputDir).toBe(PATHS.images);
+    expect(resolveOutputPlacement({}).outputDir).toBe(PATHS.images);
+    expect(resolveOutputPlacement({ dir: 123 }).outputDir).toBe(PATHS.images);
+  });
+});
+
+describe('imageGen local.generateImage runtime pre-flight', () => {
+  beforeEach(() => {
+    mockResolveFlux2Python.mockReset();
+    mockIsFlux2VenvHealthy.mockReset();
+  });
+
+  // The binary exists, so buildArgs would happily spawn it — and did, until the
+  // render died inside python with an ImportError the Decks page rendered as an
+  // unexplained "Failed". Refuse before spawning, with the reason and the
+  // one-button remedy the status probe reports for the same machine.
+  it('refuses a shared-torch-runtime render when the venv is present but unhealthy', async () => {
+    mockResolveFlux2Python.mockReturnValue('/fake/venv-flux2/bin/python3');
+    mockIsFlux2VenvHealthy.mockResolvedValue(false);
+
+    await expect(generateImage({ modelId: 'qwen-image-2.1', prompt: 'a fox' })).rejects.toMatchObject({
+      // Same code buildArgs throws when the venv's python is missing outright.
+      code: 'IMAGE_GEN_FLUX2_NOT_INSTALLED',
+      status: 400,
+      message: expect.stringContaining('not installed or healthy'),
+    });
+    expect(mockIsFlux2VenvHealthy).toHaveBeenCalledWith('QwenImage21Pipeline');
+  });
+});
+
+// Regression: SSE had the Python diagnosis, but the queue and status snapshot
+// replaced it with only an exit code. Exercise the actual child close boundary.
+describe('local render failure delivery', () => {
+  it.each([
+    ['USER_ERROR:torch_runtime_broken\n❌ Unknown diffusers pipeline class: QwenImage21Pipeline. Reinstall the runtime.\n', 'Reinstall the runtime.'],
+    ['runner.py: error: invalid value for --steps\n', 'invalid value for --steps'],
+  ])('preserves the runner diagnosis in failed events and SSE replays', async (stderr, expected) => {
+    mockResolveFlux2Python.mockReturnValue('/fake/venv-flux2/bin/python3');
+    mockIsFlux2VenvHealthy.mockResolvedValue(true);
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    mockSpawn.mockReturnValue(child);
+    const { imageGenEvents } = await import('../imageGenEvents.js');
+    const { attachSseClient } = await import('./local.js');
+    const failed = new Promise((resolve) => imageGenEvents.once('failed', resolve));
+    const { jobId } = await generateImage({ modelId: 'qwen-image-2.1', prompt: 'a fox' });
+    child.stderr.emit('data', Buffer.from(stderr));
+    child.emit('close', 2);
+    expect((await failed).error).toContain(expected);
+    const response = { writeHead: vi.fn(), write: vi.fn(), end: vi.fn(), req: new EventEmitter() };
+    expect(attachSseClient(jobId, response)).toBe(true);
+    expect(response.write.mock.calls[0][0]).toContain(expected);
+    response.req.emit('close');
+  });
+});
+
+// Regression (#8905): proc.on('close', async …) had no outer try/catch, so a
+// throw from the post-render work (rejectDegenerateFrame, autoCleanGeneratedImage,
+// …) escaped as an unhandled rejection instead of settling the job — leaving it
+// stuck 'running' forever with no terminal SSE frame and no scheduled cleanup.
+describe('local render failure delivery — post-render throw safety net', () => {
+  beforeEach(() => {
+    mockRejectDegenerateFrame.mockReset();
+    mockRejectDegenerateFrame.mockResolvedValue(null);
+  });
+
+  it('settles the job to error, emits failed, and schedules cleanup when a post-render hook rejects', async () => {
+    mockResolveFlux2Python.mockReturnValue('/fake/venv-flux2/bin/python3');
+    mockIsFlux2VenvHealthy.mockResolvedValue(true);
+    // Simulate a post-exit hook throwing on an otherwise-successful render
+    // (code 0) — the exact hazard window the shipped runtime never covered.
+    mockRejectDegenerateFrame.mockRejectedValueOnce(new Error('disk read failed mid-decode'));
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    mockSpawn.mockReturnValue(child);
+    const { imageGenEvents } = await import('../imageGenEvents.js');
+    const { attachSseClient } = await import('./local.js');
+    const { SSE_CLEANUP_DELAY_MS } = await import('../../lib/sseUtils.js');
+    const failed = new Promise((resolve) => imageGenEvents.once('failed', resolve));
+    const { jobId } = await generateImage({ modelId: 'qwen-image-2.1', prompt: 'a fox' });
+
+    vi.useFakeTimers();
+    try {
+      child.emit('close', 0);
+      const failure = await failed;
+      expect(failure.error).toContain('disk read failed mid-decode');
+
+      // Still delivers a terminal SSE frame instead of leaving a connected
+      // client hanging — replay proves the job settled to 'error', not stuck
+      // 'running'.
+      const response = { writeHead: vi.fn(), write: vi.fn(), end: vi.fn(), req: new EventEmitter() };
+      expect(attachSseClient(jobId, response)).toBe(true);
+      expect(response.write.mock.calls[0][0]).toContain('disk read failed mid-decode');
+      response.req.emit('close');
+
+      // closeJobAfterDelay was scheduled from the outer catch/finally — the
+      // job is still present immediately after, then gone once the grace
+      // window elapses, proving cleanup was scheduled exactly once (not
+      // skipped by the throw).
+      vi.advanceTimersByTime(SSE_CLEANUP_DELAY_MS);
+      const late = { writeHead: vi.fn(), write: vi.fn(), end: vi.fn(), req: new EventEmitter() };
+      expect(attachSseClient(jobId, late)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// Regression (#8915): the terminal dispatch was a bare
+// `broadcastSse(...); imageGenEvents.emit(...)` pair — a throwing SSE client
+// (e.g. a dead connection's res.write) that fires from inside broadcastSse
+// would abort BEFORE the lifecycle emit ran, silently skipping the gallery
+// index / peer-sync / job-queue bookkeeping the emit drives even though the
+// job's own status/error fields were already correct. Both dispatch paths
+// (the `code !== 0` failure branch and the success branch) now go through
+// `dispatchTerminalEvent`, which isolates each call in its own try/catch.
+describe('local render terminal dispatch — SSE/lifecycle decoupling (#8915)', () => {
+  beforeEach(() => {
+    mockRejectDegenerateFrame.mockReset();
+    mockRejectDegenerateFrame.mockResolvedValue(null);
+  });
+
+  it('still emits the failed lifecycle event when a connected SSE client throws on write', async () => {
+    mockResolveFlux2Python.mockReturnValue('/fake/venv-flux2/bin/python3');
+    mockIsFlux2VenvHealthy.mockResolvedValue(true);
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    mockSpawn.mockReturnValue(child);
+    const { imageGenEvents } = await import('../imageGenEvents.js');
+    const { attachSseClient } = await import('./local.js');
+    const { jobId } = await generateImage({ modelId: 'qwen-image-2.1', prompt: 'a fox' });
+
+    // Feed the stderr diagnosis BEFORE attaching the throwing client — the
+    // intermediate status broadcasts this line triggers are unrelated to the
+    // terminal-dispatch decoupling under test.
+    child.stderr.emit('data', Buffer.from('runner.py: error: invalid value for --steps\n'));
+
+    // A connected client whose write() throws — the dead-client hazard the
+    // issue names (a broken pipe surfacing as a synchronous throw) — attached
+    // just before the terminal close so only the terminal SSE frame hits it.
+    // (attachSseClient's own replay of the cached lastPayload is a first,
+    // separate write call — let that one through so it doesn't mask the
+    // terminal-dispatch assertion below.)
+    let writeCalls = 0;
+    const throwingClient = {
+      writeHead: vi.fn(),
+      write: vi.fn(() => {
+        writeCalls += 1;
+        if (writeCalls > 1) throw new Error('write after end');
+      }),
+      end: vi.fn(),
+      req: new EventEmitter(),
+    };
+    expect(attachSseClient(jobId, throwingClient)).toBe(true);
+
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const failed = new Promise((resolve) => imageGenEvents.once('failed', resolve));
+    child.emit('close', 2);
+
+    // The lifecycle event still fires — and still carries the real
+    // diagnosis — even though the SSE broadcast to this client threw.
+    const failure = await failed;
+    expect(failure.error).toContain('invalid value for --steps');
+    expect(errSpy).toHaveBeenCalledWith(expect.stringContaining('SSE client write failed'));
+    errSpy.mockRestore();
+  });
+
+  it('still emits the completed lifecycle event when a connected SSE client throws on write', async () => {
+    mockResolveFlux2Python.mockReturnValue('/fake/venv-flux2/bin/python3');
+    mockIsFlux2VenvHealthy.mockResolvedValue(true);
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    mockSpawn.mockReturnValue(child);
+    const { imageGenEvents } = await import('../imageGenEvents.js');
+    const { attachSseClient } = await import('./local.js');
+    const { jobId } = await generateImage({ modelId: 'qwen-image-2.1', prompt: 'a fox' });
+
+    const throwingClient = {
+      writeHead: vi.fn(),
+      write: vi.fn(() => { throw new Error('write after end'); }),
+      end: vi.fn(),
+      req: new EventEmitter(),
+    };
+    expect(attachSseClient(jobId, throwingClient)).toBe(true);
+
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const completed = new Promise((resolve) => imageGenEvents.once('completed', resolve));
+    child.emit('close', 0);
+
+    // Gallery indexing / peer-sync (driven by 'completed') still fires even
+    // though the SSE 'complete' frame threw delivering to this client.
+    await expect(completed).resolves.toMatchObject({ mode: 'local' });
+    expect(errSpy).toHaveBeenCalledWith(expect.stringContaining('SSE client write failed'));
+    errSpy.mockRestore();
+  });
+});
+
+
+it('drains a snapshot through local upscale and the sidecar naming the delivered dimensions', async () => {
+  mockResolveFlux2Python.mockReturnValue('/fake/venv-flux2/bin/python3');
+  mockIsFlux2VenvHealthy.mockResolvedValue(true);
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  mockSpawn.mockReturnValue(child);
+  const { default: sharp } = await import('sharp');
+  const { acquireBackupSnapshotCut } = await import('../../lib/backupSnapshotBoundary.js');
+  const { imageGenEvents } = await import('../imageGenEvents.js');
+  let reachedFrame;
+  const reached = new Promise(resolve => { reachedFrame = resolve; });
+  let finishFrame;
+  const frame = new Promise(resolve => { finishFrame = resolve; });
+  mockRejectDegenerateFrame.mockImplementationOnce(async () => { reachedFrame(); await frame; return null; });
+  const job = await generateImage({ modelId: 'qwen-image-2.1', prompt: 'example', width: 64, height: 64,
+    upscaleTo: { width: 128, height: 128 } });
+  const pixels = await sharp({ create: { width: 64, height: 64, channels: 3, background: '#123456' } }).png().toBuffer();
+  writeFileSync(join(PATHS.images, job.filename), pixels);
+  const completed = new Promise(resolve => imageGenEvents.once('completed', resolve));
+  child.emit('close', 0);
+  await reached;
+  let cutReady = false;
+  const cut = acquireBackupSnapshotCut().then(release => { cutReady = true; return release; });
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    expect(cutReady, 'snapshot must drain the upscale and metadata tail').toBe(false);
+  } finally { finishFrame(); }
+  await completed;
+  const release = await cut;
+  try {
+    expect(await sharp(join(PATHS.images, job.filename)).metadata()).toMatchObject({ width: 128, height: 128 });
+    expect(JSON.parse(readFileSync(join(PATHS.images, `${job.jobId}.metadata.json`), 'utf8')))
+      .toMatchObject({ width: 128, height: 128, renderWidth: 64, renderHeight: 64 });
+  } finally { release(); }
+});
+
+
+it('settles a refused close-event publication and releases the process and heavy claim', async () => {
+  mockResolveFlux2Python.mockReturnValue('/fake/venv-flux2/bin/python3');
+  mockIsFlux2VenvHealthy.mockResolvedValue(true);
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
+  mockSpawn.mockReturnValue(child);
+  const { imageGenEvents } = await import('../imageGenEvents.js');
+  const { attachSseClient, getActiveJob } = await import('./local.js');
+  const { SSE_CLEANUP_DELAY_MS } = await import('../../lib/sseUtils.js');
+  const { jobId } = await generateImage({ modelId: 'qwen-image-2.1', prompt: 'admission failure' });
+  const releasedBefore = releaseClaim.mock.calls.length;
+  const failed = new Promise(resolve => imageGenEvents.once('failed', resolve));
+  admissionFault.error = new Error('injected publication admission refusal');
+  vi.useFakeTimers();
+  try {
+    child.emit('close', 0);
+    expect((await failed).error).toContain('injected publication admission refusal');
+    expect(getActiveJob()).toBeNull();
+    expect(releaseClaim.mock.calls.length).toBe(releasedBefore + 1);
+    const response = { writeHead: vi.fn(), write: vi.fn(), end: vi.fn(), req: new EventEmitter() };
+    expect(attachSseClient(jobId, response)).toBe(true);
+    expect(response.write.mock.calls[0][0]).toContain('injected publication admission refusal');
+    response.req.emit('close');
+    vi.advanceTimersByTime(SSE_CLEANUP_DELAY_MS);
+    expect(attachSseClient(jobId, response)).toBe(false);
+  } finally { admissionFault.error = null; vi.useRealTimers(); }
+});

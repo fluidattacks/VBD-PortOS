@@ -1,0 +1,277 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import express from 'express';
+import { request } from '../lib/testHelper.js';
+
+vi.mock('../services/jira.js', () => ({
+  getInstances: vi.fn(),
+  upsertInstance: vi.fn(),
+  deleteInstance: vi.fn(),
+  testConnection: vi.fn(),
+  getProjects: vi.fn(),
+  createTicket: vi.fn(),
+  updateTicket: vi.fn(),
+  addComment: vi.fn(),
+  getTransitions: vi.fn(),
+  transitionTicket: vi.fn(),
+  getMyCurrentSprintTickets: vi.fn(),
+  fetchMyCurrentSprintTickets: vi.fn(),
+  getBoardColumns: vi.fn(),
+  getActiveSprints: vi.fn(),
+  getBoards: vi.fn(),
+  getIssue: vi.fn(),
+  getEpicChildren: vi.fn(),
+  addIssuesToSprint: vi.fn(),
+  addLabels: vi.fn(),
+  searchEpics: vi.fn()
+}));
+vi.mock('../services/jiraReports.js', () => ({
+  listReports: vi.fn(),
+  generateReport: vi.fn(),
+  generateAllReports: vi.fn(),
+  getLatestReport: vi.fn(),
+  getReport: vi.fn()
+}));
+vi.mock('../services/apps.js', () => ({ getAppById: vi.fn() }));
+
+import * as jiraService from '../services/jira.js';
+import * as jiraReports from '../services/jiraReports.js';
+import { errorMiddleware } from '../lib/errorHandler.js';
+import jiraRoutes from './jira.js';
+
+function makeApp() {
+  const app = express();
+  app.use(express.json());
+  app.use('/api/jira', jiraRoutes);
+  app.use(errorMiddleware);
+  return app;
+}
+
+describe('POST /instances token updates', () => {
+  const details = { id: 'example', name: 'Example Jira', baseUrl: 'https://jira.example.com', email: 'user@example.com' };
+
+  beforeEach(() => vi.clearAllMocks());
+
+  it('requires a token when creating an instance', async () => {
+    jiraService.getInstances.mockResolvedValue({ instances: {} });
+    const response = await request(makeApp()).post('/api/jira/instances').send(details);
+    expect(response.status).toBe(400);
+    expect(jiraService.upsertInstance).not.toHaveBeenCalled();
+  });
+
+  it('keeps the saved token when updating other fields', async () => {
+    jiraService.getInstances.mockResolvedValue({ instances: { example: { apiToken: 'stored-secret' } } });
+    jiraService.upsertInstance.mockResolvedValue({ ...details, hasApiToken: true, tokenUpdatedAt: '2026-01-01T00:00:00.000Z' });
+    const response = await request(makeApp()).post('/api/jira/instances').send(details);
+    expect(response.status).toBe(200);
+    expect(jiraService.upsertInstance).toHaveBeenCalledWith('example', expect.objectContaining({ apiToken: undefined }));
+  });
+});
+
+describe('GET /reports/:appId/:date', () => {
+  it('rejects unsafe path parameters before reading a report', async () => {
+    const response = await request(makeApp()).get('/api/jira/reports/bad@app/2026-01-01');
+
+    expect(response.status).toBe(400);
+    expect(jiraReports.getReport).not.toHaveBeenCalled();
+  });
+
+  it('rejects invalid dates before reading a report', async () => {
+    const response = await request(makeApp()).get('/api/jira/reports/example-app/not-a-date');
+
+    expect(response.status).toBe(400);
+    expect(jiraReports.getReport).not.toHaveBeenCalled();
+  });
+});
+
+describe('GET /reports/:appId/latest', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('rejects invalid appId characters with 400 VALIDATION_ERROR', async () => {
+    const response = await request(makeApp()).get('/api/jira/reports/bad@app/latest');
+
+    expect(response.status).toBe(400);
+    expect(response.body.code).toBe('VALIDATION_ERROR');
+    expect(jiraReports.getLatestReport).not.toHaveBeenCalled();
+  });
+
+  it('rejects appId with spaces and special characters', async () => {
+    const response = await request(makeApp()).get('/api/jira/reports/bad%20app/latest');
+
+    expect(response.status).toBe(400);
+    expect(response.body.code).toBe('VALIDATION_ERROR');
+    expect(jiraReports.getLatestReport).not.toHaveBeenCalled();
+  });
+
+  it('accepts valid appId with alphanumeric, dot, underscore, and dash', async () => {
+    jiraReports.getLatestReport.mockResolvedValue({ appId: 'valid-app.v2_0', date: '2026-01-01', status: 'ok' });
+
+    const response = await request(makeApp()).get('/api/jira/reports/valid-app.v2_0/latest');
+
+    expect(response.status).toBe(200);
+    expect(jiraReports.getLatestReport).toHaveBeenCalledWith('valid-app.v2_0');
+  });
+
+  it('returns 404 when no reports found', async () => {
+    jiraReports.getLatestReport.mockResolvedValue(null);
+
+    const response = await request(makeApp()).get('/api/jira/reports/example-app/latest');
+
+    expect(response.status).toBe(404);
+    expect(response.body.code).toBe('NOT_FOUND');
+  });
+});
+
+describe('POST /reports/generate', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('rejects invalid appId in request body', async () => {
+    const response = await request(makeApp()).post('/api/jira/reports/generate').send({ appId: 'bad@app' });
+
+    expect(response.status).toBe(400);
+    expect(response.body.code).toBe('VALIDATION_ERROR');
+    expect(jiraReports.generateReport).not.toHaveBeenCalled();
+  });
+
+  it('accepts empty appId to generate all reports', async () => {
+    jiraReports.generateAllReports.mockResolvedValue([{ appId: 'app1' }, { appId: 'app2' }]);
+
+    const response = await request(makeApp()).post('/api/jira/reports/generate').send({});
+
+    expect(response.status).toBe(200);
+    expect(jiraReports.generateAllReports).toHaveBeenCalled();
+  });
+
+  it('rejects non-string appId values', async () => {
+    const response = await request(makeApp()).post('/api/jira/reports/generate').send({ appId: 123 });
+
+    expect(response.status).toBe(400);
+    expect(response.body.code).toBe('VALIDATION_ERROR');
+    expect(jiraReports.generateReport).not.toHaveBeenCalled();
+  });
+});
+
+describe('GET /instances/:instanceId/my-sprint-tickets/:projectKey', () => {
+  let app;
+  beforeEach(() => {
+    app = makeApp();
+    vi.clearAllMocks();
+  });
+
+  it('returns the sprint tickets', async () => {
+    jiraService.fetchMyCurrentSprintTickets.mockResolvedValue([{ key: 'EX-1', summary: 'Example ticket' }]);
+
+    const r = await request(app).get('/api/jira/instances/jira-1/my-sprint-tickets/EX');
+
+    expect(r.status).toBe(200);
+    expect(r.body).toEqual([{ key: 'EX-1', summary: 'Example ticket' }]);
+  });
+
+  it('returns an empty sprint as an empty list, not an error', async () => {
+    jiraService.fetchMyCurrentSprintTickets.mockResolvedValue([]);
+
+    const r = await request(app).get('/api/jira/instances/jira-1/my-sprint-tickets/EX');
+
+    expect(r.status).toBe(200);
+    expect(r.body).toEqual([]);
+  });
+
+  it('surfaces a fetch failure instead of answering 200 with an empty list (#3437)', async () => {
+    // The swallow-to-[] wrapper made an unreachable instance indistinguishable
+    // from an empty sprint, so the UI stated "No tickets assigned to you".
+    jiraService.fetchMyCurrentSprintTickets.mockRejectedValue(new Error('connect ECONNREFUSED'));
+
+    const r = await request(app).get('/api/jira/instances/jira-1/my-sprint-tickets/EX');
+
+    expect(r.status).toBe(502);
+    expect(r.body.code).toBe('JIRA_FETCH_FAILED');
+    expect(r.body.error).toContain('connect ECONNREFUSED');
+    // The soft wrapper must not be what the UI route calls.
+    expect(jiraService.getMyCurrentSprintTickets).not.toHaveBeenCalled();
+  });
+});
+
+// #5042 — the endpoints the JIRA claim flow's epic decomposition needs. Before
+// this, the flow's prompt told the agent to GET `/tickets/<KEY>`, a route that
+// did not exist, and there was no way at all to stamp a label, list an epic's
+// children, or move a filed child into the sprint.
+describe('epic-decomposition endpoints (#5042)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('GET /instances/:instanceId/tickets/:ticketId reads one ticket', async () => {
+    jiraService.getIssue.mockResolvedValue({ key: 'PROJ-1', labels: ['decomposed'], description: 'body', epicKey: null });
+    const response = await request(makeApp()).get('/api/jira/instances/inst-1/tickets/PROJ-1');
+    expect(response.status).toBe(200);
+    expect(response.body.labels).toEqual(['decomposed']);
+    expect(jiraService.getIssue).toHaveBeenCalledWith('inst-1', 'PROJ-1');
+  });
+
+  it('POST /instances/:instanceId/tickets/:ticketId/labels adds labels additively', async () => {
+    jiraService.addLabels.mockResolvedValue({ success: true, ticketId: 'PROJ-1' });
+    const response = await request(makeApp())
+      .post('/api/jira/instances/inst-1/tickets/PROJ-1/labels')
+      .send({ labels: ['decomposed'] });
+    expect(response.status).toBe(200);
+    expect(jiraService.addLabels).toHaveBeenCalledWith('inst-1', 'PROJ-1', ['decomposed']);
+  });
+
+  it('rejects a labels request with no labels rather than issuing a no-op write', async () => {
+    const response = await request(makeApp())
+      .post('/api/jira/instances/inst-1/tickets/PROJ-1/labels')
+      .send({ labels: [] });
+    expect(response.status).toBe(400);
+    expect(jiraService.addLabels).not.toHaveBeenCalled();
+  });
+
+  it('GET /instances/:instanceId/epics/:epicKey/children lists an epic\'s children', async () => {
+    jiraService.getEpicChildren.mockResolvedValue([{ key: 'PROJ-2', status: 'To Do' }]);
+    const response = await request(makeApp()).get('/api/jira/instances/inst-1/epics/PROJ-1/children');
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual([{ key: 'PROJ-2', status: 'To Do' }]);
+    expect(jiraService.getEpicChildren).toHaveBeenCalledWith('inst-1', 'PROJ-1');
+  });
+
+  it('POST /instances/:instanceId/sprints/:sprintId/issues moves issues into a sprint', async () => {
+    jiraService.addIssuesToSprint.mockResolvedValue({ success: true, sprintId: '42', issueKeys: ['PROJ-2'] });
+    const response = await request(makeApp())
+      .post('/api/jira/instances/inst-1/sprints/42/issues')
+      .send({ issueKeys: ['PROJ-2'] });
+    expect(response.status).toBe(200);
+    expect(jiraService.addIssuesToSprint).toHaveBeenCalledWith('inst-1', '42', ['PROJ-2']);
+  });
+
+  it('rejects a sprint move with no issue keys', async () => {
+    const response = await request(makeApp())
+      .post('/api/jira/instances/inst-1/sprints/42/issues')
+      .send({ issueKeys: [] });
+    expect(response.status).toBe(400);
+    expect(jiraService.addIssuesToSprint).not.toHaveBeenCalled();
+  });
+});
+
+describe('ticket id path-traversal guard', () => {
+  const base = '/api/jira/instances/example/tickets';
+  const bad = ['..%2Fx', 'a%2Fb', 'A-1%3Fx%3D1', '..%2F..%2Fapi%2F2%2Fproject%2FKEY'];
+
+  beforeEach(() => vi.clearAllMocks());
+
+  it.each(bad)('rejects %s on comment, transition and update with no upstream call', async (id) => {
+    const app = makeApp();
+    const responses = [
+      await request(app).post(`${base}/${id}/comments`).send({ comment: 'hi' }),
+      await request(app).post(`${base}/${id}/transition`).send({ transitionId: '1' }),
+      await request(app).put(`${base}/${id}`).send({ summary: 'x' })
+    ];
+    responses.forEach((r) => expect(r.status).toBe(400));
+    expect(jiraService.addComment).not.toHaveBeenCalled();
+    expect(jiraService.transitionTicket).not.toHaveBeenCalled();
+    expect(jiraService.updateTicket).not.toHaveBeenCalled();
+  });
+
+  it('still accepts issue keys and numeric ids', async () => {
+    jiraService.getIssue.mockResolvedValue({ key: 'ABC-123' });
+    expect((await request(makeApp()).get(`${base}/ABC-123`)).status).toBe(200);
+    expect((await request(makeApp()).get(`${base}/10001`)).status).toBe(200);
+  });
+});

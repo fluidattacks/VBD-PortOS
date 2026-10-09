@@ -1,0 +1,230 @@
+/**
+ * Postgres-backed round-trip for the pipeline issues DB adapter (#1015).
+ * SKIPS cleanly when no DB is reachable. Snapshots + restores the table.
+ */
+
+import { describe, it, expect, afterAll, beforeAll, beforeEach, vi } from 'vitest';
+import { checkHealth, ensureSchema, query, close } from '../../../lib/db.js';
+import * as dbConnection from '../../../lib/db.js';
+import { PIPELINE_STAGE_IDS } from '../../../lib/pipelineStages.js';
+import { requireDbOrSkip } from '../../../lib/dbTestGate.js';
+
+// Exercise the real PG facade/service without importing this install's legacy
+// files. The dedicated DB runner still enforces portos_test for all SQL.
+vi.mock('../../../lib/pgFileFacade.js', async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    createPgFileFacade: (options) => actual.createPgFileFacade({ ...options, isFile: () => false }),
+    resolvePgBackend: async ({ loadDb, makePg }) => makePg(await loadDb()),
+  };
+});
+
+let dbReady = false;
+let skipReason = '';
+{
+  const health = await checkHealth().catch((e) => ({ connected: false, error: e?.message }));
+  if (!health.connected) {
+    skipReason = `Postgres not reachable (${health.error || 'no connection'})`;
+  } else {
+    await ensureSchema().catch(() => {});
+    const probe = await query(
+      `SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name = 'pipeline_issues') AS ok`,
+    ).catch(() => ({ rows: [{ ok: false }] }));
+    if (probe.rows?.[0]?.ok) dbReady = true;
+    else skipReason = 'pipeline_issues table not present';
+  }
+}
+
+const runDb = requireDbOrSkip('services/pipeline/issuesStore/db.test', dbReady, skipReason);
+
+const I = (id, extra = {}) => ({
+  id, seriesId: 'ser-1', seasonId: null, number: 1, status: 'draft', title: id,
+  stages: {}, createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-02T00:00:00.000Z',
+  deleted: false, deletedAt: null, ...extra,
+});
+
+describe.skipIf(!runDb)('pipeline issues DB adapter round-trip', () => {
+  let db;
+  let snap = [];
+  beforeAll(async () => {
+    db = await import('./db.js');
+    snap = (await query(`SELECT * FROM pipeline_issues`)).rows;
+  });
+
+  beforeEach(async () => { await query(`DELETE FROM pipeline_issues`); });
+
+  afterAll(async () => {
+    await query(`DELETE FROM pipeline_issues`).catch(() => {});
+    for (const r of snap) {
+      await query(
+        `INSERT INTO pipeline_issues (id, series_id, season_id, number, status, data, ephemeral, created_at, updated_at, deleted, deleted_at)
+         VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9,$10,$11) ON CONFLICT (id) DO NOTHING`,
+        [r.id, r.series_id, r.season_id, r.number, r.status, JSON.stringify(r.data), r.ephemeral, r.created_at, r.updated_at, r.deleted, r.deleted_at],
+      ).catch(() => {});
+    }
+    await close();
+  });
+
+  it('writes a record and reads it back verbatim (full stages map preserved)', async () => {
+    const rec = I('iss-1', { stages: { idea: { status: 'ready', output: 'beats', lastRunId: 'run-7' } } });
+    await db.writeRaw('iss-1', rec);
+    expect(await db.readRaw('iss-1')).toEqual(rec);
+  });
+
+  it('lean reads remove only known stage histories while full reads remain lossless', async () => {
+    const stages = Object.fromEntries(PIPELINE_STAGE_IDS.map((id) => [id, {
+      output: 'active', runHistory: [{ output: 'older', runId: 'run-1' }],
+      cover: { prompt: 'cover' }, custom: { nested: true },
+    }]));
+    const rec = I('iss-history', { stages, custom: { retained: true } });
+    await db.writeRaw(rec.id, rec);
+    await db.writeRaw('iss-other', I('iss-other', { seriesId: 'ser-other', stages: null }));
+    const lean = { ...rec, stages: Object.fromEntries(PIPELINE_STAGE_IDS.map((id) => {
+      const { runHistory, ...stage } = stages[id];
+      return [id, stage];
+    })) };
+    expect(await db.listRawBySeries('ser-1', { withHistory: false })).toEqual([lean]);
+    expect(await db.listRawBySeriesIds(['ser-1'], { withHistory: false })).toEqual([lean]);
+    expect((await db.listRaw({ withHistory: false })).find((r) => r.id === rec.id)).toEqual(lean);
+    expect(await db.readRaw(rec.id)).toEqual(rec);
+    expect(await db.listRawBySeries('ser-1')).toEqual([rec]);
+    expect((await db.listRaw({ withHistory: false })).find((r) => r.id === 'iss-other').stages).toBeNull();
+  });
+
+  it('recent reads limit in SQL and summaries never transfer stage data', async () => {
+    for (let n = 0; n < 60; n += 1) {
+      await db.writeRaw(`iss-${n}`, I(`iss-${n}`, {
+        updatedAt: new Date(Date.UTC(2026, 0, 1, 0, n)).toISOString(),
+        stages: { idea: { output: 'active', runHistory: [{ output: 'older' }] } },
+        deleted: n === 59,
+      }));
+    }
+    const querySpy = vi.spyOn(dbConnection, 'query');
+    const summaries = await db.listRecentRaw({ limit: 2, summary: true });
+    expect(summaries.map((r) => r.id)).toEqual(['iss-58', 'iss-57']);
+    expect(Object.keys(summaries[0]).sort()).toEqual(['createdAt', 'id', 'number', 'seriesId', 'title', 'updatedAt']);
+    expect(querySpy).toHaveBeenCalledTimes(1);
+    const [sql, params] = querySpy.mock.calls[0];
+    expect(sql).toMatch(/WHERE deleted IS NOT TRUE\s+ORDER BY updated_at DESC NULLS LAST, id DESC LIMIT \$1/);
+    expect(sql).toContain('jsonb_build_object');
+    expect(params).toEqual([2]);
+    querySpy.mockRestore();
+    const full = await db.listRecentRaw({ limit: 1, includeDeleted: true });
+    expect(full[0].id).toBe('iss-59');
+    expect(full[0].stages.idea.runHistory).toHaveLength(1);
+    const lean = await db.listRecentRaw({ limit: 1, withHistory: false });
+    expect(lean[0].stages.idea).toEqual({ output: 'active' });
+  });
+
+  it('public PG lists project before transfer while detail keeps history', async () => {
+    const svc = await import('../issueCrud.js');
+    const record = I('iss-service', { stages: { idea: {
+      output: 'active', runHistory: [{ runId: 'run-old', output: 'older' }],
+    } } });
+    await db.writeRaw(record.id, record);
+    const querySpy = vi.spyOn(dbConnection, 'query');
+    const lists = [
+      await svc.listIssues({ seriesId: 'ser-1', withHistory: false }),
+      await svc.listIssues({ withHistory: false }),
+      await svc.listAllIssues({ withHistory: false }),
+      await svc.listAllIssues({ seriesIds: ['ser-1'], withHistory: false }),
+      await svc.listIssuesForSeries('ser-1', { withHistory: false }),
+      await svc.listRecentIssues({ withHistory: false }),
+    ];
+    for (const list of lists) {
+      expect(list[0].stages.idea).toMatchObject({ output: 'active', runHistory: [] });
+    }
+    // Assert on actual PostgreSQL results, before the facade can strip history.
+    for (const result of querySpy.mock.results) {
+      expect((await result.value).rows[0].data.stages.idea).not.toHaveProperty('runHistory');
+    }
+    querySpy.mockRestore();
+    expect((await svc.getIssue(record.id)).stages.idea.runHistory).toHaveLength(1);
+    expect((await svc.listAllIssues())[0].stages.idea.runHistory).toHaveLength(1);
+    expect(await svc.listRecentIssues({ limit: 1, summary: true })).toEqual([{
+      id: record.id, title: record.title, number: record.number,
+      seriesId: record.seriesId, updatedAt: record.updatedAt,
+    }]);
+  });
+
+  it('lean SQL tolerates malformed stage containers and recent summaries sanitize legacy fields', async () => {
+    const svc = await import('../issueCrud.js');
+    for (const [n, stages] of [[], 'invalid', { idea: [] }, { idea: 'invalid' }].entries()) {
+      await db.writeRaw(`iss-malformed-${n}`, I(`iss-malformed-${n}`, { stages }));
+    }
+    expect(await svc.listIssues({ withHistory: false })).toHaveLength(4);
+    await db.writeRaw('iss-legacy', I('iss-legacy', {
+      title: '  Legacy title  ', number: null, updatedAt: '2026-02-01T00:00:00.000Z',
+    }));
+    await query("UPDATE pipeline_issues SET deleted = NULL WHERE id = 'iss-legacy'");
+    const summary = await svc.listRecentIssues({ limit: 1, summary: true });
+    expect(summary).toEqual([{
+      id: 'iss-legacy', title: 'Legacy title', number: 0, seriesId: 'ser-1',
+      updatedAt: '2026-02-01T00:00:00.000Z',
+    }]);
+    await query("UPDATE pipeline_issues SET updated_at = NULL WHERE id = 'iss-legacy'");
+    expect((await svc.listRecentIssues({ limit: 1 }))[0].id).not.toBe('iss-legacy');
+    await db.writeRaw('iss-invalid-title', I('iss-invalid-title', {
+      title: 123, updatedAt: '2026-03-01T00:00:00.000Z',
+    }));
+    expect(await svc.listRecentIssues({ limit: 1, summary: true })).toEqual([]);
+  });
+
+  it('upsert updates the record and the mirror columns (series_id/number/status)', async () => {
+    await db.writeRaw('iss-1', I('iss-1', { number: 1, status: 'draft' }));
+    await db.writeRaw('iss-1', I('iss-1', { number: 3, status: 'shipped', updatedAt: '2026-03-03T00:00:00.000Z' }));
+    const col = (await query(`SELECT series_id, number, status, updated_at FROM pipeline_issues WHERE id = 'iss-1'`)).rows[0];
+    expect(col.number).toBe(3);
+    expect(col.status).toBe('shipped');
+    expect(new Date(col.updated_at).toISOString()).toBe('2026-03-03T00:00:00.000Z');
+  });
+
+  it('idx_issues_series serves the renumber query (series ordered by number)', async () => {
+    await db.writeRaw('iss-b', I('iss-b', { number: 2 }));
+    await db.writeRaw('iss-a', I('iss-a', { number: 1 }));
+    await db.writeRaw('iss-d', I('iss-d', { number: 9, deleted: true, deletedAt: '2026-02-02T00:00:00.000Z' }));
+    const ordered = (await query(
+      `SELECT id FROM pipeline_issues WHERE series_id = 'ser-1' AND deleted = FALSE ORDER BY number`,
+    )).rows;
+    expect(ordered.map((r) => r.id)).toEqual(['iss-a', 'iss-b']);
+  });
+
+  it('listRawBySeriesIds returns only the requested series', async () => {
+    await db.writeRaw('iss-1', I('iss-1', { seriesId: 'ser-1' }));
+    await db.writeRaw('iss-2', I('iss-2', { seriesId: 'ser-2' }));
+    await db.writeRaw('iss-3', I('iss-3', { seriesId: 'ser-3' }));
+    expect((await db.listRawBySeriesIds(['ser-1', 'ser-3'])).map((r) => r.id).sort())
+      .toEqual(['iss-1', 'iss-3']);
+    expect(await db.listRawBySeriesIds([])).toEqual([]);
+  });
+
+  it('listIds returns live, tombstoned, and ephemeral ids alike', async () => {
+    await db.writeRaw('iss-live', I('iss-live'));
+    await db.writeRaw('iss-dead', I('iss-dead', { deleted: true, deletedAt: '2026-02-02T00:00:00.000Z' }));
+    await db.writeRaw('iss-ghost', I('iss-ghost', { ephemeral: true }));
+    expect((await db.listIds()).sort()).toEqual(['iss-dead', 'iss-ghost', 'iss-live']);
+  });
+
+  it('listIds({ includeDeleted: false }) excludes tombstones via the mirror column (#2540)', async () => {
+    await db.writeRaw('iss-live', I('iss-live'));
+    await db.writeRaw('iss-ghost', I('iss-ghost', { ephemeral: true }));
+    await db.writeRaw('iss-dead', I('iss-dead', { deleted: true, deletedAt: '2026-02-02T00:00:00.000Z' }));
+    // Ephemeral rows are live (deleted = false) so they stay in the sweep.
+    expect((await db.listIds({ includeDeleted: false })).sort()).toEqual(['iss-ghost', 'iss-live']);
+  });
+
+  it('tolerates a malformed timestamp without throwing', async () => {
+    await db.writeRaw('iss-bad', I('iss-bad', { updatedAt: 'not-a-date', createdAt: 'nope' }));
+    const col = (await query(`SELECT created_at, updated_at FROM pipeline_issues WHERE id = 'iss-bad'`)).rows[0];
+    expect(col.created_at).toBeInstanceOf(Date);
+    expect(col.updated_at).toBeInstanceOf(Date);
+  });
+
+  it('deleteRaw removes the row (idempotent)', async () => {
+    await db.writeRaw('iss-1', I('iss-1'));
+    await db.deleteRaw('iss-1');
+    expect(await db.readRaw('iss-1')).toBeNull();
+    await db.deleteRaw('iss-1');
+  });
+});

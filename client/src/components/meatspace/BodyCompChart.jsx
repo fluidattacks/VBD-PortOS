@@ -1,0 +1,129 @@
+import { useState, useEffect, useCallback } from 'react';
+import {
+  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend
+} from 'recharts';
+import * as api from '../../services/api';
+import BrailleSpinner from '../BrailleSpinner';
+import LoadFailureNotice from './LoadFailureNotice';
+import useChartColors from '../../hooks/useChartColors.js';
+import { formatMonthDay, formatPercent, formatWeight } from '../../utils/formatters.js';
+
+export default function BodyCompChart() {
+  const chartColors = useChartColors();
+  const [data, setData] = useState([]);
+  const [failed, setFailed] = useState(false);
+  const [loading, setLoading] = useState(true);
+
+  const fetchData = useCallback(async () => {
+    const history = await api.getBodyHistory({ silent: true }).catch(() => null);
+    setFailed(history === null);
+    const chartData = (history || []).map(entry => ({
+      date: entry.date,
+      label: formatMonthDay(entry.date),
+      weight: entry.weightLbs || null,
+      fatPct: entry.fatPct || null,
+      musclePct: entry.musclePct || null
+    })).filter(d => d.weight !== null);
+    setData(chartData);
+    setLoading(false);
+  }, []);
+
+  useEffect(() => {
+    fetchData();
+  }, [fetchData]);
+
+  if (loading) {
+    return (
+      <div className="bg-port-card border border-port-border rounded-xl p-6">
+        <div className="flex justify-center py-8">
+          <BrailleSpinner text="Loading chart" />
+        </div>
+      </div>
+    );
+  }
+
+  if (failed) {
+    return <LoadFailureNotice message="Could not load body composition. Retry." onRetry={fetchData} />;
+  }
+
+  if (data.length === 0) {
+    return (
+      <div className="bg-port-card border border-port-border rounded-xl p-6">
+        <h3 className="text-sm font-medium text-gray-400 uppercase tracking-wider mb-2">Body Composition</h3>
+        <p className="text-gray-500 text-sm">No body composition data. Import your health spreadsheet to see trends.</p>
+      </div>
+    );
+  }
+
+  const CustomTooltip = ({ active, payload, label }) => {
+    if (!active || !payload?.length) return null;
+    return (
+      <div className="bg-port-card border border-port-border rounded-lg p-2 text-sm">
+        <p className="text-gray-400 mb-1">{label}</p>
+        {payload.map(p => (
+          <p key={p.dataKey} style={{ color: p.color }}>
+            {p.name}: {p.dataKey === 'weight' ? formatWeight(p.value) : formatPercent(p.value)}
+          </p>
+        ))}
+      </div>
+    );
+  };
+
+  // Determine Y axes
+  const hasBodyFat = data.some(d => d.fatPct);
+
+  return (
+    <div className="bg-port-card border border-port-border rounded-xl p-6">
+      <h3 className="text-sm font-medium text-gray-400 uppercase tracking-wider mb-4">
+        Body Composition Over Time
+      </h3>
+      <ResponsiveContainer width="100%" height={300}>
+        <LineChart data={data} margin={{ top: 5, right: 5, bottom: 5, left: 0 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke={chartColors.grid} />
+          <XAxis
+            dataKey="label"
+            tick={{ fill: chartColors.axis, fontSize: 11 }}
+            interval={Math.max(0, Math.floor(data.length / 12))}
+          />
+          <YAxis
+            yAxisId="weight"
+            tick={{ fill: chartColors.axis, fontSize: 11 }}
+            domain={['dataMin - 5', 'dataMax + 5']}
+          />
+          {hasBodyFat && (
+            <YAxis
+              yAxisId="pct"
+              orientation="right"
+              tick={{ fill: chartColors.axis, fontSize: 11 }}
+              domain={[0, 50]}
+            />
+          )}
+          <Tooltip content={<CustomTooltip />} />
+          <Legend />
+          <Line
+            yAxisId="weight"
+            type="monotone"
+            dataKey="weight"
+            name="Weight (lbs)"
+            stroke={chartColors.accent}
+            dot={false}
+            strokeWidth={2}
+            connectNulls
+          />
+          {hasBodyFat && (
+            <Line
+              yAxisId="pct"
+              type="monotone"
+              dataKey="fatPct"
+              name="Body Fat %"
+              stroke={chartColors.error}
+              dot={false}
+              strokeWidth={2}
+              connectNulls
+            />
+          )}
+        </LineChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}

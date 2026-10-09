@@ -1,0 +1,850 @@
+/**
+ * Auto-Fixer Service
+ *
+ * Handles automatic agent spawning for critical errors
+ * Integrates with error handler and CoS task system
+ */
+
+import { isRunning } from './cos.js';
+import { getBootCommit, getInstallState } from './installState.js';
+import { fileInvestigationTask, __resetInvestigationCircuit } from './investigationTaskProducer.js';
+import { investigationFingerprint } from '../lib/investigationTasks.js';
+import { errorEvents } from '../lib/errorHandler.js';
+import { ERROR_CATEGORIES } from '../lib/aiToolkit/errorDetection.js';
+
+// Track recent errors to prevent duplicate auto-fix tasks
+const recentErrors = new Map();
+const ERROR_DEDUPE_WINDOW = 60000; // 1 minute
+
+// Defer task creation as a backstop for the case where NO fallback is
+// attempted (e.g. no fallback configured) — the timer fires and the
+// investigation task is created. When a fallback IS attempted, promptRunner.js
+// drives the lifecycle explicitly (noteFallbackStarted → noteFallbackHandled /
+// noteFallbackFailed), which is authoritative regardless of how long the
+// fallback takes. The fixed timer alone was a bug: a slow CLI fallback (Claude
+// Code can take 20–30s) outran the window, so a successfully-recovered failure
+// still left an investigation task in the user's plan.
+const TASK_DEFER_MS = 5000;
+// Invariant: every path that removes a timer here MUST also delete the
+// matching map entry (the setTimeout callback, noteFallbackHandled, and
+// _resetAutoFixerForTests all uphold this) — otherwise the map grows
+// unbounded across the lifetime of the process.
+const deferredTasks = new Map(); // errorKey -> { timer }
+// Error keys whose failure is currently being retried via a fallback. While a
+// key is in this set, the backstop timer is suppressed (we wait for the
+// fallback's real outcome). Cleared by noteFallbackHandled (success → no task)
+// and noteFallbackFailed (failure → the fallback's own task already covers it).
+const inFlightFallbacks = new Set(); // errorKey
+// Error keys explicitly escalated via escalateProviderFailure, with the ms
+// timestamp of the escalation. Deduped on its own window (NOT recentErrors,
+// which the primary failure may already have populated) so a concurrent
+// no-fallback failure storm collapses to ONE escalated investigation task
+// instead of one per call. Pruned + reset alongside the other maps.
+const escalatedKeys = new Map(); // errorKey -> number (ms timestamp)
+
+// Circuit breaker: if the SAME resource (errorKey) trips auto-fix more than
+// CIRCUIT_MAX_FAILURES times within CIRCUIT_WINDOW_MS, stop creating
+// investigation/fix tasks for it. A resource failing this persistently won't be
+// healed by yet another identical task — repeating only exhausts the plan queue
+// and can drive an unbounded retry loop. The window is rolling: timestamps older
+// than CIRCUIT_WINDOW_MS are pruned on every check, so the circuit auto-closes
+// once the failure rate ages out (no manual reset needed).
+const CIRCUIT_WINDOW_MS = 60 * 60 * 1000; // 1 hour
+const CIRCUIT_MAX_FAILURES = 3;
+const failureTimestamps = new Map(); // errorKey -> number[] (ms timestamps, newest-last)
+
+// Record a task-worthy failure for `errorKey` and report whether the circuit is
+// now OPEN — i.e. this failure is the (CIRCUIT_MAX_FAILURES + 1)th within the
+// rolling window and the caller should SUPPRESS task creation. Only genuinely
+// new failures (past the dedupe + in-flight-fallback guards) should reach here,
+// so the count reflects distinct recovery attempts, not log spam.
+function tripCircuit(errorKey) {
+  const now = Date.now();
+
+  // Sweep fully-aged keys so the map can't grow unbounded — `error.message`
+  // (part of the generic errorKey) can carry dynamic text, so distinct keys
+  // accumulate over the process lifetime otherwise. Mirrors isDuplicateError's
+  // global cleanup of recentErrors.
+  for (const [key, stamps] of failureTimestamps.entries()) {
+    if (stamps.every((t) => now - t >= CIRCUIT_WINDOW_MS)) {
+      failureTimestamps.delete(key);
+    }
+  }
+
+  const recent = (failureTimestamps.get(errorKey) || []).filter((t) => now - t < CIRCUIT_WINDOW_MS);
+  recent.push(now);
+  failureTimestamps.set(errorKey, recent);
+  return recent.length > CIRCUIT_MAX_FAILURES;
+}
+
+// Store pending tasks when CoS is not running (for later pickup)
+const pendingAutoFixTasks = [];
+
+// Collapse a (possibly multi-line) error string to one capped line for logging
+// — the single-line logging convention forbids multi-line blobs; the untruncated
+// text always remains in the run record's `error` field.
+const oneLine = (s, max = 300) => {
+  const t = String(s ?? '').replace(/\s+/g, ' ').trim();
+  return t.length > max ? `${t.slice(0, max - 1)}…` : t;
+};
+
+// ── Tiered fallback cascade (issue #2328) ─────────────────────────────────
+// A failure is routed to the CHEAPEST tier that can plausibly recover it,
+// escalating only when no deterministic fix applies:
+//   1 config/env             — wrong provider/model/key/path/env; fixable by config
+//   2 schema/type            — malformed request/response; type/format/parse/build
+//   3 constrained-agent-retry — transient/recoverable; a bounded retry may clear it
+//   4 escalate               — unknown or human-judgement-required; hand to investigation
+export const FIX_TIERS = {
+  CONFIG_ENV: 1,
+  SCHEMA_TYPE: 2,
+  CONSTRAINED_RETRY: 3,
+  ESCALATE: 4,
+};
+
+const FIX_TIER_META = {
+  [FIX_TIERS.CONFIG_ENV]: { strategy: 'config/env', label: 'config/env correction' },
+  [FIX_TIERS.SCHEMA_TYPE]: { strategy: 'schema/type', label: 'schema/type correction' },
+  [FIX_TIERS.CONSTRAINED_RETRY]: { strategy: 'constrained-agent-retry', label: 'constrained agent retry' },
+  [FIX_TIERS.ESCALATE]: { strategy: 'escalate', label: 'escalate for investigation' },
+};
+
+// Deterministic error-category → tier map. Categories come from BOTH
+// errorDetection.js (AI-provider failures) and agentErrorAnalysis.js (CoS agent
+// failures); the two vocabularies overlap and are unioned here. Anything
+// unmapped falls through to Tier 4 (escalate) — an unrecognized failure has no
+// deterministic fix, so an investigation task carries it to a human/agent.
+const CATEGORY_TO_TIER = {
+  // Tier 1 — config/env (wrong key/model/path/permissions/env)
+  'auth-error': FIX_TIERS.CONFIG_ENV,
+  forbidden: FIX_TIERS.CONFIG_ENV,
+  'model-not-found': FIX_TIERS.CONFIG_ENV,
+  'model-not-supported': FIX_TIERS.CONFIG_ENV,
+  'quota-exceeded': FIX_TIERS.CONFIG_ENV,
+  'billing-error': FIX_TIERS.CONFIG_ENV,
+  'usage-limit': FIX_TIERS.CONFIG_ENV,
+  'spawn-error': FIX_TIERS.CONFIG_ENV,
+  // A provider CLI refusing to load its own config file: deterministic, and the
+  // fix is literally a config edit — never worth three identical retries plus an
+  // investigation task.
+  'cli-config-invalid': FIX_TIERS.CONFIG_ENV,
+  'permission-denied': FIX_TIERS.CONFIG_ENV,
+  'file-not-found': FIX_TIERS.CONFIG_ENV,
+  // Tier 2 — schema/type (malformed request/response, parse/build/format)
+  'parse-error': FIX_TIERS.SCHEMA_TYPE,
+  'bad-request': FIX_TIERS.SCHEMA_TYPE,
+  'context-length': FIX_TIERS.SCHEMA_TYPE,
+  'ollama-context-window': FIX_TIERS.SCHEMA_TYPE,
+  'output-length': FIX_TIERS.SCHEMA_TYPE,
+  'build-error': FIX_TIERS.SCHEMA_TYPE,
+  'lint-error': FIX_TIERS.SCHEMA_TYPE,
+  // Tier 3 — constrained-agent-retry (transient/recoverable)
+  'rate-limit': FIX_TIERS.CONSTRAINED_RETRY,
+  'network-error': FIX_TIERS.CONSTRAINED_RETRY,
+  timeout: FIX_TIERS.CONSTRAINED_RETRY,
+  'server-error': FIX_TIERS.CONSTRAINED_RETRY,
+  'tool-error': FIX_TIERS.CONSTRAINED_RETRY,
+  'mcp-error': FIX_TIERS.CONSTRAINED_RETRY,
+  'test-failure': FIX_TIERS.CONSTRAINED_RETRY,
+  'npm-error': FIX_TIERS.CONSTRAINED_RETRY,
+  'memory-error': FIX_TIERS.CONSTRAINED_RETRY,
+  'turn-limit': FIX_TIERS.CONSTRAINED_RETRY,
+  'process-killed': FIX_TIERS.CONSTRAINED_RETRY,
+  'browser-error': FIX_TIERS.CONSTRAINED_RETRY,
+  'locator-error': FIX_TIERS.CONSTRAINED_RETRY,
+  'claude-error': FIX_TIERS.CONSTRAINED_RETRY,
+  'startup-failure': FIX_TIERS.CONSTRAINED_RETRY,
+  // Tier 4 — escalate (explicit entries; also the fall-through default)
+  'content-refusal': FIX_TIERS.ESCALATE,
+  'content-filtered': FIX_TIERS.ESCALATE,
+  'task-rejected': FIX_TIERS.ESCALATE,
+  'git-conflict': FIX_TIERS.ESCALATE,
+  'git-error': FIX_TIERS.ESCALATE,
+  'no-changes': FIX_TIERS.ESCALATE,
+  unknown: FIX_TIERS.ESCALATE,
+};
+
+/**
+ * Deterministically map an error category to a fallback tier (issue #2328).
+ * Pure — no I/O. Unknown/absent categories escalate (Tier 4), so a failure the
+ * cascade doesn't recognize is never silently swallowed.
+ * @param {string} [category]
+ * @returns {{ tier: number, strategy: string, label: string }}
+ */
+export function classifyFixTier(category) {
+  const tier = CATEGORY_TO_TIER[category] ?? FIX_TIERS.ESCALATE;
+  return { tier, ...FIX_TIER_META[tier] };
+}
+
+/**
+ * Look up the human-facing metadata for a fallback tier NUMBER (issue #2328).
+ * The persisted diagnostics record already carries the tier number, so the
+ * telemetry aggregator resolves labels from the number rather than re-running
+ * the category classifier. Unknown tiers degrade to an explicit 'unknown'
+ * rather than throwing. Pure — no I/O.
+ * @param {number} tier
+ * @returns {{ strategy: string, label: string }}
+ */
+export function fixTierMeta(tier) {
+  return FIX_TIER_META[tier] || { strategy: 'unknown', label: 'unknown' };
+}
+
+/**
+ * Build a structured, per-attempt auto-fix diagnostics record (issue #2328).
+ * Beyond the single-line log, this object rides on the task/return shape so
+ * downstream telemetry can break failures out by tier / category / reason /
+ * time-to-recovery. Pure — no I/O.
+ * @returns {{ triggerEvent: string, target: string, errorType: string,
+ *   category: string, tier: number, fixStrategy: string, failureReason: string,
+ *   observedAt: string }}
+ */
+export function buildFixDiagnostics({ triggerEvent, target, category, failureReason, observedAt } = {}) {
+  const cat = category || 'unknown';
+  const { tier, strategy } = classifyFixTier(cat);
+  return {
+    triggerEvent: triggerEvent || 'unknown',
+    target: target || 'unknown',
+    errorType: cat,
+    category: cat,
+    tier,
+    fixStrategy: strategy,
+    failureReason: oneLine(failureReason) || 'no error text captured',
+    // ISO timestamp of when the failure was observed (issue #2328). Rides on the
+    // persisted diagnostics so the telemetry aggregator can compute
+    // time-to-recovery (task completion time − this) without a second timestamp
+    // source. Injectable so callers pass the failure's real timestamp (and tests
+    // stay deterministic); defaults to now when the caller has none.
+    observedAt: observedAt || new Date().toISOString(),
+  };
+}
+
+/**
+ * Derive the diagnostics record for an AI-provider failure `error`. Kept as a
+ * single helper so the deferred log line and the investigation task record are
+ * always built from the same fields (no drift).
+ */
+function providerFixDiagnostics(error) {
+  const ctx = error.context || {};
+  return buildFixDiagnostics({
+    triggerEvent: error.code,
+    target: `${ctx.provider || 'Unknown'} (${ctx.model || 'N/A'})`,
+    category: ctx.errorAnalysis?.category,
+    failureReason: ctx.errorDetails || ctx.errorAnalysis?.message,
+    // Pin observedAt to the failure's own timestamp so the log-line record and
+    // the persisted task record (both built from this helper) agree, and so
+    // time-to-recovery measures from the actual failure, not from whenever the
+    // deferred handler ran.
+    observedAt: error.timestamp ? new Date(error.timestamp).toISOString() : undefined,
+  });
+}
+
+function aiProviderErrorKey(providerName, model) {
+  // NUL separator: provider names ("Claude Code CLI") and model ids
+  // ("gpt-4o-mini") both commonly contain `-`, so a `-`-joined key would
+  // collide for pairs like ("gpt-4o", "mini") vs ("gpt", "4o-mini") and
+  // silently dedupe distinct failures together. NUL never appears in
+  // legitimate provider/model identifiers, so the key is unambiguous.
+  return `AI_PROVIDER_EXECUTION_FAILED\x00${providerName}\x00${model}`;
+}
+
+/**
+ * Cancel a deferred investigation task for `provider`/`model` because a
+ * fallback retry succeeded. Called from `runPromptThroughProvider` after
+ * a successful fallback — the user got their result, so the queued task
+ * would be noise. Also clears the dedupe entry so a *future* failure of
+ * the same provider can still raise a task (otherwise the dedupe window
+ * would silently suppress real failures for up to 60s).
+ *
+ * `provider` matches `ctx.provider` (the provider's display name, not id)
+ * because that's what the failure event payload uses — see the
+ * `onRunFailed` hook in server/index.js.
+ */
+export function noteFallbackHandled({ provider, model }) {
+  const errorKey = aiProviderErrorKey(provider, model);
+  inFlightFallbacks.delete(errorKey);
+  const pending = deferredTasks.get(errorKey);
+  if (pending) {
+    clearTimeout(pending.timer);
+    deferredTasks.delete(errorKey);
+    console.log(`✅ Suppressed investigation task: fallback handled failure for ${provider} (${model})`);
+  }
+  // Always clear the dedupe entry — whether or not there was a timer to cancel
+  // (noteFallbackStarted may have already cancelled it) — so a *future*
+  // identical failure can still raise a task.
+  recentErrors.delete(errorKey);
+  return !!pending;
+}
+
+/**
+ * Mark that promptRunner is about to retry `provider`/`model` via a fallback.
+ * Cancels the deferred investigation task immediately and suppresses any that
+ * would otherwise be scheduled (handleAIProviderError checks the in-flight set),
+ * so a slow fallback that exceeds TASK_DEFER_MS can't leave a task behind. The
+ * fallback's eventual outcome (noteFallbackHandled / noteFallbackFailed) clears
+ * the in-flight marker.
+ */
+export function noteFallbackStarted({ provider, model }) {
+  const errorKey = aiProviderErrorKey(provider, model);
+  inFlightFallbacks.add(errorKey);
+  const pending = deferredTasks.get(errorKey);
+  if (pending) {
+    clearTimeout(pending.timer);
+    deferredTasks.delete(errorKey);
+  }
+}
+
+/**
+ * Mark that the fallback retry for `provider`/`model` ALSO failed. Releases the
+ * in-flight suppression without creating a task for the primary: the fallback
+ * provider's own failure already queued its investigation task, so one task per
+ * user action is enough. Also clears the dedupe entry so a later retry isn't
+ * silently suppressed.
+ */
+export function noteFallbackFailed({ provider, model }) {
+  const errorKey = aiProviderErrorKey(provider, model);
+  inFlightFallbacks.delete(errorKey);
+  recentErrors.delete(errorKey);
+}
+
+/**
+ * Explicitly escalate a provider failure to a Tier-4 investigation task
+ * (issue #2342). Called by promptRunner's fallback cascade ONLY when the
+ * deterministic tiers all declined/failed AND no other queued task will
+ * survive to represent the failure — specifically when a Tier-1 corrected
+ * retry was pre-suppressed but threw BEFORE execution (so its onRunFailed
+ * never queued a task) and no fallback provider exists.
+ *
+ * Bypasses the defer window (we already KNOW recovery failed) but still honors
+ * the per-resource circuit breaker, and first clears any lingering
+ * timer/in-flight/dedupe state for the key so the escalation isn't itself
+ * suppressed and a future failure isn't wrongly blocked.
+ *
+ * `error` is a synthetic `AI_PROVIDER_EXECUTION_FAILED`-shaped object built by
+ * the caller from the failure it holds (it lacks the server hook's full run
+ * metadata, so `runId`/`exitCode` may be absent — the investigation task
+ * tolerates that). Returns the created task, or null when the circuit is open.
+ */
+export async function escalateProviderFailure(error) {
+  const ctx = error?.context || {};
+  // Before dedupe: a later real fault on this route must still investigate.
+  if (ctx.errorAnalysis?.category === ERROR_CATEGORIES.RUNTIME_BUDGET_EXHAUSTED) return;
+
+  const errorKey = aiProviderErrorKey(ctx.provider, ctx.model);
+  const now = Date.now();
+
+  // Cancel any pending backstop timer + drop the in-flight suppression for this
+  // key (the cascade already cancelled the timer; make sure it's gone).
+  inFlightFallbacks.delete(errorKey);
+  const pending = deferredTasks.get(errorKey);
+  if (pending) {
+    clearTimeout(pending.timer);
+    deferredTasks.delete(errorKey);
+  }
+
+  // Dedupe on the escalation window, checked+set synchronously (single-threaded)
+  // BEFORE the first await so a concurrent no-fallback failure storm collapses
+  // to ONE task. We can't use isDuplicateError/recentErrors here — the primary
+  // failure's handleAIProviderError may already hold a recentErrors entry for
+  // this key, which would make our FIRST escalation look like a duplicate and
+  // silently swallow it.
+  const lastEscalated = escalatedKeys.get(errorKey);
+  if (lastEscalated && now - lastEscalated < ERROR_DEDUPE_WINDOW) {
+    console.log(`⏭️ Skipping duplicate escalated AI provider failure: ${ctx.provider} (${ctx.model})`);
+    return null;
+  }
+  escalatedKeys.set(errorKey, now);
+  for (const [key, ts] of escalatedKeys.entries()) {
+    if (now - ts >= ERROR_DEDUPE_WINDOW) escalatedKeys.delete(key);
+  }
+  // Clear the primary's dedupe entry so a genuinely NEW failure after this
+  // window can still raise a task through the normal deferred path.
+  recentErrors.delete(errorKey);
+
+  if (tripCircuit(errorKey)) {
+    console.log(`🔌 Auto-fix circuit OPEN for ${ctx.provider} (${ctx.model}) — suppressing escalated investigation task`);
+    return null;
+  }
+  // Clear the dedupe marker if task creation fails so an identical escalation
+  // isn't suppressed for the window (mirrors the deferred path's catch arm) —
+  // otherwise an addTask rejection would silently swallow every retry for 60s.
+  return createAIProviderInvestigationTask(error).catch((err) => {
+    escalatedKeys.delete(errorKey);
+    console.error(`❌ Escalated AI provider task creation failed: ${err.message}`);
+    return null;
+  });
+}
+
+/**
+ * Check if an error is a duplicate within the dedupe window
+ * Also cleans up expired entries
+ * @returns {boolean} true if this is a duplicate error
+ */
+function isDuplicateError(errorKey) {
+  const now = Date.now();
+  const lastSeen = recentErrors.get(errorKey);
+
+  // Clean up expired entries
+  for (const [key, timestamp] of recentErrors.entries()) {
+    if (now - timestamp > ERROR_DEDUPE_WINDOW) {
+      recentErrors.delete(key);
+    }
+  }
+
+  if (lastSeen && (now - lastSeen) < ERROR_DEDUPE_WINDOW) {
+    return true;
+  }
+
+  recentErrors.set(errorKey, now);
+  return false;
+}
+
+let autoFixerInitialized = false;
+
+/**
+ * Initialize auto-fixer event listeners
+ */
+export function initAutoFixer() {
+  if (autoFixerInitialized) return;
+  autoFixerInitialized = true;
+
+  errorEvents.on('error', (error) => {
+    (async () => {
+      // Always handle AI provider errors (even if CoS not running)
+      if (error.code === 'AI_PROVIDER_EXECUTION_FAILED') {
+        await handleAIProviderError(error);
+        return;
+      }
+
+      if (shouldAutoFix(error)) {
+        await createAutoFixTask(error);
+      }
+    })().catch(err => console.error(`❌ autoFixer handler failed: ${err.message}`));
+  });
+
+  console.log('🔧 Auto-fixer initialized');
+}
+
+/**
+ * Get pending autofix tasks (for CoS to pick up when it starts)
+ */
+export function getPendingAutoFixTasks() {
+  return [...pendingAutoFixTasks];
+}
+
+/**
+ * Clear pending autofix tasks after they've been processed
+ */
+export function clearPendingAutoFixTasks() {
+  pendingAutoFixTasks.length = 0;
+}
+
+/**
+ * Test-only: drop all deferred timers + dedupe entries so the next call
+ * starts from a clean slate. Production code paths never call this.
+ */
+export function _resetAutoFixerForTests() {
+  for (const { timer } of deferredTasks.values()) clearTimeout(timer);
+  deferredTasks.clear();
+  inFlightFallbacks.clear();
+  recentErrors.clear();
+  failureTimestamps.clear();
+  escalatedKeys.clear();
+  pendingAutoFixTasks.length = 0;
+  // This module's task-creation path now goes through the SHARED investigation
+  // circuit (investigationTaskProducer.js), so a reset that stopped at the local
+  // maps would leave earlier cases' creations counted against later ones — every
+  // test past the storm threshold would then assert against a held task.
+  __resetInvestigationCircuit();
+}
+
+/**
+ * Defer task creation by TASK_DEFER_MS. If `noteFallbackHandled` is called
+ * for the same provider/model within the window, the timer is cancelled
+ * and no task is created. Otherwise, the deferred handler runs and
+ * creates the investigation task.
+ */
+async function handleAIProviderError(error) {
+  const ctx = error.context || {};
+  if (ctx.errorAnalysis?.category === ERROR_CATEGORIES.RUNTIME_BUDGET_EXHAUSTED) return;
+
+  // A content/safety refusal is not a provider fault — we know exactly why it
+  // failed (the model declined the prompt), so there's nothing for a CoS agent
+  // to investigate. promptRunner.js already retries with a fallback and the UI
+  // is told what happened. Bail before deferring/creating a task. (server's
+  // onRunFailed already emits a distinct code for refusals so this handler
+  // normally isn't even reached; this guard covers any other emitter.)
+  if (ctx.errorAnalysis?.category === ERROR_CATEGORIES.CONTENT_REFUSAL) {
+    console.log(`🛟 AI model refused prompt on content/safety grounds: ${ctx.provider} (${ctx.model}) — no investigation task (fallback handles it)`);
+    return;
+  }
+
+  const errorKey = aiProviderErrorKey(ctx.provider, ctx.model);
+
+  // A fallback retry for this exact failure is already in flight (promptRunner
+  // called noteFallbackStarted). Don't schedule the backstop timer — the
+  // fallback's outcome decides whether to investigate. This covers the case
+  // where the fallback started before this handler ran (microtask ordering).
+  if (inFlightFallbacks.has(errorKey)) {
+    return;
+  }
+
+  if (isDuplicateError(errorKey)) {
+    console.log(`⏭️ Skipping duplicate AI provider error: ${ctx.provider} (${ctx.model})`);
+    return;
+  }
+  if (deferredTasks.has(errorKey)) {
+    return;
+  }
+
+  // Surface the actual failure reason + category inline so pm2 logs explain
+  // WHY a run failed without spelunking into data/runs/<id>/metadata.json. The
+  // reason is collapsed to a single line and capped (logging convention: no
+  // multi-line blobs) — the full text stays in the run record's `error` field.
+  const reason = oneLine(ctx.errorDetails || ctx.errorAnalysis?.message) || 'no error text captured';
+  const category = ctx.errorAnalysis?.category || 'unknown';
+  // Structured per-attempt diagnostics (issue #2328): classify the failure into
+  // a fallback tier and surface it inline so pm2 logs (and the task record
+  // below) break failures out by tier/strategy without spelunking metadata.
+  const diagnostics = providerFixDiagnostics(error);
+  console.log(`🤖 AI provider error detected: ${ctx.provider} (${ctx.model}) [${category}] tier=${diagnostics.tier} (${diagnostics.fixStrategy}) exit=${ctx.exitCode ?? '?'} - run ${ctx.runId}: ${reason} (deferring ${TASK_DEFER_MS}ms for possible fallback retry)`);
+
+  const timer = setTimeout(() => {
+    deferredTasks.delete(errorKey);
+    // Circuit breaker: only count a failure that actually survives the defer
+    // window (a fallback that recovered the failure has already cancelled this
+    // timer, so it never reaches here). A provider/model that keeps producing
+    // real investigation tasks this often won't be fixed by yet another — trip
+    // the circuit and suppress. Auto-closes once failures age out of the window.
+    if (tripCircuit(errorKey)) {
+      console.log(`🔌 Auto-fix circuit OPEN for ${ctx.provider} (${ctx.model}) — >${CIRCUIT_MAX_FAILURES} failures within the last hour; suppressing investigation task`);
+      return;
+    }
+    createAIProviderInvestigationTask(error).catch(err => {
+      console.error(`❌ Deferred AI provider task creation failed: ${err.message}`);
+      // Clear the dedupe entry so the next identical failure isn't
+      // silently suppressed for up to 60s — without this, an addTask
+      // failure here would block legitimate retries that might succeed.
+      recentErrors.delete(errorKey);
+    });
+  }, TASK_DEFER_MS);
+  // Keep the timer from preventing process exit (e.g. in tests / shutdown).
+  timer.unref?.();
+  deferredTasks.set(errorKey, { timer });
+}
+
+async function createAIProviderInvestigationTask(error) {
+  const ctx = error.context || {};
+  // Structured diagnostics ride on the task record so downstream telemetry can
+  // break auto-fix outcomes out by tier / category / failure reason (#2328).
+  const diagnostics = providerFixDiagnostics(error);
+  // A server that booted BEFORE the current checkout can keep reproducing a
+  // failure that is already fixed on disk — exactly what happened when a
+  // local-LLM playground timeout was filed a second time hours after its fix
+  // landed (#5771), costing a whole investigation agent to rediscover. Surface
+  // the boot-vs-HEAD gap in the task body so the agent checks that first.
+  // Skipped entirely when no boot commit was captured (tarball install, tests,
+  // any process that never called captureBootCommit): without it the comparison
+  // is meaningless, and skipping keeps this off the git/fs path in those cases.
+  const installState = getBootCommit() ? await getInstallState().catch(() => null) : null;
+  // Build specialized context for AI provider errors
+  const context = buildAIProviderErrorContext(error, diagnostics, installState);
+
+  const taskData = {
+    // Mirror the `|| 'Unknown'` fallbacks buildAIProviderErrorContext already
+    // applies to the body. Without them an unattributable failure filed a task
+    // titled "Investigate AI provider failure: undefined (undefined)".
+    description: `Investigate AI provider failure: ${ctx.provider || 'Unknown provider'} (${ctx.model || 'unknown model'})`,
+    priority: 'MEDIUM',
+    context,
+    diagnostics,
+    // No `app`. `metadata.app` is WORKSPACE ROUTING — it must name a record in
+    // `data/apps.json` — and 'portos' matches neither the seeded id
+    // ('portos-default') nor its name ('PortOS'), so it resolved to nothing.
+    // That was harmless while an unresolvable app fell through to the PortOS
+    // root, which is where this work belongs anyway; since the #3180 guard,
+    // `prepareAgentWorkspace` refuses to spawn an agent whose app doesn't
+    // resolve to a repo path, so every provider investigation was filed and
+    // then rejected. Absent `app` resolves to that same PortOS root, and
+    // matches the other two task producers in this file.
+  };
+
+  // If CoS is running, create the task immediately. The approval verdict is
+  // resolved INSIDE this branch: on the other path the task is only queued for
+  // later pickup, so a verdict computed now would be read against a backlog that
+  // is stale by the time it is filed — and the read (both task files) buys
+  // nothing.
+  if (isRunning()) {
+    // Unattended by default, matching every other investigation producer (#3714):
+    // a provider failure is exactly the diagnosis CoS exists to do for itself, and
+    // gating it behind an approval only meant the queue filled with approvals while
+    // the provider stayed broken. The loop guards are unchanged and still upstream
+    // of here — `isDuplicateError` collapses a repeat inside the dedupe window and
+    // `tripCircuit` suppresses the task entirely past CIRCUIT_MAX_FAILURES.
+    const { task } = await fileInvestigationTask({
+      ...taskData,
+      fingerprint: investigationFingerprint({
+        category: diagnostics.category,
+        kind: 'provider-failure',
+        scope: ctx.provider
+      })
+    });
+    console.log(`✅ AI provider investigation task created: ${task.id} [tier ${diagnostics.tier}: ${diagnostics.fixStrategy}]`);
+    return task;
+  }
+
+  // Otherwise, store for later pickup
+  console.log(`📋 CoS not running - queuing AI provider investigation task [tier ${diagnostics.tier}: ${diagnostics.fixStrategy}]`);
+  pendingAutoFixTasks.push({
+    ...taskData,
+    createdAt: Date.now(),
+    error: {
+      code: error.code,
+      message: error.message,
+      context: ctx
+    }
+  });
+
+  return null;
+}
+
+/**
+ * Determine if an error should trigger auto-fix
+ */
+function shouldAutoFix(error) {
+  // Only auto-fix if CoS is running
+  if (!isRunning()) {
+    return false;
+  }
+
+  // Only auto-fix critical errors or those explicitly marked as auto-fixable
+  if (error.severity !== 'critical' && !error.canAutoFix) {
+    return false;
+  }
+
+  const errorKey = `${error.code}-${error.message}`;
+
+  if (isDuplicateError(errorKey)) {
+    console.log(`⏭️ Skipping duplicate error: ${error.code}`);
+    return false;
+  }
+
+  // Circuit breaker: the same critical error recurring past the threshold won't
+  // be resolved by spawning another identical fix task — suppress to prevent a
+  // runaway loop. Auto-closes once the failure rate ages out of the window.
+  if (tripCircuit(errorKey)) {
+    console.log(`🔌 Auto-fix circuit OPEN for ${error.code} — >${CIRCUIT_MAX_FAILURES} failures within the last hour; suppressing auto-fix task`);
+    return false;
+  }
+
+  return true;
+}
+
+/**
+ * Build detailed context for AI provider execution errors
+ *
+ * @param {object} [installState] result of `getInstallState()`, when available —
+ *   only `runningStaleCode` / `bootCommit` / `currentCommit` are read, to warn
+ *   that the failing process predates the checkout being investigated.
+ */
+function buildAIProviderErrorContext(error, diagnostics, installState = null) {
+  const ctx = error.context || {};
+  const lines = [
+    '# AI Provider Execution Failure',
+    '',
+    '## Run Details',
+    `- **Run ID:** ${ctx.runId || 'N/A'}`,
+    `- **Provider:** ${ctx.provider || 'Unknown'}`,
+    `- **Provider ID:** ${ctx.providerId || 'N/A'}`,
+    `- **Model:** ${ctx.model || 'N/A'}`,
+    `- **Exit Code:** ${ctx.exitCode ?? 'N/A'}`,
+    `- **Duration:** ${ctx.duration ? `${(ctx.duration / 1000).toFixed(1)}s` : 'N/A'}`,
+    `- **Workspace:** ${ctx.workspaceName || ctx.workspacePath || 'N/A'}`,
+    ''
+  ];
+
+  // The running process is behind the on-disk checkout, so the failure may have
+  // been fixed since it booted. Named first (right under Run Details) because it
+  // changes what the whole investigation should do: read the diff before
+  // debugging, and restart rather than write code if the fix is already there.
+  if (installState?.runningStaleCode) {
+    const boot = (installState.bootCommit || '').slice(0, 7) || 'unknown';
+    const head = (installState.currentCommit || '').slice(0, 7) || 'unknown';
+    lines.push('## Deployed Build: STALE');
+    lines.push(`- **Booted at commit:** ${boot}`);
+    lines.push(`- **Checkout HEAD:** ${head}`);
+    lines.push(`- The running server started before the current checkout, so it does NOT include every fix on disk. Check \`git log ${boot}..${head}\` for a fix covering this failure before debugging it — if one exists, the remedy is a restart (\`npm run pm2:restart\`), not a code change.`);
+    lines.push('');
+  }
+
+  // Fallback-tier diagnostics (issue #2328) — tells the investigating agent
+  // which class of fix to try first before escalating to open-ended debugging.
+  if (diagnostics) {
+    lines.push('## Fallback Tier');
+    lines.push(`- **Tier:** ${diagnostics.tier} (${diagnostics.fixStrategy})`);
+    lines.push(`- **Error Type:** ${diagnostics.errorType}`);
+    lines.push(`- **Failure Reason:** ${diagnostics.failureReason}`);
+    lines.push('');
+  }
+
+  // Add error category if available
+  if (ctx.errorCategory) {
+    lines.push(`## Error Category: ${ctx.errorCategory}`);
+    if (ctx.suggestedFix) {
+      lines.push(`**Suggested Fix:** ${ctx.suggestedFix}`);
+    }
+    lines.push('');
+  }
+
+  // Add error details
+  lines.push('## Error Details');
+  if (ctx.errorDetails) {
+    lines.push('```');
+    lines.push(ctx.errorDetails);
+    lines.push('```');
+  } else {
+    lines.push(error.message || 'No error details available');
+  }
+  lines.push('');
+
+  // Add prompt preview if available
+  if (ctx.promptPreview) {
+    lines.push('## Prompt Preview');
+    lines.push('```');
+    lines.push(ctx.promptPreview);
+    lines.push('```');
+    lines.push('');
+  }
+
+  // Add output tail if available (last part of output for debugging)
+  if (ctx.outputTail) {
+    lines.push('## Output Tail (last 2KB)');
+    lines.push('```');
+    lines.push(ctx.outputTail);
+    lines.push('```');
+    lines.push('');
+  }
+
+  lines.push('## Investigation Steps');
+  const steps = [
+    'Check if the AI provider is configured correctly in /devtools/providers',
+    'Verify API keys and endpoints are valid',
+    'Check server logs for additional context (pm2 logs portos-server)',
+    'If this is a CLI provider, verify the command is installed and accessible',
+    'Check for rate limiting or quota issues with the provider',
+    'Review the output tail for specific error messages',
+  ];
+  // Numbered here rather than hardcoded so the stale-build step can lead the
+  // list without renumbering the rest by hand.
+  if (installState?.runningStaleCode) {
+    steps.unshift('Rule out the stale deployed build above — a fix already in the checkout only needs a restart');
+  }
+  steps.forEach((step, index) => lines.push(`${index + 1}. ${step}`));
+
+  return lines.join('\n');
+}
+
+/**
+ * Create a CoS task to fix the error
+ */
+async function createAutoFixTask(error) {
+  // Structured diagnostics (issue #2328): a bare crash usually has no recognized
+  // category, so it classifies to Tier 4 (escalate) — an investigation rather
+  // than a deterministic correction.
+  const diagnostics = buildFixDiagnostics({
+    triggerEvent: error.code,
+    target: error.code,
+    category: error.context?.errorAnalysis?.category,
+    failureReason: error.message,
+    observedAt: error.timestamp ? new Date(error.timestamp).toISOString() : undefined,
+  });
+  console.log(`🤖 Creating auto-fix task for error: ${error.code} [tier ${diagnostics.tier}: ${diagnostics.fixStrategy}]`);
+
+  // Build context for the agent
+  const context = buildErrorContext(error);
+
+  // Unattended by default, matching every other error-driven task creator in this
+  // file. `shouldAutoFix` has already applied the dedupe + circuit breaker before
+  // we get here, so this only fires for a genuinely new critical error, and the
+  // shared policy still holds it for a human when the same cause is looping or
+  // failures are cascading.
+  const { task } = await fileInvestigationTask({
+    description: `Fix critical error: ${error.message}`,
+    priority: 'HIGH',
+    context,
+    diagnostics,
+    fingerprint: investigationFingerprint({
+      category: diagnostics.category,
+      kind: 'critical-error',
+      scope: error.code
+    })
+  });
+  console.log(`✅ Auto-fix task created: ${task.id}`);
+
+  return task;
+}
+
+/**
+ * Build detailed context for the auto-fix agent
+ */
+function buildErrorContext(error) {
+  const lines = [
+    '# Error Details',
+    '',
+    `**Error Code:** ${error.code}`,
+    `**Severity:** ${error.severity}`,
+    `**Timestamp:** ${new Date(error.timestamp).toISOString()}`,
+    '',
+    '## Error Message',
+    error.message,
+    ''
+  ];
+
+  // Add stack trace if available
+  if (error.stack) {
+    lines.push('## Stack Trace');
+    lines.push('```');
+    lines.push(error.stack);
+    lines.push('```');
+    lines.push('');
+  }
+
+  // Add context if available
+  if (error.context && Object.keys(error.context).length > 0) {
+    lines.push('## Context');
+    for (const [key, value] of Object.entries(error.context)) {
+      lines.push(`- **${key}:** ${JSON.stringify(value)}`);
+    }
+    lines.push('');
+  }
+
+  lines.push('## Instructions');
+  lines.push('1. Analyze the error and identify the root cause');
+  lines.push('2. Check server logs and browser console for additional context');
+  lines.push('3. Fix the issue in the codebase');
+  lines.push('4. Verify the fix works by testing the affected functionality');
+  lines.push('5. If you cannot fix the issue, document your findings in a comment');
+
+  return lines.join('\n');
+}
+
+/**
+ * Handle manual error recovery request from UI
+ */
+export async function handleErrorRecovery(errorCode, context) {
+  console.log(`🔧 Manual error recovery requested: ${errorCode}`);
+
+  // No standing approval gate: the user clicking "investigate this error" IS the
+  // approval, and asking them to approve their own request a second time is the
+  // friction this whole path exists to remove. The shared loop policy can still
+  // hold it — if they ask again about a cause we investigated hours ago, another
+  // unattended agent would just repeat that run.
+  const { task } = await fileInvestigationTask({
+    description: `Investigate and fix error: ${errorCode}`,
+    priority: 'MEDIUM',
+    context: context || `User requested investigation of error code: ${errorCode}`,
+    fingerprint: investigationFingerprint({ kind: 'manual-recovery', scope: errorCode })
+  });
+  console.log(`✅ Recovery task created: ${task.id}`);
+
+  return task;
+}

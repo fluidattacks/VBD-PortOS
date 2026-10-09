@@ -1,0 +1,283 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import express from 'express';
+import { request } from '../lib/testHelper.js';
+import importerRoutes from './importer.js';
+import {
+  ERR_VALIDATION, ERR_LOCKED, ERR_PARTIAL_COMMIT_ISSUES, ERR_IMPORT_IN_PROGRESS, IMPORTER_SOURCE_CHAR_LIMIT,
+} from '../services/importer.js';
+import * as universeSvc from '../services/universeBuilder.js';
+import * as seriesSvc from '../services/pipeline/series.js';
+import { ARC_ROLES, ARC_SHAPE_IDS } from '../lib/storyArc.js';
+
+vi.mock('../services/importer.js', async () => {
+  const actual = await vi.importActual('../services/importer.js');
+  return {
+    ...actual,                       // real ERR_VALIDATION, ERR_LOCKED, IMPORTER_SOURCE_CHAR_LIMIT, etc.
+    analyzeImport: vi.fn(),          // mocked behavior
+    classifyImportContent: vi.fn(),  // mocked behavior
+    commitImport: vi.fn(),           // mocked behavior
+    retryIssueSplit: vi.fn(),        // mocked behavior
+  };
+});
+
+// No mock for ../services/universeBuilder.js, ../services/pipeline/series.js,
+// or ../lib/storyArc.js — the route only reads `ERR_NOT_FOUND` constants
+// from the service modules and `ARC_ROLES`/`ARC_SHAPE_IDS` from storyArc.
+// Using the real modules keeps `ERR_NOT_FOUND` aligned with the
+// SERVICE_ERROR_STATUS map, and keeps the Zod enums aligned with the
+// prompts — placeholder mocks would silently mask drift.
+
+import * as importerSvc from '../services/importer.js';
+
+function buildApp() {
+  const app = express();
+  app.use(express.json());
+  app.use('/api/importer', importerRoutes);
+  return app;
+}
+
+describe('GET /api/importer/config', () => {
+  it('returns sourceCharLimit, arcRoles, and arcShapeIds', async () => {
+    const app = buildApp();
+    const res = await request(app).get('/api/importer/config');
+    expect(res.status).toBe(200);
+    expect(res.body.sourceCharLimit).toBe(IMPORTER_SOURCE_CHAR_LIMIT);
+    expect(Array.isArray(res.body.arcRoles)).toBe(true);
+    expect(res.body.arcRoles).toEqual([...ARC_ROLES]);
+    expect(Array.isArray(res.body.arcShapeIds)).toBe(true);
+    // Pin to ARC_SHAPE_IDS — the client's STORY_SHAPES dropdown filter
+    // expects this membership and a drift would silently hide shapes.
+    expect(res.body.arcShapeIds).toEqual([...ARC_SHAPE_IDS]);
+  });
+});
+
+describe('POST /api/importer/classify', () => {
+  beforeEach(() => vi.resetAllMocks());
+
+  it('returns 200 with the classifier result on success', async () => {
+    importerSvc.classifyImportContent.mockResolvedValue({
+      contentType: 'screenplay',
+      confidence: 'high',
+      reasoning: 'INT. CAFE — DAY scene heading present',
+    });
+    const app = buildApp();
+    const res = await request(app).post('/api/importer/classify').send({ source: 'FADE IN:\nINT. CAFE — DAY' });
+    expect(res.status).toBe(200);
+    expect(res.body.contentType).toBe('screenplay');
+    expect(res.body.confidence).toBe('high');
+  });
+
+  it('returns 400 when source is missing', async () => {
+    const app = buildApp();
+    const res = await request(app).post('/api/importer/classify').send({});
+    expect(res.status).toBe(400);
+  });
+
+  it('returns 400 when the service throws ERR_VALIDATION', async () => {
+    const err = Object.assign(new Error('source is required'), { code: ERR_VALIDATION });
+    importerSvc.classifyImportContent.mockRejectedValue(err);
+    const app = buildApp();
+    const res = await request(app).post('/api/importer/classify').send({ source: 'x' });
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe(ERR_VALIDATION);
+  });
+});
+
+describe('POST /api/importer/analyze', () => {
+  beforeEach(() => vi.resetAllMocks());
+
+  it('returns 200 with the service result on success', async () => {
+    importerSvc.analyzeImport.mockResolvedValue({ universe: {}, series: {}, issueProposals: [] });
+    const app = buildApp();
+    const res = await request(app).post('/api/importer/analyze').send({
+      universeName: 'U',
+      seriesName: 'S',
+      contentType: 'short-story',
+      source: 'text',
+    });
+    expect(res.status).toBe(200);
+    expect(res.body.issueProposals).toEqual([]);
+  });
+
+  it('returns 400 when the service throws ERR_VALIDATION', async () => {
+    const err = Object.assign(new Error('source is required'), { code: ERR_VALIDATION });
+    importerSvc.analyzeImport.mockRejectedValue(err);
+    const app = buildApp();
+    const res = await request(app).post('/api/importer/analyze').send({
+      universeName: 'U',
+      seriesName: 'S',
+      contentType: 'short-story',
+      source: 'x',
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe(ERR_VALIDATION);
+  });
+
+  it('returns 409 when the service throws ERR_LOCKED', async () => {
+    const err = Object.assign(
+      new Error('Series "X" has a locked arc.'),
+      { code: ERR_LOCKED },
+    );
+    importerSvc.analyzeImport.mockRejectedValue(err);
+    const app = buildApp();
+    const res = await request(app).post('/api/importer/analyze').send({
+      universeName: 'U',
+      seriesName: 'X',
+      contentType: 'short-story',
+      source: 'text',
+    });
+    expect(res.status).toBe(409);
+    expect(res.body.code).toBe(ERR_LOCKED);
+  });
+});
+
+describe('POST /api/importer/retry-issues', () => {
+  beforeEach(() => vi.resetAllMocks());
+
+  it('returns 200 with the re-proposed issues on success', async () => {
+    importerSvc.retryIssueSplit.mockResolvedValue({
+      issueProposals: [{ title: 'Issue 1', proseExcerpt: 'verbatim' }],
+      method: 'mechanical',
+    });
+    const app = buildApp();
+    const res = await request(app).post('/api/importer/retry-issues').send({
+      contentType: 'comic-script',
+      source: 'ISSUE #1\nstuff',
+    });
+    expect(res.status).toBe(200);
+    expect(res.body.method).toBe('mechanical');
+    expect(res.body.issueProposals).toHaveLength(1);
+  });
+
+  it('rejects an unknown contentType at the Zod layer with 400', async () => {
+    const app = buildApp();
+    const res = await request(app).post('/api/importer/retry-issues').send({
+      contentType: 'haiku',
+      source: 'x',
+    });
+    expect(res.status).toBe(400);
+    expect(importerSvc.retryIssueSplit).not.toHaveBeenCalled();
+  });
+
+  it('maps a service ERR_VALIDATION to 400', async () => {
+    const err = Object.assign(new Error('source is required'), { code: ERR_VALIDATION });
+    importerSvc.retryIssueSplit.mockRejectedValue(err);
+    const app = buildApp();
+    const res = await request(app).post('/api/importer/retry-issues').send({
+      contentType: 'novel',
+      source: 'x',
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe(ERR_VALIDATION);
+  });
+});
+
+describe('POST /api/importer/commit', () => {
+  beforeEach(() => vi.resetAllMocks());
+
+  it('returns 200 with the service result on success', async () => {
+    importerSvc.commitImport.mockResolvedValue({
+      universe: {}, series: {}, createdIssueIds: ['issue-1'], remappedIssues: [],
+    });
+    const app = buildApp();
+    const res = await request(app).post('/api/importer/commit').send({
+      universeId: 'uni-1',
+      seriesId: 'ser-1',
+      canonSelections: { characters: [], places: [], objects: [] },
+      arc: null,
+      seasons: [],
+      issues: [{ title: 'I1', arcPosition: 1 }],
+    });
+    expect(res.status).toBe(200);
+    expect(res.body.createdIssueIds).toEqual(['issue-1']);
+  });
+
+  it('returns 400 when the service throws ERR_VALIDATION', async () => {
+    const err = Object.assign(new Error('universeId is required'), { code: ERR_VALIDATION });
+    importerSvc.commitImport.mockRejectedValue(err);
+    const app = buildApp();
+    const res = await request(app).post('/api/importer/commit').send({
+      universeId: 'uni-1',
+      seriesId: 'ser-1',
+      canonSelections: { characters: [], places: [], objects: [] },
+      arc: null,
+      seasons: [],
+      issues: [{ title: 'I1', arcPosition: 1 }],
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe(ERR_VALIDATION);
+  });
+
+  it.each([ERR_LOCKED, ERR_IMPORT_IN_PROGRESS])('returns 409 when the service throws %s', async (code) => {
+    importerSvc.commitImport.mockRejectedValue(Object.assign(new Error('commit refused'), { code }));
+    const app = buildApp();
+    const res = await request(app).post('/api/importer/commit').send({
+      universeId: 'uni-1',
+      seriesId: 'ser-1',
+      canonSelections: { characters: [], places: [], objects: [] },
+      arc: null,
+      seasons: [],
+      issues: [{ title: 'I1', arcPosition: 1 }],
+    });
+    expect(res.status).toBe(409);
+    expect(res.body.code).toBe(code);
+  });
+
+  it('returns 404 when the service throws the universe not-found code', async () => {
+    const err = Object.assign(new Error('Universe not found'), { code: universeSvc.ERR_NOT_FOUND });
+    importerSvc.commitImport.mockRejectedValue(err);
+    const app = buildApp();
+    const res = await request(app).post('/api/importer/commit').send({
+      universeId: 'missing',
+      seriesId: 'ser-1',
+      canonSelections: { characters: [], places: [], objects: [] },
+      arc: null,
+      seasons: [],
+      issues: [{ title: 'I1', arcPosition: 1 }],
+    });
+    expect(res.status).toBe(404);
+    // Pin the code too — a rename of universeSvc.ERR_NOT_FOUND would
+    // otherwise silently land here because SERVICE_ERROR_STATUS[undefined]
+    // falls through to the generic 500 handler and the status assertion
+    // alone wouldn't catch the regression.
+    expect(res.body.code).toBe(universeSvc.ERR_NOT_FOUND);
+  });
+
+  it('returns 422 with preserved context when the service throws ERR_PARTIAL_COMMIT_ISSUES', async () => {
+    // Pins the SERVICE_ERROR_STATUS entry for ERR_PARTIAL_COMMIT_ISSUES.
+    // Dropping the entry would fall through to the generic 500 handler,
+    // pager-alert on a user-action-recoverable partial commit, and strip
+    // the arcAlreadyPersisted/skipArcOnRetry retry signals the client
+    // gates the retry-without-arc-overwrite path on.
+    const err = Object.assign(
+      new Error('universe and series saved; 2 of 3 issues failed and were rolled back'),
+      {
+        code: ERR_PARTIAL_COMMIT_ISSUES,
+        context: {
+          universeId: 'uni-1',
+          seriesId: 'ser-1',
+          arcAlreadyPersisted: true,
+          skipArcOnRetry: true,
+        },
+      },
+    );
+    importerSvc.commitImport.mockRejectedValue(err);
+    const app = buildApp();
+    const res = await request(app).post('/api/importer/commit').send({
+      universeId: 'uni-1',
+      seriesId: 'ser-1',
+      canonSelections: { characters: [], places: [], objects: [] },
+      arc: null,
+      seasons: [],
+      issues: [{ title: 'I1', arcPosition: 1 }],
+    });
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe(ERR_PARTIAL_COMMIT_ISSUES);
+    expect(res.body.context).toEqual({
+      universeId: 'uni-1',
+      seriesId: 'ser-1',
+      arcAlreadyPersisted: true,
+      skipArcOnRetry: true,
+    });
+  });
+});

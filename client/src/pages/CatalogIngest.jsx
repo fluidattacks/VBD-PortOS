@@ -1,0 +1,1100 @@
+/**
+ * CatalogIngest — paste-extract-review-commit flow for the catalog. Three
+ * phases gated by local state: paste → extracting (live stage checklist via
+ * `catalog:extract:progress`) → review (per-kind checkboxes with editable
+ * name + description). Full-width page; owns its own scroll.
+ */
+
+import { uuidv4 } from '../lib/uuid.js';
+import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
+import { useNavigate, useLocation } from 'react-router';
+import { Sparkles, Loader2, CheckCircle2, AlertCircle, ArrowLeft, RotateCcw, Circle, Upload, Link2, FileText, Mic, Square } from 'lucide-react';
+import { formatCount } from '../utils/formatters';
+import useProviderModels from '../hooks/useProviderModels';
+import ProviderModelSelector from '../components/ProviderModelSelector';
+import toast from '../components/ui/Toast';
+import FilePickerButton from '../components/ui/FilePickerButton';
+import Modal from '../components/ui/Modal';
+import socket from '../services/socket';
+import useMemoRecorder from '../hooks/useMemoRecorder';
+import { getRelationKind } from '../lib/catalogTypes';
+import {
+  createCatalogScrap,
+  pruneCatalogScrap,
+  extractFromCatalogScrap,
+  commitCatalogScrapDraft,
+  bulkImportCatalogIngredients,
+  ingestCatalogUrl,
+  ingestCatalogFile,
+  ingestCatalogVoice,
+  ingestCatalogBrain,
+} from '../services/apiCatalog';
+import { listUniverseNames } from '../services/apiUniverseBuilder';
+import { safeReadStorage, safeWriteStorage } from '../lib/safeStorage';
+
+// The explicit "no universe" choice, preserving today's behavior exactly
+// (source link only, no catalog_ingredient_refs row).
+const UNASSIGNED_UNIVERSE = 'unassigned';
+// Where the last-picked "Catalogue into" universe id is remembered across
+// visits (#7615). A capture-source ingest (brain-bridge / voice-memo)
+// defaults to a universe named "Reality" instead, when one exists — captured
+// thought is factual by default.
+const LAST_UNIVERSE_STORAGE_KEY = 'catalog-ingest-last-universe';
+// #7616 seeds one shipped universe with this exact id ("Reality",
+// `factual: true`). Match the id first — it survives a rename, which the
+// display name does not — and keep the name match for an install whose
+// Reality predates the seed or was recreated by hand.
+const REALITY_UNIVERSE_ID = 'universe-reality';
+const REALITY_UNIVERSE_NAME = 'Reality';
+// Ingest source kinds that default to the Reality universe rather than the
+// last-used pick — mirrors SCRAP_SOURCE_KINDS' `factual: true` entries
+// (server/lib/catalogSourceKinds.js): brain-bridge and voice-memo capture the
+// user's own lived material, not invented story text.
+const FACTUAL_INGEST_KINDS = new Set(['brain', 'voice']);
+
+// One review section per ingredient type. The first three are bible-shaped
+// (character/place/object) and use `physicalDescription`/`description` as the
+// primary editable text; the last three are light-shaped (idea/scene/concept)
+// and use `summary` — matching PRIMARY_CONTENT_KEY in Catalog.jsx.
+const KIND_SECTIONS = [
+  { key: 'characters', label: 'Characters', type: 'character' },
+  { key: 'places',     label: 'Places',     type: 'place' },
+  { key: 'objects',    label: 'Objects',    type: 'object' },
+  { key: 'ideas',      label: 'Ideas',      type: 'idea' },
+  { key: 'scenes',     label: 'Scenes',     type: 'scene' },
+  { key: 'concepts',   label: 'Concepts',   type: 'concept' },
+];
+
+// Initial stage list, used until the server's `start` frame supplies the real
+// one. Mirrors server-side EXTRACTION_STAGES — one catalog graph stage — so the
+// panel never looks empty between click and first frame.
+const INITIAL_STAGES = [
+  { id: 'catalog', label: 'Catalog graph', status: 'pending', count: 0 },
+];
+
+function StageIcon({ status }) {
+  if (status === 'completed' || status === 'done') {
+    return <CheckCircle2 className="w-4 h-4 text-port-success flex-shrink-0" aria-hidden="true" />;
+  }
+  if (status === 'failed' || status === 'error') {
+    return <AlertCircle className="w-4 h-4 text-port-error flex-shrink-0" aria-hidden="true" />;
+  }
+  if (status === 'running') {
+    return <Loader2 className="w-4 h-4 text-port-accent animate-spin flex-shrink-0" aria-hidden="true" />;
+  }
+  return <Circle className="w-4 h-4 text-gray-500 flex-shrink-0" aria-hidden="true" />;
+}
+
+export default function CatalogIngest() {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const babble = new URLSearchParams(location.search).get('mode') === 'babble';
+  const picker = useProviderModels({ withEffort: true, enabled: babble });
+  const [effort, setEffort] = useState('');
+  const [phase, setPhase] = useState('paste'); // 'paste' | 'extracting' | 'review'
+  const [title, setTitle] = useState('');
+  const [rawText, setRawText] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [committing, setCommitting] = useState(false);
+  const [scrapId, setScrapId] = useState(null);
+  const [stages, setStages] = useState(INITIAL_STAGES);
+  const [plan, setPlan] = useState(null);
+  const [relationships, setRelationships] = useState([]);
+  const [isStructuredDraft, setIsStructuredDraft] = useState(false);
+  const [optedOutRelationships, setOptedOutRelationships] = useState(new Set());
+  const [overflow, setOverflow] = useState(null);
+  // The draft returned by extractFromCatalogScrap(): per-kind candidate arrays
+  // editable inline + checkbox-gated. Defaults all to selected.
+  const [draft, setDraft] = useState({ characters: [], places: [], objects: [], ideas: [], scenes: [], concepts: [] });
+  const [confirmReset, setConfirmReset] = useState(false);
+  const [selected, setSelected] = useState({ characters: new Set(), places: new Set(), objects: new Set(), ideas: new Set(), scenes: new Set(), concepts: new Set() });
+  // Bulk import is a separate ingest path — no LLM extraction, no review.
+  // Power-user paste of pre-structured markdown/CSV/JSON. Lives on the
+  // paste phase so users can switch between the two flows freely.
+  const [bulkOpen, setBulkOpen] = useState(false);
+  const [bulkFormat, setBulkFormat] = useState('markdown');
+  const [bulkText, setBulkText] = useState('');
+  const [bulkSubmitting, setBulkSubmitting] = useState(false);
+  // Alternate ingest sources. The paste textarea is the default; 'url' and
+  // 'voice' add their own inputs. File ingest is a one-shot picker that fires
+  // immediately on select, so it has no persistent mode.
+  const [sourceMode, setSourceMode] = useState('paste'); // 'paste' | 'url'
+  const [url, setUrl] = useState('');
+  const { recording, starting, start: startMemo, stop: stopMemo, cancel: cancelMemo } = useMemoRecorder();
+  // "Catalogue into" — the universe every committed ingredient binds to
+  // (#7615). Populated on mount; defaulted per-ingest in enterReviewFromResult.
+  // Mirrored into a ref because the brain-bridge handoff runs from the
+  // mount effect, whose closure would otherwise see the pre-load empty list
+  // forever and never resolve the Reality default.
+  const [universes, setUniverses] = useState([]);
+  const universesRef = useRef([]);
+  const [universeRef, setUniverseRef] = useState(UNASSIGNED_UNIVERSE);
+  const brainHandledRef = useRef(false);
+  // Creative inbox note ids handed off from the Brain batch-send. They ride the
+  // commit request, and the server stamps them consumed in that same request so
+  // they drop out of the inbox's "ready to become ingredients" banner (issue
+  // #1722) — no follow-up call a reload could lose (#9943). Held in a ref so it
+  // survives the history-state clear and the extract/review re-renders.
+  const creativeNoteIdsRef = useRef([]);
+  // The scrap id the handoff ids are bound to — set only when the PREFILLED
+  // paste is ingested. Commit consumes the notes ONLY when it commits this exact
+  // scrap, so switching to URL/File/Voice (a different scrap) and committing that
+  // never marks the original Brain notes consumed.
+  const creativeNoteScrapIdRef = useRef(null);
+  // A Brain inbox handoff carries the Brain-selected route explicitly. The
+  // normal Catalog flow remains stage-configured; this route only exists to
+  // keep a Brain-selected provider/model from being replaced by a stale
+  // catalog stage pin.
+  const brainRouteRef = useRef(null);
+
+  // Load the "Catalogue into" options once. Best-effort — an empty list just
+  // leaves Unassigned as the only choice.
+  useEffect(() => {
+    listUniverseNames({ silent: true }).then((list) => {
+      const rows = Array.isArray(list) ? list : [];
+      universesRef.current = rows;
+      setUniverses(rows);
+    }).catch(() => {});
+  }, []);
+
+  // Default the "Catalogue into" pick for a freshly-entered review phase.
+  // Capture-source ingests (brain-bridge / voice-memo) default to the Reality
+  // universe when one exists; everything else defaults to the last-used
+  // choice (persisted through safeReadStorage), falling back to Reality, then
+  // Unassigned. `sourceKind` is one of 'paste' | 'url' | 'file' | 'voice' |
+  // 'brain' | 'babble'.
+  const defaultUniverseForSource = (sourceKind) => {
+    const loaded = universesRef.current;
+    const reality = loaded.find((u) => u.id === REALITY_UNIVERSE_ID)
+      || loaded.find((u) => u.name === REALITY_UNIVERSE_NAME);
+    if (FACTUAL_INGEST_KINDS.has(sourceKind)) return reality?.id || UNASSIGNED_UNIVERSE;
+    const lastUsed = safeReadStorage(LAST_UNIVERSE_STORAGE_KEY);
+    if (lastUsed && (lastUsed === UNASSIGNED_UNIVERSE || loaded.some((u) => u.id === lastUsed))) return lastUsed;
+    return reality?.id || UNASSIGNED_UNIVERSE;
+  };
+
+  // Any transition OUT of the paste phase must release the mic — otherwise
+  // starting File/URL/Paste ingest mid-recording hides the
+  // stop control while the stream stays live.
+  useEffect(() => {
+    if (phase !== 'paste') cancelMemo();
+  }, [phase, cancelMemo]);
+
+  // Track active runId so a stale frame from an earlier scrap can't mutate the
+  // current stage list (server fans these to all sockets — single-user trust
+  // model still applies, but tab refresh + a slow extract overlap is real).
+  const activeRunIdRef = useRef(null);
+  const commitOperationRef = useRef(null);
+  useEffect(() => {
+    if (babble) return;
+    const onProgress = (ev) => {
+      if (!ev || typeof ev !== 'object') return;
+      if (ev.type === 'start') {
+        activeRunIdRef.current = ev.runId;
+        const next = Array.isArray(ev.stages) && ev.stages.length > 0
+          ? ev.stages.map((s) => ({ ...s, status: s.status || 'pending' }))
+          : INITIAL_STAGES;
+        setStages(next);
+        if (ev.plan) setPlan(ev.plan);
+        return;
+      }
+      if (ev.runId && ev.runId !== activeRunIdRef.current) return;
+      if (ev.type === 'stage') {
+        setStages((prev) => prev.map((s) => (
+          s.id === ev.id
+            ? { ...s, status: ev.status || s.status, count: ev.count ?? s.count, error: ev.error || s.error }
+            : s
+        )));
+      }
+    };
+    socket.on('catalog:extract:progress', onProgress);
+    return () => socket.off('catalog:extract:progress', onProgress);
+  }, [babble]);
+
+  const reset = () => {
+    commitOperationRef.current = null;
+    activeRunIdRef.current = null;
+    // Abandoning the review (Start Over / Cancel) discards the Brain hand-off —
+    // a later commit of unrelated text must NOT mark the original notes consumed.
+    creativeNoteIdsRef.current = [];
+    creativeNoteScrapIdRef.current = null;
+    brainRouteRef.current = null;
+    cancelMemo();
+    setPhase('paste');
+    setScrapId(null);
+    setStages(INITIAL_STAGES);
+    setPlan(null);
+    setRelationships([]);
+    setIsStructuredDraft(false);
+    setOptedOutRelationships(new Set());
+    setOverflow(null);
+    setDraft({ characters: [], places: [], objects: [], ideas: [], scenes: [], concepts: [] });
+    setSelected({ characters: new Set(), places: new Set(), objects: new Set(), ideas: new Set(), scenes: new Set(), concepts: new Set() });
+  };
+
+  const requestReset = () => {
+    const hasDraftItems = KIND_SECTIONS.some(({ key }) => draft[key].length > 0);
+    if (rawText.trim() || hasDraftItems) {
+      setConfirmReset(true);
+      return;
+    }
+    reset();
+  };
+
+  // Shared review-entry: every ingest path (paste / url / file / voice) yields
+  // a `{ scrap, draft }` response with the same draft shape, so they all funnel
+  // through here to populate the review phase.
+  const enterReviewFromResult = (result, sourceKind) => {
+    if (!result?.draft) { setPhase('paste'); return false; }
+    commitOperationRef.current = null;
+    if (result.scrap?.id) setScrapId(result.scrap.id);
+    setUniverseRef(defaultUniverseForSource(sourceKind));
+    const d = Object.fromEntries(KIND_SECTIONS.map((s) => [
+      s.key,
+      Array.isArray(result.draft[s.key]) ? result.draft[s.key] : [],
+    ]));
+    setDraft(d);
+    setSelected(Object.fromEntries(KIND_SECTIONS.map((s) => [
+      s.key,
+      new Set(d[s.key].map((c, i) => c.draftId || `legacy-${s.key}-${i}`)),
+    ])));
+    const rawRels = Array.isArray(result.draft.relationships) ? result.draft.relationships : [];
+    const hasStructuredRels = result.draft.relationships !== undefined;
+    const hasDraftIds = KIND_SECTIONS.some((s) => d[s.key].some((c) => Boolean(c.draftId)));
+    setIsStructuredDraft(hasStructuredRels || hasDraftIds);
+    setRelationships(rawRels);
+    setOptedOutRelationships(new Set());
+    setPlan(result.draft.plan || null);
+    setOverflow(result.draft.overflow || null);
+    // Prefer server-supplied stage list; otherwise mark defaults completed.
+    // The bundled `ideasScenesConcepts` stage has no matching `d[id]` array,
+    // so its count is the sum of the three light kinds it backs.
+    if (Array.isArray(result.draft.stages) && result.draft.stages.length > 0) {
+      setStages(result.draft.stages.map((s) => ({ ...s, status: s.status || 'completed' })));
+    } else {
+      const countForStage = (id) => {
+        if (id === 'catalog') return KIND_SECTIONS.reduce((sum, s) => sum + (d[s.key]?.length || 0), 0);
+        if (id === 'ideasScenesConcepts') return (d.ideas?.length || 0) + (d.scenes?.length || 0) + (d.concepts?.length || 0);
+        return d[id]?.length || 0;
+      };
+      setStages((prev) => prev.map((s) => ({ ...s, status: 'completed', count: countForStage(s.id) })));
+    }
+    setPhase('review');
+    return true;
+  };
+
+  const handleIngest = async (e) => {
+    e?.preventDefault?.();
+    const text = rawText.trim();
+    if (!text) { toast.error('Paste some text first.'); return; }
+    setSubmitting(true);
+    setPhase('extracting');
+    setStages(babble ? [{ id: 'prune', label: 'Prune brainstorm', status: 'running' }] : INITIAL_STAGES);
+    // silent: own error handling below — avoids double-toast.
+    const created = await createCatalogScrap({ rawText: text, title: title.trim() || undefined }, { silent: true })
+      .catch((err) => { toast.error(err?.message || 'Failed to save scrap'); return null; });
+    if (!created?.scrap?.id) { setSubmitting(false); setPhase('paste'); return; }
+    setScrapId(created.scrap.id);
+    // Bind any pending Brain handoff ids to THIS scrap, so only a commit of the
+    // scrap built from the prefilled text consumes them (not a later URL/file/voice).
+    if (creativeNoteIdsRef.current.length) creativeNoteScrapIdRef.current = created.scrap.id;
+    const result = await (babble
+      ? pruneCatalogScrap(created.scrap.id, { providerId: picker.selectedProviderId, model: picker.selectedModel, ...(effort ? { effort } : {}) }, { silent: true })
+      : extractFromCatalogScrap(created.scrap.id, brainRouteRef.current || {}, { silent: true }))
+      .catch((err) => { toast.error(err?.message || 'Extraction failed'); return null; });
+    setSubmitting(false);
+    enterReviewFromResult(result, babble ? 'babble' : 'paste');
+  };
+
+  const handleUrlIngest = async (e) => {
+    e?.preventDefault?.();
+    const trimmed = url.trim();
+    if (!trimmed) { toast.error('Paste a URL first.'); return; }
+    setSubmitting(true);
+    setPhase('extracting');
+    setStages(INITIAL_STAGES);
+    const result = await ingestCatalogUrl({ url: trimmed }, { silent: true })
+      .catch((err) => { toast.error(err?.message || 'URL ingest failed'); return null; });
+    setSubmitting(false);
+    enterReviewFromResult(result, 'url');
+  };
+
+  // Brain → catalog handoff: the brain UI navigates here with
+  // location.state.brainIngest = { brainType, brainId, title }, then we run the
+  // SAME extract→review flow as URL/file/voice (live stage checklist included).
+  const handleBrainIngest = async ({ brainType, brainId }) => {
+    setSubmitting(true);
+    setPhase('extracting');
+    setStages(INITIAL_STAGES);
+    const result = await ingestCatalogBrain({ brainType, brainId }, { silent: true })
+      .catch((err) => { toast.error(err?.message || 'Brain ingest failed'); return null; });
+    setSubmitting(false);
+    enterReviewFromResult(result, 'brain');
+  };
+
+  // Handle inbound router-state handoffs once on mount:
+  //  - brainIngest { brainType, brainId } → run the brain-bridge extract→review.
+  //  - prefill { title, rawText, providerOverride?, modelOverride? } → drop the
+  //    text into the paste box and retain an explicit Brain route for the
+  //    eventual extraction (the creative-notes batch send uses this).
+  // Either way we clear the history state afterwards so a refresh/back doesn't
+  // re-trigger the handoff (and, for brainIngest, a second LLM-billed run).
+  useEffect(() => {
+    if (brainHandledRef.current) return;
+    const brainIngest = location.state?.brainIngest;
+    const prefill = location.state?.prefill;
+    let handled = false;
+    if (brainIngest?.brainType && brainIngest?.brainId) {
+      handled = true;
+      handleBrainIngest(brainIngest);
+    } else if (typeof prefill?.rawText === 'string' && prefill.rawText.trim()) {
+      handled = true;
+      setSourceMode('paste');
+      setTitle(prefill.title || '');
+      setRawText(prefill.rawText);
+      brainRouteRef.current = {
+        ...(prefill.providerOverride ? { providerOverride: prefill.providerOverride } : {}),
+        ...(prefill.modelOverride ? { modelOverride: prefill.modelOverride } : {}),
+      };
+      if (Array.isArray(prefill.creativeNoteIds)) {
+        creativeNoteIdsRef.current = prefill.creativeNoteIds.filter(Boolean);
+      }
+    }
+    if (handled) {
+      brainHandledRef.current = true;
+      navigate('.', { replace: true, state: {} });
+    }
+  }, []);
+
+  const handleFilePicked = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const name = (file.name || '').toLowerCase();
+    if (name.endsWith('.pdf')) {
+      toast.error('PDFs are not accepted — paste the text or upload a .txt/.md file.');
+      return;
+    }
+    const text = await file.text().catch(() => '');
+    if (!text.trim()) { toast.error('That file had no readable text.'); return; }
+    setSubmitting(true);
+    setPhase('extracting');
+    setStages(INITIAL_STAGES);
+    const result = await ingestCatalogFile(
+      { text, filename: file.name, mime: file.type || undefined },
+      { silent: true },
+    ).catch((err) => { toast.error(err?.message || 'File ingest failed'); return null; });
+    setSubmitting(false);
+    enterReviewFromResult(result, 'file');
+  };
+
+  const startRecording = async () => {
+    await startMemo().catch((err) => {
+      toast.error(err?.message || 'Microphone unavailable');
+    });
+  };
+
+  const stopRecordingAndIngest = async () => {
+    const pendingClip = stopMemo();
+    if (!pendingClip) return;
+    const clip = await pendingClip.catch((err) => {
+      toast.error(err?.message || 'Recording failed');
+      return null;
+    });
+    if (!clip?.audioBase64) return;
+    if (clip.peak !== undefined && clip.peak < 0.01) {
+      toast.error('That memo was silent — check your microphone and try again.');
+      return;
+    }
+    setSubmitting(true);
+    setPhase('extracting');
+    setStages(INITIAL_STAGES);
+    const result = await ingestCatalogVoice(
+      { audioBase64: clip.audioBase64, mimeType: clip.mimeType, title: title.trim() || undefined },
+      { silent: true },
+    ).catch((err) => { toast.error(err?.message || 'Voice ingest failed'); return null; });
+    setSubmitting(false);
+    enterReviewFromResult(result, 'voice');
+  };
+
+  const handleBulkImport = async () => {
+    const payload = bulkText.trim();
+    if (!payload) { toast.error('Paste a markdown / CSV / JSON dump first.'); return; }
+    setBulkSubmitting(true);
+    const result = await bulkImportCatalogIngredients({ format: bulkFormat, payload }, { silent: true })
+      .catch((err) => { toast.error(err?.message || 'Bulk import failed'); return null; });
+    setBulkSubmitting(false);
+    if (!result) return;
+    const n = result.count || 0;
+    const warnings = Array.isArray(result.warnings) ? result.warnings : [];
+    toast.success(`Bulk imported ${n} ingredient${n === 1 ? '' : 's'}.`);
+    // Surface parser warnings (e.g. `## Plce: …` typos in markdown) before
+    // navigating away — otherwise the user has no signal that some sections
+    // were silently skipped.
+    if (warnings.length > 0) {
+      toast.error(`${warnings.length} section${warnings.length === 1 ? '' : 's'} skipped: ${warnings.join('; ')}`, { duration: 8000 });
+    }
+    setBulkText('');
+    setBulkOpen(false);
+    navigate('/catalog');
+  };
+
+  const candidateMap = useMemo(() => {
+    const map = new Map();
+    for (const section of KIND_SECTIONS) {
+      const arr = draft[section.key] || [];
+      arr.forEach((c, idx) => {
+        const id = c.draftId || `legacy-${section.key}-${idx}`;
+        map.set(id, { ...c, draftId: id, sectionKey: section.key, sectionType: section.type });
+      });
+    }
+    return map;
+  }, [draft]);
+
+  const isEntrySelected = useCallback((draftId) => {
+    for (const section of KIND_SECTIONS) {
+      if (selected[section.key]?.has(draftId)) return true;
+    }
+    return false;
+  }, [selected]);
+
+  const toggle = (kind, id) => {
+    setSelected((prev) => {
+      const next = new Set(prev[kind]);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return { ...prev, [kind]: next };
+    });
+  };
+
+  const selectAll = (kind, on) => {
+    setSelected((prev) => ({
+      ...prev,
+      [kind]: on ? new Set(draft[kind].map((c, i) => c.draftId || `legacy-${kind}-${i}`)) : new Set(),
+    }));
+  };
+
+  const patchCandidate = (kind, id, patch) => {
+    setDraft((prev) => ({
+      ...prev,
+      [kind]: prev[kind].map((c, i) => ((c.draftId || `legacy-${kind}-${i}`) === id ? { ...c, ...patch } : c)),
+    }));
+  };
+
+  const toggleRelationship = (relId) => {
+    setOptedOutRelationships((prev) => {
+      const next = new Set(prev);
+      if (next.has(relId)) next.delete(relId); else next.add(relId);
+      return next;
+    });
+  };
+
+  const selectAllRelationships = (on) => {
+    if (on) {
+      setOptedOutRelationships(new Set());
+    } else {
+      const allIds = relationships.map((r) => r.id || `${r.fromDraftId}:${r.toDraftId}:${r.kind}`);
+      setOptedOutRelationships(new Set(allIds));
+    }
+  };
+
+  const handleRetry = async () => {
+    if (!scrapId) return;
+    setSubmitting(true);
+    setPhase('extracting');
+    setStages(INITIAL_STAGES);
+    const result = await extractFromCatalogScrap(scrapId, brainRouteRef.current || {}, { silent: true })
+      .catch((err) => { toast.error(err?.message || 'Extraction failed'); return null; });
+    setSubmitting(false);
+    enterReviewFromResult(result, 'paste');
+  };
+
+  const handleCommit = async () => {
+    if (!scrapId || committing) return;
+
+    const totalSelected = KIND_SECTIONS.reduce((sum, s) => sum + (selected[s.key]?.size || 0), 0);
+    const activeRelCount = isStructuredDraft
+      ? relationships.filter((r) => {
+          const relId = r.id || `${r.fromDraftId}:${r.toDraftId}:${r.kind}`;
+          return !optedOutRelationships.has(relId) && isEntrySelected(r.fromDraftId) && isEntrySelected(r.toDraftId);
+        }).length
+      : 0;
+
+    if (totalSelected > 200 || activeRelCount > 1000) {
+      toast.error('Draft exceeds capacity limits (maximum 200 entries and 1,000 relationships). Deselect items to continue.');
+      return;
+    }
+
+    const accepted = [];
+    for (const section of KIND_SECTIONS) {
+      const arr = draft[section.key];
+      const sel = selected[section.key];
+      for (let i = 0; i < arr.length; i += 1) {
+        const c = arr[i];
+        const itemId = c.draftId || `legacy-${section.key}-${i}`;
+        if (!sel.has(itemId)) continue;
+        const name = (c.name || '').trim();
+        if (!name) continue;
+        const { draftId, sourceIdentity: _sourceIdentity, id: _id, type: _type, name: _name, tags: _tags, payload: nestedPayload, description, span, ...rest } = c;
+        const payload = { ...rest, ...(nestedPayload && typeof nestedPayload === 'object' ? nestedPayload : {}) };
+        if (description !== undefined) payload.description = description;
+        accepted.push({
+          type: section.type,
+          name,
+          payload,
+          tags: Array.isArray(c.tags) ? c.tags : [],
+          ...(draftId ? { draftId } : {}),
+          ...(span ? { span } : {}),
+        });
+      }
+    }
+    if (accepted.length === 0) {
+      toast.error('Select at least one candidate to commit.');
+      return;
+    }
+    setCommitting(true);
+
+    let relsToCommit = undefined;
+    if (isStructuredDraft) {
+      const acceptedIds = new Set(accepted.map((a) => a.draftId).filter(Boolean));
+      relsToCommit = relationships
+        .filter((r) => {
+          const relId = r.id || `${r.fromDraftId}:${r.toDraftId}:${r.kind}`;
+          return !optedOutRelationships.has(relId) && acceptedIds.has(r.fromDraftId) && acceptedIds.has(r.toDraftId);
+        })
+        .map(({ fromDraftId, toDraftId, kind, evidence }) => ({
+          fromDraftId,
+          toDraftId,
+          kind,
+          evidence,
+        }));
+    }
+
+    const commitOptions = {
+      universeRef: universeRef === UNASSIGNED_UNIVERSE ? undefined : universeRef,
+      relationships: relsToCommit,
+    };
+    // Only a commit of the exact scrap built from the Brain handoff consumes its
+    // notes. Not part of `submission` below: they are bookkeeping about the
+    // source, not the reviewed content whose identity the operation key tracks.
+    const noteIds = creativeNoteIdsRef.current;
+    const consumesNotes = noteIds.length > 0 && scrapId === creativeNoteScrapIdRef.current;
+    const submission = JSON.stringify({ scrapId, accepted, ...commitOptions });
+    if (commitOperationRef.current?.submission !== submission) {
+      commitOperationRef.current = { submission, key: uuidv4() };
+    }
+    const result = await commitCatalogScrapDraft(scrapId, accepted, {
+      ...commitOptions,
+      ...(consumesNotes ? { creativeNoteIds: noteIds } : {}),
+      operationKey: commitOperationRef.current.key,
+      silent: true,
+    }).catch((err) => {
+      toast.error(err?.message || 'Commit failed');
+      return null;
+    });
+    if (!result) { setCommitting(false); return; }
+    commitOperationRef.current = null;
+    // Keep `committing` true through the navigate: re-enabling the Commit button
+    // would open a double-submit window that re-commits the same scrap and
+    // duplicates ingredients. We navigate away on success, so it never needs
+    // clearing.
+    const n = Array.isArray(result.ingredients) ? result.ingredients.length : accepted.length;
+    toast.success(`Added ${n} ingredient${n === 1 ? '' : 's'} to the catalog.`);
+    // The server already stamped the source notes consumed; drop the handoff.
+    if (consumesNotes) {
+      creativeNoteIdsRef.current = [];
+      creativeNoteScrapIdRef.current = null;
+    }
+    navigate('/catalog');
+  };
+
+  return (
+    <section className="h-full overflow-y-auto p-4 md:p-6">
+      <div className="max-w-4xl mx-auto space-y-5">
+        <header className="flex items-start justify-between gap-3 flex-wrap">
+          <div className="flex items-start gap-3">
+            <Sparkles className="w-7 h-7 text-port-accent mt-1" aria-hidden="true" />
+            <div>
+              <h1 className="text-2xl font-bold text-white">{babble ? 'Babble and Prune' : 'Catalog Ingest'}</h1>
+              <p className="text-sm text-gray-400 mt-1">
+                {babble ? 'Write freely first. Then choose an AI provider to refine the useful fragments into catalog suggestions.' : 'Paste prose, notes, or a synopsis. Extract characters, places, objects, ideas, scenes, and concepts; review and commit only what you want to keep.'}
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <button type="button" onClick={() => navigate('/catalog')}
+              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm text-gray-400 hover:text-white">
+              <ArrowLeft size={14} aria-hidden="true" /> Back to Catalog
+            </button>
+            {phase === 'paste' && !babble && (
+              <button type="button" onClick={() => setBulkOpen((v) => !v)}
+                disabled={recording}
+                title={recording ? 'Stop the voice recording first' : undefined}
+                className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm border border-port-border text-gray-300 hover:text-white disabled:opacity-40 disabled:cursor-not-allowed"
+                aria-expanded={bulkOpen}>
+                <Upload size={14} aria-hidden="true" /> Bulk Import
+              </button>
+            )}
+            {phase !== 'paste' && (
+              <button type="button" onClick={requestReset}
+                className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm border border-port-border text-gray-300 hover:text-white">
+                <RotateCcw size={14} aria-hidden="true" /> Start Over
+              </button>
+            )}
+          </div>
+        </header>
+
+        <Modal open={confirmReset} onClose={() => setConfirmReset(false)} size="sm"
+          ariaLabelledBy="catalog-reset-title">
+          <div className="p-5 space-y-4">
+            <h2 id="catalog-reset-title" className="text-lg font-semibold text-white">Start over?</h2>
+            <p className="text-sm text-gray-300">
+              This will discard the current extracted draft and any edits you made. This action cannot be undone.
+            </p>
+            <div className="flex justify-end gap-2">
+              <button type="button" onClick={() => setConfirmReset(false)}
+                className="px-3 py-2 rounded-lg text-sm text-gray-300 hover:text-white">
+                Cancel
+              </button>
+              <button type="button" onClick={() => { setConfirmReset(false); reset(); }}
+                className="px-3 py-2 rounded-lg text-sm bg-port-error text-white hover:bg-port-error/90">
+                Discard draft
+              </button>
+            </div>
+          </div>
+        </Modal>
+
+        {phase === 'paste' && bulkOpen && (
+          <div className="bg-port-card border border-port-border rounded-lg p-4 sm:p-6 space-y-4">
+            <div>
+              <h2 className="text-lg font-semibold text-white flex items-center gap-2">
+                <Upload className="w-4 h-4 text-port-accent" aria-hidden="true" /> Bulk Import
+              </h2>
+              <p className="text-xs text-gray-500 mt-1">
+                Direct ingest — no LLM extraction. Markdown sections use
+                <code className="mx-1 px-1 bg-port-bg rounded">## &lt;Type&gt;: &lt;Name&gt;</code>
+                headings; CSV expects <code className="mx-1 px-1 bg-port-bg rounded">type,name,description,tags</code>;
+                JSON is an array of <code className="mx-1 px-1 bg-port-bg rounded">{'{ type, name, description?, payload?, tags? }'}</code>.
+              </p>
+            </div>
+            <div>
+              <label htmlFor="bulk-format" className="block text-sm font-medium mb-1 text-white">Format</label>
+              <select id="bulk-format" value={bulkFormat} onChange={(e) => setBulkFormat(e.target.value)}
+                className="px-3 py-2 bg-port-bg border border-port-border rounded text-white text-sm focus:outline-none focus:border-port-accent">
+                <option value="markdown">Markdown</option>
+                <option value="csv">CSV</option>
+                <option value="json">JSON</option>
+              </select>
+            </div>
+            <div>
+              <label htmlFor="bulk-text" className="block text-sm font-medium mb-1 text-white">Data to import</label>
+              <textarea id="bulk-text" rows={10} value={bulkText} onChange={(e) => setBulkText(e.target.value)}
+                placeholder={bulkFormat === 'csv'
+                  ? 'type,name,description,tags\ncharacter,Alice,A curious sleuth,"noir, gritty"\nplace,The Hollow,Abandoned subway tunnel,'
+                  : bulkFormat === 'json'
+                    ? '[\n  { "type": "character", "name": "Alice", "description": "A curious sleuth", "tags": ["noir"] }\n]'
+                    : '## Character: Alice\nA curious sleuth.\ntags: noir, gritty\n\n## Place: The Hollow\nAbandoned subway tunnel.\n'}
+                className="w-full px-3 py-2 bg-port-bg border border-port-border rounded text-white text-sm font-mono focus:outline-none focus:border-port-accent" />
+              <p className="text-xs text-gray-500 mt-1">{formatCount(bulkText.length)} {bulkText.length === 1 ? 'character' : 'characters'}</p>
+            </div>
+            <div className="flex items-center justify-end gap-2">
+              <button type="button" onClick={() => setBulkOpen(false)} disabled={bulkSubmitting}
+                className="px-3 py-2 rounded-lg text-gray-400 hover:text-white text-sm">
+                Cancel
+              </button>
+              <button type="button" onClick={handleBulkImport} disabled={bulkSubmitting || !bulkText.trim()}
+                className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-port-accent hover:bg-port-accent/90 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-medium">
+                {bulkSubmitting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
+                {bulkSubmitting ? 'Importing…' : 'Import'}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {phase === 'paste' && !bulkOpen && (
+          <>
+            {/* Source picker — paste / URL / file / voice all funnel into the
+                same review phase. File + voice fire immediately; paste + URL
+                have their own input rows. */}
+            <div hidden={babble} className={babble ? 'hidden' : 'flex flex-wrap items-center gap-2'}>
+              <button type="button" onClick={() => setSourceMode('paste')}
+                className={`inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm border ${sourceMode === 'paste' ? 'border-port-accent text-white bg-port-accent/10' : 'border-port-border text-gray-300 hover:text-white'}`}>
+                <Sparkles size={14} aria-hidden="true" /> Paste
+              </button>
+              <button type="button" onClick={() => setSourceMode('url')}
+                className={`inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm border ${sourceMode === 'url' ? 'border-port-accent text-white bg-port-accent/10' : 'border-port-border text-gray-300 hover:text-white'}`}>
+                <Link2 size={14} aria-hidden="true" /> URL
+              </button>
+              <FilePickerButton accept=".txt,.md,.markdown,text/plain,text/markdown"
+                onChange={handleFilePicked} disabled={submitting} ariaLabel="Ingest a text or markdown file"
+                className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm border border-port-border text-gray-300 hover:text-white">
+                <FileText size={14} aria-hidden="true" /> File
+              </FilePickerButton>
+              {!recording ? (
+                <button type="button" onClick={startRecording} disabled={submitting || starting}
+                  className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm border border-port-border text-gray-300 hover:text-white disabled:opacity-50">
+                  <Mic size={14} aria-hidden="true" /> Voice Memo
+                </button>
+              ) : (
+                <button type="button" onClick={stopRecordingAndIngest}
+                  className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm border border-port-error text-white bg-port-error/10 animate-pulse">
+                  <Square size={14} aria-hidden="true" /> Stop &amp; Transcribe
+                </button>
+              )}
+            </div>
+
+            {sourceMode === 'url' && (
+              <form onSubmit={handleUrlIngest} className="bg-port-card border border-port-border rounded-lg p-4 sm:p-6 space-y-4">
+                <div>
+                  <label htmlFor="ingest-url" className="block text-sm font-medium mb-1 text-white">URL</label>
+                  <input id="ingest-url" type="url" value={url} onChange={(e) => setUrl(e.target.value)}
+                    placeholder="https://example.com/article"
+                    className="w-full px-3 py-2 bg-port-bg border border-port-border rounded text-white text-sm focus:outline-none focus:border-port-accent" />
+                  <p className="text-xs text-gray-500 mt-1">Fetched through the browser service; main article text is extracted server-side.</p>
+                </div>
+                <div className="flex items-center justify-end">
+                  <button type="submit" disabled={submitting || !url.trim()}
+                    className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-port-accent hover:bg-port-accent/90 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-medium">
+                    {submitting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Link2 className="w-4 h-4" />}
+                    {submitting ? 'Fetching…' : 'Fetch & Ingest'}
+                  </button>
+                </div>
+              </form>
+            )}
+
+            {sourceMode === 'paste' && (
+              <form onSubmit={handleIngest} className="bg-port-card border border-port-border rounded-lg p-4 sm:p-6 space-y-4">
+                <div>
+                  <label htmlFor="ingest-title" className="block text-sm font-medium mb-1 text-white">
+                    Title <span className="text-gray-500 font-normal">(optional)</span>
+                  </label>
+                  <input id="ingest-title" type="text" value={title} onChange={(e) => setTitle(e.target.value)}
+                    placeholder="e.g. Chapter 3 notes" maxLength={200}
+                    className="w-full px-3 py-2 bg-port-bg border border-port-border rounded text-white text-sm focus:outline-none focus:border-port-accent" />
+                </div>
+                <div>
+                  <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+                    <label htmlFor="ingest-text" className="block text-sm font-medium text-white">{babble ? 'Babble freely — no need to organize or judge yet' : 'Raw text'}</label>
+                    <button type="submit" disabled={submitting || !rawText.trim() || (babble && (picker.loading || !picker.selectedProviderId || !picker.selectedModel))}
+                      className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-port-accent hover:bg-port-accent/90 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-medium">
+                      {submitting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+                      {submitting ? 'Working…' : babble ? 'Prune into suggestions' : 'Ingest'}
+                    </button>
+                  </div>
+                  <textarea id="ingest-text" maxLength={babble ? 30000 : undefined} rows={6} value={rawText} onChange={(e) => setRawText(e.target.value)}
+                    placeholder="Paste prose, scene notes, character sketches — anything you want catalogued."
+                    className="w-full min-h-36 max-h-[55vh] sm:min-h-72 sm:max-h-[70vh] resize-y overflow-y-auto px-3 py-2 bg-port-bg border border-port-border rounded text-white text-sm font-mono focus:outline-none focus:border-port-accent" />
+                  <p className="text-xs text-gray-500 mt-1">{formatCount(rawText.length)}{babble ? ' / 30,000 chars' : ' chars'}</p>
+                </div>
+                {babble && <>
+                  <p className="text-sm text-gray-400">One AI pass refines your brainstorm into distinct suggestions: story ideas, character journeys, alternate realities, scenes, dialogue, and concepts. Review and edit before saving. Your original text is preserved as a scrap.</p>
+                  <ProviderModelSelector providers={picker.providers} selectedProviderId={picker.selectedProviderId}
+                    selectedModel={picker.selectedModel} availableModels={picker.availableModels}
+                    onProviderChange={(id) => { picker.setSelectedProviderId(id); setEffort(''); }}
+                    onModelChange={(model) => { picker.setSelectedModel(model); setEffort(''); }}
+                    effort={effort} onEffortChange={setEffort} loading={picker.loading} />
+                </>}
+              </form>
+            )}
+          </>
+        )}
+
+        {phase === 'extracting' && (
+          <div className="bg-port-card border border-port-border rounded-lg p-6 space-y-3">
+            <p className="text-sm font-medium text-white flex items-center gap-2">
+              <Loader2 className="w-4 h-4 animate-spin text-port-accent" aria-hidden="true" />
+              {babble
+                ? 'Pruning your brainstorm — one AI pass.'
+                : stages.length === 1 || plan?.mode === 'whole'
+                ? 'Extracting ingredients — one AI pass.'
+                : `Extracting ingredients — one pass per source chunk (${stages.length} chunk${stages.length === 1 ? '' : 's'}).`}
+            </p>
+            <ul className="space-y-1.5 mt-2">
+              {stages.map((s) => (
+                <li key={s.id} className="flex items-center gap-2 text-sm">
+                  <StageIcon status={s.status} />
+                  <span className={s.status === 'running' ? 'text-white' : 'text-gray-400'}>
+                    {s.label}
+                  </span>
+                  {Number.isFinite(s.count) && s.count > 0 && (
+                    <span className="text-xs text-gray-500">({s.count})</span>
+                  )}
+                  {s.error && <span role="status" className="text-xs text-port-error">— {s.error}</span>}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {phase === 'review' && (() => {
+          const totalDraftEntries = KIND_SECTIONS.reduce((sum, s) => sum + (draft[s.key]?.length || 0), 0);
+          const selectedEntriesCount = KIND_SECTIONS.reduce((sum, s) => sum + (selected[s.key]?.size || 0), 0);
+          const activeRelationshipsCount = isStructuredDraft
+            ? relationships.filter((r) => {
+                const relId = r.id || `${r.fromDraftId}:${r.toDraftId}:${r.kind}`;
+                return !optedOutRelationships.has(relId) && isEntrySelected(r.fromDraftId) && isEntrySelected(r.toDraftId);
+              }).length
+            : 0;
+          const isOverLimit = selectedEntriesCount > 200 || activeRelationshipsCount > 1000;
+          const hasExtractedOverflow = totalDraftEntries > 200 || relationships.length > 1000 || Boolean(overflow);
+
+          return (
+            <div className="space-y-5">
+              <div className="bg-port-card border border-port-border rounded-lg p-4 space-y-3">
+                <p className="text-sm text-gray-300">
+                  Review the candidates below. Uncheck anything you don&apos;t want, edit names and descriptions inline, then commit the rest.
+                </p>
+                <div className="max-w-xs">
+                  <label htmlFor="ingest-universe-ref" className="block text-sm font-medium mb-1 text-white">Catalogue into</label>
+                  <select id="ingest-universe-ref" value={universeRef}
+                    onChange={(e) => {
+                      const next = e.target.value;
+                      setUniverseRef(next);
+                      safeWriteStorage(LAST_UNIVERSE_STORAGE_KEY, next);
+                    }}
+                    className="w-full px-3 py-2 bg-port-bg border border-port-border rounded text-white text-sm focus:outline-none focus:border-port-accent">
+                    <option value={UNASSIGNED_UNIVERSE}>Unassigned</option>
+                    {universes.map((u) => (
+                      <option key={u.id} value={u.id}>{u.name}</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+              {(isOverLimit || hasExtractedOverflow) && (
+                <div role="alert" className="bg-port-card border border-port-error rounded-lg p-4 text-sm space-y-1 text-port-error">
+                  <p className="font-semibold">Draft exceeds capacity limits</p>
+                  <p>
+                    {isOverLimit
+                      ? `Too many items selected (${selectedEntriesCount > 200 ? `${selectedEntriesCount} entries (max 200); ` : ''}${activeRelationshipsCount > 1000 ? `${activeRelationshipsCount} relationships (max 1,000); ` : ''}). Deselect items before committing.`
+                      : `Extraction exceeded limits (${totalDraftEntries > 200 ? `${totalDraftEntries} entries (max 200); ` : ''}${relationships.length > 1000 ? `${relationships.length} relationships (max 1,000); ` : ''}). Deselect items before committing.`}
+                  </p>
+                </div>
+              )}
+              {stages.some((stage) => stage.status === 'failed') && (
+                <div role="alert" className="bg-port-card border border-port-error rounded-lg p-4 text-sm space-y-2">
+                  <div className="flex items-center justify-between flex-wrap gap-2">
+                    <p className="text-white font-medium">Extraction is incomplete. These candidates cover only the successful parts of your source. Retry ingestion to cover the failed parts.</p>
+                    <button
+                      type="button"
+                      onClick={handleRetry}
+                      disabled={submitting}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded bg-port-accent hover:bg-port-accent/90 text-white text-xs font-medium"
+                    >
+                      <RotateCcw size={12} aria-hidden="true" /> Retry extraction
+                    </button>
+                  </div>
+                  {stages.filter((stage) => stage.status === 'failed').map((stage) => (
+                    <p key={stage.id} className="text-port-error">{stage.label}: {stage.error || 'Extraction failed'}</p>
+                  ))}
+                </div>
+              )}
+              {KIND_SECTIONS.map((section) => (
+                <ReviewSection
+                  key={section.key}
+                  section={section}
+                  items={draft[section.key]}
+                  selected={selected[section.key]}
+                  onToggle={(id) => toggle(section.key, id)}
+                  onSelectAll={(on) => selectAll(section.key, on)}
+                  onPatch={(id, patch) => patchCandidate(section.key, id, patch)}
+                />
+              ))}
+              {isStructuredDraft && relationships.length > 0 && (
+                <RelationshipsReviewSection
+                  relationships={relationships}
+                  optedOutRelationships={optedOutRelationships}
+                  candidateMap={candidateMap}
+                  isEntrySelected={isEntrySelected}
+                  onToggleRelationship={toggleRelationship}
+                  onSelectAll={selectAllRelationships}
+                />
+              )}
+              <div className="sticky bottom-4 bg-port-card border border-port-border rounded-lg p-3 flex items-center justify-end gap-2 shadow-lg">
+                <button type="button" onClick={reset} disabled={committing}
+                  className="px-3 py-2 rounded-lg text-gray-400 hover:text-white text-sm">
+                  Cancel
+                </button>
+                <button type="button" onClick={handleCommit} disabled={committing || isOverLimit}
+                  className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-port-success hover:bg-port-success/90 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-medium">
+                  {committing ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle2 className="w-4 h-4" />}
+                  {committing ? 'Committing…' : 'Commit Selected'}
+                </button>
+              </div>
+            </div>
+          );
+        })()}
+      </div>
+    </section>
+  );
+}
+
+function ReviewSection({ section, items, selected, onToggle, onSelectAll, onPatch }) {
+  const total = items.length;
+  const count = items.filter((c, idx) => selected.has(c.draftId || `legacy-${section.key}-${idx}`)).length;
+  if (total === 0) {
+    return (
+      <section className="bg-port-card border border-port-border rounded-lg p-4">
+        <h2 className="text-lg font-semibold text-white mb-1">{section.label}</h2>
+        <p className="text-xs text-gray-500">None extracted from this scrap.</p>
+      </section>
+    );
+  }
+  return (
+    <section className="bg-port-card border border-port-border rounded-lg p-4 space-y-3">
+      <div className="flex items-center justify-between flex-wrap gap-2">
+        <h2 className="text-lg font-semibold text-white">
+          {section.label} <span className="text-sm font-normal text-gray-500">({count} / {total} selected)</span>
+        </h2>
+        <div className="flex items-center gap-1 text-xs">
+          <button type="button" onClick={() => onSelectAll(true)} className="px-2 py-1 rounded border border-port-border text-gray-300 hover:text-white">
+            Select All
+          </button>
+          <button type="button" onClick={() => onSelectAll(false)} className="px-2 py-1 rounded border border-port-border text-gray-300 hover:text-white">
+            Deselect All
+          </button>
+        </div>
+      </div>
+      <ul className="space-y-2">
+        {items.map((c, idx) => {
+          const itemId = c.draftId || `legacy-${section.key}-${idx}`;
+          const baseId = `${section.key}-${idx}`;
+          // Each type's primary editable field matches PRIMARY_CONTENT_KEY in
+          // Catalog.jsx: character → physicalDescription (canon shape from
+          // sanitizeCharacter); place/object → description; idea/scene/concept
+          // → summary. Without this an edit lands in a sibling key the
+          // catalog editor doesn't read.
+          let descField;
+          if (section.type === 'character') descField = 'physicalDescription';
+          else if (section.type === 'place' || section.type === 'object') descField = 'description';
+          else descField = 'summary';
+          return (
+            <li key={itemId} className="border border-port-border rounded p-3 bg-port-bg/40 flex items-start gap-2">
+              <input id={`${baseId}-check`} type="checkbox" checked={selected.has(itemId)} onChange={() => onToggle(itemId)}
+                className="accent-port-accent mt-1" aria-label={`Include ${c.name || section.label}`} />
+              <div className="flex-1 min-w-0 space-y-2">
+                <label htmlFor={`${baseId}-name`} className="sr-only">Name</label>
+                <input id={`${baseId}-name`} type="text" value={c.name || ''} onChange={(e) => onPatch(itemId, { name: e.target.value })}
+                  placeholder="Name" maxLength={200}
+                  className="w-full px-2 py-1 bg-port-bg border border-port-border rounded text-sm text-white focus:outline-none focus:border-port-accent" />
+                <label htmlFor={`${baseId}-desc`} className="sr-only">Description</label>
+                <textarea id={`${baseId}-desc`} rows={2} value={c[descField] ?? ''}
+                  onChange={(e) => onPatch(itemId, { [descField]: e.target.value })} placeholder="Short description"
+                  className="w-full px-2 py-1 bg-port-bg border border-port-border rounded text-xs text-gray-200 focus:outline-none focus:border-port-accent" />
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+    </section>
+  );
+}
+
+function RelationshipsReviewSection({
+  relationships,
+  optedOutRelationships,
+  candidateMap,
+  isEntrySelected,
+  onToggleRelationship,
+  onSelectAll,
+}) {
+  const total = relationships.length;
+  if (total === 0) return null;
+
+  const activeRelationships = relationships.filter((r) => {
+    const relId = r.id || `${r.fromDraftId}:${r.toDraftId}:${r.kind}`;
+    const fromSelected = isEntrySelected(r.fromDraftId);
+    const toSelected = isEntrySelected(r.toDraftId);
+    return fromSelected && toSelected && !optedOutRelationships.has(relId);
+  });
+  const activeCount = activeRelationships.length;
+
+  return (
+    <section className="bg-port-card border border-port-border rounded-lg p-4 space-y-3">
+      <div className="flex items-center justify-between flex-wrap gap-2">
+        <h2 className="text-lg font-semibold text-white">
+          Relationships <span className="text-sm font-normal text-gray-500">({activeCount} / {total} active)</span>
+        </h2>
+        <div className="flex items-center gap-1 text-xs">
+          <button
+            type="button"
+            onClick={() => onSelectAll(true)}
+            className="px-2 py-1 rounded border border-port-border text-gray-300 hover:text-white"
+          >
+            Select All
+          </button>
+          <button
+            type="button"
+            onClick={() => onSelectAll(false)}
+            className="px-2 py-1 rounded border border-port-border text-gray-300 hover:text-white"
+          >
+            Deselect All
+          </button>
+        </div>
+      </div>
+      <ul className="space-y-2">
+        {relationships.map((rel, idx) => {
+          const relId = rel.id || `${rel.fromDraftId}:${rel.toDraftId}:${rel.kind}`;
+          const fromItem = candidateMap.get(rel.fromDraftId);
+          const toItem = candidateMap.get(rel.toDraftId);
+          const fromName = (fromItem?.name || '').trim() || rel.fromDraftId;
+          const toName = (toItem?.name || '').trim() || rel.toDraftId;
+          const fromSelected = isEntrySelected(rel.fromDraftId);
+          const toSelected = isEntrySelected(rel.toDraftId);
+          const endpointsActive = fromSelected && toSelected;
+          const isOptedIn = !optedOutRelationships.has(relId);
+          const isChecked = endpointsActive && isOptedIn;
+          const kindObj = getRelationKind(rel.kind);
+          const kindLabel = kindObj?.label || rel.kind;
+          const inverseLabel = kindObj?.inverseLabel;
+
+          return (
+            <li
+              key={relId}
+              className={`border border-port-border rounded p-3 flex items-start gap-2 ${
+                endpointsActive ? 'bg-port-bg/40' : 'bg-port-bg/20 opacity-75'
+              }`}
+            >
+              <input
+                id={`rel-check-${idx}`}
+                type="checkbox"
+                checked={isChecked}
+                disabled={!endpointsActive}
+                onChange={() => endpointsActive && onToggleRelationship(relId)}
+                className="accent-port-accent mt-1 disabled:opacity-40 disabled:cursor-not-allowed"
+                aria-label={`Include relationship ${fromName} ${kindLabel} ${toName}`}
+              />
+              <div className="flex-1 min-w-0 space-y-1">
+                <div className="flex items-center gap-2 flex-wrap text-sm">
+                  <span className="font-medium text-white">{fromName}</span>
+                  <span className="text-port-accent text-xs">→</span>
+                  <span className="text-xs px-2 py-0.5 rounded bg-port-bg border border-port-border text-port-accent font-medium">
+                    {kindLabel}
+                  </span>
+                  <span className="text-port-accent text-xs">→</span>
+                  <span className="font-medium text-white">{toName}</span>
+                  {inverseLabel && (
+                    <span className="text-[11px] text-gray-500">
+                      (inverse: {inverseLabel})
+                    </span>
+                  )}
+                </div>
+                {rel.evidence && (
+                  <blockquote className="text-xs text-gray-400 italic pl-2 border-l-2 border-port-border/80">
+                    “{rel.evidence}”
+                  </blockquote>
+                )}
+                {!endpointsActive && (
+                  <div role="status" className="text-xs text-port-warning font-medium">
+                    {!fromSelected && !toSelected
+                      ? `Disabled — both ${fromName} and ${toName} are deselected`
+                      : !fromSelected
+                      ? `Disabled — ${fromName} is deselected`
+                      : `Disabled — ${toName} is deselected`}
+                  </div>
+                )}
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+    </section>
+  );
+}

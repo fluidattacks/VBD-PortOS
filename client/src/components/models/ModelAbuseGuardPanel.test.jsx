@@ -1,0 +1,117 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+
+vi.mock('./UntrustedContentPolicyPanel.jsx', () => ({ default: () => <div>Content safety policies</div> }));
+
+vi.mock('../../services/api', () => ({
+  getModelAbuseGuardStatus: vi.fn(),
+  getHfTokenStatus: vi.fn(),
+  installModelAbuseGuard: vi.fn(),
+  cancelModelAbuseGuardInstall: vi.fn(),
+}));
+vi.mock('../../services/socket', () => ({
+  default: { on: vi.fn(), off: vi.fn() },
+}));
+vi.mock('../ui/Toast', () => ({
+  default: Object.assign(vi.fn(), { success: vi.fn(), error: vi.fn(), warning: vi.fn(), info: vi.fn() }),
+}));
+
+import {
+  cancelModelAbuseGuardInstall,
+  getHfTokenStatus,
+  getModelAbuseGuardStatus,
+  installModelAbuseGuard,
+} from '../../services/api';
+import socket from '../../services/socket';
+import ModelAbuseGuardPanel from './ModelAbuseGuardPanel';
+
+const STAGES = [
+  { id: 'huggingface-token', label: 'Hugging Face access token', description: 'A read token plus gated-model approval.', ready: true },
+  { id: 'python', label: 'Host Python', description: 'A Python interpreter for the dedicated runtime.', ready: true },
+  { id: 'venv', label: 'Dedicated Prompt Guard runtime', description: 'A private virtualenv.', ready: false },
+  { id: 'packages', label: 'Classifier packages', description: 'Pinned classifier imports.', ready: false },
+  { id: 'model', label: 'Pinned model snapshot', description: 'The five required Prompt Guard files.', ready: false },
+];
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  getModelAbuseGuardStatus.mockResolvedValue({
+    id: 'llama-prompt-guard-2-86m',
+    name: 'Llama Prompt Guard 2 86M',
+    sourceUrl: 'https://huggingface.co/meta-llama/Llama-Prompt-Guard-2-86M',
+    ready: false,
+    modelCached: false,
+    runtimeReady: false,
+    pythonAvailable: true,
+    venvReady: false,
+    stages: STAGES,
+  });
+  getHfTokenStatus.mockResolvedValue({ hfTokenPresent: true, source: 'stored' });
+  installModelAbuseGuard.mockResolvedValue({ ok: true, ready: true });
+  cancelModelAbuseGuardInstall.mockResolvedValue({ cancelled: true });
+});
+
+const renderPanel = async () => {
+  render(<ModelAbuseGuardPanel />);
+  const heading = await screen.findByRole('heading', { name: 'Model-abuse guard' });
+  expect(heading).toBeInTheDocument();
+  expect(screen.getByRole('tabpanel')).toHaveAttribute('aria-labelledby', heading.id);
+};
+
+describe('ModelAbuseGuardPanel', () => {
+  it('offers repair for partial setup and disables installation without Python', async () => {
+    getModelAbuseGuardStatus.mockResolvedValueOnce({
+      ready: false, setupState: 'incomplete', venvReady: true, pythonAvailable: false, stages: STAGES,
+    });
+    await renderPanel();
+    expect(screen.getByText('Setup incomplete')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Repair model-abuse guard' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Refresh status' })).toBeEnabled();
+    expect(screen.getByRole('status')).toHaveTextContent('A partial or failed installation blocks screening');
+  });
+
+  it('tracks each install stage separately from the chat catalog', async () => {
+    await renderPanel();
+
+    expect(screen.getByText('Required by default · local classifier')).toBeInTheDocument();
+    expect(screen.getByRole('list', { name: 'Abuse guard setup stages' })).toBeInTheDocument();
+    expect(screen.getByTestId('abuse-guard-stage-huggingface-token')).toHaveAttribute('data-ready', 'true');
+    expect(screen.getByTestId('abuse-guard-stage-python')).toHaveAttribute('data-ready', 'true');
+    expect(screen.getByTestId('abuse-guard-stage-venv')).toHaveAttribute('data-ready', 'false');
+    expect(screen.getByTestId('abuse-guard-stage-packages')).toHaveAttribute('data-ready', 'false');
+    expect(screen.getByTestId('abuse-guard-stage-model')).toHaveAttribute('data-ready', 'false');
+    expect(screen.queryByText('Recommended for Security Scan')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Install model-abuse guard' })).toBeInTheDocument();
+  });
+
+  it('marks the live install stage from security-guard progress events', async () => {
+    let deferred;
+    installModelAbuseGuard.mockImplementation(() => new Promise((resolve) => { deferred = resolve; }));
+    await renderPanel();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Install model-abuse guard' }));
+    await waitFor(() => expect(installModelAbuseGuard).toHaveBeenCalled());
+    await act(async () => {});
+
+    const handler = socket.on.mock.calls.find((call) => call[0] === 'localLlm:progress')?.[1];
+    expect(handler).toEqual(expect.any(Function));
+    act(() => {
+      handler({ scope: 'security-guard', event: 'stage', stage: 'venv', message: 'Preparing the dedicated Prompt Guard runtime…' });
+    });
+    expect(screen.getByTestId('abuse-guard-stage-venv').textContent).toMatch(/Installing/);
+    expect(screen.getByText('Preparing the dedicated Prompt Guard runtime…')).toBeInTheDocument();
+
+    await act(async () => { deferred({ ok: true, ready: true }); });
+  });
+});
+
+it('keeps a failed installation actionable after refresh and remount', async () => {
+  getModelAbuseGuardStatus.mockResolvedValue({ ready: false, pythonAvailable: true, venvReady: true, setupState: 'incomplete', stages: STAGES, lastInstallFailure: { stage: 'packages', code: 'network-failed', exitCode: 1, message: 'Package server unreachable.', action: 'Check the Python package index connection.' } });
+  await renderPanel();
+  const failureAlert = await screen.findByRole('alert');
+  expect(failureAlert).toHaveTextContent('packages: network-failed (exit 1)');
+  expect(failureAlert).toHaveTextContent('Check the Python package index connection.');
+  fireEvent.click(screen.getByRole('button', { name: 'Refresh status' }));
+  await waitFor(() => expect(getModelAbuseGuardStatus).toHaveBeenCalledTimes(2));
+  expect(screen.getByRole('alert')).toHaveTextContent('Package server unreachable.');
+});

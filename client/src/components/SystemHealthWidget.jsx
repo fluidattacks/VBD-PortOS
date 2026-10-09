@@ -1,0 +1,339 @@
+import { useState, memo, useMemo } from 'react';
+import { Link } from 'react-router';
+import {
+  Activity,
+  Server,
+  Cpu,
+  HardDrive,
+  Database,
+  ChevronRight,
+  AlertTriangle,
+  Clock,
+  Zap,
+  RefreshCw,
+  X
+} from 'lucide-react';
+import { MicroGlyph } from './micrographics';
+import { useHealthWarningDismiss } from '../hooks/useHealthWarningDismiss.jsx';
+import { HEALTH_STYLE, pctTone, barTone, resolveHealthThresholds } from '../lib/healthStyle.js';
+
+/**
+ * SystemHealthWidget - Compact system health overview for the Dashboard
+ * Shows server uptime, memory/CPU usage, process status, and warnings
+ */
+const SystemHealthWidget = memo(function SystemHealthWidget({ dashboardState }) {
+  const health = dashboardState?.health;
+  const refetchHealth = dashboardState?.refetchHealth;
+  const [refreshing, setRefreshing] = useState(false);
+  const { dismissingType, handleDismissWarning } = useHealthWarningDismiss(refetchHealth);
+
+  const handleRefresh = async () => {
+    if (!refetchHealth || refreshing) return;
+    setRefreshing(true);
+    await refetchHealth();
+    setRefreshing(false);
+  };
+
+  // Decorative chrome that reflects real state — top row reads as a HUD
+  // readout (memory/cpu/proc/apps/disk), rows below fade so the eye
+  // doesn't read it as a chart. Computed before the early returns below
+  // so React's hook count stays stable across renders.
+  const memPct = health?.system?.memory?.usagePercent;
+  const cpuPct = health?.system?.cpu?.usagePercent;
+  const diskPct = Object.hasOwn(health?.system || {}, 'dataDisk')
+    ? health.system.dataDisk?.usagePercent : health?.system?.disk?.usagePercent;
+  const procOnline = health?.processes?.online;
+  const procTotal = health?.processes?.total;
+  const appOnline = health?.apps?.online;
+  const appTotal = health?.apps?.total;
+  const matrixIntensity = useMemo(() => {
+    const cells = new Array(25).fill(0.18);
+    const norm = (pct) => Math.max(0.18, Math.min(1, (pct ?? 0) / 100));
+    cells[0] = norm(memPct);
+    cells[1] = norm(cpuPct);
+    cells[2] = procTotal ? Math.max(0.25, procOnline / procTotal) : 0.25;
+    cells[3] = appTotal ? Math.max(0.25, appOnline / appTotal) : 0.25;
+    cells[4] = norm(diskPct);
+    for (let row = 1; row < 5; row++) {
+      const decay = 1 - row * 0.18;
+      for (let col = 0; col < 5; col++) {
+        cells[row * 5 + col] = Math.max(0.18, cells[col] * decay);
+      }
+    }
+    return cells;
+  }, [memPct, cpuPct, diskPct, procOnline, procTotal, appOnline, appTotal]);
+
+  // Don't render if no data
+  if (!health) {
+    return null;
+  }
+
+  const { overallHealth, warnings, system, processes, apps, cos } = health;
+  const diskProbeUnavailable = warnings.some(warning => warning.type === 'probe-unavailable' && warning.source === 'disk');
+  const cosProbeUnavailable = warnings.some(warning => warning.type === 'probe-unavailable' && warning.source === 'cos');
+  const cosQueueUnavailable = warnings.some(warning => warning.type === 'probe-unavailable' && warning.source === 'cos-queue');
+  const cosAgentsUnavailable = warnings.some(warning => warning.type === 'probe-unavailable' && warning.source === 'cos-agents');
+  const pm2ProbeUnavailable = warnings.some(warning => warning.type === 'probe-unavailable' && warning.source === 'pm2');
+
+  const healthStyle = HEALTH_STYLE[overallHealth] || { color: 'text-gray-400', bg: 'bg-gray-400/10', icon: Activity };
+  const HealthIcon = healthStyle.icon;
+  const thresholds = resolveHealthThresholds(health.thresholds);
+
+  return (
+    <div className="@container min-w-0 bg-port-card border border-port-border rounded-xl p-4">
+      {/* Header */}
+      <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
+        <div className="flex min-w-0 items-center gap-3">
+          <div className={`shrink-0 p-2 rounded-lg ${healthStyle.bg}`}>
+            <Server className={`w-5 h-5 ${healthStyle.color}`} />
+          </div>
+          <div className="min-w-0">
+            <h3 className="text-base @sm:text-lg font-semibold leading-tight text-white">System Health</h3>
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-sm">
+              <HealthIcon size={14} className={healthStyle.color} />
+              <span className={healthStyle.color}>
+                {overallHealth.charAt(0).toUpperCase() + overallHealth.slice(1)}
+              </span>
+              <span className="text-gray-500">•</span>
+              <Clock size={12} className="text-gray-400" />
+              <span className="text-gray-400">{system.uptimeFormatted}</span>
+            </div>
+          </div>
+        </div>
+        <div className="flex shrink-0 items-center gap-1 @sm:gap-3">
+          <span
+            className={`hidden @sm:inline-flex ${healthStyle.color}`}
+            title="Live load matrix — top row reflects memory/cpu/proc/apps/disk"
+          >
+            <MicroGlyph variant="matrix" size={28} intensity={matrixIntensity} />
+          </span>
+          <button
+            type="button"
+            onClick={handleRefresh}
+            disabled={!refetchHealth || refreshing}
+            className="inline-flex min-h-[40px] min-w-[40px] items-center justify-center rounded text-gray-400 transition-colors hover:bg-port-border/50 hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
+            title="Refresh system health"
+            aria-label={refreshing ? 'Refreshing system health' : 'Refresh system health'}
+          >
+            <RefreshCw size={15} className={refreshing ? 'animate-spin' : ''} aria-hidden="true" />
+          </button>
+          <Link
+            to="/system-resources/overview"
+            className="flex items-center gap-1 text-sm text-port-accent hover:text-port-accent/80 transition-colors min-h-[40px] px-2"
+          >
+            <span className="@max-xs:sr-only">Details</span>
+            <ChevronRight size={16} />
+          </Link>
+        </div>
+      </div>
+
+      {/* Warnings */}
+      {warnings.length > 0 && (
+        <div className="mb-4 space-y-2">
+          {warnings.map((warning, idx) => (
+            <div
+              key={idx}
+              className="flex items-center gap-2 px-3 py-2 rounded-lg bg-port-warning/10 text-port-warning text-sm"
+            >
+              <AlertTriangle size={14} className="shrink-0" />
+              <span className="flex-1">{warning.message}</span>
+              {warning.dismissible !== false && (
+                <button
+                  type="button"
+                  onClick={() => handleDismissWarning(warning)}
+                  disabled={!refetchHealth || dismissingType === warning.type}
+                  className="shrink-0 inline-flex min-h-[28px] min-w-[28px] items-center justify-center rounded text-port-warning/70 transition-colors hover:bg-port-warning/20 hover:text-port-warning disabled:cursor-not-allowed disabled:opacity-50"
+                  title="Dismiss as resolved"
+                  aria-label={`Dismiss warning: ${warning.message}`}
+                >
+                  <X size={13} aria-hidden="true" />
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Stats Grid */}
+      <div className="grid grid-cols-2 @sm:grid-cols-3 @2xl:grid-cols-5 gap-3">
+        {/* Memory Usage */}
+        <div className="bg-port-bg/50 rounded-lg p-3">
+          <div className="flex min-w-0 items-center gap-2 mb-1">
+            <HardDrive size={14} className="hidden shrink-0 text-purple-400 @2xs:block" />
+            <span className="truncate text-xs text-gray-500">Memory</span>
+          </div>
+          <div className="text-lg @sm:text-xl font-bold text-port-accent">
+            {system.memory.usagePercent}%
+          </div>
+          <div className="text-xs text-gray-500">
+            {system.memory.usedFormatted} / {system.memory.totalFormatted}
+          </div>
+          <div className="mt-2 h-1.5 bg-port-border rounded-full overflow-hidden">
+            <div
+              className="h-full rounded-full transition-all bg-port-accent"
+              style={{ width: `${system.memory.usagePercent}%` }}
+            />
+          </div>
+        </div>
+
+        {/* CPU Usage */}
+        <div className="bg-port-bg/50 rounded-lg p-3">
+          <div className="flex min-w-0 items-center gap-2 mb-1">
+            <Cpu size={14} className="hidden shrink-0 text-blue-400 @2xs:block" />
+            <span className="truncate text-xs text-gray-500">CPU</span>
+          </div>
+          <div className="text-lg @sm:text-xl font-bold text-port-accent">
+            {system.cpu.usagePercent}%
+          </div>
+          <div className="text-xs text-gray-500">
+            {system.cpu.cores} cores
+          </div>
+          <div className="mt-2 h-1.5 bg-port-border rounded-full overflow-hidden">
+            <div
+              className="h-full rounded-full transition-all bg-port-accent"
+              style={{ width: `${Math.min(100, system.cpu.usagePercent)}%` }}
+            />
+          </div>
+        </div>
+
+        {/* Processes */}
+        {processes ? (
+          <div className="bg-port-bg/50 rounded-lg p-3">
+            <div className="flex min-w-0 items-center gap-2 mb-1">
+              <Activity size={14} className="hidden shrink-0 text-emerald-400 @2xs:block" />
+              <span className="truncate text-xs text-gray-500">Processes</span>
+            </div>
+            <div className="text-lg @sm:text-xl font-bold text-white">
+              {processes.online}
+              <span className="text-sm font-normal text-gray-500">/{processes.total}</span>
+            </div>
+            <div className="flex items-center gap-1 text-xs text-gray-500">
+              {processes.errored > 0 ? (
+                <span className="text-port-error">{processes.errored} errored</span>
+              ) : processes.stopped > 0 ? (
+                <span>{processes.stopped} stopped</span>
+              ) : (
+                <span className="text-port-success">All running</span>
+              )}
+            </div>
+          </div>
+        ) : pm2ProbeUnavailable ? (
+          <div className="rounded-lg bg-port-bg/50 p-3" aria-label="Process manager status unavailable">
+            <div className="text-xs text-gray-500">Processes</div>
+            <div className="text-lg font-bold text-port-warning">Unavailable</div>
+          </div>
+        ) : null}
+
+        {/* Services — PM2-managed apps; native (Xcode/iOS) projects shown as "+N native" */}
+        <div
+          className="bg-port-bg/50 rounded-lg p-3"
+          title="PM2-managed apps online vs. total. Native projects (Xcode, iOS) have no detectable runtime and are listed separately."
+        >
+          <div className="flex min-w-0 items-center gap-2 mb-1">
+            <Zap size={14} className="hidden shrink-0 text-amber-400 @2xs:block" />
+            <span className="truncate text-xs text-gray-500">Services</span>
+          </div>
+          {apps.status === 'unavailable' ? (
+            <div className="text-lg font-bold text-port-warning">Apps unavailable</div>
+          ) : apps.total > 0 ? (
+            <>
+              <div className="text-lg @sm:text-xl font-bold text-white">
+                {apps.online}
+                <span className="text-sm font-normal text-gray-500">/{apps.total}</span>
+              </div>
+              <div className="flex items-center gap-1 text-xs text-gray-500">
+                {apps.online === apps.total ? (
+                  <span className="text-port-success">All running</span>
+                ) : apps.stopped > 0 ? (
+                  <span>{apps.stopped} stopped</span>
+                ) : apps.notStarted > 0 ? (
+                  <span>{apps.notStarted} not running</span>
+                ) : null}
+                {apps.unmanaged > 0 && (
+                  <span className="text-gray-500">
+                    {(apps.online === apps.total || apps.stopped > 0 || apps.notStarted > 0) ? ' · ' : ''}
+                    +{apps.unmanaged} native
+                  </span>
+                )}
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="text-lg @sm:text-xl font-bold text-gray-500">—</div>
+              <div className="text-xs text-gray-500">
+                {apps.unmanaged > 0 ? `${apps.unmanaged} native only` : 'No apps'}
+              </div>
+            </>
+          )}
+        </div>
+
+        {/* Root fields remain compatible with older health responses. */}
+        {[{ disk: system.disk, label: 'Root disk', unavailable: diskProbeUnavailable },
+          ...(Object.hasOwn(system, 'dataDisk') ? [{ disk: system.dataDisk, label: 'Runtime data disk', unavailable: true }] : [])
+        ].map(({ disk, label, unavailable }) => (
+        disk ? (
+          <Link
+            key={label}
+            to="/system-resources/storage"
+            aria-label={label === 'Root disk' ? 'Open disk usage report' : 'Open runtime data disk usage report'}
+            className="block rounded-lg bg-port-bg/50 p-3 transition-colors hover:bg-port-bg/80 focus:outline-none focus:ring-2 focus:ring-port-accent/60"
+          >
+            <div className="flex min-w-0 items-center gap-2 mb-1">
+              <Database size={14} className="hidden shrink-0 text-cyan-400 @2xs:block" />
+              <span className="truncate text-xs text-gray-500">{label}</span>
+            </div>
+            <div className={`text-lg @sm:text-xl font-bold ${pctTone(disk.usagePercent, thresholds.diskWarn, thresholds.diskCritical)}`}>
+              {disk.usagePercent}%
+            </div>
+            <div className="text-xs text-gray-500">
+              {disk.usedFormatted} / {disk.totalFormatted}
+            </div>
+            <div className="mt-2 h-1.5 bg-port-border rounded-full overflow-hidden">
+              <div
+                className={`h-full rounded-full transition-all ${barTone(disk.usagePercent, thresholds.diskWarn, thresholds.diskCritical)}`}
+                style={{ width: `${disk.usagePercent}%` }}
+              />
+            </div>
+          </Link>
+        ) : unavailable ? (
+          <div className="rounded-lg bg-port-bg/50 p-3" key={label} aria-label={label === 'Root disk' ? 'Disk status unavailable' : `${label} status unavailable`}>
+            <div className="text-xs text-gray-500">{label}</div>
+            <div className="text-lg font-bold text-port-warning">Unavailable</div>
+          </div>
+        ) : null
+        ))}
+      </div>
+
+      {/* CoS Status (if running) */}
+      {(cos || cosProbeUnavailable) && (
+        <div className="mt-4 pt-4 border-t border-port-border">
+          <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 text-sm">
+            <div className="flex min-w-0 items-center gap-2">
+              <div className={`w-2 h-2 rounded-full ${cosProbeUnavailable ? 'bg-port-warning' : cos.running ? (cos.paused ? 'bg-port-warning' : 'bg-port-success animate-pulse') : 'bg-gray-500'}`} />
+              <span className="truncate text-gray-300">Chief of Staff</span>
+              <span className="text-gray-500">
+                {cosProbeUnavailable ? 'Unavailable' : cos.running ? (cos.paused ? 'Paused' : 'Active') : 'Stopped'}
+              </span>
+            </div>
+            {cos?.running && !cosProbeUnavailable && (
+              <div className="flex items-center gap-3 text-xs text-gray-500">
+                {cosAgentsUnavailable ? (
+                  <span className="text-port-warning">Agents unavailable</span>
+                ) : cos.activeAgents > 0 && (
+                  <span className="text-port-accent">{cos.activeAgents} agent{cos.activeAgents !== 1 ? 's' : ''}</span>
+                )}
+                {cosQueueUnavailable || cosAgentsUnavailable ? (
+                  <span className="text-port-warning">Queue unavailable</span>
+                ) : cos.queuedTasks > 0 && (
+                  <span>{cos.queuedTasks} queued</span>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+});
+
+export default SystemHealthWidget;

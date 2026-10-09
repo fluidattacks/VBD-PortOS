@@ -1,0 +1,657 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import express from 'express';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { writeFile, rm } from 'node:fs/promises';
+import { request } from '../lib/testHelper.js';
+import { errorMiddleware } from '../lib/errorHandler.js';
+
+// Mock the services so the route test is deterministic regardless of the test
+// host's real arch/memory and never touches a real subprocess.
+const TRELLIS2_TARGET = {
+  id: 'trellis2',
+  label: 'TRELLIS.2',
+  executionLane: 'local-mps',
+  outputKind: 'glb-mesh',
+  unavailableReason: null,
+  gatedRepos: [
+    {
+      label: 'facebook/dinov3-vitl16-pretrain-lvd1689m',
+      url: 'https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m',
+    },
+    { label: 'briaai/RMBG-2.0', url: 'https://huggingface.co/briaai/RMBG-2.0' },
+  ],
+};
+
+// Partial mock: the resolver/probe functions are stubbed so the route tests stay
+// hardware-independent, but the reason→label map + `unavailableReasonLabel` come
+// from the real module, so the refusal message asserted below is the exact string
+// a user would see.
+vi.mock('../services/imageTo3d/targets.js', async (importOriginal) => ({
+  ...(await importOriginal()),
+  detectHostCapabilities: vi.fn(() => ({ appleSilicon: true, unifiedMemoryGb: 128, cuda: false })),
+  getTarget: vi.fn((id) => (id === 'trellis2' ? TRELLIS2_TARGET : null)),
+  listTargets: vi.fn((caps) => [
+    { ...TRELLIS2_TARGET, available: caps.appleSilicon && caps.unifiedMemoryGb >= 24 },
+  ]),
+  unavailableReason: vi.fn(() => null),
+  IMAGE_TO_3D_TARGET_IDS: ['trellis2'],
+}));
+
+vi.mock('../services/imageTo3d/trellis2.js', async (importOriginal) => ({
+  // The pure half (`resolveDegradedBakeRemedy`, the `TRELLIS2_*` constants) comes through
+  // REAL — the adapter's `degraded` projection is asserted below, so stubbing it would
+  // test the stub.
+  ...(await importOriginal()),
+  isTrellis2Installed: vi.fn(() => false),
+  trellis2Root: vi.fn(() => '/tmp/trellis2'),
+  installTrellis2: vi.fn(({ onEvent }) => {
+    onEvent({ type: 'stage', stage: 'clone', message: 'git clone …' });
+    onEvent({ type: 'complete', message: 'TRELLIS.2 installed.' });
+    return { promise: Promise.resolve({ ok: true }), kill: vi.fn() };
+  }),
+  // Not exercised by these route-level tests (render dispatch is covered in
+  // models.test.js), but the adapter registry imports it — an incomplete mock
+  // here would 'no export defined' at import time.
+  runTrellis2Generate: vi.fn(),
+  // Both probes shell out (venv python / `xcrun metal`). Mocked to the healthy
+  // result so the suite never touches the host toolchain; individual tests below
+  // override them to drive the degraded-install branches (#2952).
+  probeTrellis2TextureBake: vi.fn(async () => ({
+    quality: 'metal', modules: {}, missing: [], degradedQuality: [],
+  })),
+  probeMetalToolchain: vi.fn(async () => ({ available: true })),
+}));
+
+// The install route resolves the central HF child env (#3032).
+// Mock it so the suite never reads the host's real settings.json or
+// ~/.cache/huggingface/token, and so the resolution-failure branch is drivable.
+vi.mock('../services/hfToken.js', () => ({
+  hfChildEnv: vi.fn(async () => ({ HF_TOKEN: 'hf_test', HUGGINGFACE_HUB_TOKEN: 'hf_test' })),
+}));
+
+vi.mock('../services/imageTo3d/models.js', () => ({
+  listModels: vi.fn(),
+  getModel: vi.fn(),
+  createModel: vi.fn(),
+  startGeneration: vi.fn(),
+  deleteModel: vi.fn(),
+  getModelAsset: vi.fn(),
+  getModelFullMesh: vi.fn(),
+  getModelUsdz: vi.fn(),
+  saveModelUsdz: vi.fn(),
+  USDZ_MAX_BYTES: 64 * 1024 * 1024,
+}));
+
+import * as targets from '../services/imageTo3d/targets.js';
+import * as trellis2 from '../services/imageTo3d/trellis2.js';
+import * as models from '../services/imageTo3d/models.js';
+import { hfChildEnv } from '../services/hfToken.js';
+import routes from './imageTo3d.js';
+
+const makeApp = () => {
+  const app = express();
+  app.use(express.json());
+  app.use('/api/image-to-3d', routes);
+  app.use(errorMiddleware);
+  return app;
+};
+
+// Parse `data: {json}\n\n` SSE frames out of a buffered response body.
+const sseFrames = (text) => text
+  .split('\n')
+  .filter((l) => l.startsWith('data: '))
+  .map((l) => JSON.parse(l.slice(6)));
+
+describe('image-to-3d routes', () => {
+  it('GET /targets returns host capabilities and annotated targets', async () => {
+    const res = await request(makeApp()).get('/api/image-to-3d/targets');
+    expect(res.status).toBe(200);
+    expect(res.body.capabilities).toMatchObject({ appleSilicon: true, unifiedMemoryGb: 128 });
+    expect(Array.isArray(res.body.targets)).toBe(true);
+    expect(res.body.targets[0]).toMatchObject({
+      id: 'trellis2',
+      available: true,
+      installed: false,
+      gatedRepos: [
+        {
+          label: 'facebook/dinov3-vitl16-pretrain-lvd1689m',
+          url: 'https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m',
+        },
+        { label: 'briaai/RMBG-2.0', url: 'https://huggingface.co/briaai/RMBG-2.0' },
+      ],
+    });
+  });
+
+  // #2952: an installed TRELLIS.2 whose Metal bake is missing still renders, but
+  // the surface comes out scrambled — the client needs that distinction to avoid
+  // showing a flat "Ready".
+  it('GET /targets annotates an installed trellis2 with its texture-bake quality', async () => {
+    trellis2.isTrellis2Installed.mockReturnValueOnce(true);
+    trellis2.probeTrellis2TextureBake.mockResolvedValueOnce({
+      quality: 'fallback', missing: ['mtldiffrast'], degradedQuality: [], modules: {}, help: 'fix it',
+    });
+    const res = await request(makeApp()).get('/api/image-to-3d/targets');
+    expect(res.body.targets[0].textureBake).toMatchObject({ quality: 'fallback', help: 'fix it' });
+  });
+
+  // #3041: the card must offer the right remedy — Repair install fetches the
+  // toolchain, but on a Command-Line-Tools-only host nothing PortOS runs can fix it.
+  it('GET /targets marks a degraded bake repairable when the toolchain is merely missing', async () => {
+    trellis2.isTrellis2Installed.mockReturnValueOnce(true);
+    trellis2.probeTrellis2TextureBake.mockResolvedValueOnce({
+      quality: 'fallback', missing: ['mtldiffrast'], degradedQuality: [], modules: {}, help: 'fix it',
+    });
+    trellis2.probeMetalToolchain.mockResolvedValueOnce({ available: false, installable: true });
+    const res = await request(makeApp()).get('/api/image-to-3d/targets');
+    expect(res.body.targets[0].textureBake).toMatchObject({ repairable: true, help: 'fix it' });
+  });
+
+  it('GET /targets marks a degraded bake NOT repairable when only Command Line Tools are active', async () => {
+    trellis2.isTrellis2Installed.mockReturnValueOnce(true);
+    trellis2.probeTrellis2TextureBake.mockResolvedValueOnce({
+      quality: 'fallback', missing: ['mtldiffrast'], degradedQuality: [], modules: {}, help: 'fix it',
+    });
+    trellis2.probeMetalToolchain.mockResolvedValueOnce({
+      available: false, installable: false, blocker: 'requires-xcode', hint: 'install Xcode',
+    });
+    const res = await request(makeApp()).get('/api/image-to-3d/targets');
+    expect(res.body.targets[0].textureBake).toMatchObject({
+      repairable: false, blocker: 'requires-xcode', help: 'install Xcode',
+    });
+  });
+
+  it('GET /targets does not probe the toolchain for a healthy bake', async () => {
+    trellis2.probeMetalToolchain.mockClear();
+    trellis2.isTrellis2Installed.mockReturnValueOnce(true);
+    const res = await request(makeApp()).get('/api/image-to-3d/targets');
+    expect(res.body.targets[0].textureBake).toMatchObject({ quality: 'metal' });
+    expect(res.body.targets[0].textureBake.repairable).toBeUndefined();
+    // A healthy bake names no modules — and reports no degradation at all.
+    expect(res.body.targets[0].degraded).toBeUndefined();
+    expect(trellis2.probeMetalToolchain).not.toHaveBeenCalled();
+  });
+
+  // FINDING: the render-option projection had no route coverage at all, and the client
+  // does `setRecord(next)` with the POST bodies — so a create/re-render response that
+  // omitted the field blanked the disabled Quality control until the next poll.
+  describe('supportsRenderOptions projection', () => {
+    const record = (target) => ({ id: 'image3d-1', target, status: 'ready', runs: [] });
+
+    it('projects the field onto GET, create, and re-render responses', async () => {
+      const app = makeApp();
+      models.getModel.mockResolvedValue(record('pixal3dCuda'));
+      models.createModel.mockResolvedValue(record('pixal3dCuda'));
+      models.startGeneration.mockResolvedValue(record('pixal3dCuda'));
+      // Read from the registry rather than restated, so adding a knob to a
+      // descriptor does not need an edit here to stay honest.
+      const expected = targets.renderOptionSupportFor('pixal3dCuda');
+
+      const get = await request(app).get('/api/image-to-3d/models/image3d-1');
+      expect(get.body.supportsRenderOptions).toEqual(expected);
+
+      const created = await request(app).post('/api/image-to-3d/models')
+        .send({ filename: 'example.png', name: 'x' });
+      expect(created.body.supportsRenderOptions).toEqual(expected);
+
+      const regen = await request(app).post('/api/image-to-3d/models/image3d-1/generate').send({});
+      expect(regen.body.supportsRenderOptions).toEqual(expected);
+    });
+
+    it('tells the client the detail control is unusable on a VRAM-derived lane', () => {
+      // Pixal3D picks 1024/1536 from the card's VRAM, so a rendered-but-ignored
+      // Detail control would be a lie about what the render will do.
+      expect(targets.renderOptionSupportFor('pixal3dCuda').detail).toBe(false);
+      expect(targets.renderOptionSupportFor('trellis2Cuda').detail).toBe(false);
+      // The MPS lane is the one that honors it.
+      expect(targets.renderOptionSupportFor('trellis2')).toBeNull();
+    });
+
+    it('omits the field for a target that honors every knob', async () => {
+      // Absent must mean "all supported" so existing targets need no descriptor entry.
+      models.getModel.mockResolvedValue(record('trellis2'));
+      const res = await request(makeApp()).get('/api/image-to-3d/models/image3d-1');
+      expect(res.body.supportsRenderOptions).toBeUndefined();
+    });
+  });
+
+  // The `degraded` projection is what the CLIENT actually renders (badge, help panel,
+  // Repair button); `textureBake` above is retained only for API back-compat and has no
+  // in-repo reader. These cases pin the live contract, which was previously untested.
+  it('GET /targets projects a degraded bake into the normalized `degraded` shape', async () => {
+    trellis2.isTrellis2Installed.mockReturnValueOnce(true);
+    trellis2.probeTrellis2TextureBake.mockResolvedValueOnce({
+      quality: 'fallback', missing: ['mtldiffrast'], degradedQuality: [], modules: {}, help: 'fix it',
+    });
+    const res = await request(makeApp()).get('/api/image-to-3d/targets');
+    expect(res.body.targets[0].degraded).toEqual({
+      label: 'degraded textures',
+      help: 'fix it',
+      repairable: true,
+      // #4636: `help` names the remedy, `detail` names what is actually missing —
+      // without it a Repair that keeps failing only ever reprints the same sentence.
+      detail: 'Missing: mtldiffrast',
+    });
+  });
+
+  it('GET /targets carries repairable:false into `degraded` when nothing PortOS runs can fix it', async () => {
+    trellis2.isTrellis2Installed.mockReturnValueOnce(true);
+    trellis2.probeTrellis2TextureBake.mockResolvedValueOnce({
+      quality: 'fallback', missing: ['mtldiffrast'], degradedQuality: [], modules: {}, help: 'fix it',
+    });
+    trellis2.probeMetalToolchain.mockResolvedValueOnce({
+      available: false, installable: false, blocker: 'requires-xcode', hint: 'install Xcode',
+    });
+    const res = await request(makeApp()).get('/api/image-to-3d/targets');
+    // The inversion here (`repairable !== false`) is easy to get backwards, and getting
+    // it backwards offers a Repair button that cannot work.
+    expect(res.body.targets[0].degraded).toMatchObject({ repairable: false, help: 'install Xcode' });
+  });
+
+  it('GET /targets omits `degraded` when the bake probe could not determine anything', async () => {
+    // The sentinel that matters: 'unknown' must NOT read as degraded, or a probe that
+    // simply failed makes a healthy install look broken.
+    trellis2.isTrellis2Installed.mockReturnValueOnce(true);
+    trellis2.probeTrellis2TextureBake.mockResolvedValueOnce({
+      quality: 'unknown', missing: [], degradedQuality: [], modules: {},
+    });
+    const res = await request(makeApp()).get('/api/image-to-3d/targets');
+    expect(res.body.targets[0].degraded).toBeUndefined();
+  });
+
+  it('GET /targets omits `degraded` for a healthy bake', async () => {
+    trellis2.isTrellis2Installed.mockReturnValueOnce(true);
+    const res = await request(makeApp()).get('/api/image-to-3d/targets');
+    expect(res.body.targets[0].degraded).toBeUndefined();
+  });
+
+  it('GET /targets skips the bake probe entirely when trellis2 is not installed', async () => {
+    trellis2.probeTrellis2TextureBake.mockClear();
+    trellis2.isTrellis2Installed.mockReturnValueOnce(false);
+    const res = await request(makeApp()).get('/api/image-to-3d/targets');
+    expect(res.body.targets[0].textureBake).toBeUndefined();
+    expect(trellis2.probeTrellis2TextureBake).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /trellis2/install (SSE)', () => {
+  it('keeps both GET install URLs read-only and returns target status', async () => {
+    trellis2.installTrellis2.mockClear();
+    trellis2.isTrellis2Installed.mockReturnValue(false);
+    const canonical = await request(makeApp()).get('/api/image-to-3d/targets/trellis2/install');
+    const legacy = await request(makeApp()).get('/api/image-to-3d/trellis2/install');
+    expect(canonical.status).toBe(200);
+    expect(canonical.body.target).toMatchObject({ id: 'trellis2', installed: false });
+    expect(legacy.body.target).toMatchObject({ id: 'trellis2', installed: false });
+    expect(trellis2.installTrellis2).not.toHaveBeenCalled();
+  });
+
+  it('streams the canonical POST target install route', async () => {
+    trellis2.isTrellis2Installed.mockReturnValueOnce(false);
+    const res = await request(makeApp()).post('/api/image-to-3d/targets/trellis2/install');
+    expect(sseFrames(res.text).at(-1)).toMatchObject({ type: 'complete' });
+  });
+
+  it('streams stage → complete on the happy path', async () => {
+    trellis2.isTrellis2Installed.mockReturnValueOnce(false);
+    const res = await request(makeApp()).post('/api/image-to-3d/trellis2/install');
+    const frames = sseFrames(res.text);
+    expect(frames).toContainEqual({ type: 'stage', stage: 'clone', message: 'git clone …' });
+    expect(frames.at(-1)).toMatchObject({ type: 'complete' });
+    expect(trellis2.installTrellis2).toHaveBeenCalled();
+  });
+
+  // #3041: a missing-but-fetchable toolchain becomes a step of the install itself,
+  // rather than a command printed for the user to run.
+  it('tells the install to download the Metal Toolchain when it is missing but fetchable', async () => {
+    trellis2.installTrellis2.mockClear();
+    trellis2.isTrellis2Installed.mockReturnValueOnce(false);
+    trellis2.probeMetalToolchain.mockResolvedValueOnce({
+      available: false, installable: true, hint: 'it will be downloaded',
+    });
+    const res = await request(makeApp()).post('/api/image-to-3d/trellis2/install');
+    expect(trellis2.installTrellis2).toHaveBeenCalledWith(
+      expect.objectContaining({ installMetalToolchain: true }),
+    );
+    expect(sseFrames(res.text).find((f) => f.stage === 'preflight')?.message).toContain('it will be downloaded');
+  });
+
+  // Without this the user waits out a ~15 GB install and an hour-long render before
+  // discovering the Metal backends could never have built on this host (#2952).
+  it('warns but still installs when the toolchain cannot be fetched (Command Line Tools only)', async () => {
+    trellis2.installTrellis2.mockClear();
+    trellis2.isTrellis2Installed.mockReturnValueOnce(false);
+    trellis2.probeMetalToolchain.mockResolvedValueOnce({
+      available: false, installable: false, blocker: 'requires-xcode', hint: 'install Xcode',
+    });
+    const res = await request(makeApp()).post('/api/image-to-3d/trellis2/install');
+    expect(sseFrames(res.text).find((f) => f.stage === 'preflight')?.message).toContain('install Xcode');
+    // A warning, not a refusal — geometry is unaffected — and no step that would fail.
+    expect(trellis2.installTrellis2).toHaveBeenCalledWith(
+      expect.objectContaining({ installMetalToolchain: false }),
+    );
+  });
+
+  it('adds no toolchain step or warning when it is already present', async () => {
+    trellis2.installTrellis2.mockClear();
+    trellis2.isTrellis2Installed.mockReturnValueOnce(false);
+    const res = await request(makeApp()).post('/api/image-to-3d/trellis2/install');
+    expect(sseFrames(res.text).find((f) => f.stage === 'preflight')).toBeUndefined();
+    expect(trellis2.installTrellis2).toHaveBeenCalledWith(
+      expect.objectContaining({ installMetalToolchain: false }),
+    );
+  });
+
+  it('re-runs setup.sh on ?repair=1 instead of short-circuiting on "already installed"', async () => {
+    // The Repair install button's whole purpose: rebuild the Metal backends over an
+    // existing install once the Metal Toolchain is present (#2952).
+    trellis2.installTrellis2.mockClear();
+    trellis2.isTrellis2Installed.mockReturnValueOnce(true);
+    const res = await request(makeApp()).post('/api/image-to-3d/trellis2/install?repair=1');
+    expect(trellis2.installTrellis2).toHaveBeenCalled();
+    expect(sseFrames(res.text).at(-1)).toMatchObject({ type: 'complete' });
+  });
+
+  it('reports a degraded bake on an already-installed host instead of a bare "nothing to do"', async () => {
+    trellis2.isTrellis2Installed.mockReturnValueOnce(true);
+    trellis2.probeTrellis2TextureBake.mockResolvedValueOnce({
+      quality: 'fallback', missing: ['mtldiffrast'], degradedQuality: [], modules: {}, help: 'repair me',
+    });
+    const res = await request(makeApp()).post('/api/image-to-3d/trellis2/install');
+    const frames = sseFrames(res.text);
+    const warning = frames.find((f) => f.stage === 'verify' && f.type === 'log')?.message;
+    expect(warning).toContain('repair me');
+    // #4636: this lane writes the SAME `verify` stage the install's own hook does, so it
+    // has to name the culprit too — otherwise one condition emits two different frames
+    // depending on whether the caller hit the short-circuit or ran the install.
+    expect(warning).toContain('Missing: mtldiffrast.');
+    expect(frames.at(-1)).toMatchObject({ type: 'complete' });
+  });
+
+  it('hands the resolved HF token env to the install child', async () => {
+    // #3032: the install must carry the CENTRAL token (settings-stored included),
+    // not just whatever the server process happened to be launched with.
+    trellis2.installTrellis2.mockClear();
+    trellis2.isTrellis2Installed.mockReturnValueOnce(false);
+    await request(makeApp()).post('/api/image-to-3d/trellis2/install');
+    expect(trellis2.installTrellis2).toHaveBeenCalledWith(expect.objectContaining({
+      env: expect.objectContaining({ HF_TOKEN: 'hf_test', HUGGINGFACE_HUB_TOKEN: 'hf_test' }),
+    }));
+  });
+
+  it('emits a terminal error frame — not a half-open stream — when the env cannot be resolved', async () => {
+    // The SSE headers are already flushed by this point, so a throw here can't
+    // reach the error middleware as JSON; it has to surface as an error frame.
+    trellis2.installTrellis2.mockClear();
+    trellis2.isTrellis2Installed.mockReturnValueOnce(false);
+    hfChildEnv.mockRejectedValueOnce(new Error('settings.json is not valid JSON'));
+    const res = await request(makeApp()).post('/api/image-to-3d/trellis2/install');
+    const frames = sseFrames(res.text);
+    expect(frames.at(-1)).toMatchObject({
+      type: 'error',
+      message: expect.stringMatching(/could not prepare.*install environment.*settings\.json is not valid JSON/i),
+    });
+    // And no multi-GB install is started on a failed resolve.
+    expect(trellis2.installTrellis2).not.toHaveBeenCalled();
+  });
+
+  it('short-circuits with complete when already installed (no install spawned)', async () => {
+    trellis2.installTrellis2.mockClear();
+    trellis2.isTrellis2Installed.mockReturnValueOnce(true);
+    const res = await request(makeApp()).post('/api/image-to-3d/trellis2/install');
+    const frames = sseFrames(res.text);
+    expect(frames.at(-1)).toMatchObject({ type: 'complete', message: expect.stringMatching(/already/i) });
+    expect(trellis2.installTrellis2).not.toHaveBeenCalled();
+  });
+
+  it('appends a resume hint when the install fails with a transient network error', async () => {
+    trellis2.isTrellis2Installed.mockReturnValueOnce(false);
+    trellis2.installTrellis2.mockImplementationOnce(() => ({
+      promise: Promise.reject(Object.assign(
+        new Error("TRELLIS.2 install step 'setup' exited 128"),
+        { code: 'TRELLIS2_INSTALL_FAILED', stage: 'setup', transient: true },
+      )),
+      kill: vi.fn(),
+    }));
+    const res = await request(makeApp()).post('/api/image-to-3d/trellis2/install');
+    const frames = sseFrames(res.text);
+    expect(frames.at(-1)).toMatchObject({
+      type: 'error',
+      stage: 'setup',
+      message: expect.stringMatching(/exited 128.*network hiccup — click Install again to resume/is),
+    });
+  });
+
+  it('does NOT append the resume hint for a non-transient failure', async () => {
+    trellis2.isTrellis2Installed.mockReturnValueOnce(false);
+    trellis2.installTrellis2.mockImplementationOnce(() => ({
+      promise: Promise.reject(Object.assign(
+        new Error('TRELLIS.2 install step \'setup\' exited 1'),
+        { code: 'TRELLIS2_INSTALL_FAILED', stage: 'setup', transient: false },
+      )),
+      kill: vi.fn(),
+    }));
+    const res = await request(makeApp()).post('/api/image-to-3d/trellis2/install');
+    const frames = sseFrames(res.text);
+    expect(frames.at(-1)).toMatchObject({ type: 'error', message: expect.stringMatching(/exited 1$/) });
+    expect(frames.at(-1).message).not.toMatch(/network hiccup/i);
+  });
+
+  it('refuses on unsupported hardware', async () => {
+    trellis2.installTrellis2.mockClear();
+    trellis2.isTrellis2Installed.mockReturnValueOnce(false);
+    targets.unavailableReason.mockReturnValueOnce('requires-apple-silicon');
+    const res = await request(makeApp()).post('/api/image-to-3d/trellis2/install');
+    const frames = sseFrames(res.text);
+    // The human label, not the raw kebab-case reason code (#3579).
+    expect(frames.at(-1)).toMatchObject({ type: 'error', message: expect.stringMatching(/Requires an Apple Silicon Mac/) });
+    expect(frames.at(-1).message).not.toMatch(/requires-apple-silicon/);
+    expect(trellis2.installTrellis2).not.toHaveBeenCalled();
+  });
+});
+
+describe('image-to-3d model records', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('GET /models lists records', async () => {
+    models.listModels.mockResolvedValue([{ id: 'image3d-1', status: 'ready' }]);
+    const res = await request(makeApp()).get('/api/image-to-3d/models');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([{ id: 'image3d-1', status: 'ready' }]);
+  });
+
+  it('POST /models creates a record (202) from a validated gallery image', async () => {
+    models.createModel.mockResolvedValue({ id: 'image3d-1', status: 'generating' });
+    const res = await request(makeApp())
+      .post('/api/image-to-3d/models')
+      .send({ name: 'Beacon', filename: 'shot.png' });
+    expect(res.status).toBe(202);
+    expect(res.body).toMatchObject({ id: 'image3d-1', status: 'generating' });
+    expect(models.createModel).toHaveBeenCalledWith(expect.objectContaining({ name: 'Beacon', filename: 'shot.png' }));
+  });
+
+  it('POST /models 400s on a non-image filename', async () => {
+    const res = await request(makeApp())
+      .post('/api/image-to-3d/models')
+      .send({ name: 'Beacon', filename: 'not-an-image.txt' });
+    expect(res.status).toBe(400);
+    expect(models.createModel).not.toHaveBeenCalled();
+  });
+
+  it('POST /models 400s on a path-traversal filename', async () => {
+    const res = await request(makeApp())
+      .post('/api/image-to-3d/models')
+      .send({ name: 'Beacon', filename: '../secrets.png' });
+    expect(res.status).toBe(400);
+    expect(models.createModel).not.toHaveBeenCalled();
+  });
+
+  it('GET /models/:id 404s when absent', async () => {
+    models.getModel.mockResolvedValue(null);
+    const res = await request(makeApp()).get('/api/image-to-3d/models/nope');
+    expect(res.status).toBe(404);
+  });
+
+  it('POST /models/:id/generate re-renders (202)', async () => {
+    models.startGeneration.mockResolvedValue({ id: 'image3d-1', status: 'generating' });
+    const res = await request(makeApp()).post('/api/image-to-3d/models/image3d-1/generate');
+    expect(res.status).toBe(202);
+    // A bodiless re-render forwards empty options — stored renderOptions apply.
+    expect(models.startGeneration).toHaveBeenCalledWith('image3d-1', { options: {} });
+  });
+
+  it('POST /models/:id/generate forwards per-run options and rejects invalid ones', async () => {
+    models.startGeneration.mockResolvedValue({ id: 'image3d-1', status: 'generating' });
+    const res = await request(makeApp())
+      .post('/api/image-to-3d/models/image3d-1/generate')
+      .send({ steps: 24, seed: 7, keyBackground: false });
+    expect(res.status).toBe(202);
+    expect(models.startGeneration).toHaveBeenCalledWith(
+      'image3d-1',
+      { options: { steps: 24, seed: 7, keyBackground: false } },
+    );
+
+    const bad = await request(makeApp())
+      .post('/api/image-to-3d/models/image3d-1/generate')
+      .send({ steps: 999 });
+    expect(bad.status).toBe(400);
+  });
+
+  it('POST /models/:id/generate takes a subject scale in (0, 1] and 400s outside it', async () => {
+    models.startGeneration.mockResolvedValue({ id: 'image3d-1', status: 'generating' });
+    const ok = await request(makeApp())
+      .post('/api/image-to-3d/models/image3d-1/generate')
+      .send({ subjectScale: 0.65 });
+    expect(ok.status).toBe(202);
+    expect(models.startGeneration).toHaveBeenCalledWith('image3d-1', { options: { subjectScale: 0.65 } });
+
+    // 0 scales the subject out of existence; above 1 crops it — which is the exact
+    // failure the knob exists to prevent, so it must not be reachable by accident.
+    for (const subjectScale of [0, -0.5, 1.5]) {
+      // eslint-disable-next-line no-await-in-loop
+      const bad = await request(makeApp())
+        .post('/api/image-to-3d/models/image3d-1/generate')
+        .send({ subjectScale });
+      expect(bad.status, `subjectScale ${subjectScale}`).toBe(400);
+    }
+  });
+
+  it('DELETE /models/:id soft-deletes', async () => {
+    models.deleteModel.mockResolvedValue({ ok: true });
+    const res = await request(makeApp()).delete('/api/image-to-3d/models/image3d-1');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true });
+  });
+
+  it('GET /models/:id/asset streams the GLB with a download filename', async () => {
+    const tmp = join(tmpdir(), `it-asset-${process.pid}.glb`);
+    await writeFile(tmp, 'GLB-BYTES');
+    models.getModelAsset.mockResolvedValue({ path: tmp, filename: 'beacon.glb' });
+    const res = await request(makeApp()).get('/api/image-to-3d/models/image3d-1/asset');
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toMatch(/model\/gltf-binary/);
+    expect(res.headers['content-disposition']).toMatch(/beacon\.glb/);
+    expect(res.text).toBe('GLB-BYTES');
+    await rm(tmp, { force: true });
+  });
+
+  it('GET /models/:id/asset 409s when the mesh is not ready', async () => {
+    const { ServerError } = await import('../lib/errorHandler.js');
+    models.getModelAsset.mockRejectedValue(new ServerError('not ready', { status: 409, code: 'MODEL_NOT_READY' }));
+    const res = await request(makeApp()).get('/api/image-to-3d/models/image3d-1/asset');
+    expect(res.status).toBe(409);
+  });
+
+  it('GET /models/:id/full-mesh streams the pre-decimation OBJ', async () => {
+    const tmp = join(tmpdir(), `it-full-${process.pid}.obj`);
+    await writeFile(tmp, 'v 0 0 0\nf 1 1 1\n');
+    models.getModelFullMesh.mockResolvedValue({ path: tmp, filename: 'beacon-full.obj' });
+    const res = await request(makeApp()).get('/api/image-to-3d/models/image3d-1/full-mesh');
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toMatch(/model\/obj/);
+    expect(res.headers['content-disposition']).toMatch(/beacon-full\.obj/);
+    await rm(tmp, { force: true });
+  });
+
+  it('GET /models/:id/full-mesh 404s when the sidecar was never written', async () => {
+    // A missing OBJ is NOT a broken record — older renders simply have none, so it
+    // must not read as the model being unavailable.
+    const { ServerError } = await import('../lib/errorHandler.js');
+    models.getModelFullMesh.mockRejectedValue(
+      new ServerError('no full mesh', { status: 404, code: 'FULL_MESH_MISSING' }),
+    );
+    const res = await request(makeApp()).get('/api/image-to-3d/models/image3d-1/full-mesh');
+    expect(res.status).toBe(404);
+    expect(res.body?.error?.code || res.body?.code).toBe('FULL_MESH_MISSING');
+  });
+
+  // ── AR Quick Look (USDZ) ────────────────────────────────────────────────
+  // The bytes are produced in the browser, so the route's whole job is to accept a
+  // raw body past the app-wide JSON parser, persist it, and re-serve it with the
+  // exact content type + disposition AR Quick Look requires.
+
+  // A minimal stored-zip header — USDZ is an uncompressed zip, and the service
+  // gates on that magic rather than trusting the request's content type.
+  const ZIP_BYTES = Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x00, 0x00]);
+
+  it('POST /models/:id/usdz accepts a raw USDZ body past the JSON parser', async () => {
+    models.saveModelUsdz.mockResolvedValue({
+      id: 'image3d-1', status: 'ready', usdzPath: '/data/image-to-3d/image3d-1/model.usdz',
+    });
+    const res = await request(makeApp())
+      .post('/api/image-to-3d/models/image3d-1/usdz')
+      .set('Content-Type', 'model/vnd.usdz+zip')
+      .send(ZIP_BYTES);
+    expect(res.status).toBe(201);
+    expect(res.body.usdzPath).toBe('/data/image-to-3d/image3d-1/model.usdz');
+    const [id, body] = models.saveModelUsdz.mock.calls.at(-1);
+    expect(id).toBe('image3d-1');
+    expect(Buffer.from(body).equals(ZIP_BYTES)).toBe(true);
+  });
+
+  it('POST /models/:id/usdz surfaces the service refusal for a non-USDZ payload', async () => {
+    const { ServerError } = await import('../lib/errorHandler.js');
+    models.saveModelUsdz.mockRejectedValue(
+      new ServerError('Payload is not a USDZ archive', { status: 400, code: 'USDZ_INVALID' }),
+    );
+    const res = await request(makeApp())
+      .post('/api/image-to-3d/models/image3d-1/usdz')
+      .set('Content-Type', 'application/octet-stream')
+      .send(Buffer.from('not a zip'));
+    expect(res.status).toBe(400);
+    expect(res.body?.error?.code || res.body?.code).toBe('USDZ_INVALID');
+  });
+
+  it('GET /models/:id/usdz serves inline with the AR Quick Look content type', async () => {
+    // `inline`, not `attachment`: Safari will not engage AR Quick Look on an
+    // attachment response, so this header pair IS the feature.
+    const tmp = join(tmpdir(), `it-usdz-${process.pid}.usdz`);
+    await writeFile(tmp, ZIP_BYTES);
+    models.getModelUsdz.mockResolvedValue({ path: tmp, filename: 'beacon.usdz' });
+    const res = await request(makeApp()).get('/api/image-to-3d/models/image3d-1/usdz');
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toMatch(/model\/vnd\.usdz\+zip/);
+    expect(res.headers['content-disposition']).toMatch(/^inline; filename="beacon\.usdz"$/);
+    await rm(tmp, { force: true });
+  });
+
+  it('GET /models/:id/usdz 404s when the model was never exported for AR', async () => {
+    const { ServerError } = await import('../lib/errorHandler.js');
+    models.getModelUsdz.mockRejectedValue(
+      new ServerError('not exported', { status: 404, code: 'USDZ_MISSING' }),
+    );
+    const res = await request(makeApp()).get('/api/image-to-3d/models/image3d-1/usdz');
+    expect(res.status).toBe(404);
+    expect(res.body?.error?.code || res.body?.code).toBe('USDZ_MISSING');
+  });
+
+  it('routes /full-mesh to its own handler with the record id', async () => {
+    // Deliberately NOT claiming this proves route ordering: Express's `:id` matches a
+    // single path segment, so `/models/x/full-mesh` can never match `/models/:id`
+    // regardless of registration order. What it does pin is that the id is parsed
+    // from the right segment and reaches the handler.
+    models.getModelFullMesh.mockRejectedValue(new Error('boom'));
+    await request(makeApp()).get('/api/image-to-3d/models/image3d-1/full-mesh');
+    expect(models.getModelFullMesh).toHaveBeenCalledWith('image3d-1');
+  });
+});

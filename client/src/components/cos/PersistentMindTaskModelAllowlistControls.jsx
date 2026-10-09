@@ -1,0 +1,172 @@
+import { useEffect, useId, useMemo, useState } from 'react';
+import * as api from '../../services/api';
+import {
+  filterHardwareCompatibleProviderModels,
+  filterSelectableModels,
+  providerModelList,
+  selectableModelsForProvider,
+} from '../../utils/providers.js';
+import toast from '../ui/Toast';
+import ProviderModelSelector from '../ProviderModelSelector.jsx';
+
+const normalizeEntries = (value) => (Array.isArray(value) ? value : [])
+  .filter((entry) => typeof entry?.providerId === 'string' && typeof entry?.model === 'string')
+  .map((entry) => ({ providerId: entry.providerId, model: entry.model }));
+
+const modelId = (entry) => typeof entry === 'string' ? entry : entry?.id;
+
+const modelsFor = (provider) => filterHardwareCompatibleProviderModels(
+  filterSelectableModels(selectableModelsForProvider(provider, providerModelList(provider))),
+  provider,
+).map(modelId).filter(Boolean);
+
+export default function PersistentMindTaskModelAllowlistControls({
+  capabilities,
+  disabled = false,
+  onSaved,
+  onSavingChange,
+}) {
+  const idPrefix = useId();
+  const [providers, setProviders] = useState([]);
+  const [entries, setEntries] = useState(() => normalizeEntries(capabilities?.taskModelAllowlist));
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState(null);
+  const policyInvalid = capabilities?.taskModelAllowlistInvalid === true;
+
+  useEffect(() => {
+    setEntries(normalizeEntries(capabilities?.taskModelAllowlist));
+  }, [capabilities?.schemaVersion, capabilities?.taskModelAllowlist]);
+
+  useEffect(() => {
+    api.getProviders({ silent: true })
+      .then((response) => setProviders((response?.providers || []).filter((provider) => (
+        provider.enabled !== false && (provider.type === 'cli' || provider.type === 'tui')
+      ))))
+      .catch((requestError) => setError(requestError?.message || 'Coding providers are unavailable'));
+  }, []);
+
+  const providerById = useMemo(() => new Map(providers.map((provider) => [provider.id, provider])), [providers]);
+  const availableProviders = useMemo(() => {
+    const current = entries.map((entry) => providerById.get(entry.providerId)).filter(Boolean);
+    const unavailable = entries
+      .filter((entry) => !providerById.has(entry.providerId))
+      .map((entry) => ({ id: entry.providerId, name: `${entry.providerId} (no longer available)`, type: 'unavailable', models: [] }));
+    return [...providers, ...current.filter((provider) => !providers.includes(provider)), ...unavailable]
+      .filter((provider, index, list) => list.findIndex((candidate) => candidate.id === provider.id) === index);
+  }, [entries, providerById, providers]);
+
+  const save = async (nextEntries) => {
+    const previous = entries;
+    const deduped = [...new Map(nextEntries.map((entry) => [`${entry.providerId}\0${entry.model}`, entry])).values()];
+    setEntries(deduped);
+    setSaving(true);
+    setError(null);
+    onSavingChange?.(true);
+    try {
+      const next = {
+        schemaVersion: 3,
+        createTasks: capabilities?.createTasks === true,
+        manageToolRecipes: capabilities?.manageToolRecipes === true,
+        readPortos: capabilities?.readPortos === true,
+        writePortos: capabilities?.writePortos === true,
+        taskModelAllowlist: deduped,
+        ...(Array.isArray(capabilities?.allowedAppIds) ? { allowedAppIds: capabilities.allowedAppIds } : {}),
+      };
+      await api.updateCosConfig({ persistentMindCapabilities: next }, { silent: true });
+      onSaved?.({ ...capabilities, ...next });
+      toast.success(deduped.length ? 'Persistent mind task models restricted' : 'Persistent mind task model restriction cleared');
+    } catch (requestError) {
+      setEntries(previous);
+      setError(requestError?.message || 'Could not save the task model policy');
+      toast.error(requestError?.message || 'Could not save the task model policy');
+    } finally {
+      setSaving(false);
+      onSavingChange?.(false);
+    }
+  };
+
+  const addEntry = () => {
+    const provider = availableProviders.find((candidate) => modelsFor(candidate).length > 0);
+    if (!provider) {
+      setError('No selectable coding models are available. Configure a CLI/TUI provider first.');
+      return;
+    }
+    save([...entries, { providerId: provider.id, model: modelsFor(provider)[0] }]);
+  };
+
+  const updateEntry = (index, patch) => {
+    const next = entries.map((entry, entryIndex) => entryIndex === index ? { ...entry, ...patch } : entry);
+    if (patch.providerId) {
+      const provider = providerById.get(patch.providerId);
+      const models = modelsFor(provider);
+      next[index].model = models[0] || '';
+    }
+    if (!next[index].model) return;
+    save(next);
+  };
+
+  const removeEntry = (index) => save(entries.filter((_, entryIndex) => entryIndex !== index));
+
+  return (
+    <section className="rounded border border-port-border bg-port-bg/40 p-3" aria-labelledby={`${idPrefix}-heading`}>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h3 id={`${idPrefix}-heading`} className="text-sm font-semibold text-port-text">Task model allowlist</h3>
+          <p className="mt-1 text-xs leading-relaxed text-port-text-muted">Models the mind may queue tasks on. Empty means every enabled coding model. This does not change the mind's own model. Effort is chosen per task.</p>
+        </div>
+        <button
+          type="button"
+          onClick={addEntry}
+          disabled={disabled || saving}
+          className="rounded border border-port-accent/40 px-3 py-1.5 text-xs font-medium text-port-accent hover:bg-port-accent/10 disabled:opacity-50"
+        >
+          Add model
+        </button>
+      </div>
+      {error && <p role="alert" className="mt-3 rounded border border-port-warning/30 bg-port-warning/10 px-3 py-2 text-xs text-port-warning">{error}</p>}
+      {policyInvalid && <p className="mt-3 rounded border border-port-warning/30 bg-port-warning/10 px-3 py-2 text-xs text-port-warning">The saved policy is invalid, so task model selection is currently blocked. Add a valid model pair to repair it.</p>}
+      {!policyInvalid && entries.length > 0 && (
+        <div className="mt-3 space-y-2">
+          {entries.map((entry, index) => {
+            const provider = providerById.get(entry.providerId);
+            const models = modelsFor(provider);
+            const stale = !provider || !models.includes(entry.model);
+            return (
+              <div key={`${entry.providerId}-${entry.model}-${index}`} className="flex flex-col gap-2 sm:flex-row sm:items-end">
+                {/* A stale pair keeps its stored model on screen, named as such —
+                    the queue-time check rejects it until the human removes it.
+                    Compose is off: the allowlist is checked as exact
+                    provider/model PAIRS against stored records at queue time,
+                    which a composed route has none of. */}
+                <ProviderModelSelector
+                  id={`${idPrefix}-provider-${index}`}
+                  providers={availableProviders}
+                  selectedProviderId={entry.providerId}
+                  selectedModel={entry.model}
+                  availableModels={stale && entry.model ? [{ id: entry.model, name: `${entry.model} (no longer available)` }, ...models] : models}
+                  disabled={disabled || saving}
+                  modelDisabled={!provider}
+                  alwaysShowModel
+                  highlightToolUse
+                  highlightVision
+                  compose={false}
+                  onProviderChange={(providerId) => updateEntry(index, { providerId })}
+                  onModelChange={(model) => updateEntry(index, { model })}
+                />
+                <button
+                  type="button"
+                  onClick={() => removeEntry(index)}
+                  disabled={disabled || saving}
+                  className="self-start rounded border border-port-border px-2 py-1.5 text-xs text-port-text-muted hover:border-port-warning hover:text-port-warning sm:self-end"
+                >
+                  Remove
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+      {entries.length > 0 && <p className="mt-3 text-[11px] leading-relaxed text-port-text-muted">Queueing accepts only these exact pairs. Remove a model here after it leaves its provider.</p>}
+    </section>
+  );
+}

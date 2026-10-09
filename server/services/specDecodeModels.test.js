@@ -1,0 +1,688 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
+import { homedir, tmpdir } from 'os';
+import { isAbsolute, join, relative } from 'path';
+import { Readable } from 'stream';
+import {
+  downloadSpecDecodeModel,
+  cancelSpecDecodeModelDownload,
+  removeSpecDecodeModel,
+  getSpecDecodePresetStatus,
+  pickGgufSibling,
+  resolveSpecModelPath,
+  _resetSpecDecodeDownloadsForTests,
+} from './specDecodeModels.js';
+import * as specDecodePresets from '../lib/specDecodePresets.js';
+import * as hfToken from './hfToken.js';
+import * as huggingfaceLora from '../lib/huggingfaceLora.js';
+
+// removeSpecDecodeModel reaches this lazily (a static import would cycle back
+// here — llamaServerManager.js imports resolveSpecModelPath from this module)
+// to refuse deleting a weight llama-server is actively running.
+vi.mock('./llamaServerManager.js', () => ({
+  getLlamaServerStatus: vi.fn(async () => ({ running: false, config: null })),
+}));
+import { getLlamaServerStatus } from './llamaServerManager.js';
+
+const siblings = (...names) => ({ siblings: names.map((rfilename) => ({ rfilename, size: 6 })) });
+
+describe('pickGgufSibling', () => {
+  it('matches a quant hint across the naming styles repos actually publish', () => {
+    const model = siblings('README.md', 'Qwen3.8-27B-q4_k_m.gguf', 'Qwen3.8-27B-Q8_0.gguf');
+    expect(pickGgufSibling(model, { quant: 'Q4_K_M', repo: 'o/r' })).toBe('Qwen3.8-27B-q4_k_m.gguf');
+  });
+
+  it('prefers the plainest name when several builds carry the quant', () => {
+    const model = siblings('Qwen3.8-27B-Q4_K_M-abliterated.gguf', 'Qwen3.8-27B-Q4_K_M.gguf');
+    expect(pickGgufSibling(model, { quant: 'Q4_K_M', repo: 'o/r' })).toBe('Qwen3.8-27B-Q4_K_M.gguf');
+  });
+
+  it('honours an exact filename over the quant hint', () => {
+    const model = siblings('pinned.gguf', 'Qwen3.8-27B-Q4_K_M.gguf');
+    expect(pickGgufSibling(model, { file: 'pinned.gguf', quant: 'Q4_K_M', repo: 'o/r' })).toBe('pinned.gguf');
+  });
+
+  // A preset pins `file` only where the quant tag can't discriminate the target,
+  // so falling back to the hint when the pin is gone reinstates the ambiguity —
+  // here it would fetch the 1.6 GB drafter into the base model's path.
+  it('refuses to fall back to the quant hint when a pinned file is gone', () => {
+    const model = siblings(
+      'Muse-Glimmer-30B-KQuant-Dynamic-Q4_K_XL.gguf',
+      'dflash-Muse-Glimmer-30B-Q4_K_M.gguf',
+    );
+    expect(() => pickGgufSibling(model, {
+      file: 'Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf',
+      quant: 'Q4_K_M',
+      repo: 'meta-models/Muse-Glimmer-30B-GGUF',
+    })).toThrow(/no longer publishes the pinned file/i);
+  });
+
+  // A lone shard on disk would satisfy the launcher's existence check and then
+  // fail at load — the exact confusion this module exists to remove.
+  it('refuses a sharded-only repo instead of fetching part one', () => {
+    const model = siblings('Qwen3.8-27B-Q4_K_M-00001-of-00003.gguf', 'Qwen3.8-27B-Q4_K_M-00002-of-00003.gguf');
+    expect(() => pickGgufSibling(model, { quant: 'Q4_K_M', repo: 'o/r' })).toThrow(/sharded/i);
+  });
+
+  it('names the available builds when the requested quant is absent', () => {
+    const model = siblings('Qwen3.8-27B-Q8_0.gguf');
+    expect(() => pickGgufSibling(model, { quant: 'Q4_K_M', repo: 'o/r' })).toThrow(/Q8_0/);
+  });
+
+  it('rejects a repo with no GGUF at all', () => {
+    expect(() => pickGgufSibling(siblings('model.safetensors'), { quant: 'Q4_K_M', repo: 'o/r' })).toThrow(/no \.gguf/i);
+  });
+
+  // meta-models/Muse-Glimmer-30B-GGUF ships the projector and the repo's own
+  // drafter beside the target, all three tagged Q4_K_M. Shortest-name-wins would
+  // hand back the 1.4 GB `mmproj-…`, which then satisfies the launcher's
+  // existence check and fails at load.
+  it('never auto-picks an mmproj projector that carries the wanted quant', () => {
+    const model = siblings(
+      'Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf',
+      'mmproj-Muse-Glimmer-30B-Q4_K_M.gguf',
+    );
+    expect(pickGgufSibling(model, { quant: 'Q4_K_M', repo: 'meta-models/Muse-Glimmer-30B-GGUF' }))
+      .toBe('Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf');
+  });
+
+  it('says "projectors only" rather than blaming sharding when that is all a repo has', () => {
+    expect(() => pickGgufSibling(siblings('mmproj-model-Q4_K_M.gguf'), { quant: 'Q4_K_M', repo: 'o/r' }))
+      .toThrow(/projector \(mmproj\) sidecars/i);
+  });
+
+  // Naming an `mmproj-` file by hand used to be the only way to fetch a
+  // projector, so the pin was allowed to escape the projector filter. The
+  // `projector` role replaced that escape hatch (#7611), and a pin is now held
+  // to its role's half of the repo — otherwise a `model`-role pin would land a
+  // vision sidecar in the path the launcher hands `-m`, where it satisfies every
+  // existence check and fails at load.
+  it('honours an explicit projector filename only under the projector role', () => {
+    const model = siblings('model-Q4_K_M.gguf', 'mmproj-model-Q4_K_M.gguf');
+    expect(pickGgufSibling(model, { file: 'mmproj-model-Q4_K_M.gguf', quant: 'Q4_K_M', repo: 'o/r', role: 'projector' }))
+      .toBe('mmproj-model-Q4_K_M.gguf');
+    expect(() => pickGgufSibling(model, { file: 'mmproj-model-Q4_K_M.gguf', quant: 'Q4_K_M', repo: 'o/r' }))
+      .toThrow(/projector \(mmproj\) sidecar, not loadable weights/i);
+    // And the mirror: a projector role pinned at language weights is the same
+    // authoring mistake, caught rather than downloaded into the mmproj path.
+    expect(() => pickGgufSibling(model, { file: 'model-Q4_K_M.gguf', repo: 'o/r', role: 'projector' }))
+      .toThrow(/not a projector/i);
+  });
+
+  // The preset pins `file` precisely because the quant hint is ambiguous here;
+  // this asserts the pin still resolves against the repo's real sibling list.
+  it('resolves the Muse-Glimmer preset to the 17 GB target, not its dflash sidecar', () => {
+    const entry = specDecodePresets.findSpecDecodePreset('muse-glimmer-30b').model;
+    const model = siblings(
+      'Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf',
+      'Muse-Glimmer-30B-KQuant-Dynamic-Q4_K_XL.gguf',
+      'dflash-Muse-Glimmer-30B-Q4_K_M.gguf',
+      'mmproj-Muse-Glimmer-30B-Q4_K_M.gguf',
+    );
+    expect(pickGgufSibling(model, { file: entry.file, quant: entry.quant, repo: entry.repo }))
+      .toBe('Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf');
+  });
+
+  // The Ternary Bonsai preset carries NO `file` pin, which is only correct while
+  // its quant hint discriminates. Its repo publishes two ternary packs whose tags
+  // differ by one leading letter (`PQ2_0` / `PTQ1_0`) next to a 53.8 GB `F16` — so
+  // a hint that fell through to the shortest name would fetch 46 GB of the wrong
+  // weights, and one matching loosely would fetch the 1-bit pack instead.
+  it('resolves the Ternary Bonsai 2 preset to PQ2_0, not PTQ1_0 or the 53.8 GB F16', () => {
+    const entry = specDecodePresets.findSpecDecodePreset('ternary-bonsai-2-27b').model;
+    const model = siblings(
+      'Ternary-Bonsai-2-27B-F16.gguf',
+      'Ternary-Bonsai-2-27B-PQ2_0.gguf',
+      'Ternary-Bonsai-2-27B-PTQ1_0.gguf',
+      'Ternary-Bonsai-2-27B-mmproj-BF16.gguf',
+      'Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf',
+    );
+    expect(entry.file).toBeUndefined();
+    expect(pickGgufSibling(model, { quant: entry.quant, repo: entry.repo }))
+      .toBe('Ternary-Bonsai-2-27B-PQ2_0.gguf');
+  });
+
+  // The `projector` role inverts the projector filter, so the SAME sibling list
+  // resolves to opposite halves of the repo depending on the role. Asserted
+  // against the real Ternary Bonsai list — two projectors beside three language
+  // packs — because the regression this catches is the two selections colliding,
+  // not either one in isolation (#7611).
+  //
+  // The quant hint alone is what proves the invert: the preset's `file` pin
+  // short-circuits at the exact-match branch ABOVE the filter, so a pinned pick
+  // would resolve to a projector even with the filter still hard-coded the old
+  // way. Both are asserted — the pin because it is what the preset ships, the
+  // hint because it is what actually reaches the clause under test.
+  it('selects a projector sibling for the projector role, by pin and by quant hint', () => {
+    const preset = specDecodePresets.findSpecDecodePreset('ternary-bonsai-2-27b');
+    const model = siblings(
+      'Ternary-Bonsai-2-27B-F16.gguf',
+      'Ternary-Bonsai-2-27B-PQ2_0.gguf',
+      'Ternary-Bonsai-2-27B-PTQ1_0.gguf',
+      'Ternary-Bonsai-2-27B-mmproj-BF16.gguf',
+      'Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf',
+    );
+    expect(pickGgufSibling(model, { ...preset.projector, role: 'projector' }))
+      .toBe('Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf');
+    expect(pickGgufSibling(model, { quant: 'Q8_0', repo: preset.projector.repo, role: 'projector' }))
+      .toBe('Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf');
+    // …while the same hint under the model role still cannot see a projector at
+    // all: `Q8_0` is carried only by the two sidecars here, so there is nothing
+    // left for it to match among the language packs.
+    expect(() => pickGgufSibling(model, { quant: 'Q8_0', repo: preset.model.repo, role: 'model' }))
+      .toThrow(/no Q8_0 build/i);
+  });
+
+  it('refuses a projector-role pick with no projector in the repo', () => {
+    const model = siblings('model-Q4_K_M.gguf', 'model-Q8_0.gguf');
+    expect(() => pickGgufSibling(model, { quant: 'Q8_0', repo: 'o/r', role: 'projector' }))
+      .toThrow(/no projector/i);
+  });
+
+  // Every non-projector role shares the base model's filter, so the drafter is
+  // protected from a same-quant projector by the same clause.
+  it('keeps a projector out of a drafter-role pick', () => {
+    const model = siblings('mmproj-model-Q4_K_M.gguf', 'drafter-model-Q4_K_M.gguf');
+    expect(pickGgufSibling(model, { quant: 'Q4_K_M', repo: 'o/r', role: 'draftModel' }))
+      .toBe('drafter-model-Q4_K_M.gguf');
+  });
+});
+
+describe('getSpecDecodePresetStatus', () => {
+  it('reports each preset file as on-disk or not, without reaching Hugging Face', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    const presets = await getSpecDecodePresetStatus();
+
+    const recommended = presets.find((p) => p.id === 'qwen3.8-27b-dspark');
+    expect(recommended.model.path).toMatch(/\.gguf$/);
+    expect(recommended.model.exists).toBe(false);
+    expect(recommended.model.downloadable).toBe(true);
+    expect(recommended.model.repoUrl).toContain('huggingface.co');
+    const q2k = presets.find((p) => p.id === 'qwen3.8-27b-dflash2-q2k');
+    expect(q2k.specType).toBe('draft-dflash');
+    expect(q2k.draftModel.path).toMatch(/DFlash2-Q2_K\.gguf$/);
+    expect(q2k.draftModel.repo).toBe('analogalok/Qwen3.8-27B-DFlash2-Q2_K-GGUF');
+    expect(q2k.draftModel.downloadable).toBe(true);
+    // `custom` carries no paths, so it has no weights rows to render.
+    expect(presets.find((p) => p.id === 'custom').model).toBeNull();
+    // A drafter-free preset is the MIXED state neither of the above produces:
+    // a populated, downloadable base beside a null drafter. That is what the
+    // launcher card reads to render one weights row instead of two and to leave
+    // its drafter field empty, so `custom`'s both-null row does not stand in
+    // for it.
+    const bonsai = presets.find((p) => p.id === 'ternary-bonsai-2-27b');
+    expect(bonsai.specType).toBe('none');
+    expect(bonsai.model.downloadable).toBe(true);
+    expect(bonsai.draftModel).toBeNull();
+    // The projector role is reported beside the other two, so the card renders a
+    // third weights row with its own Download button rather than leaving the
+    // vision tower as the one file the user must fetch by hand (#7611).
+    expect(bonsai.projector.path).toMatch(/mmproj-Q8_0\.gguf$/);
+    expect(bonsai.projector.role).toBe('projector');
+    expect(bonsai.projector.downloadable).toBe(true);
+    // A text-only preset reports no projector at all, which is what keeps the
+    // row out of every other preset's card.
+    expect(recommended.projector).toBeNull();
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe('downloadSpecDecodeModel', () => {
+  let dir;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'portos-spec-decode-'));
+    _resetSpecDecodeDownloadsForTests();
+    vi.spyOn(hfToken, 'getHfToken').mockResolvedValue(null);
+  });
+
+  afterEach(async () => {
+    vi.useRealTimers();
+    _resetSpecDecodeDownloadsForTests();
+    vi.restoreAllMocks();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const stubPreset = (overrides = {}) => {
+    const preset = {
+      id: 'test-preset',
+      label: 'Test',
+      specType: 'draft-dspark',
+      model: { path: join(dir, 'base.gguf'), repo: 'acme/Example-GGUF', quant: 'Q4_K_M' },
+      draftModel: { path: join(dir, 'draft.gguf') },
+      ...overrides,
+    };
+    vi.spyOn(specDecodePresets, 'specDecodeSource').mockImplementation((id, role) => {
+      if (id !== preset.id) return null;
+      const entry = preset[role];
+      return entry?.repo && entry?.path ? entry : null;
+    });
+    return preset;
+  };
+
+  it('streams the resolved GGUF into the launcher path', async () => {
+    stubPreset();
+    vi.spyOn(huggingfaceLora, 'fetchHuggingfaceModel').mockResolvedValue(siblings('Example-Q4_K_M.gguf'));
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: { get: () => '6' },
+      body: Readable.toWeb(Readable.from([Buffer.from('gg'), Buffer.from('ufgg')])),
+    });
+    const frames = [];
+
+    const result = await downloadSpecDecodeModel({
+      presetId: 'test-preset',
+      role: 'model',
+      onProgress: (frame) => frames.push(frame),
+    });
+
+    expect(result.file).toBe('Example-Q4_K_M.gguf');
+    expect(await readFile(join(dir, 'base.gguf'), 'utf8')).toBe('ggufgg');
+    expect(frames.at(-1)).toMatchObject({ event: 'complete', role: 'model' });
+  });
+
+  it('keeps the .partial on a transport failure so a retry can Range-resume', async () => {
+    stubPreset();
+    vi.spyOn(huggingfaceLora, 'fetchHuggingfaceModel').mockResolvedValue(siblings('Example-Q4_K_M.gguf'));
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: { get: () => '99' },
+      body: Readable.toWeb(new Readable({
+        read() { this.destroy(new Error('connection reset')); },
+      })),
+    });
+
+    await expect(downloadSpecDecodeModel({ presetId: 'test-preset', role: 'model' }))
+      .rejects.toThrow(/connection reset/);
+    const { readdir } = await import('fs/promises');
+    // The partial survives for a Range-resume, alongside the ETag sidecar
+    // recorded up front so that resume can send If-Range.
+    expect((await readdir(dir)).sort()).toEqual(['base.gguf.partial', 'base.gguf.partial.etag']);
+  });
+
+  it('cancels an active transfer, emits a terminal frame, and removes its partial file', async () => {
+    stubPreset();
+    vi.spyOn(huggingfaceLora, 'fetchHuggingfaceModel').mockResolvedValue(siblings('Example-Q4_K_M.gguf'));
+    let signal;
+    const stream = new Readable({ read() {} });
+    stream.push(Buffer.from('gg'));
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, options) => {
+      signal = options.signal;
+      signal.addEventListener('abort', () => stream.destroy(new Error('aborted')));
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => '99' },
+        body: Readable.toWeb(stream),
+      };
+    });
+    const frames = [];
+    const download = downloadSpecDecodeModel({
+      presetId: 'test-preset', role: 'model', onProgress: (frame) => frames.push(frame),
+    });
+
+    await vi.waitFor(() => expect(signal).toBeDefined());
+    expect(cancelSpecDecodeModelDownload({ presetId: 'test-preset', role: 'model' })).toBe(true);
+    await expect(download).rejects.toMatchObject({ code: 'SPEC_DOWNLOAD_CANCELLED' });
+
+    const { readdir } = await import('fs/promises');
+    expect(await readdir(dir)).toEqual([]);
+    expect(frames.at(-1)).toMatchObject({ event: 'cancelled', message: 'Download cancelled' });
+  });
+
+  it('aborts a byte-silent transfer when its idle watchdog expires', async () => {
+    vi.useFakeTimers();
+    try {
+      stubPreset();
+      vi.spyOn(huggingfaceLora, 'fetchHuggingfaceModel').mockResolvedValue(siblings('Example-Q4_K_M.gguf'));
+      let signalReady;
+      const signalReadyPromise = new Promise((resolve) => { signalReady = resolve; });
+      let signal;
+      const stream = new Readable({ read() {} });
+      vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, options) => {
+        signal = options.signal;
+        signalReady();
+        signal.addEventListener('abort', () => stream.destroy(new Error('aborted')));
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => '99' },
+          body: Readable.toWeb(stream),
+        };
+      });
+
+      const download = downloadSpecDecodeModel({ presetId: 'test-preset', role: 'model' });
+      // Attach the rejection assertion before advancing timers — the extra
+      // promise hop the resumable-download refactor added means the real
+      // stream-destroy → pipeline-reject chain can settle a tick after
+      // advanceTimersByTimeAsync returns, so subscribing afterward races an
+      // "unhandled rejection" against Node's own handler-attached check.
+      const assertion = expect(download).rejects.toMatchObject({ code: 'SPEC_DOWNLOAD_STALLED' });
+      await signalReadyPromise;
+      await vi.advanceTimersByTimeAsync(20 * 60 * 1000);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // The slot is claimed before the Hugging Face round trip: a second click
+  // landing inside that window would otherwise clear the in-flight check and
+  // start a parallel multi-gigabyte transfer of the same file.
+  it('refuses a second request that arrives while the repo is still being resolved', async () => {
+    stubPreset();
+    let releaseMetadata;
+    vi.spyOn(huggingfaceLora, 'fetchHuggingfaceModel').mockImplementation(
+      () => new Promise((resolve) => { releaseMetadata = () => resolve(siblings('Example-Q4_K_M.gguf')); }),
+    );
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: { get: () => '2' },
+      body: Readable.toWeb(Readable.from([Buffer.from('gg')])),
+    });
+
+    const first = downloadSpecDecodeModel({ presetId: 'test-preset', role: 'model' });
+    await vi.waitFor(() => expect(releaseMetadata).toBeTypeOf('function'));
+
+    await expect(downloadSpecDecodeModel({ presetId: 'test-preset', role: 'model' }))
+      .rejects.toThrow(/already downloading/);
+
+    releaseMetadata();
+    await expect(first).resolves.toMatchObject({ success: true });
+  });
+
+  // …and the claim is released when that resolution fails, or the file could
+  // never be retried without restarting the server.
+  it('releases the claim when resolving the repo fails', async () => {
+    stubPreset();
+    vi.spyOn(huggingfaceLora, 'fetchHuggingfaceModel').mockRejectedValue(new Error('HF unreachable'));
+
+    await expect(downloadSpecDecodeModel({ presetId: 'test-preset', role: 'model' }))
+      .rejects.toThrow(/HF unreachable/);
+
+    const status = await getSpecDecodePresetStatus();
+    expect(status.every((p) => !p.model?.downloading && !p.draftModel?.downloading)).toBe(true);
+  });
+
+  it.each(['headers', 'body'])('times out hanging metadata %s, emits an error, and releases the slot for retry', async (phase) => {
+    vi.useFakeTimers();
+    try {
+      stubPreset();
+      let metadataCalls = 0;
+      let fetchReady;
+      const fetchReadyPromise = new Promise((resolve) => { fetchReady = resolve; });
+      vi.stubGlobal('fetch', vi.fn(async (_url, { signal }) => {
+        metadataCalls += 1;
+        if (metadataCalls === 1) fetchReady();
+        if (metadataCalls > 1) return new Response(JSON.stringify(siblings('Example-Q4_K_M.gguf')));
+        if (phase === 'headers') {
+          return new Promise((_resolve, reject) => {
+            signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+          });
+        }
+        return {
+          ok: true,
+          status: 200,
+          text: () => new Promise((_resolve, reject) => {
+            signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+          }),
+        };
+      }));
+      const frames = [];
+      const first = downloadSpecDecodeModel({
+        presetId: 'test-preset', role: 'model', onProgress: (frame) => frames.push(frame),
+      });
+      const assertion = expect(first).rejects.toMatchObject({ code: 'SPEC_METADATA_TIMEOUT', status: 504 });
+
+      await fetchReadyPromise;
+      await vi.advanceTimersByTimeAsync(10_000);
+      await assertion;
+      expect(frames.at(-1)).toMatchObject({ event: 'error' });
+      expect(frames.at(-1).message).toMatch(/metadata lookup.*timed out.*retry/i);
+    } finally {
+      vi.useRealTimers();
+    }
+    vi.spyOn(huggingfaceLora, 'fetchHuggingfaceModel').mockResolvedValue(siblings('Example-Q4_K_M.gguf'));
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: { get: () => '2' },
+      body: Readable.toWeb(Readable.from([Buffer.from('gg')])),
+    });
+    await expect(downloadSpecDecodeModel({ presetId: 'test-preset', role: 'model' }))
+      .resolves.toMatchObject({ success: true });
+  });
+
+  it('keeps the size-probe fallback inside the metadata deadline', async () => {
+    vi.useFakeTimers();
+    try {
+      stubPreset();
+      vi.spyOn(huggingfaceLora, 'fetchHuggingfaceModel').mockResolvedValue({
+        siblings: [{ rfilename: 'Example-Q4_K_M.gguf' }],
+      });
+      let aborted = false;
+      let fetchReady;
+      const fetchReadyPromise = new Promise((resolve) => { fetchReady = resolve; });
+      vi.spyOn(globalThis, 'fetch').mockImplementation((_url, { signal }) => {
+        fetchReady();
+        if (aborted || signal.aborted) return Promise.reject(signal.reason);
+        return new Promise((_resolve, reject) => {
+          signal.addEventListener('abort', () => {
+            aborted = true;
+            reject(signal.reason);
+          }, { once: true });
+        });
+      });
+      const download = downloadSpecDecodeModel({ presetId: 'test-preset', role: 'model' });
+      const assertion = expect(download).rejects.toMatchObject({ code: 'SPEC_METADATA_TIMEOUT' });
+      await fetchReadyPromise;
+
+      await vi.advanceTimersByTimeAsync(10_000);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('preserves explicit cancellation while metadata headers are pending', async () => {
+    stubPreset();
+    vi.spyOn(huggingfaceLora, 'fetchHuggingfaceModel').mockImplementation((_repo, { signal }) => (
+      new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }))
+    ));
+    const frames = [];
+    const download = downloadSpecDecodeModel({
+      presetId: 'test-preset', role: 'model', onProgress: (frame) => frames.push(frame),
+    });
+    await vi.waitFor(() => expect(frames).toHaveLength(1));
+    expect(cancelSpecDecodeModelDownload({ presetId: 'test-preset', role: 'model' })).toBe(true);
+
+    await expect(download).rejects.toMatchObject({ code: 'SPEC_DOWNLOAD_CANCELLED' });
+    expect(frames.at(-1).event).toBe('cancelled');
+  });
+
+  it('does not apply the metadata deadline to the weight transfer', async () => {
+    vi.useFakeTimers();
+    try {
+      stubPreset();
+      vi.spyOn(huggingfaceLora, 'fetchHuggingfaceModel').mockResolvedValue(siblings('Example-Q4_K_M.gguf'));
+      let transferSignal;
+      let finish;
+      let transferReady;
+      const transferReadyPromise = new Promise((resolve) => { transferReady = resolve; });
+      vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, { signal }) => {
+        transferSignal = signal;
+        transferReady();
+        const body = new Readable({ read() {} });
+        finish = () => body.push(Buffer.from('gg')) && body.push(null);
+        return { ok: true, status: 200, headers: { get: () => '2' }, body: Readable.toWeb(body) };
+      });
+      const download = downloadSpecDecodeModel({ presetId: 'test-preset', role: 'model' });
+      await transferReadyPromise;
+
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(transferSignal.aborted).toBe(false);
+      finish();
+      await expect(download).resolves.toMatchObject({ success: true });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('short-circuits when the weights are already on disk', async () => {
+    stubPreset();
+    await writeFile(join(dir, 'base.gguf'), 'already here');
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+
+    const result = await downloadSpecDecodeModel({ presetId: 'test-preset', role: 'model' });
+
+    expect(result).toMatchObject({ success: true, alreadyDownloaded: true });
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  // The drafter half of some pairs ships safetensors only — the UI links out
+  // rather than offering a button, and the route has to agree.
+  it('refuses a role with no registered Hugging Face source', async () => {
+    stubPreset();
+    await expect(downloadSpecDecodeModel({ presetId: 'test-preset', role: 'draftModel' }))
+      .rejects.toThrow(/No Hugging Face source/);
+  });
+
+  it('rejects an unknown role outright', async () => {
+    await expect(downloadSpecDecodeModel({ presetId: 'test-preset', role: 'sneaky' }))
+      .rejects.toThrow(/Unknown model role/);
+  });
+});
+
+describe('removeSpecDecodeModel', () => {
+  let dir;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'portos-spec-decode-remove-'));
+    _resetSpecDecodeDownloadsForTests();
+  });
+
+  afterEach(async () => {
+    _resetSpecDecodeDownloadsForTests();
+    vi.restoreAllMocks();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const stubEntry = (path) => {
+    vi.spyOn(specDecodePresets, 'findSpecDecodePreset').mockImplementation((id) => (
+      id === 'test-preset' ? { model: { path }, draftModel: { path } } : null
+    ));
+  };
+
+  it('deletes an on-disk weight file', async () => {
+    const path = join(dir, 'base.gguf');
+    await writeFile(path, 'weights');
+    stubEntry(path);
+
+    const result = await removeSpecDecodeModel({ presetId: 'test-preset', role: 'model' });
+
+    expect(result).toMatchObject({ success: true, deleted: true, path });
+    await expect(readFile(path)).rejects.toThrow();
+  });
+
+  it('is a no-op when nothing is on disk to delete', async () => {
+    const path = join(dir, 'missing.gguf');
+    stubEntry(path);
+
+    const result = await removeSpecDecodeModel({ presetId: 'test-preset', role: 'model' });
+
+    expect(result).toMatchObject({ success: true, deleted: false, path });
+  });
+
+  // Deleting the partial mid-transfer would pull the file out from under the
+  // stream write it's racing; Cancel is the correct action for that, not Delete.
+  it('refuses to delete a file that is still downloading', async () => {
+    stubEntry(join(dir, 'base.gguf'));
+    vi.spyOn(specDecodePresets, 'specDecodeSource').mockImplementation((id, role) => (
+      id === 'test-preset' && role === 'model'
+        ? { path: join(dir, 'base.gguf'), repo: 'acme/Example-GGUF', quant: 'Q4_K_M' }
+        : null
+    ));
+    vi.spyOn(hfToken, 'getHfToken').mockResolvedValue(null);
+    let releaseMetadata;
+    vi.spyOn(huggingfaceLora, 'fetchHuggingfaceModel').mockImplementation(
+      () => new Promise((resolve) => { releaseMetadata = () => resolve(siblings('Example-Q4_K_M.gguf')); }),
+    );
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: { get: () => '2' },
+      body: Readable.toWeb(Readable.from([Buffer.from('gg')])),
+    });
+
+    const download = downloadSpecDecodeModel({ presetId: 'test-preset', role: 'model' });
+    await vi.waitFor(() => expect(releaseMetadata).toBeTypeOf('function'));
+
+    await expect(removeSpecDecodeModel({ presetId: 'test-preset', role: 'model' }))
+      .rejects.toThrow(/still downloading/);
+
+    releaseMetadata();
+    await download;
+  });
+
+  // Deleting the weight out from under a running launch would leave
+  // llama-server serving a now-deleted (POSIX) or unwritable (Windows) file.
+  it('refuses to delete a weight llama-server is currently running', async () => {
+    const path = join(dir, 'base.gguf');
+    await writeFile(path, 'weights');
+    stubEntry(path);
+    getLlamaServerStatus.mockResolvedValueOnce({ running: true, config: { model: path } });
+
+    await expect(removeSpecDecodeModel({ presetId: 'test-preset', role: 'model' }))
+      .rejects.toThrow(/Stop llama-server/);
+    await expect(readFile(path, 'utf8')).resolves.toBe('weights');
+  });
+
+  // The comparison resolves both sides — the running config can carry a
+  // relative launch-line path while the preset's own path is absolute (or
+  // vice versa) and the two must still be recognized as the same file.
+  it('matches the running config against the resolved path, not the raw string', async () => {
+    const path = join(dir, 'base.gguf');
+    await writeFile(path, 'weights');
+    stubEntry(path);
+    getLlamaServerStatus.mockResolvedValueOnce({ running: true, config: { model: relative(process.cwd(), path) } });
+
+    await expect(removeSpecDecodeModel({ presetId: 'test-preset', role: 'model' }))
+      .rejects.toThrow(/Stop llama-server/);
+  });
+
+  it('allows deletion once llama-server is running a different weight', async () => {
+    const path = join(dir, 'base.gguf');
+    await writeFile(path, 'weights');
+    stubEntry(path);
+    getLlamaServerStatus.mockResolvedValueOnce({ running: true, config: { model: join(dir, 'other.gguf') } });
+
+    const result = await removeSpecDecodeModel({ presetId: 'test-preset', role: 'model' });
+
+    expect(result).toMatchObject({ success: true, deleted: true, path });
+  });
+
+  it('rejects an unknown role outright', async () => {
+    stubEntry(join(dir, 'base.gguf'));
+    await expect(removeSpecDecodeModel({ presetId: 'test-preset', role: 'sneaky' }))
+      .rejects.toThrow(/Unknown model role/);
+  });
+});
+
+describe('resolveSpecModelPath', () => {
+  it('resolves a relative launcher path to an absolute one', () => {
+    const resolved = resolveSpecModelPath('models/base.gguf');
+    expect(isAbsolute(resolved)).toBe(true);
+    expect(resolved.endsWith(join('models', 'base.gguf'))).toBe(true);
+  });
+
+  // `spawn` performs no shell expansion, so a `~` path has to be expanded here
+  // or the launcher and the downloader disagree about which file they mean.
+  it('expands a leading ~ rather than passing it through literally', () => {
+    const resolved = resolveSpecModelPath('~/models/base.gguf');
+    expect(resolved.startsWith(homedir())).toBe(true);
+    expect(resolved).not.toContain('~');
+  });
+});

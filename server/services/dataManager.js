@@ -1,0 +1,619 @@
+import { readdir, opendir, stat, lstat, statfs, mkdtemp, open, link, readFile } from 'fs/promises';
+import { join, relative, resolve, isAbsolute } from 'path';
+import { existsSync } from 'fs';
+import { randomUUID } from 'crypto';
+import { assertNotRealDataWrite } from '../lib/testDataIsolation.js';
+import { execFile } from '../lib/childProcess.js';
+import { promisify } from 'util';
+import { parseFilesystemStats, sha256Text } from '../lib/fileCore.js';
+import { PATHS, ensureDir, isTopLevelEntryName, rmGuarded, writeFileGuarded } from '../lib/fileUtils.js';
+import { ServerError } from '../lib/errorHandler.js';
+import { withBackupAssetPublication } from '../lib/backupSnapshotBoundary.js';
+import {
+  federatedMediaInboxBusy, imageCleanTmpBusy, trainingRunsBusy, updateDetachedBusy,
+} from './dataManagerBusy.js';
+
+const execFileAsync = promisify(execFile);
+const DATA_DIR = PATHS.data;
+
+// Every top-level directory PortOS can create under `data/` needs an entry here.
+// A missing entry doesn't just show "Unknown category" on the Data Manager — it
+// also strips the Archive/Purge affordances, so the biggest thing on a cleanup
+// page becomes the one thing the cleanup page refuses to act on (issue #3285).
+// `dataManager.categories.test.js` enumerates the directories the codebase can
+// emit and fails when one of them is unclassified.
+//
+// Flag semantics — be conservative, the user cannot undo a purge:
+//   archivable — worth tarring into `data/backup/`. False for large binary trees
+//     (the tarball lands *inside* data/, so archiving them grows the very number
+//     the user came here to shrink) and for anything holding secrets.
+//   deletable  — the bytes are genuinely reproducible (caches, ephemeral working
+//     dirs, re-downloadable assets) or are already duplicated elsewhere. False
+//     whenever purging would destroy the only copy of generated or uploaded work.
+//   purgeScope — how much a purge may take at once. Only meaningful when
+//     `deletable`; omit it (it resolves to null) on protected categories.
+//       'category' — the whole directory can go in one action.
+//       'items'    — only a per-item delete (`subPath`) is offered; the
+//         category-wide wipe is refused server-side. For a mixed directory of
+//         uploads and renders that other records point at, "reclaim space" is a
+//         legitimate need but an all-or-nothing wipe is not (issue #3327).
+//     `purgeCategory` fails closed: anything other than an explicit 'category'
+//     refuses the directory-wide purge, so a missing or misspelled scope can
+//     never widen a delete.
+//   busyCheck — optional `() => Promise<{ busy, reason }>`. Some directories are
+//     genuinely reproducible scratch, yet only while nothing is USING them: a
+//     category-wide purge mid-job destroys the working state of a render, a
+//     trainer, or a self-update. A category carrying a `busyCheck` refuses the
+//     purge with 409 CATEGORY_BUSY while its probe says busy, including
+//     per-item deletion: naming a directory does not make a live job safe.
+//     Categories with no `busyCheck` are unaffected. Probes live in
+//     `dataManagerBusy.js`.
+export const CATEGORIES = {
+  'agents': { label: 'Agents', description: 'Agent personality data', archivable: false, deletable: false },
+  'ask-conversations': { label: 'Ask Conversations', description: 'Saved Ask chat transcripts', archivable: true, deletable: false },
+  'audio': { label: 'Audio', description: 'Rendered voice-over lines referenced by pipeline issues', archivable: true, deletable: false },
+  'autofixer': { label: 'Autofixer', description: 'Autofixer run data', archivable: true, deletable: true, purgeScope: 'category' },
+  'avatar': { label: 'Avatar', description: 'Uploaded avatar images', archivable: true, deletable: false },
+  // Machine-local ownership authority must survive every generic cleanup action.
+  'backup-admission': { label: 'Backup Admission', description: 'Active publication and snapshot ownership — reconcile through backup recovery', archivable: false, deletable: false },
+  'backup': { label: 'Backups', description: 'Data backup archives', archivable: false, deletable: true, purgeScope: 'category' },
+  'brain': { label: 'Brain', description: 'Brain items and sync log', archivable: true, deletable: false },
+  // The Beeper attachment byte mirror (#37) — the only thing the Beeper feature
+  // writes to `data/`; every other Beeper record is Postgres. Not archivable:
+  // the tarball would land inside `data/` and grow the number the user came here
+  // to shrink, and the bytes are re-fetchable from Beeper anyway. NOT deletable
+  // from here either (audit cluster 04, decision 2): the directory holds a
+  // single subdirectory, `attachments/`, which the per-item purge form refuses
+  // outright (item-scoped purges remove a single FILE and never recurse — see
+  // `purgeCategory` below) and the category-wide form was never reachable
+  // without `purgeScope: 'category'`. The visible purge control was dead on
+  // arrival either way. Reclamation is two paths that both reference-check
+  // before touching a byte: the attachment budget sweep (least-recently-viewed
+  // eviction, bounded by `settings.beeper.attachmentBudgetGb`) and the
+  // per-conversation purge (`DELETE /api/beeper/conversations/:id`, content-
+  // addressed so a photo forwarded into three chats survives one being
+  // purged). This category reports size only.
+  'beeper': { label: 'Beeper Attachments', description: 'Mirrored Beeper attachment bytes — reclaimed by the attachment budget sweep and per-conversation purge, not from here', archivable: false, deletable: false },
+  // Legacy location — current installs download to ~/Downloads (PATHS.browserDownloads),
+  // but installs that predate that move still carry the dir, and backup still excludes it.
+  'browser-downloads': { label: 'Browser Downloads', description: 'Files the agent browser downloaded — re-downloadable, safe to purge', archivable: false, deletable: true, purgeScope: 'category' },
+  'browser-profile': { label: 'Browser Profile', description: 'Chrome/Chromium browser data', archivable: false, deletable: true, purgeScope: 'category' },
+  cache: { label: 'Remote API and Reading Cache', description: 'Cached remote API metadata and the author-hosted Accelerando reading source — refetched on demand, safe to purge', archivable: false, deletable: true, purgeScope: 'category' },
+  'calendar': { label: 'Calendar', description: 'Calendar sync data', archivable: true, deletable: false },
+  'cover-fonts': { label: 'Cover Fonts', description: 'Typefaces uploaded for music video cover lettering; covers made with one fall back to a built-in typeface if it is removed', archivable: true, deletable: false },
+  'private': { label: 'Private Keys', description: 'Machine-local integration credentials — managed in Settings > Credentials', archivable: false, deletable: false },
+  'certs': { label: 'TLS Certificates', description: 'HTTPS certificate and private key — purging drops the install back to HTTP', archivable: false, deletable: false },
+  'launch-videos': { label: 'Launch Videos', description: 'App launch-video compositions, plans, captions and rendered deliverables', archivable: true, deletable: false },
+  'composition-proofs': { label: 'Composition Proofs', description: 'Contact-sheet review stills from HTML-composition proof renders — re-rendered from source, safe to purge', archivable: false, deletable: true, purgeScope: 'category' },
+  // Development artifacts ("ingredients") of Music Video projects — every
+  // version of a Cast & Sets sheet, animatic, treatment or storyboard, one
+  // immutable file each, referenced by the project record. Not deletable from
+  // here: a purge would strand those references (delete the artifact instead).
+  'music-video': { label: 'Music Video Development Files', description: 'Versioned development artifacts (check-in sheets, animatics, treatments) and composition documents referenced by Music Video projects', archivable: true, deletable: false },
+  'music-video-compositions': { label: 'Music Video Overlay Scratch', description: 'Typography overlay frames for an in-flight composed music-video render — removed when the render ends and swept at boot', archivable: false, deletable: false },
+  'music-video-song-renders': { label: 'Music Video Composition Render Scratch', description: 'A staged copy of a composition document plus its scene media for an in-flight music-video render — removed when the render ends and swept at boot', archivable: false, deletable: false },
+  'code-animation-workspaces': { label: 'Code Animation Contained Workers', description: 'Per-run staged input, output and scratch for a sandboxed Code Animation worker — removed when the run ends and swept on the next run', archivable: false, deletable: false },
+  'code-animations': { label: 'Code Animations', description: 'Generated animation HTML retained with its job history — the only copy of provider-generated work', archivable: true, deletable: false },
+  'code-animation-exports': { label: 'Code Animation Export Staging', description: 'Animation HTML plus the frame-exact render shim, staged once per MP4 export — safe to purge', archivable: false, deletable: true, purgeScope: 'category' },
+  'commission-feedback': { label: 'Commission Feedback', description: 'Reactions on creative commissions (file mirror of the Postgres store)', archivable: true, deletable: false },
+  'conflict-journal': { label: 'Conflict Journal', description: 'Peer-sync conflict history — diagnostics only, safe to purge', archivable: true, deletable: true, purgeScope: 'category' },
+  'cos': { label: 'Chief of Staff', description: 'Agent data, reports, memories', archivable: true, deletable: false },
+  'creative': { label: 'Creative Ledger', description: 'Append-only ledger of creative generation runs', archivable: true, deletable: false },
+  'creative-commissions': { label: 'Creative Commissions', description: 'Commission records (file mirror of the Postgres store)', archivable: true, deletable: false },
+  'db-dumps': { label: 'DB Dumps', description: 'PostgreSQL database backups', archivable: true, deletable: true, purgeScope: 'category' },
+  'digital-twin': { label: 'Digital Twin', description: 'Identity, goals, character data', archivable: true, deletable: false },
+  'eidoverse': { label: 'Eidoverse Worlds', description: 'Machine-local world history owned by the optional Eidoverse runtime — backed up and not federated', archivable: true, deletable: false },
+  'fableloom': { label: 'FableLoom', description: 'Branching-narrative records (file mirror of the Postgres store)', archivable: true, deletable: false },
+  // Another machine's conditioning images, staged for one federated render and
+  // swept on a TTL (#4348). Not archivable for the same reason it is excluded
+  // from backups: none of it is this install's data, and a restored entry is
+  // either already expired or already rendered. Purgeable as a category —
+  // deleting a staged asset only forces the peer that owns it to re-upload,
+  // which is one transfer, not lost work.
+  'federated-media-inbox': { label: 'Federated Media Inbox', description: 'Source images peers uploaded for federated renders — expire automatically, safe to purge when no federated render is in flight', archivable: false, deletable: true, purgeScope: 'category', busyCheck: federatedMediaInboxBusy },
+  'games': { label: 'Games', description: 'Game project records and assets', archivable: true, deletable: false },
+  'health': { label: 'Apple Health', description: 'Daily health JSON snapshots', archivable: true, deletable: false },
+  'image-clean-tmp': { label: 'Image Cleaner Scratch', description: 'Ephemeral working files for Image Cleaner renders — swept automatically, safe to purge when no render is in flight', archivable: false, deletable: true, purgeScope: 'category', busyCheck: imageCleanTmpBusy },
+  'image-refs': { label: 'Image References', description: 'Reference images uploaded for multi-reference edits — still served to existing renders', archivable: true, deletable: false },
+  'image-to-3d': { label: 'Image to 3D', description: 'Generated GLB meshes — the only copy; records live in Postgres', archivable: false, deletable: false },
+  'images': { label: 'Images', description: 'Uploaded and generated images — delete individually; gallery, pipeline, and collection records point at these files', archivable: true, deletable: true, purgeScope: 'items' },
+  'insights': { label: 'Insights', description: 'Derived goal scorecards and insights — rebuilt on the next insights run', archivable: true, deletable: true, purgeScope: 'category' },
+  // Project-specific jev heads plus the corpora and cached embeddings behind
+  // them.
+  //
+  // NOT deletable: the corpus and the embedding cache regenerate, but a trained
+  // head does not — the forge queries that built its corpus return different
+  // rows a month later, and it is the one artifact here an operator made an
+  // adoption decision about. Purging the category would silently return scope
+  // adherence to the stock scorer with nothing to restore.
+  //
+  // NOT archivable either, and for the opposite reason: this tree is mostly the
+  // embedding cache, which `backup.js` excludes precisely because it is
+  // gigabytes of pure cache. Archiving gzips exactly those gigabytes INTO
+  // `data/backup/` — growing the directory an operator opened this page to
+  // shrink, and blowing the shared tar timeout on the way. The few kilobytes
+  // worth keeping (the heads) are already in every snapshot.
+  'jev': { label: 'jev Project Heads', description: 'Trained project-specific scorer heads, their training corpora, and cached frozen-encoder outputs — machine-local; a head is not regenerable once its corpus is stale, and the cache beside it is bulk that rebuilds', archivable: false, deletable: false },
+  'jira-reports': { label: 'Jira Reports', description: 'Generated Jira reports — regenerable from Jira', archivable: true, deletable: true, purgeScope: 'category' },
+  'loops': { label: 'Loops', description: 'Output history from scheduled loop runs', archivable: true, deletable: false },
+  'lora-datasets': { label: 'LoRA Datasets', description: 'Training images and captions for LoRA runs — uploaded source material, not regenerable', archivable: false, deletable: false },
+  // Measured local-model assessments. Deletable: every record is reproducible by
+  // re-running the assessment, and a stale one (taken before a RAM upgrade or a
+  // backend update) actively misleads the picker.
+  'local-llm': { label: 'Local Model Assessments', description: 'Measured fit and performance results for installed local models — re-runnable, and stale after a hardware or backend change', archivable: true, deletable: true, purgeScope: 'category' },
+  'loras': { label: 'LoRAs', description: 'Trained LoRA adapters — excluded from backups and not regenerable without hours of GPU retraining', archivable: false, deletable: false },
+  'meatspace': { label: 'MeatSpace', description: 'Body metrics, blood tests, eyes', archivable: true, deletable: false },
+  'media-collections': { label: 'Media Collections', description: 'Media collection records', archivable: true, deletable: false },
+  'media-sketches': { label: 'Media Sketches', description: 'Saved sketch canvases used as render inputs', archivable: true, deletable: false },
+  'messages': { label: 'Messages', description: 'Email and messaging data', archivable: true, deletable: true, purgeScope: 'category' },
+  'model-personality': { label: 'Model Personality', description: 'Model personality probe results and settings', archivable: true, deletable: false },
+  'model-tests': { label: 'Model Capability Tests', description: 'Throwaway agent sandboxes from the capability test suite — recreated per run, safe to purge', archivable: false, deletable: true, purgeScope: 'category' },
+  'music': { label: 'Music', description: 'Uploaded and generated background tracks', archivable: true, deletable: false },
+  'openclaw': { label: 'OpenClaw', description: 'OpenClaw integration config', archivable: true, deletable: false },
+  'peer-execution': { label: 'Peer Execution Recovery', description: 'Machine-local launch evidence and completion receipts required to reconcile authorized peer maintenance — preserve unresolved operations', archivable: false, deletable: false },
+  'pipeline-comparative-rank': { label: 'Comparative Rank', description: 'Cached comparative issue rankings — re-running them costs LLM calls', archivable: true, deletable: false },
+  'pipeline-editorial': { label: 'Editorial Analysis', description: 'Cached editorial analyses — re-running them costs LLM calls', archivable: true, deletable: false },
+  'pipeline-editorial-health': { label: 'Editorial Health', description: 'Cached editorial health scores — re-running them costs LLM calls', archivable: true, deletable: false },
+  'pipeline-foundation-judge': { label: 'Foundation Judge', description: 'Cached foundation-judge verdicts — re-running them costs LLM calls', archivable: true, deletable: false },
+  'pipeline-issues': { label: 'Pipeline Issues (legacy)', description: 'Pre-Postgres issue files kept as the recovery source until the migration is confirmed', archivable: true, deletable: false },
+  'pipeline-judge': { label: 'Pipeline Judge', description: 'Cached pipeline-judge verdicts — re-running them costs LLM calls', archivable: true, deletable: false },
+  'pipeline-pov-rewrites': { label: 'POV Rewrites', description: 'Cached perspective rewrites — re-running them costs LLM calls', archivable: true, deletable: false },
+  'pipeline-reader-panel': { label: 'Reader Panel', description: 'Cached reader-panel reactions — re-running them costs LLM calls', archivable: true, deletable: false },
+  'pipeline-series': { label: 'Pipeline Series (legacy)', description: 'Pre-Postgres series files kept as the recovery source until the migration is confirmed', archivable: true, deletable: false },
+  'pipeline-series-review': { label: 'Series Review', description: 'Cached series reviews — re-running them costs LLM calls', archivable: true, deletable: false },
+  'privacy': { label: 'Privacy', description: 'Data-broker opt-out records and request history', archivable: true, deletable: false },
+  'prompts': { label: 'Prompts', description: 'AI prompt templates', archivable: false, deletable: false },
+  'venvs': { label: 'Optional SDK Runtimes', description: 'Explicitly installed Python environments for media SDKs; reinstall with the corresponding setup command', archivable: false, deletable: false },
+  'python': { label: 'Python Runtime', description: 'Managed virtualenv for local ML tooling — rebuilt on the next Python-backed run (re-downloads several GB of wheels)', archivable: false, deletable: true, purgeScope: 'category' },
+  // A pasted or URL-fetched book is the user's only copy — the shelf is not a
+  // cache of anything re-fetchable, so it is neither archivable nor deletable.
+  'rapid-reader-library': { label: 'Rapid Reader Shelf', description: 'Saved books for Rapid Reader — pasted and URL-imported prose kept on this machine, not regenerable', archivable: false, deletable: false },
+  'repos': { label: 'Cloned Repos', description: 'Git repositories cloned by agents', archivable: false, deletable: true, purgeScope: 'category' },
+  'review': { label: 'Review', description: 'Review hub items', archivable: true, deletable: true, purgeScope: 'category' },
+  'rigging': { label: 'Rigging Clip Library', description: 'User-dropped animation-bearing GLB source files for retargeting — the only copy of assets you supplied', archivable: false, deletable: false },
+  'runs': { label: 'AI Runs', description: 'Agent run logs and outputs', archivable: true, deletable: true, purgeScope: 'category' },
+  'screenshots': { label: 'Screenshots', description: 'Task screenshots and images dropped into shell sessions — shell drops auto-delete after 7 days, others after 30 days unless an open task still uses them', archivable: true, deletable: true, purgeScope: 'category' },
+  'settings': { label: 'Settings', description: 'Per-feature settings files', archivable: true, deletable: false },
+  'sharing': { label: 'Peer Sync State', description: 'Peer-sync bookkeeping — purging forces a full resync and can resurrect deleted records', archivable: true, deletable: false },
+  'spotify': { label: 'Spotify Sync', description: 'Machine-local Spotify sync cursor and cache — purging resets the cursor and can leave a gap in imported history', archivable: true, deletable: false },
+  'sprites': { label: 'Sprites', description: 'Sprite reference art, walk frames, and runtime atlases — the only copy of the generated art; records live in Postgres', archivable: false, deletable: false },
+  'story-builder': { label: 'Story Builder', description: 'Story Builder project records', archivable: true, deletable: false },
+  'supercollider': { label: 'SuperCollider Runtime', description: 'Machine-local readiness evidence for the managed SuperCollider image, in-flight render scratch and 24-hour render previews — re-created by npm run setup:supercollider, safe to purge', archivable: false, deletable: true, purgeScope: 'category' },
+  'telegram': { label: 'Telegram', description: 'Telegram bot data', archivable: true, deletable: true, purgeScope: 'category' },
+  'templates': { label: 'Visual Templates', description: 'Shipped layout assets used as render anchors', archivable: false, deletable: false },
+  'tools': { label: 'Tools', description: 'Tool execution data', archivable: true, deletable: true, purgeScope: 'category' },
+  'training-runs': { label: 'LoRA Training Runs', description: 'Training checkpoints, caches, and sample previews — the finished adapters live in LoRAs and survive a purge; run history in Postgres will point at missing artifacts', archivable: false, deletable: true, purgeScope: 'category', busyCheck: trainingRunsBusy },
+  'universes': { label: 'Universes', description: 'Universe Builder records — bibles, canon, and style references', archivable: true, deletable: false },
+  'update-detached': { label: 'Update Control', description: 'Control files for a detached self-update run — safe to purge when no update is running', archivable: false, deletable: true, purgeScope: 'category', busyCheck: updateDetachedBusy },
+  'uploads': { label: 'Uploads', description: 'Files uploaded through the UI and referenced by records', archivable: true, deletable: false },
+  'video-thumbnails': { label: 'Video Thumbnails', description: 'JPEG thumbnails for generated videos', archivable: false, deletable: true, purgeScope: 'category' },
+  'image-thumbnails': { label: 'Image Thumbnails', description: 'Regenerable WebP previews for generated images', archivable: false, deletable: true, purgeScope: 'category' },
+  'videos': { label: 'Videos', description: 'Locally generated videos — delete individually; the render is the only copy and re-rendering costs provider spend', archivable: true, deletable: true, purgeScope: 'items' },
+  'voice-profiles': { label: 'Voice Profiles', description: 'Machine-local voice profile source recordings, benchmarks, and local engine artifacts', archivable: true, deletable: false },
+  'writers-room': { label: 'Writers Room', description: 'Writers Room works and story bibles', archivable: true, deletable: false },
+  'youtube': { label: 'YouTube Sync', description: 'Machine-local YouTube sync state — purging resets the cursor and can leave a gap in imported history', archivable: true, deletable: false }
+};
+
+// Shown for a directory with no CATEGORIES entry. Phrased as an outcome ("we
+// don't know whether removing this is safe") rather than a mechanism ("unknown
+// category") so the absent Archive/Purge buttons read as a deliberate safety
+// stance instead of a broken row.
+export const UNKNOWN_CATEGORY_DESCRIPTION = "Not classified — PortOS doesn't know if this is safe to remove";
+
+/**
+ * Resolve the display/permission metadata for a `data/` directory name.
+ * Adds `classified: false` for the unknown fallback so the client can style
+ * the row as "deliberately unactionable" instead of guessing from the copy.
+ * `purgeScope` is always present in the payload (null on protected categories)
+ * so the client never has to distinguish "absent" from "not purgeable".
+ * `busyCheck` is stripped — it is server-side behavior, not payload.
+ */
+function categoryMeta(name) {
+  const known = CATEGORIES[name];
+  if (known) {
+    const { busyCheck: _busyCheck, ...serializable } = known;
+    return { purgeScope: null, ...serializable, classified: true };
+  }
+  return { label: name, description: UNKNOWN_CATEGORY_DESCRIPTION, archivable: false, deletable: false, purgeScope: null, classified: false };
+}
+
+/**
+ * Run a category's `busyCheck`, if it has one, and shape the answer for both
+ * the API payload (`busy` / `busyReason`) and the purge gate (issue #3342).
+ * A category with no probe is always `{ busy: false }` — today's behavior.
+ *
+ * Fails CLOSED. A probe that throws, or hands back a shape we can't read,
+ * reports busy: "we could not verify" and "nothing is running" must not
+ * collapse into the same answer on a page whose buttons are irreversible.
+ */
+export async function resolveCategoryBusy(categoryKey) {
+  const check = CATEGORIES[categoryKey]?.busyCheck;
+  if (typeof check !== 'function') return { busy: false, busyReason: null };
+  const result = await check().catch((err) => {
+    console.error(`❌ Busy check failed for data/${categoryKey}: ${err.message}`);
+    return null;
+  });
+  if (typeof result?.busy !== 'boolean') {
+    return { busy: true, busyReason: `PortOS could not confirm whether anything is using data/${categoryKey} right now, so the purge is withheld.` };
+  }
+  if (!result.busy) return { busy: false, busyReason: null };
+  return { busy: true, busyReason: result.reason || `Something is using data/${categoryKey} right now — purge once it finishes.` };
+}
+
+// Validate category key contains only safe characters
+const SAFE_NAME = /^[a-z0-9_-]+$/;
+
+// Walk one directory at a time: never buffer an entire tree's path list in a
+// child-process stdout pipe. Failed scans stay unknown, distinct from empty.
+async function countFiles(dirPath, deadline) {
+  if (Date.now() >= deadline) throw new Error('File count timed out');
+  let count = 0;
+  const directory = await opendir(dirPath);
+  for await (const entry of directory) {
+    if (Date.now() >= deadline) throw new Error('File count timed out');
+    if (entry.isDirectory()) count += await countFiles(join(dirPath, entry.name), deadline);
+    else if (entry.isFile()) count++;
+  }
+  return count;
+}
+
+async function getDirSizeAndCount(dirPath, { strict = false } = {}) {
+  if (strict) {
+    const present = await stat(dirPath).then(
+      () => true,
+      (err) => {
+        if (err?.code === 'ENOENT') return false;
+        throw err;
+      },
+    );
+    if (!present) return { size: 0, fileCount: 0 };
+  } else if (!existsSync(dirPath)) {
+    return { size: 0, fileCount: 0 };
+  }
+  const [duOut, findOut] = await Promise.all([
+    execFileAsync('du', ['-sk', dirPath], { timeout: 30000 })
+      .then(r => r.stdout.trim())
+      .catch((err) => {
+        if (strict) throw err;
+        return '0';
+      }),
+    countFiles(dirPath, Date.now() + 30000).catch((err) => {
+      if (strict) throw err;
+      return null;
+    })
+  ]);
+  const kb = typeof duOut === 'string' ? parseInt(duOut.split('\t')[0], 10) : NaN;
+  if (!Number.isFinite(kb) || kb < 0) {
+    if (strict) throw new Error(`Could not parse directory size for ${dirPath}`);
+    return { size: 0, fileCount: findOut };
+  }
+  const fileCount = findOut;
+  return { size: kb * 1024, fileCount };
+}
+
+export async function getDataOverview({ strict = false } = {}) {
+  // Capacity of the volume holding data/ so the page can show how much room is
+  // left, not just what PortOS occupies. Null when the platform can't say.
+  // Independent of the scans below, so it runs alongside them.
+  const diskPromise = statfs(DATA_DIR).then(parseFilesystemStats).catch(() => null);
+  const entries = await readdir(DATA_DIR, { withFileTypes: true }).catch((err) => {
+    if (strict) throw err;
+    return [];
+  });
+  const dirs = entries.filter(e => e.isDirectory());
+
+  // Parallel: get total size + per-directory sizes in one batch
+  const [totalResult, ...dirResults] = await Promise.all([
+    getDirSizeAndCount(DATA_DIR, { strict }),
+    ...dirs.map(d => getDirSizeAndCount(join(DATA_DIR, d.name), { strict }))
+  ]);
+
+  // Busy state ships with the overview so the Data Manager can drop the Purge
+  // button before the user commits, rather than failing on click (#3342). Only
+  // the handful of categories carrying a `busyCheck` cost anything here.
+  const busyStates = await Promise.all(dirs.map(d => resolveCategoryBusy(d.name)));
+
+  const categories = dirs.map((d, i) => ({
+    key: d.name,
+    path: `data/${d.name}`,
+    ...categoryMeta(d.name),
+    ...busyStates[i],
+    ...dirResults[i]
+  }));
+
+  categories.sort((a, b) => b.size - a.size);
+
+  const disk = await diskPromise;
+
+  return {
+    totalSize: totalResult.size,
+    totalFileCount: totalResult.fileCount,
+    categories,
+    disk,
+    dataDir: 'data'
+  };
+}
+
+export async function getCategoryDetail(categoryKey, { measure = false } = {}) {
+  if (!SAFE_NAME.test(categoryKey)) return null;
+  const dirPath = join(DATA_DIR, categoryKey);
+  if (!existsSync(dirPath)) return null;
+
+  const entries = await readdir(dirPath, { withFileTypes: true }).catch(() => []);
+
+  // Parallel: stat files + getDirSizeAndCount for subdirs
+  const itemPromises = entries.map(async (entry) => {
+    const fullPath = join(dirPath, entry.name);
+    if (entry.isDirectory()) {
+      const { size, fileCount } = await getDirSizeAndCount(fullPath);
+      return { name: entry.name, type: 'directory', size, fileCount };
+    }
+    const fileStat = await stat(fullPath).catch(() => null);
+    return {
+      name: entry.name,
+      type: 'file',
+      size: fileStat?.size || 0,
+      modified: fileStat?.mtime?.toISOString() || null
+    };
+  });
+
+  const items = await Promise.all(itemPromises);
+  // Resolve opaque training-run folders in one bounded-to-the-list
+  // lookup, including old runs beyond the training page's recent-run limit.
+  if (categoryKey === 'training-runs' && items.length) {
+    const { query } = await import('../lib/db.js');
+    const result = await query(
+      'SELECT data FROM lora_training_runs WHERE id = ANY($1::text[])',
+      [items.filter(item => item.type === 'directory').map(item => item.name)],
+    ).catch(() => null);
+    const runs = new Map((result?.rows || []).map(({ data }) => [data.id, data]));
+    for (const item of items) {
+      const run = runs.get(item.name);
+      if (run) {
+        item.label = run.name || run.character?.name || run.baseModelId || item.name;
+        item.description = [run.baseModelId, run.status].filter(Boolean).join(' · ');
+        if (run.datasetId) item.sourceHref = `/models/training/${encodeURIComponent(run.datasetId)}`;
+      }
+      item.sourceUnavailable = result === null ? 'Source lookup unavailable' : !run ? 'Run record no longer available' : null;
+    }
+  }
+  if (categoryKey === 'images' || categoryKey === 'videos') {
+    for (const item of items) {
+      if (item.type === 'file') item.sourceHref = `/data/${categoryKey}/${encodeURIComponent(item.name)}`;
+    }
+  }
+  items.sort((a, b) => b.size - a.size);
+
+  const totalSize = items.reduce((sum, item) => sum + item.size, 0);
+  const busy = await resolveCategoryBusy(categoryKey);
+
+  const measurement = measure ? {
+    ...await getDirSizeAndCount(dirPath, { strict: true }),
+    disk: await statfs(DATA_DIR).then(parseFilesystemStats).catch(() => null),
+  } : undefined;
+  return { key: categoryKey, ...categoryMeta(categoryKey), ...busy, totalSize, items, ...(measurement && { measurement }) };
+}
+
+export async function archiveCategory(categoryKey, options = {}) {
+  if (!SAFE_NAME.test(categoryKey)) throw new ServerError('Invalid category name', { status: 400, code: 'VALIDATION_ERROR' });
+  const meta = CATEGORIES[categoryKey];
+  if (!meta?.archivable) {
+    throw new ServerError(`Category "${categoryKey}" is not archivable`, { status: 403, code: 'CATEGORY_NOT_ARCHIVABLE' });
+  }
+
+  const dirPath = join(DATA_DIR, categoryKey);
+  if (!existsSync(dirPath)) {
+    throw new ServerError(`Category directory not found: ${categoryKey}`, { status: 404, code: 'NOT_FOUND' });
+  }
+
+  const backupDir = join(DATA_DIR, 'backup');
+  await ensureDir(backupDir);
+
+  // Reserve scratch before selecting inputs: even a fixed clock cannot make
+  // separate requests share their file list or partially written archive.
+  assertNotRealDataWrite(backupDir, 'archiveCategory');
+  const operationDir = await mkdtemp(join(backupDir, '.archive-'));
+  const stagedArchive = join(operationDir, 'archive.tar.gz');
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const archiveName = `${categoryKey}-${timestamp}-${randomUUID()}.tar.gz`;
+  const archivePath = join(backupDir, archiveName);
+
+  try {
+    const capturedDays = [];
+    let queueDayWrite;
+    if (categoryKey === 'health') {
+      const daysToKeep = options.daysToKeep ?? 365;
+      const cutoff = new Date();
+      cutoff.setDate(cutoff.getDate() - daysToKeep);
+      const cutoffStr = cutoff.toISOString().slice(0, 10);
+
+      const files = await readdir(dirPath);
+      const oldFiles = files.filter(f => /^\d{4}-\d{2}-\d{2}\.json$/.test(f) && f.slice(0, 10) < cutoffStr);
+      if (oldFiles.length === 0) return { archived: 0, removed: 0, retained: 0, alreadyAbsent: 0, archivePath: null, message: 'No old files to archive' };
+
+      // Share the importers' queue for capture and removal, but release it
+      // during tar so a large archive does not block a historical backfill.
+      ({ queueDayWrite } = await import('./appleHealthIngest.js'));
+      const stagedDays = join(operationDir, 'days');
+      await ensureDir(stagedDays);
+      for (const file of oldFiles) {
+        await queueDayWrite(file.slice(0, 10), async () => {
+          const bytes = await readFile(join(dirPath, file));
+          await writeFileGuarded(join(stagedDays, file), bytes, { flag: 'wx' });
+          capturedDays.push({ file, hash: sha256Text(bytes) });
+        });
+      }
+      const listPath = join(operationDir, 'files.txt');
+      await writeFileGuarded(listPath, oldFiles.join('\n'));
+      await execFileAsync('tar', ['-czf', stagedArchive, '-C', stagedDays, '-T', listPath], { timeout: 120000 });
+    } else {
+      await execFileAsync('tar', ['-czf', stagedArchive, '-C', DATA_DIR, categoryKey], { timeout: 120000 });
+    }
+
+    // A hard link publishes complete bytes atomically and refuses an existing
+    // destination. Sync bytes first, then the published directory entry before
+    // deleting health sources. Both paths live on the same filesystem.
+    // Windows requires write access for FlushFileBuffers; r+ preserves existing bytes.
+    const archiveFile = await open(stagedArchive, 'r+');
+    try { await archiveFile.sync(); } finally { await archiveFile.close(); }
+    await link(stagedArchive, archivePath);
+    // Node does not expose directory fsync on Windows.
+    if (process.platform !== 'win32') {
+      const directory = await open(backupDir, 'r');
+      try { await directory.sync(); } finally { await directory.close(); }
+    }
+    const archiveStat = await stat(archivePath);
+
+    let removed = 0;
+    let retained = 0;
+    let alreadyAbsent = 0;
+    for (const { file, hash } of capturedDays) {
+      await queueDayWrite(file.slice(0, 10), async () => {
+        const livePath = join(dirPath, file);
+        const bytes = await readFile(livePath).catch(error => {
+          // Another archive may already have removed this exact day.
+          if (error.code === 'ENOENT') return null;
+          throw error;
+        });
+        if (bytes === null) {
+          alreadyAbsent++;
+        } else if (sha256Text(bytes) !== hash) {
+          retained++;
+        } else {
+          await rmGuarded(livePath);
+          removed++;
+        }
+      });
+    }
+    return categoryKey === 'health'
+      ? { archived: capturedDays.length, removed, retained, alreadyAbsent, archivePath: relative(process.cwd(), archivePath), size: archiveStat.size }
+      : { archived: 0, archivePath: relative(process.cwd(), archivePath), archiveSize: archiveStat.size };
+  } finally {
+    await rmGuarded(operationDir, { recursive: true, force: true });
+  }
+}
+
+export async function purgeCategory(categoryKey, options = {}) {
+  // A purge may retain external record references by explicit operator choice,
+  // but its deletions must never interleave with a snapshot's copy and dump.
+  return withBackupAssetPublication(async () => {
+    if (!SAFE_NAME.test(categoryKey)) throw new ServerError('Invalid category name', { status: 400, code: 'VALIDATION_ERROR' });
+    const meta = CATEGORIES[categoryKey];
+    if (!meta?.deletable) {
+      throw new ServerError(`Category "${categoryKey}" is not purgeable`, { status: 403, code: 'CATEGORY_NOT_PURGEABLE' });
+    }
+    // "Caller asked for one entry" is keyed on the option being PRESENT, not on
+    // it being truthy: `{ subPath: '' }` is a caller that meant to name something
+    // and produced nothing, and must 400 — not fall through to the branch that
+    // empties the whole directory (#3327).
+    const wantsItem = options.subPath !== undefined && options.subPath !== null;
+    if (wantsItem && !isTopLevelEntryName(options.subPath)) {
+      // Refusing separators outright means no traversal segment can form and, more
+      // importantly, no *intermediate* component can be a symlink for `rm` to
+      // follow out of the category — the lexical containment check below never
+      // touches the filesystem, so it cannot see that.
+      throw new ServerError('subPath must name a single entry in the category', { status: 400, code: 'VALIDATION_ERROR' });
+    }
+    // Item-scoped categories only ever lose one entry at a time. Written as
+    // "must be exactly 'category'" so an absent or misspelled scope refuses the
+    // wipe instead of inheriting the old all-or-nothing behavior (#3327).
+    if (!wantsItem && meta.purgeScope !== 'category') {
+      throw new ServerError(
+        `Category "${categoryKey}" only supports per-item purge — pass a subPath`,
+        { status: 400, code: 'CATEGORY_ITEM_PURGE_ONLY' }
+      );
+    }
+
+    const dirPath = join(DATA_DIR, categoryKey);
+    if (!existsSync(dirPath)) {
+      throw new ServerError(`Category directory not found: ${categoryKey}`, { status: 404, code: 'NOT_FOUND' });
+    }
+
+    // A named directory can still contain a live job's working state. Apply
+    // the same fail-closed busy probe to both deletion scopes.
+    const { busy, busyReason } = await resolveCategoryBusy(categoryKey);
+    if (busy) throw new ServerError(busyReason, { status: 409, code: 'CATEGORY_BUSY' });
+
+    if (wantsItem) {
+      const resolvedRoot = resolve(dirPath);
+      const resolvedTarget = resolve(join(dirPath, options.subPath));
+      // Boundary-aware containment check: use path.relative so a prefix like
+      // `/data/cat` cannot satisfy containment for `/data/cat2`.
+      const rel = relative(resolvedRoot, resolvedTarget);
+      if (!rel || rel.startsWith('..') || isAbsolute(rel)) {
+        throw new ServerError('Invalid subPath', { status: 400, code: 'VALIDATION_ERROR' });
+      }
+      // Item-scoped categories are flat directories of assets; their only
+      // subdirectories are working state for other features (`data/videos/.detached`
+      // holds the control files of in-flight renders). A one-click recursive
+      // delete next to those on a cleanup page is a foot-gun, so an item purge
+      // removes a single file and never recurses. `lstat`, not `stat`, so a
+      // symlinked entry is judged as the link it is and simply unlinked.
+      const itemScoped = meta.purgeScope === 'items';
+      if (itemScoped) {
+        const entryStat = await lstat(resolvedTarget).catch(() => null);
+        if (!entryStat) {
+          throw new ServerError(`Item not found in "${categoryKey}"`, { status: 404, code: 'NOT_FOUND' });
+        }
+        if (entryStat.isDirectory()) {
+          throw new ServerError(
+            `"${options.subPath}" is a directory — per-item purge in "${categoryKey}" only removes files`,
+            { status: 400, code: 'ITEM_PURGE_FILE_ONLY' }
+          );
+        }
+      }
+      await rmGuarded(resolvedTarget, { recursive: !itemScoped, force: true });
+      console.log(`🗑️ Purged item from data/${categoryKey}`);
+    } else {
+      const entries = await readdir(dirPath).catch(() => []);
+      const removals = await Promise.allSettled(entries.map(entry => rmGuarded(join(dirPath, entry), { recursive: true, force: true })));
+      const failed = removals.find(result => result.status === 'rejected');
+      if (failed) throw failed.reason;
+      console.log(`🗑️ Purged all ${entries.length} entries from data/${categoryKey}`);
+    }
+
+    return { category: categoryKey, subPath: wantsItem ? options.subPath : null };
+  });
+}
+
+export async function getBackups() {
+  const backupDir = join(DATA_DIR, 'backup');
+  if (!existsSync(backupDir)) return [];
+
+  const entries = await readdir(backupDir, { withFileTypes: true }).catch(() => []);
+  const files = entries.filter(e => e.isFile());
+
+  const backups = await Promise.all(files.map(async (entry) => {
+    const fileStat = await stat(join(backupDir, entry.name)).catch(() => null);
+    return {
+      name: entry.name,
+      size: fileStat?.size || 0,
+      created: fileStat?.birthtime?.toISOString() || fileStat?.mtime?.toISOString() || null
+    };
+  }));
+
+  backups.sort((a, b) => (b.created || '').localeCompare(a.created || ''));
+  return backups;
+}
+
+// Backup archives are named like `agents-2026-06-30T12-34-56.tar.gz`, so the raw
+// filename legitimately contains dots. Validate the dotted value directly — the
+// old `filename.replace(/[.]/g,'')` double-pass never checked the real filename,
+// leaving only the startsWith(backupDir) guard against traversal (issue #1822).
+// The regex forbids `/` and `\`, so no traversal segment can form; the only
+// regex-passing names that resolve dangerously are the bare `.`/`..` (e.g.
+// join(backupDir,'.') === backupDir), so reject those explicitly.
+const SAFE_FILENAME = /^[a-z0-9._-]+$/i;
+
+export async function deleteBackup(filename) {
+  if (!SAFE_FILENAME.test(filename) || filename === '.' || filename === '..') {
+    throw new ServerError('Invalid filename', { status: 400, code: 'INVALID_FILENAME' });
+  }
+  const backupDir = join(DATA_DIR, 'backup');
+  const fullPath = join(backupDir, filename);
+  if (!fullPath.startsWith(backupDir)) {
+    throw new ServerError('Path traversal not allowed', { status: 400, code: 'VALIDATION_ERROR' });
+  }
+  await rmGuarded(fullPath);
+  return { deleted: filename };
+}

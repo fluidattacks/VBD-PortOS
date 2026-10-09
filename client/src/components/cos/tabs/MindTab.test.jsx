@@ -1,0 +1,980 @@
+import { act } from 'react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { createEvent, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { MemoryRouter } from 'react-router';
+import { awaitEnabled, findEnabledByLabelText, findEnabledByRole } from '../../../test/enabledBarrier.js';
+
+const api = vi.hoisted(() => ({
+  getPersistentMind: vi.fn(),
+  sendPersistentMindMessage: vi.fn(),
+  uploadPersistentMindAttachment: vi.fn(),
+  deletePersistentMindAttachment: vi.fn(),
+  addPersistentMindAnnotation: vi.fn(),
+  wakePersistentMind: vi.fn(),
+  startPersistentMind: vi.fn(),
+  pausePersistentMind: vi.fn(),
+  resumePersistentMind: vi.fn(),
+  stopPersistentMind: vi.fn(),
+  acknowledgePersistentMindEvent: vi.fn(),
+  promotePersistentMindEvent: vi.fn(),
+  getProviders: vi.fn(),
+  updateCosConfig: vi.fn(),
+  getPersistentMindContext: vi.fn(),
+  getPersistentMindMaintainer: vi.fn().mockResolvedValue({
+    role: { schemaVersion: 1, enabled: false, appIds: [], intervalMinutes: 60 },
+    apps: [], availableApps: [], prerequisites: [], instructions: '',
+  }),
+  getPersistentMindTools: vi.fn(),
+  getMindRecipes: vi.fn().mockResolvedValue({ recipes: [] }),
+  getPersistentMindRuntime: vi.fn(),
+  getPersistentMindVisibility: vi.fn(),
+  createPersistentMindMemory: vi.fn(),
+  updatePersistentMindMemory: vi.fn(),
+  cleanupPersistentMind: vi.fn(),
+}));
+
+const socket = vi.hoisted(() => {
+  const handlers = new Map();
+  return {
+    on: vi.fn((event, handler) => handlers.set(event, handler)),
+    off: vi.fn((event) => handlers.delete(event)),
+    emit: vi.fn(),
+    emitServer: (event, data) => handlers.get(event)?.(data),
+    reset: () => handlers.clear(),
+  };
+});
+const localLlm = vi.hoisted(() => ({
+  getLocalLlmStatus: vi.fn(),
+  getToolUseModels: vi.fn(),
+}));
+
+vi.mock('../../../services/api', () => api);
+vi.mock('../../../services/apiLocalLlm', () => localLlm);
+vi.mock('../../../hooks/useSocket', () => ({ useSocket: () => socket }));
+
+import MindTab from './MindTab';
+
+const event = (overrides = {}) => ({
+  eventId: 'mind-message:message-1',
+  kind: 'mind.message.accepted',
+  mindId: 'cos-persistent-mind',
+  turnId: null,
+  sequence: 1,
+  at: '2026-08-26T12:00:00.000Z',
+  data: { displayText: 'Review the next bounded slice.' },
+  ...overrides,
+});
+
+const response = (overrides = {}) => ({
+  events: [event()],
+  cursor: '1:mind-message:message-1',
+  gap: false,
+  hasMore: false,
+  truncated: false,
+  snapshot: {},
+  state: { enabled: true, started: true, status: 'waiting', pauseReason: null },
+  profile: { enabled: true, providerId: 'demo', model: 'demo-model', effort: 'high', thinkingInterface: 'text', wakeIntervalMinutes: 30 },
+  capabilities: { schemaVersion: 3, createTasks: false, manageMind: false, readPortos: false, writePortos: false },
+  autonomyMode: 'execute',
+  ...overrides,
+});
+
+const renderTab = (path = '/cos/mind') => render(
+  <MemoryRouter initialEntries={[path]}>
+    <MindTab />
+  </MemoryRouter>
+);
+
+describe('MindTab', () => {
+  it('retains an in-flight visibility invalidation but drops queued reads after unmount', async () => {
+    let resolveVisibility;
+    api.getPersistentMindVisibility.mockReturnValueOnce(new Promise(resolve => { resolveVisibility = resolve; }));
+    const view = renderTab();
+    await screen.findByText('Review the next bounded slice.');
+    act(() => socket.emitServer('cos:mind:visibility', {}));
+    expect(api.getPersistentMindVisibility).toHaveBeenCalledTimes(1);
+    await act(async () => resolveVisibility({ readiness: 'ready' }));
+    expect(api.getPersistentMindVisibility).toHaveBeenCalledTimes(2);
+
+    let resolveHistory;
+    api.getPersistentMind.mockReturnValueOnce(new Promise(resolve => { resolveHistory = resolve; }));
+    act(() => socket.emitServer('cos:mind:event', {}));
+    act(() => socket.emitServer('cos:mind:status', {}));
+    const before = api.getPersistentMind.mock.calls.length;
+    view.unmount();
+    await act(async () => resolveHistory(response({ hasMore: true })));
+    expect(api.getPersistentMind).toHaveBeenCalledTimes(before);
+  });
+
+  it('reconciles Mind consumers from events and reshow without recurring API reads', async () => {
+    const view = renderTab();
+    await screen.findByText('Review the next bounded slice.');
+    vi.useFakeTimers();
+    const reads = [api.getPersistentMind, api.getPersistentMindRuntime, api.getPersistentMindVisibility];
+    const counts = () => reads.map(read => read.mock.calls.length);
+    try {
+      const initial = counts();
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+      expect(counts()).toEqual(initial);
+      for (const name of ['cos:mind:event', 'cos:mind:status', 'connect']) {
+        const before = counts();
+        await act(async () => socket.emitServer(name, {}));
+        expect(counts()).toEqual(before.map(count => count + 1));
+      }
+      const before = counts();
+      await act(async () => socket.emitServer('cos:mind:visibility', {}));
+      expect(counts()).toEqual([before[0], before[1], before[2] + 1]);
+      const hidden = counts();
+      Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
+      await act(async () => document.dispatchEvent(new Event('visibilitychange')));
+      await act(async () => socket.emitServer('cos:mind:event', {}));
+      expect(counts()).toEqual(hidden);
+      Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
+      await act(async () => document.dispatchEvent(new Event('visibilitychange')));
+      expect(counts()).toEqual(hidden.map(count => count + 1));
+      await act(async () => document.dispatchEvent(new Event('visibilitychange')));
+      expect(counts()).toEqual(hidden.map(count => count + 1));
+      view.unmount();
+      await act(async () => {
+        socket.emitServer('connect');
+        socket.emitServer('cos:mind:event', {});
+        socket.emitServer('cos:mind:visibility', {});
+        await vi.advanceTimersByTimeAsync(60_000);
+      });
+      expect(counts()).toEqual(hidden.map(count => count + 1));
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
+    }
+  });
+
+  it('shows a prominent chosen identity and refreshes a rename from the trajectory notification', async () => {
+    api.getPersistentMind.mockResolvedValue(response({ identity: { mindId: 'cos-persistent-mind', name: 'Example Star' } }));
+    renderTab();
+    expect(await screen.findByRole('heading', { name: 'Example Star' })).toHaveAttribute('aria-live', 'polite');
+    api.getPersistentMind.mockResolvedValue(response({ identity: { mindId: 'cos-persistent-mind', name: 'Étoile' } }));
+    act(() => socket.emitServer('cos:mind:event', { kind: 'mind.capability.result' }));
+    expect(await screen.findByRole('heading', { name: 'Étoile' })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Example Star' })).not.toBeInTheDocument();
+  });
+
+  it('shows the unnamed state without confusing the provider model with identity', async () => {
+    renderTab();
+    expect(await screen.findByRole('heading', { name: 'Name not yet chosen' })).toBeInTheDocument();
+    expect(screen.getByText(/Free to change later/)).toBeInTheDocument();
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    socket.reset();
+    api.getPersistentMind.mockResolvedValue(response());
+    api.sendPersistentMindMessage.mockResolvedValue({ success: true, duplicate: false });
+    api.uploadPersistentMindAttachment.mockResolvedValue({
+      attachmentId: 'attachment-1', filename: 'mind-attachment-1.png', path: '/api/screenshots/mind-attachment-1.png', originalName: 'diagram.png', mimeType: 'image/png', size: 4,
+    });
+    api.deletePersistentMindAttachment.mockResolvedValue({ success: true });
+    api.addPersistentMindAnnotation.mockResolvedValue({ success: true, duplicate: false });
+    api.startPersistentMind.mockResolvedValue({ success: true });
+    api.pausePersistentMind.mockResolvedValue({ success: true });
+    api.resumePersistentMind.mockResolvedValue({ success: true });
+    api.stopPersistentMind.mockResolvedValue({ success: true });
+    api.acknowledgePersistentMindEvent.mockResolvedValue({ success: true });
+    api.promotePersistentMindEvent.mockResolvedValue({ success: true });
+    api.getProviders.mockResolvedValue({
+      activeProvider: 'codex',
+      providers: [{
+        id: 'codex',
+        name: 'Codex',
+        enabled: true,
+        type: 'cli',
+        command: 'codex',
+        defaultModel: 'gpt-5',
+        models: ['gpt-5', 'gpt-5-mini'],
+      }],
+    });
+    api.updateCosConfig.mockResolvedValue({ success: true });
+    localLlm.getLocalLlmStatus.mockResolvedValue({ ollama: { models: [] }, lmstudio: { models: [] } });
+    localLlm.getToolUseModels.mockResolvedValue({ models: [] });
+    api.getPersistentMindContext.mockResolvedValue({
+      prompt: { schemaVersion: 1, identity: 'Resident mind', instructions: 'Stay grounded.' },
+      preview: { text: '# Effective context', chars: 19, approximateTokens: 5, summaryState: 'empty' },
+      memories: [],
+      rollups: [],
+      harness: { type: 'api', label: 'Direct API', recommendation: 'recommended', detail: 'Structured and reliable.' },
+    });
+    api.getPersistentMindTools.mockResolvedValue({
+      capabilities: { schemaVersion: 3, createTasks: false, manageMind: false, readPortos: false, writePortos: false },
+      tools: [{
+        id: 'cos.create-task',
+        name: 'Create CoS task',
+        description: 'Queue a supervised coding task.',
+        capability: 'createTasks',
+        granted: false,
+        guardrails: ['Code review then merge', 'Merge when CI is green', 'Leave open for human review'],
+      }],
+      boundaries: ['Shell access'],
+      taskCatalog: null,
+    });
+    api.getPersistentMindRuntime.mockResolvedValue({
+      observedAt: '2026-08-27T12:00:00.000Z',
+      inference: {
+        active: false,
+        providerId: 'demo',
+        model: 'demo-model',
+        residency: { status: 'provider-managed', backend: null, loaded: null, memoryBytes: null },
+      },
+      context: { chars: 19, maxChars: 32000, approximateTokens: 5, summaryState: 'empty', memoryCount: 0 },
+      system: {
+        memory: { total: 8 * 1024 ** 3, used: 4 * 1024 ** 3, free: 4 * 1024 ** 3, usagePercent: 50 },
+        process: { rss: 256 * 1024 ** 2, heapUsed: 64 * 1024 ** 2, heapTotal: 128 * 1024 ** 2 },
+        cpu: { cores: 8, loadAvg1m: 1.25 },
+      },
+    });
+    api.getPersistentMindVisibility.mockResolvedValue({
+      schemaVersion: 1,
+      capturedAt: '2026-08-27T12:00:00.000Z',
+      freshness: { state: 'fresh', ageMs: 0, ttlMs: 30_000 },
+      readiness: 'ready',
+      truncated: false,
+      workspaces: [{ appId: 'demo-app', appName: 'Demo App', readiness: 'ready', preflight: {
+        workspaces: [{ dependencies: { status: 'installed' }, engines: { node: { status: 'compatible' }, packageManager: null } }],
+        submodules: { status: 'not-configured' },
+        forge: { status: 'ready' },
+        reviewers: { required: { status: 'ready' } },
+        warnings: [],
+      } }],
+    });
+    api.createPersistentMindMemory.mockResolvedValue({ success: true });
+    api.updatePersistentMindMemory.mockResolvedValue({ success: true });
+    api.cleanupPersistentMind.mockResolvedValue({
+      success: true,
+      memoriesArchived: 0,
+      historyEventsCleared: 5,
+      historyEventsPreserved: 0,
+      rollupsCleared: 2,
+      runtimeResidueCleared: true,
+      state: { enabled: true, started: false, status: 'idle', pauseReason: null },
+    });
+  });
+
+  it('offers an immediate wake and displays failures', async () => {
+    api.wakePersistentMind.mockRejectedValue(new Error('Wake unavailable'));
+    renderTab();
+    const button = await findEnabledByRole('button', { name: 'Wake now' });
+    fireEvent.click(button);
+    await screen.findByText('Wake unavailable');
+    expect(api.wakePersistentMind).toHaveBeenCalledWith({ silent: true });
+  });
+
+  it('restores event details from the URL and keeps the chat composer single-purpose', async () => {
+    renderTab('/cos/mind?event=mind-message%3Amessage-1');
+
+    expect(await screen.findByRole('button', { name: /user input/i })).toHaveAttribute('aria-current', 'true');
+    expect(screen.getByTestId('mind-chat')).toHaveClass('flex');
+    expect(screen.getByRole('dialog', { name: 'User input' })).toBeInTheDocument();
+    expect(screen.queryByLabelText('Input type')).not.toBeInTheDocument();
+    expect(within(screen.getByTestId('mind-chat')).getByLabelText('Message')).toBeInTheDocument();
+  });
+
+  it('keeps a stale event link open with a clear unavailable detail', async () => {
+    renderTab('/cos/mind?event=mind-message%3Aexpired');
+
+    await screen.findByText('Review the next bounded slice.');
+    const details = screen.getByRole('dialog', { name: 'Event details' });
+    expect(within(details).getByText('This event is no longer available in the retained conversation history.')).toBeInTheDocument();
+    expect(within(details).queryByRole('button', { name: 'Promote to memory' })).not.toBeInTheDocument();
+  });
+
+  it('fills remaining desktop height and auto-grows the composer', async () => {
+    renderTab();
+    await screen.findByText('Review the next bounded slice.');
+
+    const chat = screen.getByTestId('mind-chat');
+    // Desktop fills the leftover column height; narrower viewports keep the
+    // dvh-relative box, and neither is capped by the old 54rem ceiling.
+    expect(chat.className).toContain('xl:h-full');
+    expect(chat.className).toContain('xl:min-h-0');
+    expect(chat.className).toContain('h-[68dvh]');
+    expect(chat.className).not.toMatch(/max-h-\[54rem\]/);
+
+    // AutoSizeTextarea sets the height from content, so the composer must not
+    // be a hand-resized fixed box any more.
+    const message = within(chat).getByLabelText('Message');
+    expect(message).toHaveClass('resize-none');
+    expect(message.className).not.toMatch(/resize-y/);
+  });
+
+  it('keeps annotations in message details instead of the primary composer', async () => {
+    const user = userEvent.setup();
+    renderTab('/cos/mind?event=mind-message%3Amessage-1');
+
+    await user.type(await screen.findByLabelText('Add a note'), 'Keep this linked context.');
+    await user.click(screen.getByRole('button', { name: 'Add note' }));
+
+    await waitFor(() => expect(api.addPersistentMindAnnotation).toHaveBeenCalledWith({
+      id: expect.stringMatching(/^annotation-/),
+      text: 'Keep this linked context.',
+      targetEventId: 'mind-message:message-1',
+    }, { silent: true }));
+  });
+
+  it('never renders a fetch failure as an empty conversation', async () => {
+    api.getPersistentMind.mockRejectedValue(new Error('Server unreachable'));
+    renderTab();
+
+    expect(await screen.findByText('Conversation unavailable')).toBeInTheDocument();
+    expect(screen.queryByText(/No conversation yet/)).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Settings/i })).toBeInTheDocument();
+  });
+
+  it('deduplicates a socket-triggered cursor backfill', async () => {
+    renderTab();
+    expect(await screen.findByText('Review the next bounded slice.')).toBeInTheDocument();
+
+    api.getPersistentMind.mockResolvedValue(response({ events: [event()], hasMore: false }));
+    await act(async () => { socket.emitServer('cos:mind:event', event()); });
+
+    await waitFor(() => expect(api.getPersistentMind).toHaveBeenCalledTimes(2));
+    expect(screen.getAllByText('Review the next bounded slice.')).toHaveLength(1);
+  });
+
+  it('shows an explicit reload state when reconnect backfill reports a gap', async () => {
+    api.getPersistentMind.mockResolvedValue(response({ gap: true }));
+    renderTab();
+
+    expect(await screen.findByText('History gap detected')).toBeInTheDocument();
+    expect(screen.getByText(/reloaded from the newest bounded snapshot/i)).toBeInTheDocument();
+  });
+
+  it('adopts a null server cursor after a fully pruned gap', async () => {
+    renderTab();
+    await screen.findByText('Review the next bounded slice.');
+    api.getPersistentMind.mockResolvedValueOnce(response({ events: [], cursor: null, gap: true }));
+    await act(async () => { socket.emitServer('connect'); });
+    await waitFor(() => expect(api.getPersistentMind).toHaveBeenCalledTimes(2));
+
+    api.getPersistentMind.mockResolvedValueOnce(response());
+    await act(async () => { socket.emitServer('cos:mind:status'); });
+    await waitFor(() => expect(api.getPersistentMind).toHaveBeenCalledTimes(3));
+    expect(api.getPersistentMind.mock.calls[2][0].cursor).toBeNull();
+  });
+
+  it('keeps a bounded initial snapshot free of a history banner', async () => {
+    api.getPersistentMind.mockResolvedValue(response({ truncated: true }));
+    renderTab();
+    await screen.findByText('Review the next bounded slice.');
+    expect(screen.queryByText('Showing recent history')).not.toBeInTheDocument();
+  });
+
+  it('opens settings from the header and drafts a repair while showing explicit recheck progress', async () => {
+    const user = userEvent.setup();
+    const diagnostics = {
+      capturedAt: '2026-09-05T12:00:00Z', readiness: 'blocked',
+      workspaces: [{ appId: 'example-app', appName: 'Example App', readiness: 'blocked', preflight: {
+        workspaces: [{ id: 'root', dependencies: { status: 'installed' }, engines: { packageManager: { name: 'npm', required: '>=12.0.0', actual: '11.0.0', status: 'incompatible' } } }],
+        warnings: [{ code: 'workspace-engines-unavailable', check: 'engines', message: 'Engine mismatch.' }],
+      } }],
+    };
+    api.getPersistentMindVisibility.mockResolvedValue(diagnostics);
+    renderTab();
+    await user.click(await screen.findByRole('button', { name: 'Settings', exact: true }));
+    expect(await screen.findByRole('heading', { name: 'AI profile' })).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Close mind workspace' }));
+    await user.click(screen.getByRole('button', { name: 'Environment details' }));
+    expect(await screen.findByText('11.0.0')).toBeInTheDocument();
+    let finishRefresh;
+    api.getPersistentMindVisibility.mockImplementationOnce(() => new Promise((resolve) => { finishRefresh = resolve; }));
+    await user.click(screen.getByRole('button', { name: 'Recheck workspaces' }));
+    expect(screen.getByRole('button', { name: 'Checking…' })).toBeDisabled();
+    expect(api.getPersistentMindVisibility).toHaveBeenLastCalledWith({ refresh: true, silent: true });
+    await act(async () => finishRefresh(diagnostics));
+    expect(screen.getByRole('button', { name: 'Recheck workspaces' })).toBeEnabled();
+    await user.click(screen.getByRole('button', { name: 'Draft repair request' }));
+    expect(screen.getByPlaceholderText('Message Persistent Mind').value).toContain('app ID: example-app');
+    expect(api.sendPersistentMindMessage).not.toHaveBeenCalled();
+  });
+
+  it('puts the AI profile controls before start and starts only after the profile save finishes', async () => {
+    const user = userEvent.setup();
+    let finishSave;
+    api.getPersistentMind.mockResolvedValue(response({
+      state: { enabled: true, started: false, status: 'idle', pauseReason: null },
+      profile: { enabled: true, providerId: 'codex', model: 'gpt-5', effort: 'high', thinkingInterface: 'text' },
+    }));
+    api.updateCosConfig.mockImplementation(() => new Promise((resolve) => { finishSave = resolve; }));
+    renderTab('/cos/mind?panel=settings');
+
+    expect(await screen.findByRole('heading', { name: 'AI profile' })).toBeInTheDocument();
+    expect(api.getPersistentMindContext).not.toHaveBeenCalled();
+    expect(api.getPersistentMindTools).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.getByLabelText('AI provider')).toHaveValue('codex'));
+    expect(screen.getByLabelText('Model')).toHaveValue('gpt-5');
+    expect(screen.getByLabelText('Thinking effort')).toHaveValue('high');
+    const start = screen.getByRole('button', { name: 'Start persistent mind' });
+
+    await user.selectOptions(screen.getByLabelText('Model'), 'gpt-5-mini');
+    expect(start).toBeDisabled();
+    expect(api.startPersistentMind).not.toHaveBeenCalled();
+    expect(api.updateCosConfig).toHaveBeenCalledWith(
+      { persistentMindProfile: expect.objectContaining({ providerId: 'codex', model: 'gpt-5-mini', effort: 'high' }) },
+      { silent: true },
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Reload' }));
+    await waitFor(() => expect(api.getPersistentMind).toHaveBeenCalledTimes(2));
+    expect(screen.getByLabelText('Model')).toHaveValue('gpt-5-mini');
+    expect(start).toBeDisabled();
+
+    finishSave({ success: true });
+    await awaitEnabled(start);
+    await user.click(start);
+    await waitFor(() => expect(api.startPersistentMind).toHaveBeenCalledTimes(1));
+  });
+
+  it('shows the next wake and persists a discoverable wake cadence', async () => {
+    const nextWakeAt = new Date(Date.now() + 30 * 60_000).toISOString();
+    api.getPersistentMind.mockResolvedValue(response({
+      state: {
+        enabled: true,
+        started: true,
+        status: 'waiting',
+        pauseReason: null,
+        nextWakeAt,
+      },
+    }));
+    renderTab('/cos/mind?panel=settings');
+
+    expect(await screen.findByText(/Waiting · next wake in/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Configure wake cadence' })).toBeInTheDocument();
+    expect(document.querySelector(`time[datetime="${nextWakeAt}"]`)).toBeInTheDocument();
+    const cadence = screen.getByLabelText('Wake cadence');
+    expect(cadence).toHaveValue('30');
+    await findEnabledByLabelText('Wake cadence');
+
+    fireEvent.change(cadence, { target: { value: '60' } });
+
+    await waitFor(() => expect(api.updateCosConfig).toHaveBeenCalledWith(
+      { persistentMindProfile: expect.objectContaining({ wakeIntervalMinutes: 60 }) },
+      { silent: true },
+    ));
+  });
+
+  it('starts a ready persistent mind directly from the dashboard header', async () => {
+    const user = userEvent.setup();
+    api.getPersistentMind.mockResolvedValue(response({
+      state: { enabled: true, started: false, status: 'idle', pauseReason: null },
+    }));
+    renderTab();
+
+    await user.click(await screen.findByRole('button', { name: 'Start' }));
+
+    await waitFor(() => expect(api.startPersistentMind).toHaveBeenCalledTimes(1));
+    expect(screen.queryByRole('dialog', { name: 'Mind workspace' })).not.toBeInTheDocument();
+  });
+
+  it('persists the separate opt-in task-creation grant', async () => {
+    const user = userEvent.setup();
+    renderTab('/cos/mind?panel=tools');
+
+    const taskAccess = await screen.findByRole('checkbox', { name: 'Allow mind to queue CoS agent tasks' });
+    expect(taskAccess).not.toBeChecked();
+    await user.click(taskAccess);
+
+    await waitFor(() => expect(api.updateCosConfig).toHaveBeenCalledWith(
+      { persistentMindCapabilities: { schemaVersion: 12, createTasks: true, fileIssues: false, auditReports: false, manageMind: false, manageToolRecipes: false, manageEidoverse: false, visitEidoversePeers: false, promoteEidoverseFoundations: false, installEidoverseControllers: false, callUser: false, adjustLocalContext: false, readPortos: false, writePortos: false, taskModelAllowlist: [] } },
+      { silent: true },
+    ));
+    expect(screen.getAllByText(/code review then merge/i).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/merge when CI is green/i).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/leave open for human review/i).length).toBeGreaterThan(0);
+  });
+
+  it('reports every enabled typed-tool grant in the dashboard status', async () => {
+    api.getPersistentMind.mockResolvedValue(response({
+      capabilities: { schemaVersion: 3, createTasks: false, manageMind: false, readPortos: true, writePortos: true },
+    }));
+    renderTab();
+
+    expect(await screen.findByText('2 grants enabled')).toBeInTheDocument();
+  });
+
+  it('cleans selected mindspace through an inline confirmation and refreshes the stopped state', async () => {
+    const user = userEvent.setup();
+    renderTab('/cos/mind?panel=maintenance');
+
+    expect(await screen.findByRole('heading', { name: 'Clean mindspace' })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: 'Cleanup' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByLabelText('Rebuild derived context')).toBeChecked();
+    expect(screen.getByLabelText('Clear conversation history')).not.toBeChecked();
+    await user.click(screen.getByLabelText('Clear conversation history'));
+    await user.type(screen.getByLabelText('Type CLEAR to run the selected cleanup'), 'CLEAR');
+    await user.click(screen.getByRole('button', { name: 'Clean selected mindspace' }));
+
+    await waitFor(() => expect(api.cleanupPersistentMind).toHaveBeenCalledWith({
+      scopes: ['context', 'history'],
+      confirmation: 'CLEAR',
+    }, { silent: true }));
+    expect(await screen.findByText('Mindspace cleaned')).toBeInTheDocument();
+    await waitFor(() => expect(api.getPersistentMind).toHaveBeenCalledTimes(2));
+  });
+
+  it('keeps Start gated until a capability save finishes', async () => {
+    const user = userEvent.setup();
+    let finishSave;
+    api.getPersistentMind.mockResolvedValue(response({
+      state: { enabled: true, started: false, status: 'idle', pauseReason: null },
+    }));
+    api.updateCosConfig.mockImplementation(() => new Promise((resolve) => { finishSave = resolve; }));
+    renderTab('/cos/mind?panel=tools');
+
+    const start = await screen.findByRole('button', { name: 'Start' });
+    await user.click(await screen.findByRole('checkbox', { name: 'Allow bounded PortOS reads' }));
+    expect(start).toBeDisabled();
+    expect(api.startPersistentMind).not.toHaveBeenCalled();
+
+    finishSave({ success: true });
+    await awaitEnabled(start);
+  });
+
+  it('keeps a failed message for a visible idempotent retry', async () => {
+    const user = userEvent.setup();
+    api.sendPersistentMindMessage.mockRejectedValueOnce(new Error('Provider unavailable'));
+    renderTab();
+    await screen.findByText('Review the next bounded slice.');
+
+    await user.type(screen.getByLabelText('Message'), 'Keep this queued.');
+    await user.click(screen.getByRole('button', { name: 'Send message' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(/Retry uses the same id/);
+    expect(screen.getByLabelText('Message')).toHaveValue('Keep this queued.');
+
+    await user.click(screen.getByRole('button', { name: 'Retry' }));
+    await waitFor(() => expect(api.sendPersistentMindMessage).toHaveBeenCalledTimes(2));
+    const firstId = api.sendPersistentMindMessage.mock.calls[0][0].id;
+    expect(api.sendPersistentMindMessage.mock.calls[1][0].id).toBe(firstId);
+  });
+
+  it('sends on Enter while preserving a newline for Option+Enter and Shift+Enter', async () => {
+    const user = userEvent.setup();
+    renderTab();
+    await screen.findByText('Review the next bounded slice.');
+    const message = screen.getByLabelText('Message');
+
+    await user.type(message, 'First line');
+    const optionEnter = createEvent.keyDown(message, { key: 'Enter', altKey: true });
+    fireEvent(message, optionEnter);
+    expect(optionEnter.defaultPrevented).toBe(false);
+    expect(api.sendPersistentMindMessage).not.toHaveBeenCalled();
+
+    const shiftEnter = createEvent.keyDown(message, { key: 'Enter', shiftKey: true });
+    fireEvent(message, shiftEnter);
+    expect(shiftEnter.defaultPrevented).toBe(false);
+    expect(api.sendPersistentMindMessage).not.toHaveBeenCalled();
+
+    await user.clear(message);
+    await user.type(message, 'First line\nSecond line');
+    expect(message).toHaveValue('First line\nSecond line');
+    await user.keyboard('{Enter}');
+    await waitFor(() => expect(api.sendPersistentMindMessage).toHaveBeenCalledWith(
+      { id: expect.stringMatching(/^message-/), text: 'First line\nSecond line' },
+      { silent: true },
+    ));
+  });
+
+  it('uploads supported images, permits an image-only message, and deletes a removed upload', async () => {
+    const user = userEvent.setup();
+    renderTab();
+    await screen.findByText('Review the next bounded slice.');
+
+    const picker = screen.getByLabelText('Attach images');
+    await user.upload(picker, new File(['png'], 'diagram.png', { type: 'image/png' }));
+    await waitFor(() => expect(api.uploadPersistentMindAttachment).toHaveBeenCalledWith(
+      { filename: 'diagram.png', data: expect.any(String) }, { silent: true },
+    ));
+    expect(screen.getByRole('button', { name: 'Remove diagram.png' })).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Send message' }));
+    await waitFor(() => expect(api.sendPersistentMindMessage).toHaveBeenCalledWith(
+      { id: expect.stringMatching(/^message-/), text: '', images: ['attachment-1'] }, { silent: true },
+    ));
+
+    await user.upload(picker, new File(['png'], 'diagram.png', { type: 'image/png' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Remove diagram.png' })).toBeInTheDocument());
+    await user.click(screen.getByRole('button', { name: 'Remove diagram.png' }));
+    await waitFor(() => expect(api.deletePersistentMindAttachment).toHaveBeenCalledWith('attachment-1', { silent: true }));
+  });
+
+  it('renders safe accepted image metadata and disables the image picker when unsupported', async () => {
+    api.getPersistentMind.mockResolvedValue(response({
+      imageCapability: { status: 'unsupported', guidance: 'Select a vision-capable model in Settings.' },
+      events: [event({ data: {
+        displayText: 'Please inspect this.',
+        images: [{ attachmentId: 'attachment-1', path: '/api/screenshots/mind-attachment-1.png', originalName: 'diagram.png', mimeType: 'image/png', size: 4 }],
+      } })],
+    }));
+    renderTab('/cos/mind?event=mind-message%3Amessage-1');
+
+    expect((await screen.findAllByAltText('diagram.png')).length).toBeGreaterThan(0);
+    expect(screen.getByLabelText('Attach images')).toBeDisabled();
+    expect(screen.getByText(/Image attachments are unavailable/)).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Settings' })).toHaveAttribute('href', '/settings?tab=providers');
+  });
+
+  it('does not submit an IME composition commit key', async () => {
+    const user = userEvent.setup();
+    renderTab();
+    await screen.findByText('Review the next bounded slice.');
+    const message = screen.getByLabelText('Message');
+
+    await user.type(message, 'Composing text');
+    fireEvent(message, createEvent.keyDown(message, { key: 'Enter', keyCode: 229 }));
+
+    expect(api.sendPersistentMindMessage).not.toHaveBeenCalled();
+    expect(message).toHaveValue('Composing text');
+  });
+
+  it('mints a new id when failed text is edited into a different submission', async () => {
+    const user = userEvent.setup();
+    api.sendPersistentMindMessage.mockRejectedValueOnce(new Error('Connection lost'));
+    renderTab();
+    await screen.findByText('Review the next bounded slice.');
+    await user.type(screen.getByLabelText('Message'), 'Original text');
+    await user.click(screen.getByRole('button', { name: 'Send message' }));
+    await screen.findByRole('alert');
+    const firstId = api.sendPersistentMindMessage.mock.calls[0][0].id;
+
+    await user.type(screen.getByLabelText('Message'), ' updated');
+    await user.click(screen.getByRole('button', { name: 'Send message' }));
+    await waitFor(() => expect(api.sendPersistentMindMessage).toHaveBeenCalledTimes(2));
+    expect(api.sendPersistentMindMessage.mock.calls[1][0].id).not.toBe(firstId);
+  });
+
+  it('renders only redacted display fields, never hidden prompt payloads', async () => {
+    api.getPersistentMind.mockResolvedValue(response({ events: [event({
+      kind: 'mind.model.result',
+      data: { summaryText: 'A synthesized summary.', prompt: { redacted: 'content', chars: 5000 }, apiKey: 'not-rendered' },
+    })] }));
+    renderTab();
+
+    await userEvent.setup().click(await screen.findByRole('checkbox', { name: 'Activity' }));
+    expect(await screen.findByText('A synthesized summary.')).toBeInTheDocument();
+    expect(screen.queryByText(/not-rendered|5000|prompt/i)).not.toBeInTheDocument();
+  });
+
+  it('renders user-visible working notes and replies in the conversation', async () => {
+    api.getPersistentMind.mockResolvedValue(response({ events: [
+      event({ eventId: 'thought-1', kind: 'mind.thought', turnId: 'mind-turn-1', sequence: 2, data: { displayText: 'I connected this with the prior decision.' } }),
+      event({ eventId: 'reply-1', kind: 'mind.reply', turnId: 'mind-turn-1', sequence: 3, data: { displayText: 'Here is the recommendation.' } }),
+    ] }));
+    renderTab();
+    expect(await screen.findByText('I connected this with the prior decision.')).toBeInTheDocument();
+    expect(screen.getByText('Here is the recommendation.')).toBeInTheDocument();
+    expect(screen.getByText('1 thought').closest('details')).not.toHaveAttribute('open');
+    expect(screen.getAllByRole('button', { name: /chief of staff/i })).toHaveLength(1);
+  });
+
+  it('keeps the trajectory rollup recap out of the conversation until Activity is on', async () => {
+    api.getPersistentMind.mockResolvedValue(response({ events: [
+      event({ eventId: 'summary-1', kind: 'mind.summary', sequence: 2, data: { summaryText: 'Earlier I confirmed the provider switch and queued follow-up wakes.' } }),
+      event({ eventId: 'reply-1', kind: 'mind.reply', turnId: 'mind-turn-1', sequence: 3, data: { displayText: 'Here is the recommendation.' } }),
+    ] }));
+    renderTab();
+
+    expect(await screen.findByText('Here is the recommendation.')).toBeInTheDocument();
+    expect(screen.queryByText(/Earlier I confirmed the provider switch/)).not.toBeInTheDocument();
+
+    await userEvent.setup().click(screen.getByRole('checkbox', { name: 'Activity' }));
+    expect(await screen.findByText(/Earlier I confirmed the provider switch/)).toBeInTheDocument();
+  });
+
+  it('shows a typing indicator in the chat header while the mind is thinking', async () => {
+    api.getPersistentMind.mockResolvedValue(response({
+      state: { enabled: true, started: true, status: 'thinking', pauseReason: null, activeTurnId: 'mind-turn-1' },
+    }));
+    renderTab();
+
+    const typingIndicator = await screen.findByRole('status', { name: 'Chief of Staff is typing' });
+    expect(typingIndicator).toHaveAttribute('data-testid', 'mind-typing-indicator');
+    expect(typingIndicator.querySelectorAll('[aria-hidden="true"]')).toHaveLength(3);
+    expect(within(screen.getByTestId('mind-chat')).queryByText('Thinking…')).not.toBeInTheDocument();
+  });
+
+  const thinkingRuntime = (inference = {}, usageLimitRetryAt = null) => ({
+    observedAt: '2026-08-27T12:02:40.000Z',
+    usageLimitRetryAt,
+    inference: {
+      active: true,
+      turnId: 'mind-turn-1',
+      startedAt: '2026-08-27T12:00:00.000Z',
+      heartbeatAt: '2026-08-27T12:02:35.000Z',
+      elapsedMs: 160_000,
+      heartbeatAgeMs: 5_000,
+      heartbeatStale: false,
+      providerId: 'ollama',
+      model: 'demo-model',
+      residency: { status: 'loaded', backend: 'ollama', loaded: true, memoryBytes: 2 * 1024 ** 3 },
+      ...inference,
+    },
+    context: { chars: 12000, maxChars: 32000, approximateTokens: 3000, summaryState: 'ready', memoryCount: 4 },
+    system: {
+      memory: { total: 8 * 1024 ** 3, used: 4 * 1024 ** 3, free: 4 * 1024 ** 3, usagePercent: 50 },
+      process: { rss: 256 * 1024 ** 2, heapUsed: 64 * 1024 ** 2, heapTotal: 128 * 1024 ** 2 },
+      cpu: { cores: 8, loadAvg1m: 1.25 },
+    },
+  });
+
+  it('shows elapsed think time, heartbeat freshness, and the current stage while a turn runs', async () => {
+    api.getPersistentMind.mockResolvedValue(response({
+      state: { enabled: true, started: true, status: 'thinking', pauseReason: null, activeTurnId: 'mind-turn-1' },
+      events: [
+        event(),
+        { ...event({ eventId: 'mind-wake:1', kind: 'mind.wake', turnId: 'mind-turn-1', sequence: 2, data: {} }) },
+        { ...event({ eventId: 'mind-model-request:1', kind: 'mind.model.request', turnId: 'mind-turn-1', sequence: 3, data: {} }) },
+      ],
+    }));
+    api.getPersistentMindRuntime.mockResolvedValue(thinkingRuntime());
+    renderTab();
+
+    const indicator = await screen.findByTestId('mind-typing-indicator');
+    expect(indicator).toHaveTextContent('Waiting on the model · 2m 40s · heartbeat 5s ago · model loaded');
+    // The announced name is the stage alone: the durations re-render every 10s
+    // poll, and putting them in a live region re-reads the same state forever.
+    expect(indicator).toHaveAccessibleName('Chief of Staff is typing — Waiting on the model');
+    expect(await screen.findByTestId('mind-turn-progress-detail'))
+      .toHaveTextContent('2m 40s · heartbeat 5s ago · model loaded');
+  });
+
+  it('renders a stale heartbeat as a stalled state rather than the normal thinking dots', async () => {
+    api.getPersistentMind.mockResolvedValue(response({
+      state: { enabled: true, started: true, status: 'thinking', pauseReason: null, activeTurnId: 'mind-turn-1' },
+    }));
+    api.getPersistentMindRuntime.mockResolvedValue(thinkingRuntime({ heartbeatAgeMs: 190_000, heartbeatStale: true }));
+    renderTab();
+
+    const stalled = await screen.findByTestId('mind-turn-indicator');
+    expect(stalled).toHaveTextContent(/Stalled, checking…/);
+    expect(stalled).toHaveTextContent(/no heartbeat for 3m 10s/);
+    expect(screen.queryByTestId('mind-typing-indicator')).not.toBeInTheDocument();
+    expect(await screen.findByTestId('mind-thought-status')).toHaveAttribute('data-phase', 'stalled');
+  });
+
+  it('renders a quota block with its retry time inline instead of an indefinite thinking state', async () => {
+    api.getPersistentMind.mockResolvedValue(response({
+      state: {
+        enabled: true,
+        started: true,
+        status: 'paused',
+        usageLimited: true,
+        pauseReason: 'Provider usage limit reached',
+        activeTurnId: null,
+        nextEligibleWakeAt: null,
+      },
+    }));
+    api.getPersistentMindRuntime.mockResolvedValue(thinkingRuntime({
+      active: false,
+      turnId: null,
+      // +12m30s: `timeUntil` floors, so a flat 12m would race the test clock
+      // down to "11m" and flake.
+    }, new Date(Date.now() + 12 * 60_000 + 30_000).toISOString()));
+    renderTab();
+
+    const blocked = await screen.findByTestId('mind-turn-indicator');
+    expect(blocked).toHaveTextContent(/Provider usage limit reached/);
+    expect(blocked).toHaveTextContent(/retry in 12m/);
+    expect(screen.queryByTestId('mind-typing-indicator')).not.toBeInTheDocument();
+    expect(await screen.findByText(/the mind retries on its own/)).toBeInTheDocument();
+  });
+
+  it('never renders raw provider reasoning in the live progress readout', async () => {
+    api.getPersistentMind.mockResolvedValue(response({
+      state: { enabled: true, started: true, status: 'thinking', pauseReason: null, activeTurnId: 'mind-turn-1' },
+    }));
+    api.getPersistentMindRuntime.mockResolvedValue(thinkingRuntime({
+      // A payload a future runtime change might carry: the progress readout must
+      // stay a function of status enums and durations, never of model text.
+      reasoning: 'SECRET-CHAIN-OF-THOUGHT',
+      residency: { status: 'loaded', backend: 'ollama', loaded: true, memoryBytes: 2 * 1024 ** 3, note: 'SECRET-CHAIN-OF-THOUGHT' },
+    }));
+    renderTab();
+
+    await screen.findByTestId('mind-typing-indicator');
+    expect(screen.queryByText(/SECRET-CHAIN-OF-THOUGHT/)).not.toBeInTheDocument();
+  });
+
+  it('animates active thought status and shows context, system, and loaded-model telemetry', async () => {
+    const user = userEvent.setup();
+    api.getPersistentMind.mockResolvedValue(response({
+      state: { enabled: true, started: true, status: 'thinking', pauseReason: null, activeTurnId: 'mind-turn-1' },
+    }));
+    api.getPersistentMindRuntime.mockResolvedValue({
+      observedAt: '2026-08-27T12:00:00.000Z',
+      inference: {
+        active: true,
+        turnId: 'mind-turn-1',
+        providerId: 'ollama',
+        model: 'demo-model',
+        residency: { status: 'loaded', backend: 'ollama', loaded: true, memoryBytes: 2 * 1024 ** 3 },
+      },
+      context: { chars: 12000, maxChars: 32000, approximateTokens: 3000, summaryState: 'ready', memoryCount: 4 },
+      system: {
+        memory: { total: 8 * 1024 ** 3, used: 4 * 1024 ** 3, free: 4 * 1024 ** 3, usagePercent: 50 },
+        process: { rss: 256 * 1024 ** 2, heapUsed: 64 * 1024 ** 2, heapTotal: 128 * 1024 ** 2 },
+        cpu: { cores: 8, loadAvg1m: 1.25 },
+      },
+    });
+    renderTab();
+
+    const thoughtStatus = await screen.findByTestId('mind-thought-status');
+    expect(thoughtStatus).toHaveTextContent('Thinking with demo-model');
+    expect(thoughtStatus).toHaveAttribute('aria-busy', 'true');
+    expect(thoughtStatus.querySelector('.animate-pulse')).toBeInTheDocument();
+    expect(screen.getByText('~3,000 tokens')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /Context/i }));
+    expect(screen.getByText('4 GB / 8 GB')).toBeInTheDocument();
+    // The active turn no longer hides residency behind a bare "Running now" —
+    // a cold local model that has not finished loading must read differently.
+    expect(screen.getAllByText('Running now · loaded in memory').length).toBeGreaterThan(0);
+    expect(screen.getByText(/ollama · 2 GB/)).toBeInTheDocument();
+  });
+
+  it('loads the editable effective context from the URL-backed context view', async () => {
+    renderTab('/cos/mind?view=context');
+    expect(screen.getByRole('tab', { name: 'Context' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.queryByRole('tab', { name: 'Memory' })).not.toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: 'Identity and operating prompt' })).toBeInTheDocument();
+    expect(screen.getByLabelText('Identity')).toHaveValue('Resident mind');
+    expect(screen.getByText('# Effective context')).toBeInTheDocument();
+    expect(api.getPersistentMindContext).toHaveBeenCalledWith({ silent: true });
+  });
+
+  it('keeps conversation central while exposing created and accessible memories', async () => {
+    api.getPersistentMindContext.mockResolvedValue({
+      prompt: { schemaVersion: 1, identity: 'Resident mind', instructions: 'Stay grounded.' },
+      preview: { text: '# Effective context', chars: 19, approximateTokens: 5, summaryState: 'ready' },
+      memories: [{ id: 'memory-1', content: 'Prefer bounded delivery.', summary: 'Delivery preference', type: 'preference', category: 'workflow', tags: [], importance: 0.8 }],
+      rollups: [],
+      harness: null,
+    });
+    renderTab('/cos/mind?panel=memories');
+
+    expect(screen.getByTestId('mind-chat')).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: 'Memories' })).toHaveAttribute('aria-selected', 'true');
+    expect(await screen.findByRole('heading', { name: 'Curated memories' })).toBeInTheDocument();
+    expect(screen.getByText('Delivery preference')).toBeInTheDocument();
+  });
+
+  it('lets the user protect a memory and makes bulk cleanup retention explicit', async () => {
+    const user = userEvent.setup();
+    const memory = { id: 'identity', content: 'My chosen name is Aster.', summary: 'Chosen name', type: 'fact', category: 'other', tags: [], importance: 0.5, protection: 'standard' };
+    api.getPersistentMindContext.mockImplementation(async () => ({ memories: [{ ...memory }], rollups: [], preview: {} }));
+    api.updatePersistentMindMemory.mockImplementation(async (_id, updates) => { Object.assign(memory, updates); return { success: true, memory }; });
+    renderTab('/cos/mind?panel=memories');
+    await user.click(await screen.findByText('Chosen name'));
+    const editor = screen.getByText('Chosen name').closest('details');
+    await user.selectOptions(within(editor).getByLabelText('Cleanup protection'), 'core-identity');
+    await user.click(within(editor).getByRole('button', { name: 'Save memory' }));
+    await waitFor(() => expect(api.updatePersistentMindMemory).toHaveBeenCalledWith('identity', expect.objectContaining({ protection: 'core-identity' }), { silent: true }));
+    expect(await screen.findByText('Core identity · Protected')).toBeInTheDocument();
+    await user.selectOptions(within(editor).getByLabelText('Cleanup protection'), 'standard');
+    expect(screen.getByText(/Saving as Standard removes protection/)).toBeInTheDocument();
+    await user.click(screen.getByRole('tab', { name: 'Cleanup' }));
+    expect(screen.getByText('Core identity and important memories survive cleanup')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Review memory protection' })).toHaveAttribute('href', '/cos/mind?panel=memories');
+  });
+
+  it('preserves newly applied protection when saving content from an older memory snapshot', async () => {
+    const user = userEvent.setup();
+    const memory = { id: 'identity', content: 'Use the name Aster.', summary: 'Chosen name', type: 'fact', category: 'other', tags: [], importance: 0.5, protection: 'standard' };
+    api.getPersistentMindContext.mockImplementation(async () => ({ memories: [{ ...memory }], rollups: [], preview: {} }));
+    api.updatePersistentMindMemory.mockImplementation(async (_id, updates) => { Object.assign(memory, updates); return { success: true, memory: { ...memory } }; });
+    renderTab('/cos/mind?panel=memories');
+    await user.click(await screen.findByText('Chosen name'));
+    const editor = screen.getByText('Chosen name').closest('details');
+    // The mind protects the record after the editor loaded its older snapshot.
+    memory.protection = 'core-identity';
+    await user.type(within(editor).getByLabelText('Content'), ' Keep this preference.');
+    await user.click(within(editor).getByRole('button', { name: 'Save memory' }));
+    await waitFor(() => expect(api.updatePersistentMindMemory).toHaveBeenCalledTimes(1));
+    expect(api.updatePersistentMindMemory.mock.calls[0][1]).not.toHaveProperty('protection');
+    expect(memory.protection).toBe('core-identity');
+    await waitFor(() => expect(within(editor).getByLabelText('Cleanup protection')).toHaveValue('core-identity'));
+    // A deliberate removal remains available, but is not replayed by later edits.
+    await user.selectOptions(within(editor).getByLabelText('Cleanup protection'), 'standard');
+    await user.click(within(editor).getByRole('button', { name: 'Save memory' }));
+    await waitFor(() => expect(memory.protection).toBe('standard'));
+    await awaitEnabled(() => within(editor).getByRole('button', { name: 'Save memory' }));
+    memory.protection = 'important';
+    await user.click(within(editor).getByRole('button', { name: 'Save memory' }));
+    await waitFor(() => expect(api.updatePersistentMindMemory).toHaveBeenCalledTimes(3));
+    expect(api.updatePersistentMindMemory.mock.calls[2][1]).not.toHaveProperty('protection');
+    expect(memory.protection).toBe('important');
+  });
+
+  it('retains unsaved context drafts across workspace panels and ignores accidental dismissal', async () => {
+    const user = userEvent.setup();
+    renderTab('/cos/mind?panel=context');
+
+    const identity = await screen.findByLabelText('Identity');
+    await user.clear(identity);
+    await user.type(identity, 'Unsaved operating identity');
+    await user.click(screen.getByRole('tab', { name: 'Memories' }));
+    await user.click(screen.getByRole('tab', { name: 'Context' }));
+    expect(screen.getByLabelText('Identity')).toHaveValue('Unsaved operating identity');
+
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(screen.getByRole('heading', { name: 'Identity and operating prompt' })).toBeInTheDocument();
+  });
+
+  it('refreshes the effective context after a memory is created', async () => {
+    const user = userEvent.setup();
+    api.getPersistentMindContext.mockImplementation(() => Promise.resolve({
+      prompt: { schemaVersion: 1, identity: 'Resident mind', instructions: 'Stay grounded.' },
+      preview: {
+        text: api.getPersistentMindContext.mock.calls.length > 2 ? '# Context with new memory' : '# Original context',
+        chars: 24,
+        approximateTokens: 6,
+        summaryState: 'ready',
+      },
+      memories: [],
+      rollups: [],
+      harness: null,
+    }));
+    renderTab('/cos/mind?panel=memories');
+
+    await user.type(await screen.findByLabelText('Add a durable memory'), 'A newly curated fact');
+    await user.click(screen.getByRole('button', { name: 'Add memory' }));
+    await waitFor(() => expect(api.getPersistentMindContext.mock.calls.length).toBeGreaterThanOrEqual(2));
+    await user.click(screen.getByRole('tab', { name: 'Context' }));
+
+    expect(await screen.findByText('# Context with new memory')).toBeInTheDocument();
+  });
+
+  it('shows the active-call chip from a broadcast state even when this tab is not the call host, and hangs it up', async () => {
+    renderTab();
+    await screen.findByText('Review the next bounded slice.');
+    expect(screen.queryByText('On a FaceTime Audio call')).not.toBeInTheDocument();
+
+    await act(async () => {
+      socket.emitServer('voice:call:state', { state: 'listening', active: true, hostAttached: true, turns: 2 });
+    });
+    expect(await screen.findByText('On a FaceTime Audio call')).toBeInTheDocument();
+    expect(screen.getByText('2 turns so far.')).toBeInTheDocument();
+
+    await userEvent.setup().click(screen.getByRole('button', { name: /Hang up/ }));
+    expect(socket.emit).toHaveBeenCalledWith('voice:call:hangup');
+
+    await act(async () => {
+      socket.emitServer('voice:call:state', { state: 'idle', active: false, hostAttached: false, turns: 0 });
+    });
+    expect(screen.queryByText('On a FaceTime Audio call')).not.toBeInTheDocument();
+  });
+
+  it('ignores an errored call-state broadcast rather than showing a stale chip', async () => {
+    renderTab();
+    await screen.findByText('Review the next bounded slice.');
+
+    await act(async () => {
+      socket.emitServer('voice:call:state', { error: 'host-taken', active: false, hostAttached: false, state: 'idle' });
+    });
+    expect(screen.queryByText('On a FaceTime Audio call')).not.toBeInTheDocument();
+  });
+});

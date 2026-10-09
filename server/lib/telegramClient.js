@@ -1,0 +1,147 @@
+/**
+ * Telegram Bot Client
+ * fetch-based polling loop replacing node-telegram-bot-api
+ */
+
+import { EventEmitter } from 'events';
+import { readResponseJson } from './readResponseJson.js';
+import { sleep } from './fileCore.js';
+
+const BASE_URL = 'https://api.telegram.org/bot';
+const POLL_TIMEOUT_SEC = 30;
+const API_TIMEOUT_MS = 10_000; // regular calls: sendMessage, editMessageText, etc.
+const POLL_CLIENT_TIMEOUT_MS = (POLL_TIMEOUT_SEC + 15) * 1000; // client-side deadline for long-poll requests
+const RETRY_DELAY_API_ERROR_MS = 5_000;
+const RETRY_DELAY_NETWORK_ERROR_MS = 2_000;
+
+function buildUrl(token, method) {
+  return `${BASE_URL}${token}/${method}`;
+}
+
+async function apiCall(token, method, body = {}) {
+  // Telegram JSON API expects reply_markup as an object, not a pre-serialized string
+  const payload = { ...body };
+  if (typeof payload.reply_markup === 'string') {
+    payload.reply_markup = JSON.parse(payload.reply_markup);
+  }
+
+  const res = await fetch(buildUrl(token, method), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(API_TIMEOUT_MS)
+  });
+  const json = await readResponseJson(res);
+  if (!json.ok) throw new Error(json.description || `Telegram API error: ${method}`);
+  return json.result;
+}
+
+/**
+ * Create a Telegram bot client.
+ * @param {string} token - Bot token from BotFather
+ * @param {{ polling?: boolean }} opts
+ */
+export function createTelegramBot(token, opts = {}) {
+  const emitter = new EventEmitter();
+  const textHandlers = []; // { regex, fn }
+  let offset = 0;
+  let polling = false;
+  let activePollController = null;
+
+  // EventEmitter/onText handlers may be async and reject. The emitter does not
+  // await listeners, so a rejected promise would surface as an unhandled
+  // rejection (process-killing on Node ≥15). Route every handler invocation
+  // through this wrapper so a throwing handler logs instead of crashing.
+  function runHandler(label, fn, args) {
+    Promise.resolve()
+      .then(() => fn(...args))
+      .catch(err => console.error(`❌ Telegram ${label} handler error: ${err?.message || String(err)}`));
+  }
+
+  async function pollLoop() {
+    while (polling) {
+      activePollController = new AbortController();
+      let updates;
+      try {
+        const res = await fetch(buildUrl(token, 'getUpdates'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ offset, timeout: POLL_TIMEOUT_SEC, allowed_updates: ['message', 'callback_query'] }),
+          signal: AbortSignal.any([activePollController.signal, AbortSignal.timeout(POLL_CLIENT_TIMEOUT_MS)])
+        });
+        const json = await readResponseJson(res);
+        if (!json.ok) {
+          // Retry after a delay on API errors
+          await sleep(RETRY_DELAY_API_ERROR_MS);
+          continue;
+        }
+        updates = json.result;
+      } catch (err) {
+        // Aborted (stopPolling called) or network/parse error
+        if (!polling) break;
+        if (err?.name !== 'AbortError') {
+          console.warn(`⚠️ Telegram poll error, retrying: ${err?.message || String(err)}`);
+        }
+        await sleep(RETRY_DELAY_NETWORK_ERROR_MS);
+        continue;
+      }
+
+      for (const update of updates) {
+        offset = update.update_id + 1;
+        if (update.message) {
+          const msg = update.message;
+          if (msg.text) {
+            for (const { regex, fn } of textHandlers) {
+              const match = msg.text.match(regex);
+              if (match) runHandler(`onText(${regex})`, fn, [msg, match]);
+            }
+          }
+          emitter.emit('message', msg);
+        }
+        if (update.callback_query) {
+          emitter.emit('callback_query', update.callback_query);
+        }
+      }
+    }
+  }
+
+  function startPolling() {
+    if (!polling) return;
+    pollLoop().catch(err => {
+      console.error(`❌ Telegram poll loop fatal: ${err?.message || String(err)}`);
+      if (polling) setTimeout(startPolling, 5000);
+    });
+  }
+
+  if (opts.polling) {
+    polling = true;
+    startPolling();
+  }
+
+  return {
+    getMe() {
+      return apiCall(token, 'getMe');
+    },
+    sendMessage(chatId, text, extra = {}) {
+      return apiCall(token, 'sendMessage', { chat_id: chatId, text, ...extra });
+    },
+    answerCallbackQuery(callbackQueryId, extra = {}) {
+      return apiCall(token, 'answerCallbackQuery', { callback_query_id: callbackQueryId, ...extra });
+    },
+    editMessageText(text, extra = {}) {
+      return apiCall(token, 'editMessageText', { text, ...extra });
+    },
+    onText(regex, fn) {
+      textHandlers.push({ regex, fn });
+    },
+    on(event, fn) {
+      // Wrap so an async listener that rejects can't leak an unhandled rejection.
+      emitter.on(event, (...args) => runHandler(event, fn, args));
+    },
+    async stopPolling() {
+      polling = false;
+      activePollController?.abort();
+      activePollController = null;
+    }
+  };
+}

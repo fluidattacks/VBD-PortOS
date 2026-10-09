@@ -1,0 +1,269 @@
+/**
+ * The server-owned namespaces have a hole that only shows up on an
+ * EXTENSIONLESS path.
+ *
+ * The SPA fallback in `server/index.js` skips a request when its path carries a
+ * file extension (`/\.\w+$/`), which worked only because every asset happened to
+ * carry one. `/data/image-to-3d/<id>/model` — no extension, no matching mount —
+ * fell through to the stamped index.html with a 200, so a binary loader parsed
+ * HTML and died on a JSON syntax error naming a `<` token, nowhere near the
+ * cause. A mistyped `/api/…` had the same hole, handing an API client HTML with
+ * a success status. The terminators close both, and this pins every half: they
+ * fire, the client's own `/data` page still reaches the SPA fallback, and real
+ * assets are still served.
+ */
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
+import express from 'express';
+import { mkdirSync, rmSync, writeFileSync } from 'fs';
+import { join } from 'path';
+import sharp from 'sharp';
+import { request } from '../lib/testHelper.js';
+import { createTempDataRoot, makePathsProxy } from '../lib/mockPathsDataRoot.js';
+
+// Re-roots every `PATHS` member under a temp tree, so the mounts resolve there
+// instead of at the running install's `data/` — including `wrWorksDir()`, which
+// derives from `PATHS.data`. This is why every `dir` in the table is a thunk:
+// it has to read `PATHS` after this mock applies, not at import.
+const tempRoot = createTempDataRoot('portos-asset-mounts-');
+vi.mock('../lib/fileUtils.js', async (importOriginal) => (
+  makePathsProxy(await importOriginal(), { dataRoot: tempRoot })
+));
+afterAll(() => {
+  sharp.cache({ files: 0 });
+  rmSync(tempRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+});
+
+// Dynamic, not a static import: the `vi.mock` factory above closes over
+// `tempRoot`, and a static import would be hoisted above that binding.
+const { ASSET_DIR_ROUTES, ASSET_MOUNTS, mountAssetRoutes, mountClientDist } = await import('./assetMounts.js');
+
+// Stand-in for the SPA fallback `server/index.js` installs after the asset
+// mounts — same extension guard, so the test exercises the real interaction
+// between the terminators and the fallback rather than a terminator alone.
+const spaFallback = (req, res, next) => {
+  if (req.path.match(/\.\w+$/) && !req.path.endsWith('.html')) return next();
+  res.type('html').send('<!DOCTYPE html><html><body>PortOS</body></html>');
+};
+
+let app;
+
+beforeAll(async () => {
+  // Real files under real mounts, so "the asset mounts still work" is proved by
+  // bytes coming back rather than by the absence of a 404.
+  mkdirSync(join(tempRoot, 'images'), { recursive: true });
+  writeFileSync(join(tempRoot, 'images', 'probe.png'), 'PNGBYTES');
+  writeFileSync(join(tempRoot, 'images', 'tile.png'), await sharp({
+    create: { width: 1024, height: 1024, channels: 3, background: '#123456' },
+  }).png().toBuffer());
+  const voiceProfiles = join(tempRoot, 'voice-profiles', 'voice-profile-1', 'benchmarks', 'v1');
+  mkdirSync(voiceProfiles, { recursive: true });
+  writeFileSync(join(voiceProfiles, '01-identity.wav'), 'WAVBYTES');
+  const drafts = join(tempRoot, 'writers-room', 'works', 'wr-work-1');
+  mkdirSync(join(drafts, 'drafts'), { recursive: true });
+  writeFileSync(join(drafts, 'drafts', 'd1.md'), '# body');
+  writeFileSync(join(drafts, 'manifest.json'), '{"private":true}');
+  for (const kind of ['characters', 'places', 'objects']) writeFileSync(join(drafts, `${kind}.json`), JSON.stringify({ [kind]: [] }));
+  mkdirSync(join(drafts, 'analysis'), { recursive: true });
+  writeFileSync(join(drafts, 'analysis', 'evaluate.json'), '{"private":true}');
+
+  app = express();
+  mountAssetRoutes(app);
+  app.use(spaFallback);
+});
+
+describe('the server-owned namespace terminators', () => {
+  it('never serves the private API key store even when the file exists', async () => {
+    mkdirSync(join(tempRoot, 'private'), { recursive: true });
+    writeFileSync(join(tempRoot, 'private/api-keys.json'), '{"example":"example-secret"}');
+    const res = await request(app).get('/data/private/api-keys.json');
+    expect(res.status).toBe(404);
+    expect(res.text).not.toContain('example-secret');
+  });
+
+  it('404s an extensionless /data path instead of answering with the SPA index', async () => {
+    const res = await request(app).get('/data/image-to-3d/abc123/model');
+    expect(res.status).toBe(404);
+    expect(res.body).toMatchObject({ error: 'Not found', code: 'NOT_FOUND' });
+    expect(res.text).not.toContain('<!DOCTYPE');
+  });
+
+  it('404s an extensioned /data path that no mount serves', async () => {
+    const res = await request(app).get('/data/image-to-3d/abc123/model.glb');
+    expect(res.status).toBe(404);
+    expect(res.body).toMatchObject({ code: 'NOT_FOUND' });
+  });
+
+  // Same hole, worse symptom: a client asking for JSON got HTML and a 200.
+  it('404s a mistyped API path instead of answering with the SPA index', async () => {
+    for (const path of ['/api/does-not-exist', '/sdapi/v1/nope']) {
+      const res = await request(app).get(path);
+      expect(res.status).toBe(404);
+      expect(res.body).toMatchObject({ code: 'NOT_FOUND' });
+    }
+  });
+
+  it('still hands the client its own /data page', async () => {
+    for (const path of ['/data', '/data/']) {
+      const res = await request(app).get(path);
+      expect(res.status).toBe(200);
+      expect(res.text).toContain('PortOS');
+    }
+  });
+
+  it('leaves a sibling route whose name merely starts with "data" alone', async () => {
+    // `app.use('/data', …)` matches on segment boundaries. `/datadog` is the
+    // probe that observes that — `/devtools/datadog` never reaches the
+    // terminator under any implementation, so it would prove nothing.
+    const res = await request(app).get('/datadog');
+    expect(res.status).toBe(200);
+    expect(res.text).toContain('PortOS');
+  });
+
+  // `spaPaths` entries are route PATTERNS, not literals — the drift guard tells
+  // people to add a client route there when it fails, and the router convention
+  // produces parameterized ones. A literal compare would 404 every concrete
+  // path while the declaration sat in the list looking correct.
+  it('lets a parameterized spaPaths entry through to the SPA', async () => {
+    const patterned = express();
+    mountAssetRoutes(patterned, [{ prefix: '/data', spaPaths: ['/data', '/data/:category'] }]);
+    patterned.use(spaFallback);
+
+    const page = await request(patterned).get('/data/images');
+    expect(page.status).toBe(200);
+    expect(page.text).toContain('PortOS');
+
+    // ...and only one segment deep, exactly as the pattern says.
+    const tooDeep = await request(patterned).get('/data/images/nested/thing');
+    expect(tooDeep.status).toBe(404);
+  });
+
+  it('still serves an asset from a mount', async () => {
+    const res = await request(app).get('/data/images/probe.png');
+    expect(res.status).toBe(200);
+    expect(res.text).toBe('PNGBYTES');
+  });
+
+  it('generates a cached thumbnail only for a flat image source', async () => {
+    const res = await request(app).get('/data/image-thumbnails/tile.webp');
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toContain('image/webp');
+    expect(res.headers['cache-control']).toContain('max-age=86400');
+    expect(res.headers.etag).toBeTruthy();
+    expect(await sharp(join(tempRoot, 'image-thumbnails/tile.webp')).metadata())
+      .toMatchObject({ format: 'webp', width: 512, height: 512 });
+    for (const path of ['missing.webp', 'tile.png', 'nested/tile.webp', '..%2Ftile.webp']) {
+      expect((await request(app).get(`/data/image-thumbnails/${path}`)).status).toBe(404);
+    }
+  });
+
+  it('sandboxes directly opened peer asset files on every media mount', async () => {
+    for (const dir of ['images', 'image-refs', 'videos', 'music', 'audio']) {
+      mkdirSync(join(tempRoot, dir), { recursive: true });
+      writeFileSync(join(tempRoot, dir, 'peer.html'), '<script>window.exploited = true</script>');
+      const res = await request(app).get(`/data/${dir}/peer.html`);
+      expect(res.status, dir).toBe(200);
+      expect(res.headers['x-content-type-options'], dir).toBe('nosniff');
+      expect(res.headers['content-security-policy'], dir).toContain('sandbox');
+      expect(res.headers['content-security-policy'], dir).toContain("default-src 'none'");
+    }
+  });
+
+  it('serves a local voice-profile benchmark from its dedicated mount', async () => {
+    const res = await request(app).get('/data/voice-profiles/voice-profile-1/benchmarks/v1/01-identity.wav');
+    expect(res.status).toBe(200);
+    expect(res.text).toBe('WAVBYTES');
+  });
+});
+
+describe('the writers-room draft-body gate', () => {
+  it('serves a draft body but not the metadata beside it', async () => {
+    const body = await request(app).get('/data/writers-room/works/wr-work-1/drafts/d1.md');
+    expect(body.status).toBe(200);
+    expect(body.text).toBe('# body');
+
+    // The gate is what keeps the static root from also serving adjacent
+    // work-metadata JSON to any client that knows a work id.
+    const manifest = await request(app).get('/data/writers-room/works/wr-work-1/manifest.json');
+    expect(manifest.status).toBe(404);
+    expect(manifest.text).not.toContain('private');
+    for (const kind of ['characters', 'places', 'objects']) {
+      const bible = await request(app).get(`/data/writers-room/works/wr-work-1/${kind}.json`);
+      expect(bible.status).toBe(200);
+      expect(bible.body).toEqual({ [kind]: [] });
+    }
+    const analysis = await request(app).get('/data/writers-room/works/wr-work-1/analysis/evaluate.json');
+    expect(analysis.status).toBe(404);
+    expect(analysis.text).not.toContain('private');
+  });
+});
+
+describe('ASSET_MOUNTS', () => {
+  it('anchors every route under a namespace the terminators close', () => {
+    // A mount added outside `/data/` would keep the pre-#4688 behaviour: an
+    // extensionless path under it answered with the SPA index and a 200.
+    expect(ASSET_MOUNTS.length).toBeGreaterThan(5);
+    expect(ASSET_MOUNTS.filter(({ route }) => !route.startsWith('/data/'))).toEqual([]);
+  });
+
+  it('mounts every route it knows a directory for', () => {
+    // The mount list is built by walking `ASSET_ROUTE_PREFIXES`, so a directory
+    // added to `ASSET_DIRS` alone is never mounted and nothing else notices —
+    // the asset just 404s. (The reverse fails loudly: a prefix with no dir
+    // throws at boot.)
+    expect([...ASSET_DIR_ROUTES].sort()).toEqual([...ASSET_MOUNTS.map((m) => m.route)].sort());
+    expect(ASSET_MOUNTS.every(({ dir }) => typeof dir === 'function')).toBe(true);
+  });
+});
+
+// The built client is served in two cache tiers. Vite content-hashes everything
+// under `dist/assets/`, so a URL there can never change bytes and is safe to
+// mark immutable — serve-static's default `max-age=0` had the browser re-send
+// every one of the dashboard's 186 chunks as a conditional GET on each warm
+// load (no service worker registers over plain HTTP, the default posture).
+// Everything else in `dist/` is `client/public/` copied under a STABLE name and
+// must keep revalidating, `sw.js` above all: a worker script pinned for a year
+// would keep a stale caching strategy in every browser that had it.
+describe('the built client mount', () => {
+  const dist = join(tempRoot, 'client-dist');
+  let clientApp;
+
+  beforeAll(() => {
+    mkdirSync(join(dist, 'assets'), { recursive: true });
+    writeFileSync(join(dist, 'assets', 'index-B5J1S4I5.js'), 'CHUNKBYTES');
+    writeFileSync(join(dist, 'sw.js'), 'WORKERBYTES');
+    writeFileSync(join(dist, 'manifest.json'), '{"name":"PortOS"}');
+    writeFileSync(join(dist, 'index.html'), '<!DOCTYPE html><html><body>RAW</body></html>');
+    clientApp = express();
+    mountClientDist(clientApp, dist);
+    clientApp.use(spaFallback);
+  });
+
+  it('serves a hashed chunk as immutable for a year', async () => {
+    const res = await request(clientApp).get('/assets/index-B5J1S4I5.js');
+    expect(res.status).toBe(200);
+    expect(res.text).toBe('CHUNKBYTES');
+    expect(res.headers['cache-control']).toBe('public, max-age=31536000, immutable');
+  });
+
+  it('keeps the service worker and the other stable-named files revalidating per load', async () => {
+    for (const path of ['/sw.js', '/manifest.json']) {
+      const res = await request(clientApp).get(path);
+      expect(res.status, path).toBe(200);
+      expect(res.headers['cache-control'], path).toBe('public, max-age=0');
+      expect(res.headers.etag, path).toBeTruthy();
+    }
+  });
+
+  it('lets / through to the SPA fallback instead of the raw index.html', async () => {
+    const res = await request(clientApp).get('/');
+    expect(res.text).toContain('PortOS');
+    expect(res.text).not.toContain('RAW');
+    expect(res.headers['cache-control']).toBeUndefined();
+  });
+
+  it('404s a chunk the current build no longer ships instead of answering with the SPA index', async () => {
+    const res = await request(clientApp).get('/assets/index-STALEHASH.js');
+    expect(res.status).toBe(404);
+    expect(res.text).not.toContain('PortOS');
+  });
+});

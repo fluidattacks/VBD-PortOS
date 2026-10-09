@@ -1,0 +1,1634 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import express from 'express';
+import { request } from '../../lib/testHelper.js';
+import { errorMiddleware } from '../../lib/errorHandler.js';
+import { enqueueJob } from '../../services/mediaJobQueue/index.js';
+import { mockNoPeers, mockTestIdentity, mockNoPeerSync } from '../../lib/mockPathsDataRoot.js';
+import * as canonSvc from '../../services/universeCanon.js';
+
+const fileStore = new Map();
+
+// Gallery resolver: any filename containing "missing" resolves to null (the
+// not-found path); everything else resolves to a deterministic absolute path.
+const resolveGalleryImageMock = vi.fn((filename) => (
+  typeof filename === 'string' && !filename.includes('missing') ? `/mock/data/images/${filename}` : null
+));
+vi.mock('../../lib/fileUtils.js', () => ({
+sleep: vi.fn().mockResolvedValue(undefined),
+tryReadFile: vi.fn().mockResolvedValue(null),
+  PATHS: { data: '/mock/data', screenshots: '/mock/data/screenshots', images: '/mock/data/images' },
+  ensureDir: vi.fn().mockResolvedValue(undefined),
+  atomicWrite: vi.fn(async (path, data) => { fileStore.set(path, data); }),
+  readJSONFile: vi.fn(async (path, fallback) => (fileStore.has(path) ? fileStore.get(path) : fallback)),
+  // collectionStore reads the type index strictly (#7261) — the in-memory
+  // store always yields a trustworthy read, so ok is unconditionally true.
+  readJSONFileStrict: vi.fn(async (path, fallback) => ({ ok: true, value: fileStore.has(path) ? fileStore.get(path) : fallback })),
+  unreadableStoreError: (filePath) => Object.assign(new Error(`Unreadable JSON file: ${filePath}`), { status: 500, code: 'UNREADABLE_STORE' }),
+  // sanitizeFilename: strip path components so a traversal attempt diverges
+  // from the input (the route 400s when safe !== input).
+  sanitizeFilename: vi.fn((f) => String(f).replace(/^.*[\\/]/, '').replace(/\.\./g, '')),
+  resolveGalleryImage: (...args) => resolveGalleryImageMock(...args),
+}));
+
+// existsSync gates uploaded-screenshot preflight: any name containing "absent"
+// is treated as missing; everything else exists.
+vi.mock('fs', async (importActual) => {
+  const actual = await importActual();
+  return { ...actual, existsSync: vi.fn((p) => !String(p).includes('absent')) };
+});
+
+// Stub the vision/refine services so the route tests exercise the image-source
+// resolution + schema glue, not a real LLM. Real constants pass through.
+const describeEntityFromImagesMock = vi.fn(async () => ({ description: 'mock prose', llm: { provider: 'mock', model: null } }));
+const correctEntityFromImageMock = vi.fn(async () => ({
+  descField: 'physicalDescription', currentDescription: 'old', proposedDescription: 'corrected', llm: { provider: 'mock', model: null },
+}));
+vi.mock('../../services/universeVisionDescribe.js', async () => {
+  const actual = await vi.importActual('../../services/universeVisionDescribe.js');
+  return {
+    ...actual,
+    describeEntityFromImages: (...args) => describeEntityFromImagesMock(...args),
+    correctEntityFromImage: (...args) => correctEntityFromImageMock(...args),
+  };
+});
+const applyCanonImageCorrectionMock = vi.fn(async (_universeId, kind, entryId, body) => ({
+  universe: { id: _universeId },
+  entry: { id: entryId, [kind === 'character' ? 'physicalDescription' : 'description']: body.description, primaryImageRef: body.imageFilename },
+}));
+const removeCanonEntryMock = vi.fn(async (universeId, kind, entryId) => ({
+  universe: { id: universeId, characters: [], places: [], objects: [] },
+  entry: { id: entryId, name: 'Alex', imageRefs: ['alex.png'], ingredientId: 'ing-alex' },
+}));
+vi.mock('../../services/universeCanon.js', async () => {
+  const actual = await vi.importActual('../../services/universeCanon.js');
+  return {
+    ...actual,
+    applyCanonImageCorrection: (...args) => applyCanonImageCorrectionMock(...args),
+    removeCanonEntry: (...args) => removeCanonEntryMock(...args),
+  };
+});
+const expandEntityFromImagesMock = vi.fn(async () => ({ fields: { pronouns: 'she/her' }, updatedFields: ['pronouns'], llm: { provider: 'mock', model: null } }));
+vi.mock('../../services/universeVisionExpand.js', async () => {
+  const actual = await vi.importActual('../../services/universeVisionExpand.js');
+  return { ...actual, expandEntityFromImages: (...args) => expandEntityFromImagesMock(...args) };
+});
+const refineWorldPromptsMock = vi.fn(async (args) => ({
+  starterPrompt: 'refined', logline: '', premise: '', styleNotes: '',
+  influences: { embrace: [], avoid: [] }, locked: {}, rationale: 'r', changes: [],
+  providerId: 'mock', model: null, _imagePath: args?.imagePath ?? null,
+}));
+vi.mock('../../services/universeBuilderRefine.js', () => ({
+  refineWorldPrompts: (...args) => refineWorldPromptsMock(...args),
+}));
+const analyzeUniverseStyleReferenceMock = vi.fn(async (args) => ({
+  reference: {
+    id: 'style-ref-test',
+    title: args.title || 'Analyzed style',
+    prompt: args.prompt || 'Analyzed recreation prompt',
+    imageRefs: [args.imageFilename],
+    createdAt: '2026-01-01T00:00:00.000Z',
+  },
+  proposed: { styleNotes: 'proposed', influences: { embrace: ['ink'], avoid: ['gloss'] } },
+  diff: { hasChanges: true },
+  rationale: 'mock rationale',
+  llm: { provider: 'mock', model: null },
+}));
+vi.mock('../../services/universeStyleReference.js', () => ({
+  analyzeUniverseStyleReference: (...args) => analyzeUniverseStyleReferenceMock(...args),
+}));
+
+// Both mocks needed: vitest.setup.js's global `instances.js` mock uses importOriginal, which leaves the per-file `peerSync.js` mock unable to suppress the createUniverse dynamic-import hoist error alone.
+vi.mock('../../services/instances.js', () => mockNoPeers());
+// Deterministic identity (#6836) — also keeps the real instanceIdentity.js
+// module (whose dataPath() call this file's exhaustive fileUtils mock can't
+// serve) from ever loading in this suite's route graph.
+vi.mock('../../services/instanceIdentity.js', () => mockTestIdentity());
+vi.mock('../../services/sharing/peerSync.js', () => mockNoPeerSync());
+
+let uuidCounter = 0;
+vi.mock('crypto', async () => {
+  const actual = await vi.importActual('crypto');
+  return { ...actual, randomUUID: () => `uuid-${++uuidCounter}` };
+});
+
+// Stub the LLM promote service so route tests don't shell out to a provider.
+// Default mock just echoes back a minimal canon entry shape so the route
+// returns 200 and the schema/validation paths get exercised end-to-end.
+const promoteVariationToCanonMock = vi.fn(async (_universeId, body = {}) => ({
+  universe: { id: _universeId, characters: [], places: [], objects: [] },
+  entry: { id: 'mock-entry', name: body.label },
+  targetKind: body.targetKind || 'characters',
+  removed: { category: body.category, label: body.label },
+  runId: 'mock-run',
+  llm: { provider: 'mock', model: null },
+}));
+vi.mock('../../services/universeBuilderPromote.js', async () => {
+  // Pass the real VALID_TARGET_KINDS through so the route's Zod enum
+  // can't drift from the source-of-truth list (derived from BIBLE_FIELD).
+  const actual = await vi.importActual('../../services/universeBuilderPromote.js');
+  return {
+    ...actual,
+    promoteVariationToCanon: (...args) => promoteVariationToCanonMock(...args),
+  };
+});
+
+// Stub the auto-sort service — same shape as promote, just returns a mock
+// classification batch so the route's Zod schema + error mapping are
+// exercised without shelling out to a real LLM.
+const autoSortOtherBucketsMock = vi.fn(async (universeId, body = {}) => ({
+  universe: { id: universeId, categories: {} },
+  results: [{ sourceKey: 'colonies', kind: 'places', suggestedKey: null }],
+  llm: { provider: 'mock', model: body.model || null },
+  runId: 'mock-autosort-run',
+}));
+vi.mock('../../services/universeBuilderAutoSort.js', () => ({
+  autoSortOtherBuckets: (...args) => autoSortOtherBucketsMock(...args),
+}));
+
+// Stub the character-expand LLM call.
+const expandUniverseCharacterMock = vi.fn(async (universeId, entryId) => ({
+  universe: { id: universeId, characters: [{ id: entryId, name: 'Vale', motivations: 'survive' }] },
+  entry: { id: entryId, name: 'Vale', motivations: 'survive' },
+  updatedFields: ['motivations'],
+  rationale: 'mock rationale',
+  runId: 'mock-expand-run',
+  providerId: 'mock', model: 'mock',
+}));
+vi.mock('../../services/universeCharacterExpand.js', () => ({
+  expandUniverseCharacter: (...args) => expandUniverseCharacterMock(...args),
+}));
+
+// Stub the reference-sheet renderer + sibling exports — only the route
+// contract is verified here; the actual prompt builder + delete plumbing are
+// exercised in universeCharacterSheet.test.js / universeCharacterSheetDelete.test.js.
+const renderCharacterReferenceSheetMock = vi.fn();
+const deleteCharacterReferenceSheetMock = vi.fn();
+const listSheetVariantsMock = vi.fn();
+const getCharacterReferenceSheetMock = vi.fn();
+vi.mock('../../services/universeCharacterSheet.js', () => ({
+  renderCharacterReferenceSheet: (...args) => renderCharacterReferenceSheetMock(...args),
+  deleteCharacterReferenceSheet: (...args) => deleteCharacterReferenceSheetMock(...args),
+  listSheetVariants: (...args) => listSheetVariantsMock(...args),
+  getCharacterReferenceSheet: (...args) => getCharacterReferenceSheetMock(...args),
+}));
+
+// Stub the LLM expander so the route test doesn't shell out to a real provider.
+vi.mock('../../services/universeBuilderExpand.js', () => ({
+  expandWorldTemplate: vi.fn(async ({ starterPrompt }) => ({
+    influences: {
+      embrace: [`mocked style for ${starterPrompt}`],
+      avoid: ['blurry'],
+    },
+    categories: {
+      landscapes: { variations: [{ label: 'Mock Land', prompt: 'mocked landscape' }] },
+      environments: { variations: [] },
+      characters: { variations: [{ label: 'Mock Char', prompt: 'mocked character' }] },
+      structures: { variations: [] },
+      vehicles: { variations: [] },
+    },
+    compositeSheets: [
+      { kind: 'reference_sheet', label: 'Mock costume sheet', prompt: 'mocked complete costume reference sheet with lineup, materials, fasteners, palette' },
+      { kind: 'world_pitch_poster', label: 'Mock universe pitch poster', prompt: 'mocked universe summary concept pitch poster with hero panorama, inset cultures, palette, materials, and theme icons' },
+    ],
+    llm: { provider: 'anthropic', model: 'claude' },
+  })),
+}));
+
+// Skip provisioning real settings — we only exercise CRUD + expand here.
+vi.mock('../../services/settings.js', () => ({
+  getSettings: vi.fn(async () => ({ imageGen: { mode: 'local', local: { pythonPath: '/usr/bin/python3' } } })),
+  saveSettings: vi.fn(),
+}));
+
+vi.mock('../../services/mediaJobQueue/index.js', async () => ({
+  assertMediaQueueRoom: vi.fn(),
+  partialBatchAdmissionError: (await import('../../services/mediaJobQueue/admission.js')).partialBatchAdmissionError,
+  enqueueJob: vi.fn(async ({ params }) => ({ jobId: `job-${++uuidCounter}`, position: 1, status: 'queued', params })),
+}));
+
+// Tiny in-memory store so repeat-render tests can verify the new
+// find-or-create semantics (existing name → same collection id).
+const collectionsByName = new Map();
+const mockCreateRec = (name) => {
+  const id = `col-${collectionsByName.size + 1}`;
+  const rec = { id, name, items: [] };
+  collectionsByName.set(name.toLowerCase(), rec);
+  return rec;
+};
+// Mirrors the production helper's universeId-first resolution so repeat-
+// render tests verify the new contract (same `universeId` → same collection
+// id) rather than the old name-only contract.
+const collectionsByUniverseId = new Map();
+const upsertUniverseRec = ({ universeId, universeName }) => {
+  if (collectionsByUniverseId.has(universeId)) return collectionsByUniverseId.get(universeId);
+  const name = `Universe: ${universeName || ''}`.slice(0, 80);
+  const rec = mockCreateRec(name);
+  rec.universeId = universeId;
+  collectionsByUniverseId.set(universeId, rec);
+  return rec;
+};
+vi.mock('../../services/mediaCollections.js', () => ({
+  createCollection: vi.fn(async ({ name }) => mockCreateRec(name)),
+  findOrCreateCollectionByName: vi.fn(async ({ name }) => {
+    return collectionsByName.get(name.toLowerCase()) ?? mockCreateRec(name);
+  }),
+  findOrCreateUniverseCollection: vi.fn(async ({ universeId, universeName }) =>
+    upsertUniverseRec({ universeId, universeName })),
+  addItem: vi.fn(),
+  // Universe rename → collection rename cascade calls this from updateUniverse.
+  // No-op here is fine: the routes test cares about the universe PATCH itself,
+  // not the bookkeeping side-effect (covered in mediaCollections.test.js).
+  renameCollectionForUniverse: vi.fn(async () => null),
+  // Universe delete → unlink linked collections so the orphaned bucket
+  // becomes a normal user-owned collection. No-op stub mirrors the rename
+  // cascade pattern above (behavior is covered in mediaCollections.test.js).
+  unlinkCollectionsForUniverse: vi.fn(async () => []),
+  universeCollectionNameFor: (name) => `Universe: ${name || ''}`.slice(0, 80),
+  // Read by duplicateDetection (linked-collection item counts) + recordMerge.
+  listCollections: vi.fn(async () => []),
+  findCollectionByUniverseId: vi.fn(async () => null),
+  bulkUpdateCollectionItems: vi.fn(async () => ({})),
+  deleteCollection: vi.fn(async () => ({})),
+  ERR_DUPLICATE: 'DUPLICATE',
+  NAME_MAX_LENGTH: 80,
+}));
+
+vi.mock('../../lib/mediaModels.js', () => ({
+  getImageModels: () => [{ id: 'dev', label: 'mflux dev' }],
+  isFlux2: () => false,
+  isZImage: () => false,
+  isErnie: () => false,
+  isEditOnly: () => false,
+}));
+
+// Controllable listSeries for DELETE /:id → 409 UNIVERSE_HAS_LIVE_SERIES test.
+// universeBuilder.deleteUniverse() calls listSeries() to guard against live series.
+const listSeriesMock = vi.fn(async () => []);
+vi.mock('../../services/pipeline/series.js', async () => {
+  const actual = await vi.importActual('../../services/pipeline/series.js');
+  return { ...actual, listSeries: (...args) => listSeriesMock(...args) };
+});
+
+// Controllable mergeFieldsWithAI for ai-resolve error contract tests.
+const mergeFieldsWithAIMock = vi.fn();
+vi.mock('../../services/recordMergeAI.js', async () => {
+  const actual = await vi.importActual('../../services/recordMergeAI.js');
+  return { ...actual, mergeFieldsWithAI: (...args) => mergeFieldsWithAIMock(...args) };
+});
+
+const universeBuilderRoutes = (await import('./index.js')).default;
+
+const buildApp = () => {
+  const app = express();
+  // Mirror production's 55mb body limit (see server/index.js) so payload-size
+  // tests exercise the Zod `.max()` boundary instead of bumping into the
+  // 100kb default body-parser limit.
+  app.use(express.json({ limit: '55mb' }));
+  app.use('/api/universe-builder', universeBuilderRoutes);
+  app.use(errorMiddleware);
+  return app;
+};
+
+describe('universe-builder routes', () => {
+  beforeEach(() => {
+    fileStore.clear();
+    uuidCounter = 0;
+    collectionsByName.clear();
+    collectionsByUniverseId.clear();
+    listSeriesMock.mockReset();
+    listSeriesMock.mockResolvedValue([]);
+    mergeFieldsWithAIMock.mockReset();
+  });
+
+
+  it('serves names and summaries before the id route while keeping the full list', async () => {
+    const app = buildApp();
+    const created = await request(app).post('/api/universe-builder').send({
+      name: 'Projected', logline: 'A world', premise: 'A large bible',
+      styleImageRefs: ['first.png', 'latest.png'],
+      characters: [{ id: 'c-one', name: 'Ada' }],
+    });
+    expect(created.status).toBe(201);
+    const names = await request(app).get('/api/universe-builder/names');
+    expect(names.status).toBe(200);
+    expect(names.body).toEqual([{ id: created.body.id, name: 'Projected' }]);
+    const summaries = await request(app).get('/api/universe-builder/summaries');
+    expect(summaries.status).toBe(200);
+    expect(summaries.body[0]).toMatchObject({ canonCount: 1, styleImageRef: 'latest.png', logline: 'A world' });
+    expect(summaries.body[0]).not.toHaveProperty('characters');
+    expect(summaries.body[0]).not.toHaveProperty('premise');
+    const full = await request(app).get('/api/universe-builder');
+    expect(full.body[0]).toMatchObject({ premise: 'A large bible', characters: [{ name: 'Ada' }] });
+  });
+
+  it('GET / returns []', async () => {
+    const res = await request(buildApp()).get('/api/universe-builder');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([]);
+  });
+
+  it('GET / returns a bounded envelope when pagination is requested', async () => {
+    const app = buildApp();
+    for (const name of ['Alpha', 'Beta', 'Gamma']) {
+      await request(app).post('/api/universe-builder').send({ name });
+    }
+    const res = await request(app).get('/api/universe-builder?limit=2&offset=1');
+    expect(res.status).toBe(200);
+    expect(res.body.items).toHaveLength(2);
+    expect(res.body.total).toBe(3);
+    expect(res.body.limit).toBe(2);
+    expect(res.body.offset).toBe(1);
+  });
+
+  it('GET /:id for a missing universe 404s without spamming console.error', async () => {
+    // LoraDatasetDetail speculatively fetches a dataset's character.universeId
+    // ({ silent: true }); that 404s whenever the universe was deleted. The route
+    // tags it severity:'warning' so the error middleware skips the log line.
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const res = await request(buildApp()).get('/api/universe-builder/does-not-exist');
+    expect(res.status).toBe(404);
+    expect(res.body.code).toBe('NOT_FOUND');
+    expect(errSpy).not.toHaveBeenCalled();
+    errSpy.mockRestore();
+  });
+
+  it('GET /:id/export/markdown returns a Markdown attachment and 404s when missing', async () => {
+    const app = buildApp();
+    const created = await request(app)
+      .post('/api/universe-builder')
+      .send({
+        name: 'The Bright World',
+        logline: 'A world beneath two suns.',
+        characters: [{ name: 'Mira', physicalDescription: 'A patient cartographer.' }],
+      });
+    expect(created.status).toBe(201);
+
+    const exported = await request(app)
+      .get(`/api/universe-builder/${created.body.id}/export/markdown`);
+    expect(exported.status).toBe(200);
+    expect(exported.headers['content-type']).toMatch(/^text\/markdown; charset=utf-8/);
+    expect(exported.headers['content-disposition']).toBe('attachment; filename="the-bright-world.md"');
+    expect(exported.text).toContain('# The Bright World');
+    expect(exported.text).toContain('### Mira');
+    expect(exported.text).not.toMatch(/\{"id"/);
+
+    const missing = await request(app)
+      .get('/api/universe-builder/does-not-exist/export/markdown');
+    expect(missing.status).toBe(404);
+    expect(missing.body.code).toBe('NOT_FOUND');
+  });
+
+  it('POST /:id/import/markdown replaces represented sections and preserves local entry metadata', async () => {
+    const app = buildApp();
+    const created = await request(app)
+      .post('/api/universe-builder')
+      .send({
+        name: 'Original Markdown World',
+        characters: [
+          { name: 'Mira', role: 'Scout', notes: 'Local note to preserve.' },
+          { name: 'Removed Character', role: 'Old role' },
+        ],
+        places: [{ name: 'The Archive', slugline: 'INT. THE ARCHIVE - DAY', description: 'Old location detail.' }],
+        categories: {
+          landscapes: {
+            kind: 'places',
+            variations: [{ label: 'Copper Flats', prompt: 'shimmering ground', imageRefs: ['local-ref.png'], locked: false }],
+          },
+          vehicles: { kind: 'objects', variations: [{ label: 'Old Skiff', prompt: 'a small boat' }] },
+        },
+        influences: { embrace: ['warm light'], avoid: ['plastic'] },
+      });
+    expect(created.status).toBe(201);
+    const miraId = created.body.characters.find((entry) => entry.name === 'Mira').id;
+    const archiveId = created.body.places[0].id;
+    const variationId = created.body.categories.landscapes.variations[0].id;
+
+    const imported = await request(app)
+      .post(`/api/universe-builder/${created.body.id}/import/markdown`)
+      .send({ markdown: [
+        '# Imported Markdown World',
+        '',
+        '**Premise:** A new map changes the coast.',
+        '',
+        '## Characters',
+        '',
+        '### Mira',
+        '',
+        '**Role:** Guide',
+        '',
+        '### Rin',
+        '',
+        '**Role:** Navigator',
+        '',
+        '## Places',
+        '',
+        '### The Archive',
+        '',
+        '**Description:** A living tower of maps.',
+        '',
+        '## Categories',
+        '',
+        '### landscapes',
+        '**Kind:** places',
+        '- **Copper Flats** — salt plains beneath a red sunrise',
+        '',
+        '## Influences',
+        '',
+        '- Embrace: copper',
+      ].join('\n') });
+
+    expect(imported.status).toBe(200);
+    expect(imported.body.name).toBe('Imported Markdown World');
+    expect(imported.body.premise).toBe('A new map changes the coast.');
+    expect(imported.body.characters.map((entry) => entry.name)).toEqual(['Mira', 'Rin']);
+    expect(imported.body.characters[0]).toMatchObject({
+      id: miraId,
+      role: 'Guide',
+      notes: 'Local note to preserve.',
+    });
+    expect(imported.body.places[0]).toMatchObject({
+      id: archiveId,
+      name: 'The Archive',
+      slugline: 'INT. THE ARCHIVE - DAY',
+      description: 'A living tower of maps.',
+    });
+    expect(imported.body.categories.landscapes.variations[0]).toMatchObject({
+      id: variationId,
+      label: 'Copper Flats',
+      prompt: 'salt plains beneath a red sunrise',
+      imageRefs: ['local-ref.png'],
+      locked: false,
+    });
+    expect(imported.body.categories.vehicles.variations).toEqual([]);
+    expect(imported.body.influences).toEqual({ embrace: ['copper'], avoid: [] });
+  });
+
+  it('POST /:id/import/markdown rejects a document without a universe title', async () => {
+    const app = buildApp();
+    const created = await request(app)
+      .post('/api/universe-builder')
+      .send({ name: 'Markdown Validation Target' });
+    const response = await request(app)
+      .post(`/api/universe-builder/${created.body.id}/import/markdown`)
+      .send({ markdown: '## Characters\n\n### Mira' });
+
+    expect(response.status).toBe(400);
+    expect(response.body.code).toBe('VALIDATION_ERROR');
+  });
+
+  it('POST / creates a universe', async () => {
+    const res = await request(buildApp())
+      .post('/api/universe-builder')
+      .send({ name: 'My Universe', starterPrompt: 'cyber forest' });
+    expect(res.status).toBe(201);
+    expect(res.body.id).toBe('uuid-1');
+    expect(res.body.name).toBe('My Universe');
+    // Default categories populated, each tagged with its canon trunk via
+    // WORLD_CATEGORY_DEFAULT_KINDS. `characters` was retired in schema v4
+    // (canon owns characters now).
+    expect(Object.keys(res.body.categories).sort()).toEqual(
+      ['environments', 'landscapes', 'structures', 'vehicles'],
+    );
+    expect(res.body.categories.landscapes.kind).toBe('places');
+    expect(res.body.categories.vehicles.kind).toBe('objects');
+  });
+
+  it('POST / accepts and persists a `kind` on each category', async () => {
+    const res = await request(buildApp())
+      .post('/api/universe-builder')
+      .send({
+        name: 'Kinded',
+        categories: {
+          factions: { kind: 'characters', variations: [{ label: 'Iron Reach', prompt: 'x' }] },
+          colonies: { kind: 'places', variations: [{ label: 'Tycho', prompt: 'y' }] },
+        },
+      });
+    expect(res.status).toBe(201);
+    expect(res.body.categories.factions.kind).toBe('characters');
+    expect(res.body.categories.colonies.kind).toBe('places');
+  });
+
+  it('POST / rejects an invalid `kind` enum value via Zod', async () => {
+    const res = await request(buildApp())
+      .post('/api/universe-builder')
+      .send({
+        name: 'Bad Kind',
+        categories: {
+          colonies: { kind: 'not-a-kind', variations: [] },
+        },
+      });
+    expect(res.status).toBe(400);
+  });
+
+  it('POST / folds a stale `characters` bucket into canon characters[] and drops the bucket', async () => {
+    const res = await request(buildApp())
+      .post('/api/universe-builder')
+      .send({
+        name: 'Stale Client',
+        categories: {
+          // Mimic an outdated client still sending the retired bucket.
+          characters: { variations: [{ label: 'Ash', prompt: 'young survivor' }] },
+        },
+      });
+    expect(res.status).toBe(201);
+    expect(res.body.categories.characters).toBeUndefined();
+    const ash = res.body.characters.find((c) => c.name === 'Ash');
+    expect(ash).toBeDefined();
+    expect(ash.prompt).toBe('young survivor');
+  });
+
+  it('POST / accepts dynamic universe-building categories', async () => {
+    const res = await request(buildApp())
+      .post('/api/universe-builder')
+      .send({
+        name: 'Colonies',
+        categories: {
+          colonies: { variations: [{ label: 'Canopy Symbiotes', prompt: 'leaf fiber outfit reference sheet' }] },
+          raider_clans: { variations: [{ label: 'Wake Jackals', prompt: 'simple scavenger pirate kit' }] },
+        },
+      });
+    expect(res.status).toBe(201);
+    expect(res.body.categories.colonies.variations).toHaveLength(1);
+    expect(res.body.categories.raider_clans.variations[0].label).toBe('Wake Jackals');
+  });
+
+  it('POST / accepts composite sheet prompts', async () => {
+    const res = await request(buildApp())
+      .post('/api/universe-builder')
+      .send({
+        name: 'Sheets',
+        compositeSheets: [
+          { label: 'Gas-Giant Drifters sheet', prompt: 'Create a clean illustrated costume reference sheet with five figures, material swatches, fasteners, accessories, and palette strip.' },
+        ],
+      });
+    expect(res.status).toBe(201);
+    expect(res.body.compositeSheets).toHaveLength(1);
+    expect(res.body.compositeSheets[0].kind).toBe('reference_sheet');
+    expect(res.body.compositeSheets[0].label).toBe('Gas-Giant Drifters sheet');
+  });
+
+  it('POST / accepts universe pitch poster composite prompts', async () => {
+    const res = await request(buildApp())
+      .post('/api/universe-builder')
+      .send({
+        name: 'Pitch Posters',
+        compositeSheets: [
+          { kind: 'world_pitch_poster', label: 'Universe summary concept pitch poster', prompt: 'Create a cinematic universe summary concept pitch poster with hero panorama, inset environments, cultures, creatures, visual language strip, color palette, materials, light atmosphere, and theme icons.' },
+        ],
+      });
+    expect(res.status).toBe(201);
+    expect(res.body.compositeSheets).toHaveLength(1);
+    expect(res.body.compositeSheets[0].kind).toBe('world_pitch_poster');
+  });
+
+  it('POST / rejects missing name', async () => {
+    const res = await request(buildApp())
+      .post('/api/universe-builder')
+      .send({ starterPrompt: 'cyber forest' });
+    expect(res.status).toBe(400);
+  });
+
+  // Starter-idea length: the legacy 4000-char cap was lifted in favor of a
+  // 200,000-char sanity ceiling. These tests pin the new Zod boundary so a
+  // future schema edit can't silently restore the old limit (or relax it
+  // past the documented ceiling).
+  it('POST / accepts a starterPrompt well beyond the legacy 4000-char limit', async () => {
+    const longPrompt = 'a'.repeat(50_000);
+    const res = await request(buildApp())
+      .post('/api/universe-builder')
+      .send({ name: 'Long Idea', starterPrompt: longPrompt });
+    expect(res.status).toBe(201);
+    expect(res.body.starterPrompt).toHaveLength(50_000);
+  });
+
+  it('POST /expand rejects a starterPrompt exceeding 200,000 chars', async () => {
+    const res = await request(buildApp())
+      .post('/api/universe-builder/expand')
+      .send({ starterPrompt: 'x'.repeat(200_001) });
+    expect(res.status).toBe(400);
+  });
+
+  it('POST /expand accepts a starterPrompt at exactly 200,000 chars', async () => {
+    const res = await request(buildApp())
+      .post('/api/universe-builder/expand')
+      .send({ starterPrompt: 'x'.repeat(200_000) });
+    expect(res.status).toBe(200);
+  });
+
+  it('PATCH /:id updates fields', async () => {
+    const app = buildApp();
+    const c = await request(app).post('/api/universe-builder').send({ name: 'A' });
+    const res = await request(app)
+      .patch(`/api/universe-builder/${c.body.id}`)
+      .send({ name: 'B', influences: { embrace: ['oil painting'], avoid: [] } });
+    expect(res.status).toBe(200);
+    expect(res.body.name).toBe('B');
+    expect(res.body.influences.embrace).toEqual(['oil painting']);
+    // The v2 prose stylePrompt / negativePrompt fields no longer round-trip.
+    expect(res.body.stylePrompt).toBeUndefined();
+    expect(res.body.negativePrompt).toBeUndefined();
+  });
+
+  it('PATCH /:id absorbs stale prose stylePrompt/negativePrompt into influences', async () => {
+    // Backward compat: a stale v2-shaped client may still PATCH the prose
+    // fields. The sanitizer's v2 → v3 migration splits them into chip tokens
+    // and merges into influences.embrace / influences.avoid.
+    const app = buildApp();
+    const c = await request(app)
+      .post('/api/universe-builder')
+      .send({ name: 'Legacy', influences: { embrace: ['existing'], avoid: ['existing-neg'] } });
+    const res = await request(app)
+      .patch(`/api/universe-builder/${c.body.id}`)
+      .send({ stylePrompt: 'oil painting, gritty', negativePrompt: 'blurry' });
+    expect(res.status).toBe(200);
+    expect(res.body.influences.embrace).toEqual(['existing', 'oil painting', 'gritty']);
+    expect(res.body.influences.avoid).toEqual(['existing-neg', 'blurry']);
+  });
+
+  it('PATCH /:id persists canon array writes (characters/settings/objects)', async () => {
+    // Regression guard for the Zod-default-strips-unknown-keys bug that
+    // would silently drop canon-array writes from the inline-edit UI.
+    const app = buildApp();
+    const c = await request(app).post('/api/universe-builder').send({ name: 'A' });
+    const res = await request(app)
+      .patch(`/api/universe-builder/${c.body.id}`)
+      .send({
+        characters: [{ name: 'Jean', physicalDescription: 'tall, dark hair' }],
+        places: [{ slugline: 'INT. BAR — NIGHT', intExt: 'INT', timeOfDay: 'night' }],
+        objects: [{ name: 'Gold pocket watch', description: 'tarnished brass casing' }],
+      });
+    expect(res.status).toBe(200);
+    expect(res.body.characters).toHaveLength(1);
+    expect(res.body.characters[0].name).toBe('Jean');
+    expect(res.body.places).toHaveLength(1);
+    expect(res.body.places[0].intExt).toBe('INT');
+    expect(res.body.places[0].timeOfDay).toBe('night');
+    expect(res.body.objects).toHaveLength(1);
+    expect(res.body.objects[0].name).toBe('Gold pocket watch');
+  });
+
+  // ---- Art style reference deltas (#3109) ----
+
+  it('POST /:id/style-references appends one reference and can adopt guidance in the same write', async () => {
+    const app = buildApp();
+    const c = await request(app).post('/api/universe-builder').send({ name: 'Refs' });
+    const first = await request(app)
+      .post(`/api/universe-builder/${c.body.id}/style-references`)
+      .send({
+        reference: { id: 'style-ref-1', title: 'Ink wash', prompt: 'Granular ink wash', imageRefs: ['a.png'] },
+      });
+    expect(first.status).toBe(200);
+    expect(first.body.styleReferences.map((r) => r.id)).toEqual(['style-ref-1']);
+
+    const second = await request(app)
+      .post(`/api/universe-builder/${c.body.id}/style-references`)
+      .send({
+        reference: { id: 'style-ref-2', title: 'Sunlit', prompt: 'Warm sunlit haze', imageRefs: ['b.png'] },
+        adopt: { styleNotes: 'Warm and hazy', influences: { embrace: ['sunlit'], avoid: ['gloss'] } },
+      });
+    expect(second.status).toBe(200);
+    // The addition composed onto the persisted list — it did not replace it.
+    expect(second.body.styleReferences.map((r) => r.id)).toEqual(['style-ref-1', 'style-ref-2']);
+    expect(second.body.styleNotes).toBe('Warm and hazy');
+    expect(second.body.influences).toEqual({ embrace: ['sunlit'], avoid: ['gloss'] });
+  });
+
+  it('POST /:id/style-references rejects a reference missing an id or a prompt', async () => {
+    const app = buildApp();
+    const c = await request(app).post('/api/universe-builder').send({ name: 'Refs' });
+    // The delta path requires an explicit id (it's what makes a re-send
+    // idempotent), unlike the wholesale-replace field where the sanitizer mints one.
+    const noId = await request(app)
+      .post(`/api/universe-builder/${c.body.id}/style-references`)
+      .send({ reference: { title: 'No id', prompt: 'Prompt', imageRefs: ['a.png'] } });
+    expect(noId.status).toBe(400);
+    const noPrompt = await request(app)
+      .post(`/api/universe-builder/${c.body.id}/style-references`)
+      .send({ reference: { id: 'style-ref-1', title: 'No prompt', imageRefs: ['a.png'] } });
+    expect(noPrompt.status).toBe(400);
+  });
+
+  it('DELETE /:id/style-references/:referenceId removes one and no-ops on an unknown id', async () => {
+    const app = buildApp();
+    const c = await request(app).post('/api/universe-builder').send({
+      name: 'Refs',
+      styleReferences: [
+        { id: 'style-ref-a', title: 'A', prompt: 'a', imageRefs: ['a.png'] },
+        { id: 'style-ref-b', title: 'B', prompt: 'b', imageRefs: ['b.png'] },
+      ],
+    });
+    const removed = await request(app)
+      .delete(`/api/universe-builder/${c.body.id}/style-references/style-ref-a`);
+    expect(removed.status).toBe(200);
+    expect(removed.body.styleReferences.map((r) => r.id)).toEqual(['style-ref-b']);
+
+    // A duplicate delete (or one that raced the image-delete purge) is a
+    // no-op, not a 404 — the caller's intent is already satisfied.
+    const again = await request(app)
+      .delete(`/api/universe-builder/${c.body.id}/style-references/style-ref-a`);
+    expect(again.status).toBe(200);
+    expect(again.body.styleReferences.map((r) => r.id)).toEqual(['style-ref-b']);
+  });
+
+  it('DELETE /:id/style-references rejects an over-long referenceId', async () => {
+    const app = buildApp();
+    const c = await request(app).post('/api/universe-builder').send({ name: 'Refs' });
+    const res = await request(app)
+      .delete(`/api/universe-builder/${c.body.id}/style-references/${'x'.repeat(81)}`);
+    expect(res.status).toBe(400);
+  });
+
+  it('PATCH /:id still accepts a wholesale styleReferences replace (older clients + peer imports)', async () => {
+    const app = buildApp();
+    const c = await request(app).post('/api/universe-builder').send({
+      name: 'Back-compat',
+      styleReferences: [{ id: 'style-ref-a', title: 'A', prompt: 'a', imageRefs: ['a.png'] }],
+    });
+    const res = await request(app)
+      .patch(`/api/universe-builder/${c.body.id}`)
+      .send({ styleReferences: [{ id: 'style-ref-b', title: 'B', prompt: 'b', imageRefs: ['b.png'] }] });
+    expect(res.status).toBe(200);
+    expect(res.body.styleReferences.map((r) => r.id)).toEqual(['style-ref-b']);
+  });
+
+  it('DELETE /:id removes the universe', async () => {
+    const app = buildApp();
+    const c = await request(app).post('/api/universe-builder').send({ name: 'A' });
+    const del = await request(app).delete(`/api/universe-builder/${c.body.id}`);
+    expect(del.status).toBe(200);
+    const list = await request(app).get('/api/universe-builder');
+    expect(list.body).toEqual([]);
+  });
+
+  it('POST /expand returns LLM expansion', async () => {
+    const res = await request(buildApp())
+      .post('/api/universe-builder/expand')
+      .send({ starterPrompt: 'moebius scifi' });
+    expect(res.status).toBe(200);
+    expect(res.body.influences.embrace[0]).toContain('moebius scifi');
+    expect(res.body.categories.landscapes.variations).toHaveLength(1);
+    expect(res.body.compositeSheets).toHaveLength(2);
+    expect(res.body.llm.provider).toBe('anthropic');
+  });
+
+  it('POST /:id/render queues image jobs and records run', async () => {
+    const app = buildApp();
+    const created = await request(app).post('/api/universe-builder').send({
+      name: 'Render Test',
+      influences: { embrace: ['style'], avoid: ['neg'] },
+      categories: {
+        landscapes: { variations: [{ label: 'A', prompt: 'a prompt' }, { label: 'B', prompt: 'b prompt' }] },
+        // `characters` was retired as a default bucket in schema v4 (canon
+        // owns characters); use a custom bucket to keep the 3-variation
+        // render scenario intact.
+        outfits: { variations: [{ label: 'C', prompt: 'c prompt' }] },
+      },
+    });
+    const res = await request(app)
+      .post(`/api/universe-builder/${created.body.id}/render`)
+      .send({ batchPerVariation: 2, mode: 'local' });
+    expect(res.status).toBe(200);
+    expect(res.body.promptCount).toBe(6); // 3 variations × 2 batch
+    expect(res.body.jobIds).toHaveLength(6);
+    expect(res.body.collectionId).toBe('col-1');
+    // Run is recorded.
+    const runs = await request(app).get(`/api/universe-builder/${created.body.id}/runs`);
+    expect(runs.body).toHaveLength(1);
+    expect(runs.body[0].promptCount).toBe(6);
+  });
+
+  it('POST /:id/render queues custom category prompts', async () => {
+    const app = buildApp();
+    const created = await request(app).post('/api/universe-builder').send({
+      name: 'Clothing',
+      influences: { embrace: ['moebius', 'clean reference sheet'], avoid: [] },
+      categories: {
+        clothing_styles: { variations: [{ label: 'Gas-Giant Drifters', prompt: 'buckles, clips, pressure rings' }] },
+      },
+    });
+    const res = await request(app)
+      .post(`/api/universe-builder/${created.body.id}/render`)
+      .send({ mode: 'local', selection: { clothing_styles: 'all' } });
+    expect(res.status).toBe(200);
+    expect(res.body.promptCount).toBe(1);
+    expect(res.body.jobIds).toHaveLength(1);
+  });
+
+  it('POST /:id/render queues composite sheet prompts', async () => {
+    const app = buildApp();
+    const created = await request(app).post('/api/universe-builder').send({
+      name: 'Composite Clothing',
+      influences: { embrace: ['moebius', 'clean reference sheet'], avoid: [] },
+      compositeSheets: [
+        { label: 'Gas-Giant Drifters sheet', prompt: 'complete costume reference sheet, five figures, material swatches, pressure rings, palette strip' },
+      ],
+    });
+    const res = await request(app)
+      .post(`/api/universe-builder/${created.body.id}/render`)
+      .send({ mode: 'local', promptMode: 'sheets' });
+    expect(res.status).toBe(200);
+    expect(res.body.promptCount).toBe(1);
+    expect(res.body.jobIds).toHaveLength(1);
+  });
+
+  it('POST /:id/render reuses the same collection on repeat renders of the same universe', async () => {
+    const app = buildApp();
+    const created = await request(app).post('/api/universe-builder').send({
+      name: 'Repeat Universe',
+      categories: {
+        landscapes: { variations: [{ label: 'A', prompt: 'a' }] },
+      },
+    });
+    const first = await request(app)
+      .post(`/api/universe-builder/${created.body.id}/render`)
+      .send({ mode: 'local' });
+    expect(first.status).toBe(200);
+    const second = await request(app)
+      .post(`/api/universe-builder/${created.body.id}/render`)
+      .send({ mode: 'local' });
+    expect(second.status).toBe(200);
+    expect(second.body.collectionId).toBe(first.body.collectionId);
+    // The auto-generated name has no date suffix — bare `Universe: <name>`.
+    expect(second.body.collectionName).toBe('Universe: Repeat Universe');
+    expect(second.body.collectionName).not.toMatch(/\d{4}-\d{2}-\d{2}/);
+  });
+
+  it('POST /:id/render rejects body.collectionName with a clear error (deprecated field)', async () => {
+    const app = buildApp();
+    const created = await request(app).post('/api/universe-builder').send({
+      name: 'Reject CollectionName Universe',
+      categories: {
+        landscapes: { variations: [{ label: 'A', prompt: 'a' }] },
+      },
+    });
+    const res = await request(app)
+      .post(`/api/universe-builder/${created.body.id}/render`)
+      .send({ mode: 'local', collectionName: 'Shared Bucket' });
+    expect(res.status).toBe(400);
+    expect(JSON.stringify(res.body)).toMatch(/collectionName/i);
+  });
+
+  it('POST /:id/render forwards seed + LoRAs in the wire format local image gen reads', async () => {
+    vi.mocked(enqueueJob).mockClear();
+    const app = buildApp();
+    const created = await request(app).post('/api/universe-builder').send({
+      name: 'Override Universe',
+      categories: {
+        landscapes: { variations: [{ label: 'A', prompt: 'a' }] },
+      },
+    });
+    const res = await request(app)
+      .post(`/api/universe-builder/${created.body.id}/render`)
+      .send({
+        mode: 'local',
+        seed: 42,
+        negativePrompt: 'low quality',
+        extraStyle: 'high contrast',
+        loras: [
+          { filename: 'foo.safetensors', name: 'Foo', scale: 0.8 },
+          { filename: 'bar.safetensors', name: 'Bar', scale: 1.2 },
+        ],
+      });
+    expect(res.status).toBe(200);
+    expect(res.body.promptCount).toBe(1);
+    // Verify the enqueued job carries the local-runner wire shape
+    // (loraFilenames + loraScales as parallel arrays), not the UI's
+    // [{filename, scale}] objects which the runner would silently ignore.
+    expect(vi.mocked(enqueueJob)).toHaveBeenCalledTimes(1);
+    const enqueuedParams = vi.mocked(enqueueJob).mock.calls[0][0].params;
+    expect(enqueuedParams.seed).toBe(42);
+    expect(enqueuedParams.loraFilenames).toEqual(['foo.safetensors', 'bar.safetensors']);
+    expect(enqueuedParams.loraScales).toEqual([0.8, 1.2]);
+    expect(enqueuedParams.loras).toBeUndefined();
+  });
+
+  it('POST /:id/render rejects non-numeric seed (local image gen would NaN)', async () => {
+    const app = buildApp();
+    const created = await request(app).post('/api/universe-builder').send({
+      name: 'Bad Seed Universe',
+      categories: {
+        landscapes: { variations: [{ label: 'A', prompt: 'a' }] },
+      },
+    });
+    const res = await request(app)
+      .post(`/api/universe-builder/${created.body.id}/render`)
+      .send({ mode: 'local', seed: 'abc123' });
+    expect(res.status).toBe(400);
+  });
+
+  it('POST /:id/render rejects lora filename with path separators (basenames only)', async () => {
+    const app = buildApp();
+    const created = await request(app).post('/api/universe-builder').send({
+      name: 'Bad LoRA Universe',
+      categories: {
+        landscapes: { variations: [{ label: 'A', prompt: 'a' }] },
+      },
+    });
+    const res = await request(app)
+      .post(`/api/universe-builder/${created.body.id}/render`)
+      .send({
+        mode: 'local',
+        loras: [{ filename: '../escape.safetensors', scale: 1.0 }],
+      });
+    expect(res.status).toBe(400);
+  });
+
+  it('POST /:id/render rejects when no variations exist', async () => {
+    const app = buildApp();
+    const created = await request(app).post('/api/universe-builder').send({ name: 'Empty' });
+    const res = await request(app)
+      .post(`/api/universe-builder/${created.body.id}/render`)
+      .send({ mode: 'local' });
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe('WORLD_BUILDER_EMPTY');
+  });
+
+  describe('POST /:id/promote-variation', () => {
+    beforeEach(() => {
+      promoteVariationToCanonMock.mockClear();
+    });
+
+    it('forwards the body to the service and returns the result', async () => {
+      const app = buildApp();
+      const res = await request(app)
+        .post('/api/universe-builder/some-id/promote-variation')
+        .send({ category: 'landscapes', label: 'Salt Flats' });
+      expect(res.status).toBe(200);
+      expect(promoteVariationToCanonMock).toHaveBeenCalledWith('some-id', expect.objectContaining({
+        category: 'landscapes',
+        label: 'Salt Flats',
+      }));
+      expect(res.body.entry.name).toBe('Salt Flats');
+    });
+
+    it('passes through targetKind for other-kinded buckets', async () => {
+      const app = buildApp();
+      const res = await request(app)
+        .post('/api/universe-builder/some-id/promote-variation')
+        .send({ category: 'myth_archetypes', label: 'Solstice Mask', targetKind: 'objects' });
+      expect(res.status).toBe(200);
+      expect(promoteVariationToCanonMock).toHaveBeenCalledWith('some-id', expect.objectContaining({
+        targetKind: 'objects',
+      }));
+    });
+
+    it('400s on missing label (Zod schema)', async () => {
+      const app = buildApp();
+      const res = await request(app)
+        .post('/api/universe-builder/some-id/promote-variation')
+        .send({ category: 'landscapes' });
+      expect(res.status).toBe(400);
+      expect(promoteVariationToCanonMock).not.toHaveBeenCalled();
+    });
+
+    it('400s on invalid targetKind enum (Zod schema)', async () => {
+      const app = buildApp();
+      const res = await request(app)
+        .post('/api/universe-builder/some-id/promote-variation')
+        .send({ category: 'landscapes', label: 'A', targetKind: 'monster' });
+      expect(res.status).toBe(400);
+      expect(promoteVariationToCanonMock).not.toHaveBeenCalled();
+    });
+
+    it('maps service ServerError status onto the HTTP response', async () => {
+      promoteVariationToCanonMock.mockRejectedValueOnce(
+        Object.assign(new Error('Bucket not found'), {
+          status: 404,
+          code: 'UNIVERSE_PROMOTE_NO_CATEGORY',
+        }),
+      );
+      const app = buildApp();
+      const res = await request(app)
+        .post('/api/universe-builder/some-id/promote-variation')
+        .send({ category: 'nonexistent', label: 'A' });
+      expect(res.status).toBe(404);
+      expect(res.body.code).toBe('UNIVERSE_PROMOTE_NO_CATEGORY');
+    });
+  });
+
+  describe('POST /:id/auto-sort', () => {
+    beforeEach(() => {
+      autoSortOtherBucketsMock.mockClear();
+    });
+
+    it('forwards the body to the service and returns the result', async () => {
+      const app = buildApp();
+      const res = await request(app)
+        .post('/api/universe-builder/some-id/auto-sort')
+        .send({ providerId: 'p1', model: 'm1' });
+      expect(res.status).toBe(200);
+      expect(autoSortOtherBucketsMock).toHaveBeenCalledWith('some-id', expect.objectContaining({
+        providerId: 'p1',
+        model: 'm1',
+      }));
+      expect(res.body.results[0].kind).toBe('places');
+      expect(res.body.runId).toBe('mock-autosort-run');
+    });
+
+    it('accepts an empty body (providerId + model are optional)', async () => {
+      const app = buildApp();
+      const res = await request(app)
+        .post('/api/universe-builder/some-id/auto-sort')
+        .send({});
+      expect(res.status).toBe(200);
+      expect(autoSortOtherBucketsMock).toHaveBeenCalled();
+    });
+
+    it('400s when providerId exceeds the schema cap (Zod schema)', async () => {
+      const app = buildApp();
+      const res = await request(app)
+        .post('/api/universe-builder/some-id/auto-sort')
+        .send({ providerId: 'a'.repeat(100) });
+      expect(res.status).toBe(400);
+      expect(autoSortOtherBucketsMock).not.toHaveBeenCalled();
+    });
+
+    it('maps service ServerError status onto the HTTP response', async () => {
+      autoSortOtherBucketsMock.mockRejectedValueOnce(
+        Object.assign(new Error('No provider'), {
+          status: 503,
+          code: 'UNIVERSE_AUTOSORT_NO_PROVIDER',
+        }),
+      );
+      const app = buildApp();
+      const res = await request(app)
+        .post('/api/universe-builder/some-id/auto-sort')
+        .send({});
+      expect(res.status).toBe(503);
+      expect(res.body.code).toBe('UNIVERSE_AUTOSORT_NO_PROVIDER');
+    });
+  });
+
+  describe('POST /:id/characters/:entryId/expand', () => {
+    beforeEach(() => expandUniverseCharacterMock.mockClear());
+
+    it('200s and forwards providerId / model to the service', async () => {
+      const res = await request(buildApp())
+        .post('/api/universe-builder/u-1/characters/c-1/expand')
+        .send({ providerId: 'anthropic', model: 'claude' });
+      expect(res.status).toBe(200);
+      expect(expandUniverseCharacterMock).toHaveBeenCalledWith('u-1', 'c-1', expect.objectContaining({
+        providerId: 'anthropic',
+        model: 'claude',
+      }));
+      expect(res.body.updatedFields).toEqual(['motivations']);
+      expect(res.body.entry.id).toBe('c-1');
+    });
+
+    it('accepts an empty body (providerId + model are optional)', async () => {
+      const res = await request(buildApp())
+        .post('/api/universe-builder/u-1/characters/c-1/expand')
+        .send({});
+      expect(res.status).toBe(200);
+      expect(expandUniverseCharacterMock).toHaveBeenCalled();
+    });
+
+    it('surfaces `locked: true` as a 200 — UI shows a Locked badge instead of a toast', async () => {
+      expandUniverseCharacterMock.mockResolvedValueOnce({
+        universe: { id: 'u-1', characters: [] },
+        entry: { id: 'c-2', name: 'Frozen', locked: true },
+        locked: true,
+        updatedFields: [],
+      });
+      const res = await request(buildApp())
+        .post('/api/universe-builder/u-1/characters/c-2/expand')
+        .send({});
+      expect(res.status).toBe(200);
+      expect(res.body.locked).toBe(true);
+      expect(res.body.updatedFields).toEqual([]);
+    });
+
+    it('maps service NOT_FOUND status onto a 404', async () => {
+      expandUniverseCharacterMock.mockRejectedValueOnce(
+        Object.assign(new Error('Character cx not found in universe'), {
+          status: 404,
+          code: 'UNIVERSE_CANON_NOT_FOUND',
+        }),
+      );
+      const res = await request(buildApp())
+        .post('/api/universe-builder/u-1/characters/cx/expand')
+        .send({});
+      expect(res.status).toBe(404);
+      expect(res.body.code).toBe('UNIVERSE_CANON_NOT_FOUND');
+    });
+  });
+
+  it('reads the scoped persisted reference sheet and validates the variant', async () => {
+    getCharacterReferenceSheetMock.mockResolvedValue({ filename: 'sheet.png', pendingJobId: null });
+    const res = await request(buildApp()).get('/api/universe-builder/u-1/characters/c-1/reference-sheet?variant=standard');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ filename: 'sheet.png', pendingJobId: null });
+    expect(getCharacterReferenceSheetMock).toHaveBeenCalledWith('u-1', 'c-1', { variant: 'standard' });
+    const invalid = await request(buildApp()).get('/api/universe-builder/u-1/characters/c-1/reference-sheet?variant=');
+    expect(invalid.status).toBe(400);
+  });
+
+  describe('POST /:id/characters/:entryId/render-reference-sheet', () => {
+    beforeEach(() => {
+      renderCharacterReferenceSheetMock.mockReset();
+      renderCharacterReferenceSheetMock.mockImplementation(async (universeId, entryId, body = {}) => ({
+        jobId: `job-${entryId}`,
+        // generationId is now an alias for jobId per the client back-compat
+        // contract — keep them identical in the mock so the test reflects prod.
+        generationId: `job-${entryId}`,
+        queuePosition: 1,
+        destFilename: `universe-${universeId}-${entryId}-sheet-job-${entryId}.png`,
+        destPath: `/data/image-refs/universe-${universeId}-${entryId}-sheet-job-${entryId}.png`,
+        promptPreview: `mock prompt for ${entryId} (override:${!!body.overridePrompt})`,
+      }));
+    });
+
+    it('200s with { jobId, generationId } and forwards overrides to the service', async () => {
+      const res = await request(buildApp())
+        .post('/api/universe-builder/u-1/characters/c-1/render-reference-sheet')
+        .send({ overridePrompt: 'custom prompt', modelId: 'flux2-klein-9b' });
+      expect(res.status).toBe(200);
+      expect(renderCharacterReferenceSheetMock).toHaveBeenCalledWith(
+        'u-1', 'c-1',
+        expect.objectContaining({ overridePrompt: 'custom prompt', modelId: 'flux2-klein-9b' }),
+      );
+      expect(res.body.jobId).toBe('job-c-1');
+      // generationId is now an alias for jobId (client back-compat).
+      expect(res.body.generationId).toBe('job-c-1');
+      expect(res.body.queuePosition).toBe(1);
+      expect(res.body.destFilename).toContain('-sheet-');
+      expect(res.body.destPath).toContain('/data/image-refs/');
+    });
+
+    it('accepts an empty body (every override is optional)', async () => {
+      const res = await request(buildApp())
+        .post('/api/universe-builder/u-1/characters/c-1/render-reference-sheet')
+        .send({});
+      expect(res.status).toBe(200);
+      expect(renderCharacterReferenceSheetMock).toHaveBeenCalledWith('u-1', 'c-1', {});
+    });
+
+    it('400s when overridePrompt exceeds the 8000-char Zod cap', async () => {
+      const res = await request(buildApp())
+        .post('/api/universe-builder/u-1/characters/c-1/render-reference-sheet')
+        .send({ overridePrompt: 'x'.repeat(8001) });
+      expect(res.status).toBe(400);
+      expect(renderCharacterReferenceSheetMock).not.toHaveBeenCalled();
+    });
+
+    it('maps a service "unsupported mode" error onto a 400 with the right code', async () => {
+      renderCharacterReferenceSheetMock.mockRejectedValueOnce(
+        Object.assign(new Error('Character reference sheet rendering needs codex or local image-gen mode'), {
+          status: 400,
+          code: 'UNIVERSE_CHARACTER_SHEET_UNSUPPORTED_MODE',
+        }),
+      );
+      const res = await request(buildApp())
+        .post('/api/universe-builder/u-1/characters/c-1/render-reference-sheet')
+        .send({});
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('UNIVERSE_CHARACTER_SHEET_UNSUPPORTED_MODE');
+    });
+  });
+
+  describe('POST /:id/characters/:entryId/render-reference-sheet (variant routing)', () => {
+    // The route is single-entry — non-default variants are selected via the
+    // body's `variant` field and forwarded to the service as a 4th arg.
+    it('forwards a body-supplied variant onto the service call', async () => {
+      const res = await request(buildApp())
+        .post('/api/universe-builder/u-1/characters/c-1/render-reference-sheet')
+        .send({ variant: 'blueprint' });
+      expect(res.status).toBe(200);
+      expect(renderCharacterReferenceSheetMock).toHaveBeenCalledWith(
+        'u-1', 'c-1', { variant: 'blueprint' },
+      );
+    });
+
+    it('rejects a variant that exceeds the 48-char Zod cap', async () => {
+      const res = await request(buildApp())
+        .post('/api/universe-builder/u-1/characters/c-1/render-reference-sheet')
+        .send({ variant: 'x'.repeat(49) });
+      expect(res.status).toBe(400);
+    });
+  });
+
+  describe('DELETE /:id/characters/:entryId/reference-sheet (variant query)', () => {
+    beforeEach(() => {
+      deleteCharacterReferenceSheetMock.mockReset();
+      deleteCharacterReferenceSheetMock.mockResolvedValue({
+        filename: 'universe-u-1-c-1-blueprint-job.png',
+        fileDeleted: true,
+        cleared: 1,
+      });
+    });
+
+    it('forwards no variant (default) when query is empty', async () => {
+      const res = await request(buildApp())
+        .delete('/api/universe-builder/u-1/characters/c-1/reference-sheet');
+      expect(res.status).toBe(200);
+      expect(deleteCharacterReferenceSheetMock).toHaveBeenCalledWith('u-1', 'c-1', {});
+    });
+
+    it('forwards `variant` from the query string', async () => {
+      const res = await request(buildApp())
+        .delete('/api/universe-builder/u-1/characters/c-1/reference-sheet?variant=blueprint');
+      expect(res.status).toBe(200);
+      expect(deleteCharacterReferenceSheetMock).toHaveBeenCalledWith('u-1', 'c-1', { variant: 'blueprint' });
+    });
+  });
+
+  describe('GET /reference-sheet-variants', () => {
+    beforeEach(() => {
+      listSheetVariantsMock.mockReset();
+      listSheetVariantsMock.mockReturnValue([
+        { id: 'standard', label: 'Illustrated', description: '...' },
+        { id: 'blueprint', label: 'Blueprint', description: '...' },
+      ]);
+    });
+
+    it('returns the registry catalog as { variants: [...] }', async () => {
+      const res = await request(buildApp()).get('/api/universe-builder/reference-sheet-variants');
+      expect(res.status).toBe(200);
+      expect(res.body.variants).toHaveLength(2);
+      expect(res.body.variants[0].id).toBe('standard');
+      expect(res.body.variants[1].id).toBe('blueprint');
+    });
+  });
+
+  describe('GET /styles', () => {
+    it('returns style tokens only, and is not swallowed by /:id', async () => {
+      const app = buildApp();
+      const created = await request(app).post('/api/universe-builder').send({
+        name: 'Styled World',
+        logline: 'a logline that must NOT ship in the styles projection',
+        influences: { embrace: ['inky linework'], avoid: ['lowres'] },
+      });
+      expect(created.status).toBe(201);
+
+      const res = await request(app).get('/api/universe-builder/styles');
+      expect(res.status).toBe(200);
+      const row = res.body.find((u) => u.id === created.body.id);
+      expect(row).toEqual({
+        id: created.body.id,
+        name: 'Styled World',
+        influences: { embrace: ['inky linework'], avoid: ['lowres'] },
+      });
+    });
+  });
+
+  describe('duplicate resolution routes', () => {
+    it('GET /duplicates returns { groups: [] } (static path not swallowed by /:id)', async () => {
+      const res = await request(buildApp()).get('/api/universe-builder/duplicates');
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ groups: [] });
+    });
+
+    it('POST /merge rejects identical survivor/loser ids with 400 (Zod refine)', async () => {
+      // Zod catches same-id at schema level → 400 with generic validation code.
+      const res = await request(buildApp())
+        .post('/api/universe-builder/merge')
+        .send({ survivorId: 'u-1', loserId: 'u-1' });
+      expect(res.status).toBe(400);
+    });
+
+    it('POST /merge returns { merged: true, cascade } on success', async () => {
+      const app = buildApp();
+      // Universe A has a logline; B has an empty logline — only A's name is
+      // non-empty, so there are no true scalar conflicts when `fieldChoices`
+      // picks the survivor for the `name` field.
+      const a = await request(app).post('/api/universe-builder').send({ name: 'Merge-A', logline: 'A logline' });
+      const b = await request(app).post('/api/universe-builder').send({ name: 'Merge-B' });
+      expect(a.status).toBe(201);
+      expect(b.status).toBe(201);
+
+      const res = await request(app)
+        .post('/api/universe-builder/merge')
+        // Explicitly resolve the name conflict so the merge can proceed.
+        .send({ survivorId: a.body.id, loserId: b.body.id, fieldChoices: { name: 'survivor' } });
+      expect(res.status).toBe(200);
+      expect(res.body.merged).toBe(true);
+      expect(res.body).toHaveProperty('cascade');
+      expect(res.body.survivorId).toBe(a.body.id);
+      expect(res.body.loserId).toBe(b.body.id);
+    });
+
+    it('DELETE /:id → 409 UNIVERSE_HAS_LIVE_SERIES with context.blockingSeries', async () => {
+      const app = buildApp();
+      const created = await request(app)
+        .post('/api/universe-builder')
+        .send({ name: 'Blocked Universe' });
+      expect(created.status).toBe(201);
+      const universeId = created.body.id;
+
+      // Simulate a live series linked to this universe so deleteUniverse throws.
+      listSeriesMock.mockResolvedValue([
+        { id: 'ser-uuid-block', name: 'Linked Series', universeId },
+      ]);
+
+      const del = await request(app).delete(`/api/universe-builder/${universeId}`);
+      expect(del.status).toBe(409);
+      expect(del.body.code).toBe('UNIVERSE_HAS_LIVE_SERIES');
+      expect(del.body.context).toBeDefined();
+      expect(Array.isArray(del.body.context.blockingSeries)).toBe(true);
+      expect(del.body.context.blockingSeries[0].id).toBe('ser-uuid-block');
+    });
+  });
+
+  describe('POST /merge/ai-resolve error contracts', () => {
+    it('422 MERGE_AI_NO_MERGEABLE_FIELDS when no fields are non-empty strings on both sides', async () => {
+      const app = buildApp();
+      const a = await request(app).post('/api/universe-builder').send({ name: 'AI-A' });
+      const b = await request(app).post('/api/universe-builder').send({ name: 'AI-B' });
+
+      // All requested fields are empty on at least one side — service throws.
+      const { ServerError } = await import('../../lib/errorHandler.js');
+      mergeFieldsWithAIMock.mockRejectedValueOnce(
+        new ServerError('No mergeable text fields', { status: 422, code: 'MERGE_AI_NO_MERGEABLE_FIELDS' }),
+      );
+
+      const res = await request(app)
+        .post('/api/universe-builder/merge/ai-resolve')
+        .send({ survivorId: a.body.id, loserId: b.body.id, fields: ['logline'] });
+      expect(res.status).toBe(422);
+      expect(res.body.code).toBe('MERGE_AI_NO_MERGEABLE_FIELDS');
+    });
+
+    it('503 MERGE_AI_NO_PROVIDER when no AI provider is configured', async () => {
+      const app = buildApp();
+      const a = await request(app).post('/api/universe-builder').send({ name: 'NoProvider-A', logline: 'x' });
+      const b = await request(app).post('/api/universe-builder').send({ name: 'NoProvider-B', logline: 'y' });
+
+      const { ServerError } = await import('../../lib/errorHandler.js');
+      mergeFieldsWithAIMock.mockRejectedValueOnce(
+        new ServerError('No AI provider available for AI-assisted merge', { status: 503, code: 'MERGE_AI_NO_PROVIDER' }),
+      );
+
+      const res = await request(app)
+        .post('/api/universe-builder/merge/ai-resolve')
+        .send({ survivorId: a.body.id, loserId: b.body.id, fields: ['logline'] });
+      expect(res.status).toBe(503);
+      expect(res.body.code).toBe('MERGE_AI_NO_PROVIDER');
+    });
+
+    it('502 LLM_INVALID_JSON when the LLM returns unparseable JSON', async () => {
+      const app = buildApp();
+      const a = await request(app).post('/api/universe-builder').send({ name: 'BadJSON-A', logline: 'x' });
+      const b = await request(app).post('/api/universe-builder').send({ name: 'BadJSON-B', logline: 'y' });
+
+      const { ServerError } = await import('../../lib/errorHandler.js');
+      mergeFieldsWithAIMock.mockRejectedValueOnce(
+        new ServerError('LLM returned invalid JSON for AI merge', { status: 502, code: 'LLM_INVALID_JSON' }),
+      );
+
+      const res = await request(app)
+        .post('/api/universe-builder/merge/ai-resolve')
+        .send({ survivorId: a.body.id, loserId: b.body.id, fields: ['logline'] });
+      expect(res.status).toBe(502);
+      expect(res.body.code).toBe('LLM_INVALID_JSON');
+    });
+
+    it('400 when survivorId === loserId (Zod schema guard)', async () => {
+      const res = await request(buildApp())
+        .post('/api/universe-builder/merge/ai-resolve')
+        .send({ survivorId: 'u-1', loserId: 'u-1', fields: ['logline'] });
+      expect(res.status).toBe(400);
+      expect(mergeFieldsWithAIMock).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('POST /describe-from-images (mixed image sources)', () => {
+    it('resolves an uploaded image to its bare filename', async () => {
+      const res = await request(buildApp())
+        .post('/api/universe-builder/describe-from-images')
+        .send({ kind: 'character', images: [{ source: 'upload', filename: 'a.png' }] });
+      expect(res.status).toBe(200);
+      expect(describeEntityFromImagesMock).toHaveBeenCalledWith(
+        expect.objectContaining({ screenshots: ['a.png'] }),
+      );
+    });
+
+    it('resolves a gallery image to its absolute path', async () => {
+      const res = await request(buildApp())
+        .post('/api/universe-builder/describe-from-images')
+        .send({ kind: 'place', images: [{ source: 'gallery', filename: 'g.png' }] });
+      expect(res.status).toBe(200);
+      expect(describeEntityFromImagesMock).toHaveBeenCalledWith(
+        expect.objectContaining({ screenshots: ['/mock/data/images/g.png'] }),
+      );
+    });
+
+    it('400 GALLERY_IMAGE_NOT_FOUND when the gallery image is missing', async () => {
+      const res = await request(buildApp())
+        .post('/api/universe-builder/describe-from-images')
+        .send({ kind: 'object', images: [{ source: 'gallery', filename: 'missing.png' }] });
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('GALLERY_IMAGE_NOT_FOUND');
+    });
+
+    it('400 SCREENSHOT_NOT_FOUND when the uploaded image is absent on disk', async () => {
+      const res = await request(buildApp())
+        .post('/api/universe-builder/describe-from-images')
+        .send({ kind: 'character', images: [{ source: 'upload', filename: 'absent.png' }] });
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('SCREENSHOT_NOT_FOUND');
+    });
+
+    it('400 VALIDATION_ERROR on a path-traversal upload filename', async () => {
+      const res = await request(buildApp())
+        .post('/api/universe-builder/describe-from-images')
+        .send({ kind: 'character', images: [{ source: 'upload', filename: '../secrets.png' }] });
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('VALIDATION_ERROR');
+    });
+  });
+
+  describe('POST /analyze-style-reference', () => {
+    it('resolves the gallery image and forwards supplied metadata and guidance', async () => {
+      const res = await request(buildApp())
+        .post('/api/universe-builder/analyze-style-reference')
+        .send({
+          image: 'g.png',
+          title: 'Supplied title',
+          prompt: 'Supplied prompt',
+          styleNotes: 'Current notes',
+          influences: { embrace: ['ink'], avoid: ['gloss'] },
+        });
+      expect(res.status).toBe(200);
+      expect(res.body.reference.title).toBe('Supplied title');
+      expect(analyzeUniverseStyleReferenceMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          imagePath: '/mock/data/images/g.png',
+          imageFilename: 'g.png',
+          styleNotes: 'Current notes',
+        }),
+      );
+    });
+
+    it('rejects a missing gallery image before invoking vision', async () => {
+      analyzeUniverseStyleReferenceMock.mockClear();
+      const res = await request(buildApp())
+        .post('/api/universe-builder/analyze-style-reference')
+        .send({ image: 'missing.png' });
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('GALLERY_IMAGE_NOT_FOUND');
+      expect(analyzeUniverseStyleReferenceMock).not.toHaveBeenCalled();
+    });
+
+    it('rejects path-bearing image names instead of silently normalizing them', async () => {
+      analyzeUniverseStyleReferenceMock.mockClear();
+      const res = await request(buildApp())
+        .post('/api/universe-builder/analyze-style-reference')
+        .send({ image: '../g.png' });
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('VALIDATION_ERROR');
+      expect(analyzeUniverseStyleReferenceMock).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('POST /:id/characters/:entryId/expand-from-images', () => {
+    it('resolves mixed sources and forwards universeId/entryId', async () => {
+      const res = await request(buildApp())
+        .post('/api/universe-builder/uni-1/characters/chr-1/expand-from-images')
+        .send({ images: [{ source: 'gallery', filename: 'g.png' }, { source: 'upload', filename: 'a.png' }] });
+      expect(res.status).toBe(200);
+      expect(res.body.updatedFields).toEqual(['pronouns']);
+      expect(expandEntityFromImagesMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          universeId: 'uni-1', entryId: 'chr-1',
+          screenshots: ['/mock/data/images/g.png', 'a.png'],
+        }),
+      );
+    });
+
+    it('400 GALLERY_IMAGE_NOT_FOUND for a missing gallery image', async () => {
+      const res = await request(buildApp())
+        .post('/api/universe-builder/uni-1/characters/chr-1/expand-from-images')
+        .send({ images: [{ source: 'gallery', filename: 'missing.png' }] });
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('GALLERY_IMAGE_NOT_FOUND');
+    });
+  });
+
+  describe('POST /:id/canon/:kind/:entryId/correct-from-image', () => {
+    it('resolves the gallery image and forwards universeId/entryId/kind, echoing the filename', async () => {
+      const res = await request(buildApp())
+        .post('/api/universe-builder/uni-1/canon/character/chr-1/correct-from-image')
+        .send({ image: 'g.png', name: 'Vex' });
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual(expect.objectContaining({
+        proposedDescription: 'corrected', imageFilename: 'g.png',
+      }));
+      expect(correctEntityFromImageMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          universeId: 'uni-1', entryId: 'chr-1', kind: 'character', name: 'Vex', screenshot: '/mock/data/images/g.png',
+        }),
+      );
+    });
+
+    it('400 GALLERY_IMAGE_NOT_FOUND for a missing gallery image, without invoking the service', async () => {
+      correctEntityFromImageMock.mockClear();
+      const res = await request(buildApp())
+        .post('/api/universe-builder/uni-1/canon/place/plc-1/correct-from-image')
+        .send({ image: 'missing.png' });
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('GALLERY_IMAGE_NOT_FOUND');
+      expect(correctEntityFromImageMock).not.toHaveBeenCalled();
+    });
+
+    it('400s an invalid kind before invoking the service', async () => {
+      correctEntityFromImageMock.mockClear();
+      const res = await request(buildApp())
+        .post('/api/universe-builder/uni-1/canon/monster/chr-1/correct-from-image')
+        .send({ image: 'g.png' });
+      expect(res.status).toBe(400);
+      expect(correctEntityFromImageMock).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('POST /:id/canon/:kind/:entryId/apply-image-correction', () => {
+    it('persists the reviewed description + image filename via canonSvc', async () => {
+      const res = await request(buildApp())
+        .post('/api/universe-builder/uni-1/canon/character/chr-1/apply-image-correction')
+        .send({ description: 'a corrected description', imageFilename: 'g.png' });
+      expect(res.status).toBe(200);
+      expect(res.body.entry).toEqual(expect.objectContaining({
+        id: 'chr-1', physicalDescription: 'a corrected description', primaryImageRef: 'g.png',
+      }));
+      expect(applyCanonImageCorrectionMock).toHaveBeenCalledWith(
+        'uni-1', 'character', 'chr-1',
+        expect.objectContaining({ description: 'a corrected description', imageFilename: 'g.png' }),
+      );
+    });
+
+    it('rejects a blank description before invoking the service', async () => {
+      applyCanonImageCorrectionMock.mockClear();
+      const res = await request(buildApp())
+        .post('/api/universe-builder/uni-1/canon/character/chr-1/apply-image-correction')
+        .send({ description: '   ', imageFilename: 'g.png' });
+      expect(res.status).toBe(400);
+      expect(applyCanonImageCorrectionMock).not.toHaveBeenCalled();
+    });
+
+    it('rejects a description over the largest per-kind descriptor limit, so it 400s instead of silently truncating on write', async () => {
+      applyCanonImageCorrectionMock.mockClear();
+      const tooLong = 'x'.repeat(Math.max(...Object.values(canonSvc.DESC_LIMIT)) + 1);
+      const res = await request(buildApp())
+        .post('/api/universe-builder/uni-1/canon/character/chr-1/apply-image-correction')
+        .send({ description: tooLong, imageFilename: 'g.png' });
+      expect(res.status).toBe(400);
+      expect(applyCanonImageCorrectionMock).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('DELETE /:id/canon/:kind/:entryId', () => {
+    it('removes the entry from its canon bucket and returns the removed record', async () => {
+      removeCanonEntryMock.mockClear();
+      const res = await request(buildApp())
+        .delete('/api/universe-builder/uni-1/canon/character/chr-1');
+      expect(res.status).toBe(200);
+      expect(removeCanonEntryMock).toHaveBeenCalledWith('uni-1', 'character', 'chr-1');
+      // The response carries the entry whole — the route must not scrub its
+      // image refs or catalog backlink on the way out, because removal is
+      // scoped to the canon array and leaves both stores alone.
+      expect(res.body.entry).toEqual(expect.objectContaining({
+        id: 'chr-1', imageRefs: ['alex.png'], ingredientId: 'ing-alex',
+      }));
+      expect(res.body.universe.characters).toEqual([]);
+    });
+
+    it('rejects an unknown kind before invoking the service', async () => {
+      removeCanonEntryMock.mockClear();
+      const res = await request(buildApp())
+        .delete('/api/universe-builder/uni-1/canon/monster/chr-1');
+      expect(res.status).toBe(400);
+      expect(removeCanonEntryMock).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('POST /refine-prompts (style-reference image)', () => {
+    it('resolves the image filename to an absolute path before the service', async () => {
+      const res = await request(buildApp())
+        .post('/api/universe-builder/refine-prompts')
+        .send({ starterPrompt: 'seed', feedback: 'pull toward this', image: 'g.png' });
+      expect(res.status).toBe(200);
+      expect(refineWorldPromptsMock).toHaveBeenCalledWith(
+        expect.objectContaining({ imagePath: '/mock/data/images/g.png' }),
+      );
+    });
+
+    it('400 GALLERY_IMAGE_NOT_FOUND for a missing reference image', async () => {
+      refineWorldPromptsMock.mockClear();
+      const res = await request(buildApp())
+        .post('/api/universe-builder/refine-prompts')
+        .send({ starterPrompt: 'seed', feedback: 'x', image: 'missing.png' });
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('GALLERY_IMAGE_NOT_FOUND');
+      expect(refineWorldPromptsMock).not.toHaveBeenCalled();
+    });
+
+    it('passes imagePath null when no image is supplied', async () => {
+      const res = await request(buildApp())
+        .post('/api/universe-builder/refine-prompts')
+        .send({ starterPrompt: 'seed', feedback: 'x' });
+      expect(res.status).toBe(200);
+      expect(refineWorldPromptsMock).toHaveBeenCalledWith(
+        expect.objectContaining({ imagePath: null }),
+      );
+    });
+  });
+});

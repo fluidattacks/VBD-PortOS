@@ -1,0 +1,80 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+vi.mock('./cosTaskStore.js', () => ({ getAllTasks: vi.fn() }));
+vi.mock('./apps.js', () => ({ getAppById: vi.fn() }));
+vi.mock('./perpetualWork.js', () => ({ detectActionableWork: vi.fn() }));
+vi.mock('./quotaBurnInvoke.js', () => ({ resolveQuotaBurnStep: vi.fn() }));
+vi.mock('./quotaBurnStore.js', () => ({ getQuotaBurnConfig: vi.fn() }));
+vi.mock('./quotaBurnCompletions.js', () => ({ recordQuotaBurnJobCompletion: vi.fn() }));
+import { getAllTasks } from './cosTaskStore.js';
+import { getAppById } from './apps.js';
+import { detectActionableWork } from './perpetualWork.js';
+import { resolveQuotaBurnStep } from './quotaBurnInvoke.js';
+import { getQuotaBurnConfig } from './quotaBurnStore.js';
+import { recordQuotaBurnJobCompletion } from './quotaBurnCompletions.js';
+import { nextQuotaBurnSequenceJob, completeQuotaBurnSequenceStep } from './quotaBurnSequence.js';
+const audit = { id: 'audit', runOnce: true, taskRef: { kind: 'builtin', taskType: 'simplify', appId: 'app-1' } };
+const drain = { id: 'drain', runOnce: true, taskRef: { kind: 'builtin', taskType: 'claim-issue', appId: 'app-1' }, drain: true, overrides: { params: {} } };
+const docs = { id: 'docs', runOnce: true, taskRef: { kind: 'builtin', taskType: 'documentation', appId: 'app-1' } };
+const family = { id: 'codex', sequence: true, jobs: [audit, drain, docs] };
+const context = () => ({ completions: { 'codex:audit': 'done' }, reservations: {}, catalog: {} });
+beforeEach(() => {
+  vi.clearAllMocks();
+  getAllTasks.mockResolvedValue({ cos: { tasks: [] }, user: { tasks: [] } });
+  getQuotaBurnConfig.mockResolvedValue({ families: { codex: family } });
+  getAppById.mockResolvedValue({ id: 'app-1', taskTypeOverrides: { 'claim-issue': { taskMetadata: { issueAuthorFilter: 'collaborators', issueExcludeLabels: ['hold'] } } } });
+  resolveQuotaBurnStep.mockResolvedValue({ ref: { taskType: 'claim-issue', appId: 'app-1' }, interval: { perpetual: true, taskMetadata: { issueAuthorFilter: 'self' } } });
+  detectActionableWork.mockResolvedValue({ hasDetector: true, actionable: true, count: 2 });
+  recordQuotaBurnJobCompletion.mockImplementation(async (f, j) => ({ [`${f}:${j}`]: 'done' }));
+});
+describe('maintenance sequence workflow', () => {
+  // Before, an audit that could never apply was a permanent barrier: every
+  // later step in the family stopped running for good.
+  it('passes an audit that does not apply to its app instead of stalling the family on it', async () => {
+    const onlyAudits = { id: 'codex', sequence: true, jobs: [audit, docs] };
+    resolveQuotaBurnStep.mockImplementation(async (job) => (job.id === 'audit'
+      ? { unavailable: { code: 'not-applicable', reason: 'does not apply' } } : {}));
+    const ctx = { completions: {}, reservations: {}, catalog: {} };
+    expect(await nextQuotaBurnSequenceJob(onlyAudits, ctx)).toEqual({ job: docs });
+    expect(recordQuotaBurnJobCompletion).toHaveBeenCalledWith('codex', 'audit');
+    expect(ctx.completions['codex:audit']).toBe('done');
+  });
+
+  it('repeats claims with saved app filters, then advances only after the backlog drains', async () => {
+    const ctx = context();
+    expect(await nextQuotaBurnSequenceJob(family, ctx)).toEqual({ job: drain });
+    expect(detectActionableWork).toHaveBeenCalledWith('claim-issue', expect.anything(), { issueAuthorFilter: 'collaborators', issueExcludeLabels: ['hold'], ignoreTaskId: null });
+    expect(recordQuotaBurnJobCompletion).not.toHaveBeenCalled();
+    detectActionableWork.mockResolvedValue({ hasDetector: true, actionable: false, count: 0 });
+    expect(await nextQuotaBurnSequenceJob(family, ctx)).toEqual({ job: docs });
+    expect(ctx.completions['codex:drain']).toBe('done');
+  });
+  it('holds for reservations, blocked tasks, failed probes, and claims still in flight', async () => {
+    expect(await nextQuotaBurnSequenceJob(family, { ...context(), reservations: { x: { familyId: 'codex' } } })).toHaveProperty('reason');
+    getAllTasks.mockResolvedValue({ cos: { tasks: [{ id: 'task-1', status: 'blocked', metadata: { quotaBurnFamily: 'codex' } }] } });
+    expect(await nextQuotaBurnSequenceJob(family, context())).toHaveProperty('reason');
+    getAllTasks.mockResolvedValue({});
+    detectActionableWork.mockResolvedValue({ hasDetector: true, transient: true, actionable: false });
+    expect(await nextQuotaBurnSequenceJob(family, context())).toHaveProperty('reason');
+    detectActionableWork.mockResolvedValue({ hasDetector: true, actionable: false, inFlightCount: 1 });
+    expect(await nextQuotaBurnSequenceJob(family, context())).toHaveProperty('reason');
+    expect(recordQuotaBurnJobCompletion).not.toHaveBeenCalled();
+  });
+  it('records only successful audit completions, leaving claim drains to the detector', async () => {
+    const agent = { metadata: { taskQuotaBurnFamily: 'codex', taskQuotaBurnStepId: 'audit' }, result: { success: false } };
+    await completeQuotaBurnSequenceStep(agent);
+    expect(recordQuotaBurnJobCompletion).not.toHaveBeenCalled();
+    agent.result.success = true;
+    await completeQuotaBurnSequenceStep(agent);
+    expect(recordQuotaBurnJobCompletion).toHaveBeenCalledWith('codex', 'audit');
+    recordQuotaBurnJobCompletion.mockClear();
+    agent.metadata.taskQuotaBurnStepId = 'drain';
+    await completeQuotaBurnSequenceStep(agent);
+    expect(recordQuotaBurnJobCompletion).not.toHaveBeenCalled();
+  });
+});
+
+
+it.each([undefined, { complete: false }])('never advances Deep quota sequences with absent or partial proof: %j', async deepAudit => {
+  await completeQuotaBurnSequenceStep({ result: { success: true, deepAudit }, metadata: { taskAuditDepth: 'deep', taskQuotaBurnFamily: 'codex', taskQuotaBurnStepId: 'audit' } });
+  expect(recordQuotaBurnJobCompletion).not.toHaveBeenCalled();
+});

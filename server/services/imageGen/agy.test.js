@@ -1,0 +1,513 @@
+import { acquireBackupSnapshotCut } from '../../lib/backupSnapshotBoundary.js';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdir, readFile, rm, writeFile } from 'fs/promises';
+import { existsSync } from 'fs';
+import { join } from 'path';
+import { tmpdir } from 'os';
+import { EventEmitter } from 'events';
+
+const admissionFault = vi.hoisted(() => ({ error: null }));
+vi.mock('../../lib/backupSnapshotBoundary.js', async original => {
+  const actual = await original();
+  return { ...actual, withBackupAssetPublication: (...args) => {
+    if (admissionFault.error) return Promise.reject(admissionFault.error);
+    return actual.withBackupAssetPublication(...args);
+  } };
+});
+
+const spawnCalls = [];
+const makeFakeChild = () => {
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.stdin = new EventEmitter();
+  child.stdin.end = vi.fn();
+  child.kill = vi.fn();
+  child.exitCode = null;
+  child.signalCode = null;
+  return child;
+};
+
+vi.mock('../../lib/childProcess.js', async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    spawn: vi.fn((bin, args) => {
+      const child = makeFakeChild();
+      spawnCalls.push({ bin, args, child });
+      return child;
+    }),
+  };
+});
+
+// The install's agy model catalog, which generateImage reads (through a
+// deferred import of services/providers.js) to clamp the effort ladder and to
+// re-point a rotated-out shipped default. Empty = "no catalog", the shape a
+// fresh install / uninitialized toolkit produces.
+const catalog = vi.hoisted(() => ({ models: [] }));
+vi.mock('../providers.js', () => ({
+  getProviderById: async (id) => (id === 'antigravity-cli' ? { id, models: catalog.models } : null),
+}));
+
+const TEST_ROOT = join(tmpdir(), `portos-agy-test-${process.pid}-${Date.now()}`);
+const FAKE_IMAGES_DIR = join(TEST_ROOT, 'data-images');
+const FAKE_DATA_DIR = join(TEST_ROOT, 'data');
+vi.mock('../../lib/fileUtils.js', async () => {
+  const actual = await vi.importActual('../../lib/fileUtils.js');
+  actual.PATHS.images = FAKE_IMAGES_DIR;
+  return {
+    ...actual,
+    ensureDir: vi.fn(async (dir) => mkdir(dir, { recursive: true })),
+    rmGuarded: vi.fn(actual.rmGuarded),
+  };
+});
+// A test-rooted maintenance journal, so cleanup-failure ownership is observable.
+const fixture = vi.hoisted(() => ({ admission: null }));
+vi.mock('../../lib/maintenanceAdmission.js', async importOriginal => ({
+  ...await importOriginal(),
+  maintenance: new Proxy({}, { get: (_target, property) => fixture.admission[property] }),
+}));
+
+const agy = await import('./agy.js');
+const { AGY_IMAGEGEN_DEFAULT_MODEL } = await import('../../lib/imageGenCapabilities.js');
+const { imageGenEvents } = await import('../imageGenEvents.js');
+const { spawn } = await import('../../lib/childProcess.js');
+const { spawn: realSpawn } = await vi.importActual('../../lib/childProcess.js');
+const { SSE_CLEANUP_DELAY_MS } = await import('../../lib/sseUtils.js');
+const { createMaintenanceAdmission } = await import('../../lib/maintenanceAdmission.js');
+const { rmGuarded } = await import('../../lib/fileUtils.js');
+const realFiles = await vi.importActual('../../lib/fileUtils.js');
+const flush = () => new Promise((resolve) => setImmediate(resolve));
+const stagingPathFor = (jobId) => join(tmpdir(), `portos-agy-${jobId}`, 'output.png');
+
+const closeChild = async (index = 0, code = 1) => {
+  spawnCalls[index].child.exitCode = code;
+  spawnCalls[index].child.emit('close', code, null);
+  await flush();
+};
+
+beforeEach(async () => {
+  catalog.models = [];
+  spawnCalls.length = 0;
+  imageGenEvents.removeAllListeners();
+  agy._internals.setHarvestTimeoutForTests(10);
+  await rm(TEST_ROOT, { recursive: true, force: true }).catch(() => {});
+  await mkdir(FAKE_DATA_DIR, { recursive: true });
+  fixture.admission = createMaintenanceAdmission(FAKE_DATA_DIR);
+  rmGuarded.mockReset().mockImplementation(realFiles.rmGuarded);
+});
+
+afterEach(async () => {
+  vi.useRealTimers();
+  agy._internals.setHarvestTimeoutForTests();
+  await rm(TEST_ROOT, { recursive: true, force: true }).catch(() => {});
+});
+
+describe('agy image provider', () => {
+  it('lists installed models after closing stdin', async () => {
+    const pending = agy.listModels({ agyPath: '/opt/agy' });
+    expect(spawnCalls[0].bin).toBe('/opt/agy');
+    expect(spawnCalls[0].args).toEqual(['models']);
+    expect(spawnCalls[0].child.stdin.end).toHaveBeenCalledTimes(1);
+    spawnCalls[0].child.stdout.emit('data', 'gemini-image\ncustom/image-v2\n');
+    spawnCalls[0].child.emit('close', 0, null);
+    await expect(pending).resolves.toEqual({
+      models: ['gemini-image', 'custom/image-v2'],
+      error: null,
+    });
+  });
+
+  // agy 2026-08 prints `<id>\t<Label>` rows, not the bare ids this parser was
+  // originally written against — so every row failed the id test and the picker
+  // reported "agy models returned no model ids" with a full, healthy catalog on
+  // stdout. Transcribed verbatim from the real binary.
+  it('lists models from the tab-labelled output agy prints today', async () => {
+    const pending = agy.listModels({ agyPath: '/opt/agy' });
+    spawnCalls[0].child.stdout.emit('data', [
+      'gemini-3.6-flash-high\tGemini 3.6 Flash (High)',
+      'gemini-3.1-pro-high\tGemini 3.1 Pro (High)',
+      'claude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)',
+      '',
+    ].join('\n'));
+    spawnCalls[0].child.emit('close', 0, null);
+    await expect(pending).resolves.toEqual({
+      models: ['gemini-3.6-flash-high', 'gemini-3.1-pro-high', 'claude-sonnet-4-6'],
+      error: null,
+    });
+  });
+
+  it('spawns headlessly with the selected model and a directed one-image prompt', async () => {
+    const job = await agy.generateImage({
+      prompt: 'a fox beneath the stars',
+      negativePrompt: 'watermark',
+      model: 'gemini-3-pro-image',
+    });
+
+    expect(job.mode).toBe('agy');
+    expect(job.model).toBe('gemini-3-pro-image');
+    expect(spawnCalls).toHaveLength(1);
+    const { bin, args } = spawnCalls[0];
+    expect(bin).toBe('agy');
+    expect(args).toContain('--dangerously-skip-permissions');
+    expect(args).toEqual(expect.arrayContaining(['--model', 'gemini-3-pro-image', '--print']));
+    const prompt = args[args.indexOf('--print') + 1];
+    expect(prompt).toContain('generate_image');
+    expect(prompt).toContain('exactly one image');
+    expect(prompt).toContain('a fox beneath the stars');
+    expect(prompt).toContain('Avoid: watermark');
+    expect(prompt).toContain(stagingPathFor(job.jobId));
+    expect(prompt).toContain('do not modify any code or workspace content');
+    await closeChild();
+  });
+
+  // resolveImageInputPath requires the file to exist under PATHS.images.
+  const stageGalleryImages = async (...names) => {
+    await mkdir(FAKE_IMAGES_DIR, { recursive: true });
+    for (const name of names) await writeFile(join(FAKE_IMAGES_DIR, name), 'fake');
+  };
+
+  it('directs an init image at the tool ImagePaths parameter with a fidelity phrase', async () => {
+    await stageGalleryImages('source.png');
+    await agy.generateImage({
+      prompt: 'edit this',
+      initImagePath: 'source.png',
+      initImageStrength: 0.1,
+    });
+    expect(spawnCalls).toHaveLength(1);
+    const { args } = spawnCalls[0];
+    const prompt = args[args.indexOf('--print') + 1];
+    expect(prompt).toContain('ImagePaths');
+    expect(prompt).toContain(join(FAKE_IMAGES_DIR, 'source.png'));
+    expect(prompt).toContain('the source image to edit');
+    // Low strength → composition-preserving fidelity phrase.
+    expect(prompt).toMatch(/preserve composition/i);
+    await closeChild();
+  });
+
+  it('passes reference images through in order and caps at the tool 3-image limit', async () => {
+    await stageGalleryImages('source.png', 'ref-a.png', 'ref-b.png', 'ref-c.png', 'ref-d.png');
+    await agy.generateImage({
+      prompt: 'a fox',
+      initImagePath: 'source.png',
+      referenceImagePaths: ['ref-a.png', 'ref-b.png', 'ref-c.png', 'ref-d.png'],
+    });
+    const { args } = spawnCalls[0];
+    const prompt = args[args.indexOf('--print') + 1];
+    const listed = prompt.slice(prompt.indexOf('ImagePaths parameter, in this order: ')).split('\n')[0];
+    expect(listed).toContain(join(FAKE_IMAGES_DIR, 'source.png'));
+    expect(listed).toContain(join(FAKE_IMAGES_DIR, 'ref-a.png'));
+    expect(listed).toContain(join(FAKE_IMAGES_DIR, 'ref-b.png'));
+    // generate_image accepts at most 3 — the trailing references drop out
+    // rather than being sent and silently ignored.
+    expect(listed).not.toContain('ref-c.png');
+    expect(listed).not.toContain('ref-d.png');
+    expect(prompt).toContain('visual references');
+    await closeChild();
+  });
+
+  it('still requires a prompt even with input images (Prompt is a required tool param)', async () => {
+    await stageGalleryImages('source.png');
+    await expect(agy.generateImage({
+      prompt: '',
+      initImagePath: 'source.png',
+    })).rejects.toMatchObject({ code: 'VALIDATION_ERROR', status: 400 });
+    expect(spawnCalls).toHaveLength(0);
+  });
+
+  // A catalog can outrun the install's PortOS version, retiring the shipped pin
+  // under it (see AGY_IMAGEGEN_DEFAULT_MODEL for the incident). The default is
+  // PortOS's own choice, so it re-points to the cheapest tier still listed.
+  it('re-points the shipped default when the catalog no longer lists it', async () => {
+    catalog.models = ['gemini-4.2-flash-high', 'gemini-4.2-flash-low', 'claude-sonnet-4-6'];
+    const job = await agy.generateImage({
+      prompt: 'a fox',
+      model: AGY_IMAGEGEN_DEFAULT_MODEL,
+      modelIsShippedDefault: true,
+    });
+
+    expect(job.model).toBe('gemini-4.2-flash-low');
+    const { args } = spawnCalls[0];
+    expect(args).toEqual(expect.arrayContaining(['--model', 'gemini-4.2-flash', '--effort', 'low']));
+    expect(args).not.toContain(AGY_IMAGEGEN_DEFAULT_MODEL);
+    await closeChild();
+  });
+
+  // A pin the USER typed is a deliberate choice: substituting it would render
+  // something else under agy's name and bury agy's own "unknown model" error.
+  // It rides through verbatim — with no --effort, since the catalog knows no
+  // tiers for it and agy validates the PAIR.
+  it('never substitutes a user-pinned model the catalog does not list', async () => {
+    catalog.models = ['gemini-4.2-flash-low', 'claude-sonnet-4-6'];
+    const job = await agy.generateImage({ prompt: 'a fox', model: 'private-build-low' });
+
+    expect(job.model).toBe('private-build-low');
+    const { args } = spawnCalls[0];
+    expect(args).toEqual(expect.arrayContaining(['--model', 'private-build-low']));
+    expect(args).not.toContain('--effort');
+    await closeChild();
+  });
+
+  // The gate is PROVENANCE, not string equality: the same id is PortOS's to
+  // re-point when it inherited it, and the user's to keep when they typed it.
+  // resolveCloudProviderConfig is the only layer that still knows which.
+  it('leaves the shipped id alone when the user pinned it themselves', async () => {
+    catalog.models = ['gemini-4.2-flash-low'];
+    const job = await agy.generateImage({
+      prompt: 'a fox',
+      model: AGY_IMAGEGEN_DEFAULT_MODEL,
+      modelIsShippedDefault: false,
+    });
+
+    expect(job.model).toBe(AGY_IMAGEGEN_DEFAULT_MODEL);
+    expect(spawnCalls[0].args).not.toContain('gemini-4.2-flash');
+    await closeChild();
+  });
+
+  // agy rejects the PAIR, not the model: "gemini-3.1-pro has no 'medium'
+  // effort (available: low, high)". The catalog is what narrows the ladder.
+  it('clamps a baked effort tier the chosen base does not offer', async () => {
+    catalog.models = ['gemini-3.1-pro-high', 'gemini-3.1-pro-low'];
+    await agy.generateImage({ prompt: 'a fox', model: 'gemini-3.1-pro-medium' });
+
+    const { args } = spawnCalls[0];
+    expect(args).toEqual(expect.arrayContaining(['--model', 'gemini-3.1-pro', '--effort', 'low']));
+    expect(args).not.toContain('medium');
+    await closeChild();
+  });
+
+  it('rejects invalid custom model ids', async () => {
+    await expect(agy.generateImage({
+      prompt: 'a fox',
+      model: 'model; rm -rf /',
+    })).rejects.toMatchObject({ code: 'VALIDATION_ERROR', status: 400 });
+    expect(spawnCalls).toHaveLength(0);
+  });
+
+  it('imports only a signature-verified directed PNG into the gallery', async () => {
+    const completed = vi.fn();
+    imageGenEvents.on('completed', completed);
+    const job = await agy.generateImage({ prompt: 'a fox' });
+    const png = Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      Buffer.from('fakepngbody'),
+    ]);
+    await writeFile(stagingPathFor(job.jobId), png);
+    const releaseCut = await acquireBackupSnapshotCut();
+    try {
+    await closeChild(0, 0);
+      await new Promise(resolve => setImmediate(resolve));
+      expect(existsSync(join(FAKE_IMAGES_DIR, job.filename)), 'provider completion must wait outside a held snapshot').toBe(false);
+    } finally { releaseCut(); }
+
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline && completed.mock.calls.length === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(completed).toHaveBeenCalledTimes(1);
+    expect(existsSync(join(FAKE_IMAGES_DIR, job.filename))).toBe(true);
+    expect(await readFile(join(FAKE_IMAGES_DIR, job.filename))).toEqual(png);
+    const sidecar = JSON.parse(await readFile(join(FAKE_IMAGES_DIR, `${job.jobId}.metadata.json`), 'utf8'));
+    // Provenance records the FIXED server-side image model, distinct from the
+    // agent/session model that drove the CLI (#3231).
+    expect(sidecar.imageModel).toBe('imagen-3.0-generate-002');
+  });
+
+  // agy is a coding agent: when generate_image is quota-exhausted it can still
+  // satisfy "a PNG exists at this path" by writing a script that draws one. The
+  // bytes pass the signature gate, so the residue left by the script is what
+  // catches it (see fabricationGuard.js).
+  it('rejects a PNG the agent drew with code instead of generate_image', async () => {
+    const failed = vi.fn();
+    imageGenEvents.on('failed', failed);
+    const job = await agy.generateImage({ prompt: 'a character sheet' });
+    const png = Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      Buffer.from('drawn by matplotlib'),
+    ]);
+    await writeFile(stagingPathFor(job.jobId), png);
+    await writeFile(join(tmpdir(), `portos-agy-${job.jobId}`, 'render_sheet.py'), 'import matplotlib');
+    await closeChild(0, 0);
+
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline && failed.mock.calls.length === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(failed).toHaveBeenCalledTimes(1);
+    expect(failed.mock.calls[0][0].error).toContain('drawn by code');
+    expect(existsSync(join(FAKE_IMAGES_DIR, job.filename))).toBe(false);
+  });
+
+  it('forbids fabricating the image by any other means', () => {
+    const prompt = agy._internals.buildAgyPrompt({ prompt: 'a fox', stagingPath: '/tmp/out.png' });
+    expect(prompt).toContain('Only the generate_image tool may produce this image');
+    expect(prompt).toContain('Reporting the failure is the correct outcome');
+  });
+
+  it('never states pixel dimensions, which generate_image cannot honor', () => {
+    // AspectRatio is the only size knob (#3231). A "target dimensions" line is
+    // an unsatisfiable instruction that invites the agent to reach for code —
+    // and it leaked into the artwork as a rendered caption.
+    const prompt = agy._internals.buildAgyPrompt({
+      prompt: 'a fox', stagingPath: '/tmp/out.png', width: 832, height: 1216,
+    });
+    expect(prompt).not.toContain('832');
+    expect(prompt).not.toContain('1216');
+    expect(prompt).toContain('Pass AspectRatio "2:3" to the tool.');
+  });
+
+  // The tool's AspectRatio parameter defaults to '1:1', so a render that names
+  // only pixel dimensions comes back square no matter what was asked for —
+  // measured against agy 1.1.8 (1024×1024 with no ratio, 1376×768 with 16:9).
+  // These lock the directive in place; without it, wide comic pages silently
+  // render square.
+  describe('buildAgyPrompt aspect ratio', () => {
+    const build = (width, height) => agy._internals.buildAgyPrompt({
+      prompt: 'a fox', stagingPath: '/tmp/out.png', width, height,
+    });
+
+    it.each([
+      [1024, 1024, '1:1'],
+      [1920, 1080, '16:9'],
+      [1080, 1920, '9:16'],
+      [1024, 768, '4:3'],
+      [768, 1024, '3:4'],
+      [1500, 1000, '3:2'],
+      [1000, 1500, '2:3'],
+    ])('directs the nearest supported ratio for %ix%i', (width, height, ratio) => {
+      expect(build(width, height)).toContain(`Pass AspectRatio "${ratio}" to the tool.`);
+    });
+
+    it('snaps an unsupported ratio to the closest supported one', () => {
+      // 21:9 ultrawide has no exact match — 16:9 is nearest.
+      expect(build(2560, 1080)).toContain('Pass AspectRatio "16:9" to the tool.');
+    });
+
+    it('omits the directive entirely when dimensions are absent', () => {
+      const prompt = agy._internals.buildAgyPrompt({ prompt: 'a fox', stagingPath: '/tmp/out.png' });
+      expect(prompt).not.toContain('AspectRatio');
+    });
+
+    it('keeps the ratio directive out of the image prompt line', () => {
+      // Anything on the "Image prompt:" line becomes part of what gets drawn —
+      // a directive that leaks in there is rendered as content.
+      const promptLine = build(1920, 1080).split('\n').find((l) => l.startsWith('Image prompt:'));
+      expect(promptLine).toBe('Image prompt: a fox');
+    });
+  });
+
+  it('fails closed when the directed output is not an image', async () => {
+    const failed = vi.fn();
+    imageGenEvents.on('failed', failed);
+    const job = await agy.generateImage({ prompt: 'a fox' });
+    await writeFile(stagingPathFor(job.jobId), 'not an image');
+    await closeChild(0, 0);
+
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline && failed.mock.calls.length === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(failed).toHaveBeenCalledTimes(1);
+    expect(existsSync(join(FAKE_IMAGES_DIR, job.filename))).toBe(false);
+  });
+});
+
+
+it('settles admission rejection from the actual close event and clears the active slot', async () => {
+  const job = await agy.generateImage({ prompt: 'admission failure' });
+  const child = spawnCalls[0].child;
+  const failed = new Promise(resolve => imageGenEvents.once('failed', resolve));
+  admissionFault.error = new Error('injected publication admission refusal');
+  try {
+    child.emit('close', 0, null);
+    expect((await failed).error).toContain('injected publication admission refusal');
+    expect(agy.getActiveJob()).toBeNull();
+    const response = { writeHead: vi.fn(), write: vi.fn(), end: vi.fn(), req: new EventEmitter() };
+    expect(agy.attachSseClient(job.jobId, response)).toBe(true);
+    expect(response.write.mock.calls[0][0]).toContain('injected publication admission refusal');
+    response.req.emit('close');
+  } finally { admissionFault.error = null; }
+});
+
+// #10749 — a launch that throws must settle through the job's own finalizer and
+// release the job-owned scratch dir, not leave a phantom 'running' job whose SSE
+// stream never terminates and whose scratch dir leaks.
+describe('agy image provider — launch refusal settlement', () => {
+  const scratchDirFor = (jobId) => join(tmpdir(), `portos-agy-${jobId}`);
+  const sseClient = () => ({ writeHead: vi.fn(), write: vi.fn(), end: vi.fn(), req: new EventEmitter() });
+
+  it.each([
+    // Node validates argv synchronously and throws before any child exists.
+    ['a real Node argument refusal', { agyPath: 'agy\0probe' }, () => spawn.mockImplementationOnce(realSpawn), /Failed to spawn/],
+    ['a synthetic launch refusal', {}, () => spawn.mockImplementationOnce(() => { throw new Error('synthetic launch refusal'); }), /synthetic launch refusal/],
+  ])('settles %s once and removes its scratch dir', async (_label, params, arrange, reason) => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const failed = vi.fn();
+    imageGenEvents.on('failed', failed);
+    arrange();
+    const job = await agy.generateImage({ prompt: 'synthetic', ...params });
+    await vi.waitFor(() => expect(existsSync(scratchDirFor(job.jobId))).toBe(false));
+
+    expect(spawnCalls).toHaveLength(0);
+    expect(failed).toHaveBeenCalledTimes(1);
+    expect(failed.mock.calls[0][0]).toMatchObject({ mode: 'agy', generationId: job.jobId, error: expect.stringMatching(reason) });
+    expect(agy.getActiveJob()).toBeNull();
+    expect(agy.cancel(job.jobId)).toBe(false);
+    const client = sseClient();
+    expect(agy.attachSseClient(job.jobId, client)).toBe(true);
+    expect(JSON.parse(client.write.mock.calls[0][0].replace(/^data: /, ''))).toMatchObject({ type: 'error', error: expect.stringMatching(reason) });
+    client.req.emit('close');
+
+    vi.advanceTimersByTime(SSE_CLEANUP_DELAY_MS);
+    expect(agy.attachSseClient(job.jobId, sseClient())).toBe(false);
+  });
+
+  it('retains an unsettled maintenance blocker when the refused launch cannot remove its scratch dir', async () => {
+    const jobId = 'agy-launch-refusal-cleanup';
+    rmGuarded.mockRejectedValueOnce(Object.assign(new Error('Cleanup denied'), { code: 'EACCES' }));
+    spawn.mockImplementationOnce(() => { throw new Error('synthetic launch refusal'); });
+    const failed = vi.fn();
+    imageGenEvents.on('failed', failed);
+    const permit = fixture.admission.admit('image', jobId);
+    await permit.run(() => agy.generateImage({ jobId, prompt: 'synthetic' }));
+    fixture.admission.begin({ reason: 'Drain renderer', owner: 'Operator' });
+    await vi.waitFor(() => expect(rmGuarded).toHaveBeenCalledTimes(1));
+    await flush();
+    await permit.finish();
+    expect(failed).toHaveBeenCalledTimes(1);
+    expect(fixture.admission.status()).toMatchObject({
+      state: 'draining', blockers: expect.arrayContaining([expect.objectContaining({ resource: jobId, unsettled: true })]),
+    });
+    await realFiles.rmGuarded(scratchDirFor(jobId), { recursive: true, force: true });
+  });
+
+  it('terminates a live child whose setup fails and releases its scratch dir only after it physically closes', async () => {
+    spawn.mockImplementationOnce((bin, args) => {
+      const child = makeFakeChild();
+      child.stdout.on = () => { throw new Error('synthetic stream setup failure'); };
+      spawnCalls.push({ bin, args, child });
+      return child;
+    });
+    const failed = vi.fn();
+    imageGenEvents.on('failed', failed);
+    const job = await agy.generateImage({ prompt: 'synthetic' });
+    const { child } = spawnCalls[0];
+    child.pid = 4242;
+
+    expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+    child.emit('error', new Error('signal delivery failed'));
+    await flush();
+    expect(failed).not.toHaveBeenCalled();
+    expect(existsSync(scratchDirFor(job.jobId))).toBe(true);
+    expect(agy.getActiveJob()).toMatchObject({ generationId: job.jobId });
+
+    child.exitCode = 0;
+    child.emit('close', 0, null);
+    child.emit('close', 0, null);
+    await vi.waitFor(() => expect(existsSync(scratchDirFor(job.jobId))).toBe(false));
+    await flush();
+    expect(failed).toHaveBeenCalledTimes(1);
+    expect(failed.mock.calls[0][0].error).toMatch(/launch setup failed: synthetic stream setup failure/);
+    expect(agy.getActiveJob()).toBeNull();
+    expect(agy.cancel(job.jobId)).toBe(false);
+  });
+});

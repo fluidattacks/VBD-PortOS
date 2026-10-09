@@ -1,0 +1,784 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { render, screen, within, act, fireEvent, waitFor } from '@testing-library/react';
+import { MemoryRouter, useLocation } from 'react-router';
+import { PINNED_KEY } from '../utils/navWorkingSet.js';
+import * as api from '../services/api';
+import socket from '../services/socket';
+import { INSTANCE_FEATURES_CHANGED } from '../constants/events.js';
+import { CMD_K_SEARCH_OPEN_EVENT } from '../hooks/useCmdKSearch.js';
+
+// This suite locks the *integration* path that SingleNavRow.test.jsx can't reach:
+// pinning a top-level `single: true` row (Dashboard `/`, Review Hub `/review`,
+// Eidoverse `/eidoverse`, Goals `/goals/list`) must make it render in the sidebar Pinned
+// section. That resolution lives in Layout itself — `navEntryByPath` indexes
+// `item.single` leaves, `resolveNavEntry` maps a stored path to a row, and
+// `useNavWorkingSet` feeds the Pinned-section render. We exercise the real
+// nav-working-set path (seeded via localStorage) and mock everything else Layout
+// pulls in (notification hooks, sockets, api fetches, theme, heavy child widgets)
+// so the render is deterministic and side-effect free.
+
+// --- Notification / status hooks: no-op, except useNotifications which feeds the
+//     dropdown with a nonzero unread count. ---
+vi.mock('../hooks/useErrorNotifications', () => ({ useErrorNotifications: () => {} }));
+vi.mock('../hooks/useSharingNotifications', () => ({ useSharingNotifications: () => {} }));
+vi.mock('../hooks/useAgentFeedbackToast', () => ({ useAgentFeedbackToast: () => {} }));
+vi.mock('../hooks/useAIStatusNotifications', () => ({ useAIStatusNotifications: () => {} }));
+vi.mock('./UpdateBanners', () => ({ default: () => null }));
+vi.mock('./SetupBanner', () => ({ default: () => null }));
+vi.mock('./MaintenanceBanner.jsx', () => ({ default: () => null }));
+vi.mock('./PasswordRiskWarning.jsx', () => ({ default: () => null }));
+vi.mock('../hooks/useNotifications', () => ({
+  useNotifications: () => ({
+    notifications: [],
+    unreadCount: 6,
+    markAsRead: vi.fn(),
+    markAllAsRead: vi.fn(),
+    removeNotification: vi.fn(),
+    clearAll: vi.fn(),
+  }),
+}));
+
+// --- Theme context: Layout reads `theme.mode` for the day/night toggle. ---
+vi.mock('./ThemeContext', () => ({
+  useThemeContext: () => ({
+    theme: { mode: 'night', label: 'Test', pair: null },
+    themeId: 'test',
+    themeList: [{ id: 'test', label: 'Test', family: 'classic', shortLabel: 'Test', density: 'comfortable' }],
+    setTheme: vi.fn(),
+    toggleMode: vi.fn(),
+  }),
+}));
+
+// --- Heavy child widgets: render nothing so they don't open sockets / fetch. ---
+vi.mock('./Logo', () => ({ default: () => null }));
+vi.mock('./NotificationDropdown', () => ({ default: () => null }));
+vi.mock('./voice/VoiceToggleButton', () => ({ default: () => null }));
+vi.mock('./voice/VoiceWidget', () => ({ default: () => null }));
+vi.mock('./CmdKSearch', () => ({ default: () => null }));
+vi.mock('./KeyboardHelp', () => ({ default: () => null }));
+
+// --- Socket: record handlers, never connect. ---
+vi.mock('../services/socket', () => ({
+  default: { on: vi.fn(), off: vi.fn(), emit: vi.fn() },
+}));
+
+// --- API: every sidebar fetch resolves empty so the dynamic sections stay bare
+//     and the single rows are the only top-level leaves under test. ---
+// Instance features gate sidebar rows (Health / POST / DataDog / JIRA / GSD / OpenClaw). Default every
+// feature ON so these tests see the full sidebar; the gating itself is covered
+// by 'Layout — instance feature gating' below.
+const allFeaturesOn = () => [
+  { id: 'post', label: 'POST', enabled: true },
+  { id: 'datadog', label: 'DataDog', enabled: true },
+  { id: 'jira', label: 'JIRA', enabled: true },
+  { id: 'eidoverse', label: 'Eidoverse Worlds', enabled: true },
+  { id: 'gsd', label: 'GSD', enabled: true },
+  { id: 'openclaw', label: 'OpenClaw', enabled: true },
+  { id: 'health', label: 'Health tracking', enabled: true },
+  { id: 'beeper', label: 'Beeper', enabled: true },
+];
+const featureMock = vi.hoisted(() => ({ features: null }));
+
+vi.mock('../services/api', () => ({
+  getApps: vi.fn(() => Promise.resolve([])),
+  listPipelineSeriesNames: vi.fn(() => Promise.resolve([])),
+  listUniverseNames: vi.fn(() => Promise.resolve([])),
+  getDailyActions: vi.fn(() => Promise.resolve({ actions: [] })),
+  getReviewQueue: vi.fn(() => new Promise(() => {})),
+  getInstanceFeatures: vi.fn(() => Promise.resolve({ features: featureMock.features })),
+}));
+
+import { __resetInstanceFeatureCache } from '../hooks/useInstanceFeatures.js';
+
+import { NAV_COMMANDS } from '../../../server/lib/navManifest.js';
+import Layout from './Layout';
+import { isFullWidthRoute } from '../lib/layoutRoutes.js';
+import {
+  NAV_PRESENTATION,
+  SECTIONS_BEFORE_GOALS,
+  SECTIONS_AFTER_GOALS,
+  SECTIONS_BELOW_MORE,
+} from '../lib/navPresentation.js';
+
+const LocationProbe = () => {
+  const location = useLocation();
+  return <output data-testid="current-path">{location.pathname}</output>;
+};
+
+const renderLayout = async (initialPath = '/brain/inbox') => {
+  const utils = render(
+    <MemoryRouter initialEntries={[initialPath]}>
+      <Layout />
+      <LocationProbe />
+    </MemoryRouter>,
+  );
+  // The sidebar's dynamic sections fire async fetches (all mocked empty here).
+  // Flush their resolution inside act() so the resulting setState lands within
+  // the React lifecycle instead of after the test body returns (which warns
+  // "update … not wrapped in act").
+  await act(async () => {});
+  return utils;
+};
+
+// The Pinned region carries a stable `data-testid` so assertions scope to it
+// without depending on the heading's DOM nesting (a benign style refactor of the
+// label shouldn't break these tests). Returns null when the section isn't rendered.
+const pinnedSection = () => screen.queryByTestId('pinned-section');
+
+describe('Layout — manifest-derived sidebar structure', () => {
+  it.each([false, true])('keeps global unread notifications off CoS navigation (collapsed: %s)', async (collapsed) => {
+    localStorage.setItem('portos-sidebar-collapsed', String(collapsed));
+    await renderLayout();
+
+    const cos = screen.getByRole('button', { name: /^Chief of Staff/ });
+    expect(cos).toHaveTextContent(/^Chief of Staff$/);
+    fireEvent.click(cos);
+    expect(screen.getByTestId('current-path')).toHaveTextContent('/cos/tasks');
+  });
+
+
+  it('loads sidebar apps through the lean navigation projection', async () => {
+    await renderLayout();
+
+    expect(api.getApps).toHaveBeenCalledWith({ silent: true, view: 'nav' });
+  });
+
+  it('keeps NAV_PRESENTATION presentation-only and keyed to live manifest paths', () => {
+    const manifestPaths = new Set(NAV_COMMANDS.map((command) => command.path));
+    expect(Object.keys(NAV_PRESENTATION).filter((path) => !manifestPaths.has(path))).toEqual([]);
+    for (const presentation of Object.values(NAV_PRESENTATION)) {
+      expect(presentation).not.toHaveProperty('to');
+      expect(presentation).not.toHaveProperty('label');
+      expect(presentation).not.toHaveProperty('section');
+      expect(presentation).not.toHaveProperty('feature');
+      expect(presentation.icon).toBeTruthy();
+    }
+  });
+
+  it('covers all sub-tabs for Settings, Digital Twin, and Messages in NAV_PRESENTATION', () => {
+    const settingsPaths = [
+      '/settings/general', '/settings/ai-assignments', '/settings/api-access', '/settings/autofixer',
+      '/settings/backup', '/settings/credentials', '/settings/database', '/settings/features',
+      '/settings/security', '/settings/sharing',
+      '/settings/telegram', '/settings/voice', '/settings/mortalloom',
+      '/openclaw', '/prompts', '/ai/presets', '/ai/harnesses', '/ai/services'
+    ];
+    for (const p of settingsPaths) {
+      expect(NAV_PRESENTATION[p], `missing NAV_PRESENTATION for settings path ${p}`).toBeDefined();
+    }
+
+    const digitalTwinTabs = [
+      'overview', 'identity', 'personas', 'goals', 'taste',
+      'documents', 'import', 'accounts', 'interview', 'autobiography', 'enrich',
+      'test', 'personality', 'voice', 'appearance', 'avatar-bio',
+      'export', 'legacy', 'time-capsule'
+    ];
+    for (const tab of digitalTwinTabs) {
+      const p = `/digital-twin/${tab}`;
+      expect(NAV_PRESENTATION[p], `missing NAV_PRESENTATION for digital twin tab ${p}`).toBeDefined();
+    }
+
+    const messageTabs = ['inbox', 'drafts', 'imessage', 'signal', 'beeper', 'contacts', 'sync', 'config'];
+    for (const tab of messageTabs) {
+      const p = `/messages/${tab}`;
+      expect(NAV_PRESENTATION[p], `missing NAV_PRESENTATION for message tab ${p}`).toBeDefined();
+    }
+  });
+});
+
+let desktopMedia;
+
+beforeEach(() => {
+  desktopMedia = Object.assign(new EventTarget(), { matches: true });
+  vi.stubGlobal('matchMedia', vi.fn(() => desktopMedia));
+  localStorage.clear();
+  // The feature list is cached at module scope so every consumer shares one
+  // fetch — drop it between tests so a case that flips a flag cannot leak.
+  __resetInstanceFeatureCache();
+  featureMock.features = allFeaturesOn();
+  // __APP_VERSION__ is a Vite build-time define; undefined under vitest.
+  vi.stubGlobal('__APP_VERSION__', 'test');
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+  api.listPipelineSeriesNames.mockResolvedValue([]);
+  api.listUniverseNames.mockResolvedValue([]);
+});
+
+describe('Layout — pinned single nav rows', () => {
+  it('renders a pinned top-level single row (Dashboard) in the Pinned section', async () => {
+    localStorage.setItem(PINNED_KEY, JSON.stringify(['/']));
+    await renderLayout();
+
+    const pinned = pinnedSection();
+    expect(pinned).toBeTruthy();
+    // The Dashboard row resolved through navEntryByPath → its label links to '/'.
+    const link = within(pinned).getByRole('link', { name: /Dashboard/i });
+    expect(link).toHaveAttribute('href', '/');
+    // And it carries the Unpin affordance (it's pinned).
+    expect(within(pinned).getByRole('button', { name: /^Unpin Dashboard$/i })).toBeTruthy();
+  });
+
+  it('resolves every top-level single row by path into the Pinned section', async () => {
+    localStorage.setItem(PINNED_KEY, JSON.stringify(['/', '/review', '/openworld', '/goals/list']));
+    await renderLayout();
+
+    const pinned = pinnedSection();
+    expect(within(pinned).getByRole('link', { name: /Dashboard/i })).toHaveAttribute('href', '/');
+    expect(within(pinned).getByRole('link', { name: /Review Hub/i })).toHaveAttribute('href', '/review');
+    expect(within(pinned).getByRole('link', { name: /Eidoverse/i })).toHaveAttribute('href', '/eidoverse');
+    expect(within(pinned).getByRole('link', { name: /Goals/i })).toHaveAttribute('href', '/goals/list');
+  });
+
+  it('omits the Pinned section entirely when nothing is pinned', async () => {
+    await renderLayout();
+    expect(pinnedSection()).toBeNull();
+  });
+
+  it('renders a pinned manifest-only path on the first paint, with no network mock', async () => {
+    // `/wiki/log` has a NAV_COMMANDS entry but no sidebar presentation, so it
+    // resolves only through `manifestEntryByPath`. That map is derived from the
+    // statically imported manifest, so the row must be in the DOM on the very
+    // first render — assert BEFORE the act() flush renderLayout does, which is
+    // what a fetch-backed manifest would have needed to land.
+    localStorage.setItem(PINNED_KEY, JSON.stringify(['/wiki/log']));
+    render(
+      <MemoryRouter initialEntries={['/brain/inbox']}>
+        <Layout />
+      </MemoryRouter>,
+    );
+
+    const pinned = pinnedSection();
+    expect(pinned).toBeTruthy();
+    expect(within(pinned).getByRole('link', { name: /Log/i })).toHaveAttribute('href', '/wiki/log');
+    await act(async () => {});
+  });
+
+  it('filters out an unknown pinned path while keeping the known one', async () => {
+    // A stored path that maps to no nav leaf and no manifest entry resolves to
+    // null and is dropped by resolveNavEntry; a known path beside it still renders.
+    // Asserting the survivor (not just absence) proves the filter, not merely that
+    // the section failed to render.
+    localStorage.setItem(PINNED_KEY, JSON.stringify(['/this/path/does/not/exist', '/openworld']));
+    await renderLayout();
+
+    const pinned = pinnedSection();
+    expect(pinned).toBeTruthy();
+    expect(within(pinned).getByRole('link', { name: /Eidoverse/i })).toHaveAttribute('href', '/eidoverse');
+    // The unknown path contributes no row.
+    expect(within(pinned).getAllByRole('link')).toHaveLength(1);
+  });
+});
+
+describe('Layout — instance feature gating', () => {
+  // Rendering an UNGATED /devtools/* route auto-expands the Dev Tools section,
+  // so its children are queryable without driving the disclosure — and the
+  // expansion does not itself depend on a gated row surviving the filter.
+  it('shows the DataDog and JIRA rows while those features are on', async () => {
+    await renderLayout('/devtools/flows');
+
+    expect(screen.getByRole('link', { name: 'DataDog' })).toHaveAttribute('href', '/devtools/datadog');
+    expect(screen.getByRole('link', { name: 'JIRA' })).toBeTruthy();
+    expect(screen.getByRole('link', { name: 'JIRA Reports' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'POST' })).toBeTruthy();
+  });
+
+  it('shows API Explorer inside Dev Tools navigation', async () => {
+    await renderLayout('/api-reference/catalog');
+
+    expect(NAV_COMMANDS.find((command) => command.path === '/api-reference/catalog')?.section).toBe('Dev Tools');
+    expect(screen.getByRole('link', { name: 'API Explorer' })).toHaveAttribute('href', '/api-reference/catalog');
+  });
+
+  it('drops only the rows of the features this install turned off', async () => {
+    featureMock.features = allFeaturesOn()
+      .map((f) => (f.id === 'post' ? f : { ...f, enabled: false }));
+
+    await renderLayout('/devtools/flows');
+
+    expect(screen.queryByRole('link', { name: 'DataDog' })).toBeNull();
+    expect(screen.queryByRole('link', { name: 'JIRA' })).toBeNull();
+    expect(screen.queryByRole('link', { name: 'JIRA Reports' })).toBeNull();
+    // Ungated Dev Tools rows and the POST section stay put.
+    expect(screen.getByRole('link', { name: 'Flows' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'POST' })).toBeTruthy();
+  });
+
+  it('shows Settings > Features in the primary navigation', async () => {
+    await renderLayout('/settings/features');
+
+    expect(screen.getByRole('link', { name: 'Features' })).toHaveAttribute('href', '/settings/features');
+  });
+
+  it('shows and hides Eidoverse with its instance feature flag', async () => {
+    await renderLayout('/eidoverse');
+    expect(screen.getByRole('link', { name: 'Eidoverse' })).toHaveAttribute('href', '/eidoverse');
+
+    featureMock.features = allFeaturesOn()
+      .map((feature) => feature.id === 'eidoverse' ? { ...feature, enabled: false } : feature);
+    act(() => window.dispatchEvent(new CustomEvent(INSTANCE_FEATURES_CHANGED, {
+      detail: { features: featureMock.features },
+    })));
+    expect(screen.queryByRole('link', { name: 'Eidoverse' })).toBeNull();
+  });
+
+  it('shows and hides OpenClaw with its instance feature flag', async () => {
+    await renderLayout('/openclaw');
+    expect(screen.getByRole('link', { name: 'OpenClaw' })).toHaveAttribute('href', '/openclaw');
+
+    featureMock.features = allFeaturesOn()
+      .map((feature) => feature.id === 'openclaw' ? { ...feature, enabled: false } : feature);
+    act(() => window.dispatchEvent(new CustomEvent(INSTANCE_FEATURES_CHANGED, {
+      detail: { features: featureMock.features },
+    })));
+    expect(screen.queryByRole('link', { name: 'OpenClaw' })).toBeNull();
+  });
+
+  it('drops the whole POST section when POST is off', async () => {
+    featureMock.features = allFeaturesOn()
+      .map((f) => (f.id === 'post' ? { ...f, enabled: false } : f));
+
+    await renderLayout('/devtools/flows');
+
+    expect(screen.queryByRole('button', { name: 'POST' })).toBeNull();
+    expect(screen.getByRole('link', { name: 'DataDog' })).toBeTruthy();
+  });
+
+  it('drops the whole Health section when health tracking is off', async () => {
+    featureMock.features = allFeaturesOn()
+      .map((f) => (f.id === 'health' ? { ...f, enabled: false } : f));
+
+    await renderLayout('/devtools/flows');
+
+    expect(screen.queryByRole('button', { name: 'Health' })).toBeNull();
+  });
+
+  it('shows everything when the feature list cannot be read', async () => {
+    api.getInstanceFeatures.mockRejectedValueOnce(new Error('offline'));
+
+    await renderLayout('/devtools/flows');
+
+    expect(screen.getByRole('link', { name: 'DataDog' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'POST' })).toBeTruthy();
+  });
+});
+
+describe('Layout — Comms section (Beeper)', () => {
+  // #30 / real-browser pass: the Beeper row never rendered in the sidebar Comms
+  // section, feature on or off, because NAV_PRESENTATION had no '/messages/beeper'
+  // key. navRowForPath() throws the other way around — for a NAV_PRESENTATION
+  // path with no matching NAV_COMMANDS entry — so a path missing from
+  // NAV_PRESENTATION itself never reaches navRowForPath at all (presentedNavRows
+  // only maps over NAV_PRESENTATION's own keys), and the row was silently absent
+  // rather than a crash.
+  it('lists Beeper in the Comms section alongside the other messaging rows when the feature is on', async () => {
+    await renderLayout('/messages/inbox');
+
+    const beeper = screen.getByRole('link', { name: 'Beeper' });
+    expect(beeper).toHaveAttribute('href', '/messages/beeper');
+    // Same section as its siblings, not a stray top-level row.
+    expect(screen.getByRole('link', { name: 'Signal' })).toBeTruthy();
+    expect(screen.getByRole('link', { name: 'iMessage' })).toBeTruthy();
+  });
+
+  it('drops only the Beeper row when the beeper feature is off, keeping the rest of Comms', async () => {
+    featureMock.features = allFeaturesOn()
+      .map((f) => (f.id === 'beeper' ? { ...f, enabled: false } : f));
+
+    await renderLayout('/messages/inbox');
+
+    expect(screen.queryByRole('link', { name: 'Beeper' })).toBeNull();
+    expect(screen.getByRole('link', { name: 'Signal' })).toBeTruthy();
+    expect(screen.getByRole('link', { name: 'iMessage' })).toBeTruthy();
+    expect(screen.getByRole('link', { name: 'Inbox' })).toBeTruthy();
+  });
+});
+
+describe('Layout — System Resources location state', () => {
+  it('keeps Dev Tools expanded and System Resources active on every subtab', async () => {
+    await renderLayout('/system-resources/storage');
+
+    const link = screen.getByRole('link', { name: 'System Resources' });
+    expect(link).toHaveAttribute('href', '/system-resources/overview');
+    expect(link.className).toContain('text-port-accent');
+  });
+});
+
+describe('Layout — section destinations', () => {
+  it('keeps a Models task route and its owning sidebar destination active', async () => {
+    localStorage.setItem(PINNED_KEY, JSON.stringify(['/models/performance/results']));
+    await renderLayout('/models/performance/results');
+
+    expect(screen.getByRole('button', { name: 'Models' })).toHaveClass('text-port-accent');
+    expect(screen.getByRole('link', { name: 'Performance' })).toHaveClass('text-port-accent');
+    expect(within(pinnedSection()).getByRole('link', { name: 'Performance Results' })).toHaveClass('text-port-accent');
+    expect(screen.getByRole('link', { name: 'Model Library' })).not.toHaveClass('text-port-accent');
+  });
+
+  it('opens LLMs when the Models section label is clicked', async () => {
+    await renderLayout();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Models' }));
+
+    expect(screen.getByTestId('current-path')).toHaveTextContent('/models/llms');
+  });
+});
+
+describe('Layout — persistent mobile touch targets', () => {
+  const expectAtLeast44px = (element) => {
+    expect(element.className).toContain('min-w-[44px]');
+    expect(element.className).toContain('min-h-[44px]');
+  };
+
+  it('keeps navigation and header controls 44px through the mobile layout', async () => {
+    await renderLayout();
+
+    const openMenu = screen.getByRole('button', { name: 'Open navigation menu' });
+    const closeMenu = screen.getByRole('button', { name: 'Close sidebar' });
+    expectAtLeast44px(openMenu);
+    expectAtLeast44px(closeMenu);
+    expect(openMenu.closest('header')?.className).toContain('lg:hidden');
+    expect(closeMenu.className).toContain('lg:hidden');
+
+    const searchButtons = screen.getAllByRole('button', { name: 'Open command palette' });
+    expect(searchButtons).toHaveLength(2);
+    searchButtons.forEach(expectAtLeast44px);
+    expect(within(screen.getByRole('banner')).getByRole('button', { name: 'Open command palette' })).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'Ambient display' })).not.toBeInTheDocument();
+
+    const themeToggles = screen.getAllByRole('button', { name: 'Toggle day/night mode' });
+    expect(themeToggles).toHaveLength(2);
+    themeToggles.forEach((toggle) => {
+      expectAtLeast44px(toggle);
+      expect(toggle.className).toContain('lg:min-w-0');
+      expect(toggle.className).toContain('lg:min-h-0');
+      expect(toggle.className).not.toContain('sm:min-w-0');
+      expect(toggle.className).not.toContain('sm:min-h-0');
+    });
+  });
+
+  it('opens the command palette from the mobile header search button', async () => {
+    await renderLayout();
+    const dispatchSpy = vi.spyOn(document, 'dispatchEvent');
+
+    fireEvent.click(within(screen.getByRole('banner')).getByRole('button', { name: 'Open command palette' }));
+
+    expect(dispatchSpy).toHaveBeenCalledWith(expect.objectContaining({ type: CMD_K_SEARCH_OPEN_EVENT }));
+    dispatchSpy.mockRestore();
+  });
+
+  it('expands section children when the mobile sidebar opens from a collapsed desktop preference', async () => {
+    localStorage.setItem('portos-sidebar-collapsed', 'true');
+    await renderLayout('/');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open navigation menu' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Expand Create' }));
+
+    expect(screen.getByRole('link', { name: 'Authors' })).toHaveAttribute('href', '/authors');
+  });
+});
+
+describe('Layout — nav footer', () => {
+  it('opens the command palette from the footer search button', async () => {
+    await renderLayout();
+    const dispatchSpy = vi.spyOn(document, 'dispatchEvent');
+    const footer = screen.getByText(/^vtest$/).closest('.border-t');
+
+    const searchButton = within(footer).getByRole('button', { name: 'Open command palette' });
+    fireEvent.click(searchButton);
+
+    expect(dispatchSpy).toHaveBeenCalledWith(expect.objectContaining({ type: CMD_K_SEARCH_OPEN_EVENT }));
+    dispatchSpy.mockRestore();
+  });
+
+  it('renders a compact footer layout preventing controls from overflowing the sidebar', async () => {
+    await renderLayout();
+
+    const version = screen.getByText(/^vtest$/);
+    expect(version.className).toContain('text-xs');
+    expect(version.className).toContain('shrink-0');
+
+    const footer = version.closest('.border-t');
+    expect(footer).toBeTruthy();
+    expect(footer.className).toContain('px-3');
+    expect(footer.className).toContain('py-2.5');
+
+    const row = version.parentElement;
+    expect(row.className).toContain('lg:flex-row');
+    expect(row.className).toContain('lg:justify-between');
+
+    const iconsContainer = row.querySelector('.flex.items-center');
+    expect(iconsContainer.className).toContain('gap-0.5');
+  });
+});
+
+describe('Layout — Game workspace scroll mode', () => {
+  it('makes only the Game detail route full-bleed', async () => {
+    const detail = await renderLayout('/game/example-game');
+    expect(detail.container.querySelector('#main-content')?.className).toContain('overflow-clip-safe');
+    detail.unmount();
+
+    const index = await renderLayout('/game');
+    const main = index.container.querySelector('#main-content');
+    expect(main?.className).toContain('overflow-auto');
+    expect(main?.className).toContain('p-4');
+    index.unmount();
+
+    const trailingSlashIndex = await renderLayout('/game/');
+    const trailingSlashMain = trailingSlashIndex.container.querySelector('#main-content');
+    expect(trailingSlashMain?.className).toContain('overflow-auto');
+    expect(trailingSlashMain?.className).toContain('p-4');
+  });
+});
+
+// Data Manager renders its own bordered title bar over a `flex-1 overflow-auto`
+// body, so it needs the bare full-width main. While it was missing from the
+// tables it nested that scroller inside `<main>`'s own `overflow-auto p-4
+// md:p-6` — two scrollbars, doubled padding (#4145).
+describe('Layout — Data Manager scroll mode', () => {
+  it('gives /data the bare full-width main, and leaves /devtools/datadog padded', async () => {
+    const dataManager = await renderLayout('/data');
+    const dataMain = dataManager.container.querySelector('#main-content');
+    expect(dataMain?.className).toContain('overflow-clip-safe');
+    expect(dataMain?.className).not.toContain('overflow-auto');
+    expect(dataMain?.className).not.toContain('p-4');
+    dataManager.unmount();
+
+    const dataDog = await renderLayout('/devtools/datadog');
+    const dataDogMain = dataDog.container.querySelector('#main-content');
+    expect(dataDogMain?.className).toContain('overflow-auto');
+    expect(dataDogMain?.className).toContain('p-4');
+  });
+});
+
+describe('Layout — dynamic third-level navigation', () => {
+  it('collapses and expands the Series and Universes children', async () => {
+    api.listPipelineSeriesNames.mockResolvedValue([{ id: 'series-1', name: 'Example Series' }]);
+    api.listUniverseNames.mockResolvedValue([{ id: 'universe-1', name: 'Example Universe' }]);
+
+    await renderLayout('/media');
+
+    await waitFor(() => {
+      expect(screen.getByRole('link', { name: 'Example Series' })).toHaveAttribute('href', '/pipeline/series/series-1');
+      expect(screen.getByRole('link', { name: 'Example Universe' })).toHaveAttribute('href', '/universes/universe-1');
+    });
+
+    const collapseSeries = screen.getByRole('button', { name: 'Collapse Series Pipeline' });
+    const collapseUniverses = screen.getByRole('button', { name: 'Collapse Universes' });
+    fireEvent.click(collapseSeries);
+    fireEvent.click(collapseUniverses);
+    expect(screen.queryByRole('link', { name: 'Example Series' })).toBeNull();
+    expect(screen.queryByRole('link', { name: 'Example Universe' })).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Expand Series Pipeline' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Expand Universes' }));
+    expect(screen.getByRole('link', { name: 'Example Series' })).toBeTruthy();
+    expect(screen.getByRole('link', { name: 'Example Universe' })).toBeTruthy();
+  });
+
+  it('updates dynamic apps navigation when apps:changed is emitted', async () => {
+    let appsChangedHandler;
+    socket.on.mockImplementation((event, handler) => {
+      if (event === 'apps:changed') appsChangedHandler = handler;
+    });
+    api.getApps.mockResolvedValueOnce([]);
+    await renderLayout('/apps');
+
+    expect(screen.queryByRole('link', { name: 'Super New App' })).not.toBeInTheDocument();
+
+    api.getApps.mockResolvedValueOnce([{ id: 'super-new-app', name: 'Super New App' }]);
+    await act(async () => {
+      appsChangedHandler?.();
+    });
+
+    expect(await screen.findByRole('link', { name: 'Super New App' })).toBeInTheDocument();
+  });
+});
+
+// `isFullWidthRoute` decides whether a page gets the bare full-width <main>
+// (owns its own scroll) or the default padded+scrolling one. It encodes 41
+// rules across three tables, and the only other coverage is the /game
+// integration case above — so a dropped or retyped entry would silently
+// change a page's layout with nothing failing. Every expectation below was
+// verified against the pre-refactor OR-chain, so this locks behavior rather
+// than merely restating the current tables.
+describe('Layout — isFullWidthRoute classification', () => {
+  it.each([
+    // Exact matches must NOT leak to longer paths that merely share the prefix.
+    ['/shell', true], ['/shell/abc', true], ['/shellx', false],
+    ['/ask', true], ['/ask/1', true], ['/asking', false],
+    ['/timeline', true], ['/timeline/2026-08-12', true],
+    ['/tribe', true], ['/rapid-reader', true], ['/rapid-reader/r1', true], ['/openclaw', true],
+    ['/review', true], ['/review/a1', true], ['/reviewing', false],
+    ['/stacker-news', true], ['/stacker-news/a1/review', true], ['/x', true], ['/x/a1/posts', true], ['/xyz', false],
+    ['/privacy', true], ['/privacy/vault', true], ['/privacy-policy', false],
+    ['/code-animation', true], ['/code-animation/j1', true], ['/code-animation/production/p1', true],
+    ['/code-animations', false], ['/apps', true],
+    ['/eidoverse', true], ['/eidoverse/world', false],
+    // Index page stays padded+scrolling; only the DETAIL route is full-width.
+    ['/catalog', false], ['/catalog/book/1', true],
+    ['/universes', false], ['/universes/u1', true],
+    ['/rounds', false], ['/rounds/guide', true],
+    ['/story-builder', false], ['/story-builder/s1/step', true],
+    // AI Providers: the index AND its editor sub-routes (a drawer over the same
+    // page) are full-width, but a sibling path sharing the `/ai` prefix is not.
+    ['/ai', true], ['/ai/presets', true], ['/ai/presets/codex', true], ['/ai/harnesses', true], ['/ai/services/ollama', true], ['/ai/edit/codex', true], ['/airlock', false],
+    ['/pipeline', false], ['/pipeline/series/s1', true],
+    ['/local-llm', false], ['/local-llm/m', true],
+    // Music owns the same full-bleed title/tab/body shell as Media Gen; Music
+    // Video has its own full-width rule, which a sibling prefix must not hit.
+    ['/music', true], ['/music/generate', true], ['/music-video', true], ['/music-video/p1/board', true], ['/music-videos', false],
+    // Video workspace index owns its own scroll; Generate Video uses the
+    // Media Gen tab shell and must stay full-width with it. `/video-gen` is
+    // a legacy redirect, not a page with an internal scroller.
+    ['/video', true], ['/video/generate', true], ['/video-gen', false],
+    // Game: only a single-segment detail workspace.
+    ['/game', false], ['/game/', false], ['/game/g1', true], ['/game/g1/x', false],
+    // Apps: detail editor is full-width, but the Add App form is explicitly excluded
+    // (it has no internal scroll container and would clip below the fold).
+    ['/apps/create', false], ['/apps/create/', false], ['/apps/a1', true], ['/apps/a1/tab', true],
+    // Data Manager owns its own bar+scroll shell, and is registered EXACT so
+    // it can't leak onto the DataDog routes that share the `/data` prefix.
+    ['/data', true], ['/datadog', false], ['/devtools/datadog', false],
+    // Models owns the same header/tabs/scroll shell as Settings — registered as
+    // a whole-section prefix, so the bare path and every tab classify alike.
+    ['/models', true], ['/models/performance', true], ['/models/llms', true],
+    // Whole-section prefixes, and the default for an unlisted route.
+    ['/songbook', true], ['/', false],
+  ])('%s -> %s', (pathname, expected) => {
+    expect(isFullWidthRoute(pathname)).toBe(expected);
+  });
+});
+
+// The sidebar's section grouping used to be three numeric slices into a single
+// flat SECTION_ORDER array, so inserting a section at its alphabetical position
+// silently pushed a real section (e.g. Settings) past the "More" divider with
+// nothing to catch it. The groups are named lists now; this locks the two
+// invariants that made the slices fragile.
+describe('Layout — sidebar section grouping', () => {
+  const alphabetical = (list) => [...list].sort((a, b) => a.localeCompare(b));
+
+  // The two lists are one alphabetical run split by the standalone Goals row, so
+  // splicing that row's label back in at the split point must re-form a sorted
+  // list. That pins BOTH the ordering within each list and where the split sits:
+  // moving a section across the Goals boundary lands it out of order here, which
+  // per-list sort checks would happily accept.
+  it('reads as one alphabetical run through the standalone Goals row', () => {
+    const goalsLabel = NAV_COMMANDS.find((command) => command.path === '/goals/list').label;
+    const run = [...SECTIONS_BEFORE_GOALS, goalsLabel, ...SECTIONS_AFTER_GOALS];
+    expect(run).toEqual(alphabetical(run));
+  });
+
+  // SECTIONS_BELOW_MORE is deliberately NOT part of that run — it is the
+  // below-the-fold bucket — so it is exempt from the sort check but still has to
+  // be disjoint and complete.
+  it('groups every presented section exactly once', () => {
+    const grouped = [...SECTIONS_BEFORE_GOALS, ...SECTIONS_AFTER_GOALS, ...SECTIONS_BELOW_MORE];
+    expect(new Set(grouped).size).toBe(grouped.length);
+
+    // `Main` (Dashboard/Review/Eidoverse plus the dynamic Apps row) and `Goals`
+    // render as standalone top-level rows, not as collapsible section groups.
+    const UNGROUPED_SECTIONS = new Set(['Main', 'Goals']);
+    const sectionByPath = new Map(NAV_COMMANDS.map((command) => [command.path, command.section]));
+    const presented = new Set(
+      Object.keys(NAV_PRESENTATION)
+        .map((path) => sectionByPath.get(path))
+        .filter((section) => section && !UNGROUPED_SECTIONS.has(section)),
+    );
+    expect(alphabetical([...presented])).toEqual(alphabetical(grouped));
+  });
+});
+
+describe('Layout — keyboard navigation shell', () => {
+  it('moves skip-link focus into main content', async () => {
+    await renderLayout();
+    const skipLink = screen.getByRole('link', { name: 'Skip to main content' });
+    skipLink.focus();
+    fireEvent.click(skipLink);
+    expect(screen.getByRole('main')).toHaveFocus();
+    expect(screen.getByRole('main')).toHaveAttribute('tabindex', '-1');
+  });
+
+  it('hides closed mobile links, traps open navigation, and restores the menu button on dismissal', async () => {
+    desktopMedia.matches = false;
+    const { container } = await renderLayout();
+    const sidebar = container.querySelector('#app-sidebar');
+    const opener = screen.getByRole('button', { name: 'Open navigation menu' });
+    expect(sidebar).toHaveAttribute('inert');
+    expect(sidebar).toHaveAttribute('aria-hidden', 'true');
+    expect(screen.queryByRole('navigation')).not.toBeInTheDocument();
+
+    fireEvent.click(opener);
+    expect(sidebar).not.toHaveAttribute('inert');
+    expect(sidebar).not.toHaveAttribute('aria-hidden');
+    expect(sidebar.contains(document.activeElement)).toBe(true);
+    const first = document.activeElement;
+    fireEvent.keyDown(first, { key: 'Tab', shiftKey: true });
+    const last = document.activeElement;
+    expect(last).not.toBe(first);
+    expect(sidebar.contains(last)).toBe(true);
+    fireEvent.keyDown(last, { key: 'Tab' });
+    expect(first).toHaveFocus();
+    fireEvent.keyDown(first, { key: 'Escape' });
+    expect(opener).toHaveFocus();
+    expect(opener).toHaveAttribute('aria-expanded', 'false');
+    expect(sidebar).toHaveAttribute('inert');
+
+    fireEvent.click(opener);
+    fireEvent.click(within(sidebar).getByRole('button', { name: 'Close sidebar' }));
+    expect(opener).toHaveFocus();
+    fireEvent.click(opener);
+    fireEvent.click(screen.getAllByRole('button', { name: 'Close sidebar' }).find(el => !sidebar.contains(el)));
+    expect(opener).toHaveFocus();
+    expect(sidebar).toHaveAttribute('inert');
+  });
+
+  it('dismisses a portaled theme picker before closing its mobile sidebar', async () => {
+    desktopMedia.matches = false;
+    const { container } = await renderLayout();
+    const sidebar = container.querySelector('#app-sidebar');
+    const opener = screen.getByRole('button', { name: 'Open navigation menu' });
+    fireEvent.click(opener);
+    const themeButton = within(sidebar).getByRole('button', { name: 'Switch theme. Current theme: Test' });
+    fireEvent.click(themeButton);
+    const option = screen.getByRole('menuitemradio', { name: /Test/ });
+    expect(option).toHaveFocus();
+    fireEvent.keyDown(option, { key: 'Escape' });
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+    expect(themeButton).toHaveFocus();
+    expect(opener).toHaveAttribute('aria-expanded', 'true');
+    fireEvent.keyDown(themeButton, { key: 'Escape' });
+    expect(opener).toHaveFocus();
+    expect(sidebar).toHaveAttribute('inert');
+  });
+
+  it('keeps desktop navigation accessible and releases the mobile trap on a breakpoint change', async () => {
+    const { container } = await renderLayout();
+    const sidebar = container.querySelector('#app-sidebar');
+    expect(sidebar).not.toHaveAttribute('inert');
+    expect(sidebar).not.toHaveAttribute('aria-hidden');
+    act(() => {
+      desktopMedia.matches = false;
+      desktopMedia.dispatchEvent(new Event('change'));
+    });
+    expect(sidebar).toHaveAttribute('inert');
+    const opener = screen.getByRole('button', { name: 'Open navigation menu' });
+    fireEvent.click(opener);
+    act(() => {
+      desktopMedia.matches = true;
+      desktopMedia.dispatchEvent(new Event('change'));
+    });
+    expect(opener).toHaveAttribute('aria-expanded', 'false');
+    expect(sidebar).not.toHaveAttribute('inert');
+    expect(sidebar).not.toHaveAttribute('aria-hidden');
+    const link = within(sidebar).getAllByRole('link')[0];
+    link.focus();
+    expect(fireEvent.keyDown(link, { key: 'Tab', shiftKey: true })).toBe(true);
+    act(() => {
+      desktopMedia.matches = false;
+      desktopMedia.dispatchEvent(new Event('change'));
+    });
+    expect(sidebar).toHaveAttribute('inert');
+  });
+});

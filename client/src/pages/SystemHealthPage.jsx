@@ -1,0 +1,415 @@
+import { useEffect, useState, useRef } from 'react';
+import { Link, Navigate, useParams } from 'react-router';
+import { Activity, AlertTriangle, HardDrive, Cpu, Database, ListOrdered, RefreshCw, ServerCog, X, Zap } from 'lucide-react';
+import * as api from '../services/api';
+import toast from '../components/ui/Toast';
+import { formatPercent } from '../utils/formatters';
+import PageSkeleton from '../components/ui/PageSkeleton';
+import Banner from '../components/ui/Banner';
+import { useSocketResource } from '../hooks/useSocketResource';
+
+import { useHealthWarningDismiss } from '../hooks/useHealthWarningDismiss.jsx';
+import { useSystemResourceReport } from '../hooks/useSystemResourceReport.js';
+import StoragePanel from '../components/system-resources/StoragePanel.jsx';
+import QueuesPanel from '../components/system-resources/QueuesPanel.jsx';
+import MediaCapacityPanel from '../components/system-resources/MediaCapacityPanel.jsx';
+import BuildStampPanel from '../components/system-resources/BuildStampPanel.jsx';
+import { getPageNavTabs } from '../../../server/lib/navManifest.js';
+import { buildPageNavTabs } from '../lib/pageNavTabs.js';
+import RouteTabsHeader from '../components/ui/RouteTabsHeader';
+import { HEALTH_STYLE, pctTone, barTone, resolveHealthThresholds } from '../lib/healthStyle.js';
+
+const READINESS_EVENTS = ['system:health:changed'];
+
+// Every alert names its own next step. The server tags each warning with a
+// `type` (server/routes/systemHealth.js), so the banner can carry the link that
+// actually resolves it instead of leaving the user to hunt for the right page.
+// `forge` is intentionally absent — its message already embeds gh's own remedy
+// text and there is no in-app page that fixes it.
+const REMEDIATION = {
+  'data-disk': { to: '/system-resources/storage', label: 'Runtime data disk usage breakdown' },
+  disk: { to: '/system-resources/storage', label: 'Disk usage breakdown' },
+  memory: { to: '/devtools/processes', label: 'All processes' },
+  cpu: { to: '/devtools/processes', label: 'All processes' },
+  process: { to: '/devtools/processes', label: 'All processes' },
+  restarts: { to: '/devtools/processes', label: 'All processes' },
+  apps: { to: '/apps', label: 'Apps' },
+  database: { to: '/settings/database', label: 'Database settings' },
+};
+
+// Drill-in links shown directly under the alerts so at least one next step is
+// above the fold at phone widths (375px), where the metric cards alone push
+// every control off-screen. Derived from REMEDIATION so a link's label and
+// destination can't drift between the banner and the nav.
+const DRILL_INS = ['disk', 'process', 'apps'].map(type => REMEDIATION[type]);
+
+
+// Icon per tab id. The manifest (`tabGroup: 'system-resources'`) owns
+// id/label/order — this page owns only how each tab looks; the short page-local
+// labels (vs the manifest's "System Resources"/"Storage Report"/
+// "Active Queues", which need the qualifier to be unambiguous in ⌘K) come from
+// the manifest's `tabLabel`. The downloaded-model inventory used to be a fourth
+// tab here. It answered the same question Models → Status answers, in a
+// different section, so it folded into that page (#4728);
+// /system-resources/models redirects there. Throws at import time on drift.
+const TAB_PRESENTATION = {
+  overview: { icon: Activity },
+  storage: { icon: HardDrive },
+  queues: { icon: ListOrdered },
+};
+
+export const RESOURCE_TABS = buildPageNavTabs(getPageNavTabs('system-resources'), TAB_PRESENTATION, 'System Resources');
+
+export default function SystemResourcesPage() {
+  const { tab = 'overview' } = useParams();
+  // The scan + cleanup lifecycle is shared with Models → Status, which renders
+  // the same server report from a different section.
+  const { report, setReport, loading: reportLoading, runReport, cleanup } = useSystemResourceReport();
+
+  const validTab = RESOURCE_TABS.some((item) => item.id === tab);
+  if (!validTab) return <Navigate to="/system-resources/overview" replace />;
+
+  // RouteTabsHeader passes no `controlsIdPrefix` (route tabs navigate, they
+  // don't reveal a sibling panel already in the DOM), so the panel names
+  // itself with its own heading rather than an `aria-labelledby` borrowed
+  // from a tab id that doesn't exist (#7420).
+  const activeTabLabel = RESOURCE_TABS.find((item) => item.id === tab)?.label;
+
+  return (
+    <div className="mx-auto max-w-7xl space-y-4">
+      <header className="overflow-hidden rounded-2xl border border-port-border bg-gradient-to-r from-port-card via-port-card to-port-accent/10 p-4 sm:p-5">
+        <div className="flex items-start gap-3">
+          <div className="rounded-xl bg-port-accent/15 p-2.5 text-port-accent"><ServerCog size={22} /></div>
+          <div>
+            <h1 className="text-xl font-bold text-white">System Resources</h1>
+            <p className="mt-1 max-w-3xl text-sm text-gray-400">
+              Health, disk intelligence, and active work queues in one control center.
+            </p>
+          </div>
+        </div>
+        <div className="mt-5">
+          <RouteTabsHeader tabs={RESOURCE_TABS} activeTab={tab} ariaLabel="System resources sections" />
+        </div>
+      </header>
+
+      <div role="tabpanel" aria-labelledby="system-resources-panel-heading">
+        <h2 id="system-resources-panel-heading" className="sr-only">{activeTabLabel}</h2>
+        {tab === 'overview' && <SystemHealthOverview />}
+        {tab === 'storage' && (
+          <StoragePanel
+            report={report}
+            loading={reportLoading}
+            onRunReport={runReport}
+            onReport={setReport}
+            cleanup={cleanup}
+          />
+        )}
+        {tab === 'queues' && <QueuesPanel />}
+      </div>
+    </div>
+  );
+}
+
+function SystemHealthOverview() {
+  const [draft, setDraft] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  // Tracks whether the user has acquired an editable draft. Cleared after a
+  // successful save so the next refetch re-seeds with the persisted thresholds.
+  const draftSeededRef = useRef(false);
+
+  const { data: health, loading, error, refetch } = useSocketResource(
+    () => api.getSystemHealth({ silent: true }),
+    { namespace: 'readiness', events: READINESS_EVENTS },
+  );
+  const { dismissingType, handleDismissWarning } = useHealthWarningDismiss(refetch);
+
+  const handleRefresh = async () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    await refetch();
+    setRefreshing(false);
+  };
+
+  // Seed the editable draft from server state on first load and after each save.
+  useEffect(() => {
+    if (health?.thresholdsAvailable === false) {
+      setDraft(null);
+      draftSeededRef.current = false;
+      return;
+    }
+    if (health?.thresholds && !draftSeededRef.current) {
+      setDraft(health.thresholds);
+      draftSeededRef.current = true;
+    }
+  }, [health]);
+
+  const handleSaveThresholds = async () => {
+    if (!draft) return;
+    setSaving(true);
+    const result = await api.updateHealthThresholds(draft, { silent: true }).catch(err => {
+      toast.error(err?.message || 'Failed to save thresholds');
+      return null;
+    });
+    setSaving(false);
+    if (result) {
+      toast.success('Thresholds saved');
+      draftSeededRef.current = false;
+      await handleRefresh();
+    }
+  };
+
+  const handleResetThresholds = () => {
+    setDraft({ memoryWarn: 85, memoryCritical: 95, diskWarn: 90, diskCritical: 98 });
+  };
+
+  if (loading) {
+    return (
+      <div className="max-w-5xl mx-auto">
+        <PageSkeleton
+          label="Loading system health"
+          headerRowClass="flex items-center justify-between gap-3"
+          titleWidthClass="w-48"
+          layout="grid"
+          gridColsClass="md:grid-cols-3"
+          cards={3}
+        />
+      </div>
+    );
+  }
+
+  if (!health) {
+    return <div className="p-6 text-gray-400">System health unavailable.</div>;
+  }
+
+  const style = HEALTH_STYLE[health.overallHealth] || HEALTH_STYLE.healthy;
+  const StatusIcon = style.icon;
+  const t = resolveHealthThresholds(health.thresholds);
+  const draftValid =
+    draft &&
+    draft.diskWarn < draft.diskCritical;
+  const draftDirty =
+    draft &&
+    (draft.diskWarn !== t.diskWarn ||
+      draft.diskCritical !== t.diskCritical);
+
+  return (
+    <div className="max-w-5xl mx-auto space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <h2 className="text-xl font-bold text-white flex items-center gap-2">
+            <ServerCog size={20} />
+            Live health
+          </h2>
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            <button
+              type="button"
+              onClick={handleRefresh}
+              disabled={refreshing}
+              className="inline-flex min-h-[40px] items-center gap-1.5 rounded-lg border border-port-border bg-port-card px-3 py-1.5 text-sm text-gray-300 transition-colors hover:border-gray-600 hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
+              title="Refresh system health"
+              aria-label={refreshing ? 'Refreshing system health' : 'Refresh system health'}
+            >
+              <RefreshCw size={14} className={refreshing ? 'animate-spin' : ''} aria-hidden="true" />
+              {refreshing ? 'Refreshing…' : 'Refresh'}
+            </button>
+            <div className={`flex items-center gap-2 px-3 py-1.5 rounded-lg border border-current/20 ${style.color} ${style.bg}`}>
+              <StatusIcon size={16} />
+              <span className="font-semibold">{style.label}</span>
+              <span className="text-gray-500">·</span>
+              <span className="text-gray-400 text-sm">{health.system.uptimeFormatted}</span>
+            </div>
+          </div>
+        </div>
+
+        {health.warnings.length > 0 && (
+          <section className="space-y-2">
+            {health.warnings.map((w, i) => {
+              const remedy = REMEDIATION[w.type];
+              return (
+                <Banner
+                  key={`${w.type || 'warning'}-${i}`}
+                  tone="warning"
+                  size="md"
+                  icon={AlertTriangle}
+                  align="start"
+                  actions={w.dismissible === false ? null : (
+                    <button
+                      type="button"
+                      onClick={() => handleDismissWarning(w)}
+                      disabled={dismissingType === w.type}
+                      className="inline-flex min-h-[28px] min-w-[28px] items-center justify-center rounded text-port-warning/70 transition-colors hover:bg-port-warning/20 hover:text-port-warning disabled:cursor-not-allowed disabled:opacity-50"
+                      title="Dismiss as resolved"
+                      aria-label={`Dismiss warning: ${w.message}`}
+                    >
+                      <X size={14} aria-hidden="true" />
+                    </button>
+                  )}
+                >
+                  <div>{w.message}</div>
+                  {remedy && (
+                    <Link to={remedy.to} className="inline-block mt-1 font-medium underline underline-offset-2 hover:no-underline">
+                      {remedy.label} →
+                    </Link>
+                  )}
+                </Banner>
+              );
+            })}
+          </section>
+        )}
+
+        <nav aria-label="System drill-downs" className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
+          {DRILL_INS.map(link => (
+            <Link key={link.to} to={link.to} className="text-port-accent hover:text-port-accent/80">{link.label} →</Link>
+          ))}
+        </nav>
+
+        <section className="grid grid-cols-1 md:grid-cols-3 gap-3">
+          <ResourceCard
+            icon={HardDrive}
+            label="Memory"
+            pct={health.system.memory.usagePercent}
+            sub={`${health.system.memory.usedFormatted} / ${health.system.memory.totalFormatted}`}
+          />
+          <ResourceCard
+            icon={Cpu}
+            label="CPU Load (1m)"
+            pct={Math.min(100, health.system.cpu.usagePercent)}
+            sub={`${health.system.cpu.cores} cores · ${health.system.cpu.loadAvg1m.toFixed(2)} load`}
+          />
+          {[{ disk: health.system.disk, label: 'Root disk', unavailable: health.warnings?.some(warning => warning.type === 'probe-unavailable' && warning.source === 'disk') },
+            ...(Object.hasOwn(health.system, 'dataDisk') ? [{ disk: health.system.dataDisk, label: 'Runtime data disk', unavailable: true }] : [])
+          ].map(({ disk, label, unavailable }) => (disk ? (
+            <ResourceCard
+              key={label}
+              icon={Database}
+              label={label}
+              pct={disk.usagePercent}
+              warn={t.diskWarn}
+              critical={t.diskCritical}
+              sub={`${disk.usedFormatted} / ${disk.totalFormatted}`}
+            />
+          ) : unavailable ? (
+            <div className="bg-port-card border border-port-border rounded-xl p-4" key={label} aria-label={label === 'Root disk' ? 'Disk status unavailable' : `${label} status unavailable`}>
+              <div className="text-xs uppercase tracking-wide text-gray-500 mb-2">{label}</div>
+              <div className="text-3xl font-bold text-port-warning">Unavailable</div>
+            </div>
+          ) : null))}
+        </section>
+
+        {error && <p role="status" className="text-port-warning">Health refresh failed. Showing the last available reading.</p>}
+
+        <MediaCapacityPanel media={health.media} />
+
+        <BuildStampPanel uptimeFormatted={health.system.uptimeFormatted} />
+
+        <section className="bg-port-card border border-port-border rounded-xl p-4">
+          <h3 className="text-sm font-semibold text-white mb-3 flex items-center gap-2">
+            <Activity size={16} />
+            Top processes by memory
+          </h3>
+          {health.topProcesses === null ? (
+            <p role="status" className="text-gray-400 text-sm">
+              Process manager (PM2) status unavailable.
+            </p>
+          ) : health.topProcesses && health.topProcesses.length > 0 ? (
+            <div className="space-y-1">
+              {health.topProcesses.map((p) => (
+                <div key={p.name} className="flex items-center gap-3 px-3 py-2 rounded-lg bg-port-bg/40 hover:bg-port-bg/60 text-sm">
+                  <span className={`w-2 h-2 rounded-full ${p.status === 'online' ? 'bg-port-success' : p.status === 'errored' ? 'bg-port-error' : 'bg-gray-500'}`} />
+                  <span className="flex-1 text-gray-200 font-mono text-xs truncate">{p.name}</span>
+                  <span className="text-gray-400 tabular-nums">{formatPercent(p.cpu, { decimals: 0 })} CPU</span>
+                  <span className="text-gray-100 tabular-nums w-24 text-right">{p.memoryFormatted}</span>
+                  {p.unstableRestarts > 0 && (
+                    <span className="text-port-warning text-xs">{p.unstableRestarts} crash-loop</span>
+                  )}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="text-gray-500 text-sm">No PM2 processes reporting.</p>
+          )}
+          <div className="mt-3 text-xs">
+            <Link to="/devtools/processes" className="text-port-accent hover:text-port-accent/80">All processes →</Link>
+          </div>
+        </section>
+
+        <section className="bg-port-card border border-port-border rounded-xl p-4">
+          <div className="flex items-center justify-between mb-3 gap-3">
+            <h3 className="text-sm font-semibold text-white flex items-center gap-2">
+              <Zap size={16} />
+              Alert thresholds
+            </h3>
+            <span className="text-xs text-gray-500">
+              {health.thresholdsAvailable === false ? 'Configured thresholds unavailable' : 'Disk capacity alerts. Defaults: 90/98%.'}
+            </span>
+          </div>
+          {health.thresholdsAvailable === false ? (
+            <p role="status" className="text-sm text-port-warning">
+              Default thresholds are being used for health checks. Repair the settings file before changing thresholds.
+            </p>
+          ) : (
+            <>
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                <ThresholdField id="system-health-disk-warn" label="Disk warn %" value={draft?.diskWarn} onChange={(v) => setDraft(d => ({ ...d, diskWarn: v }))} />
+                <ThresholdField id="system-health-disk-critical" label="Disk critical %" value={draft?.diskCritical} onChange={(v) => setDraft(d => ({ ...d, diskCritical: v }))} />
+              </div>
+              {!draftValid && (
+                <p className="mt-2 text-xs text-port-error">Warn thresholds must be lower than critical thresholds.</p>
+              )}
+              <div className="mt-3 flex gap-2">
+                <button
+                  onClick={handleSaveThresholds}
+                  disabled={!draftDirty || !draftValid || saving}
+                  className="px-3 py-2 text-sm bg-port-accent hover:bg-port-accent/80 disabled:opacity-40 disabled:cursor-not-allowed rounded-lg text-white transition-colors"
+                >
+                  {saving ? 'Saving…' : 'Save thresholds'}
+                </button>
+                <button
+                  onClick={handleResetThresholds}
+                  className="px-3 py-2 text-sm bg-port-border/50 hover:bg-port-border rounded-lg text-gray-300 transition-colors"
+                >
+                  Reset to defaults
+                </button>
+              </div>
+            </>
+          )}
+        </section>
+    </div>
+  );
+}
+
+function ResourceCard({ icon: Icon, label, pct, warn, critical, sub }) {
+  return (
+    <div className="bg-port-card border border-port-border rounded-xl p-4">
+      <div className="flex items-center gap-2 text-xs uppercase tracking-wide text-gray-500 mb-2">
+        <Icon size={14} />
+        {label}
+      </div>
+      <div className={`text-3xl font-bold ${warn == null ? 'text-port-accent' : pctTone(pct, warn, critical)}`}>{Math.round(pct)}%</div>
+      <div className="text-xs text-gray-500 mt-1">{sub}</div>
+      <div className="mt-3 h-1.5 bg-port-border rounded-full overflow-hidden">
+        <div className={`h-full ${warn == null ? 'bg-port-accent' : barTone(pct, warn, critical)} transition-all`} style={{ width: `${Math.min(100, pct)}%` }} />
+      </div>
+      <div className="mt-2 text-[11px] text-gray-600">
+        {warn == null ? 'Usage telemetry — does not affect health' : `warn ${warn}% · critical ${critical}%`}
+      </div>
+    </div>
+  );
+}
+
+function ThresholdField({ id, label, value, onChange }) {
+  return (
+    <label htmlFor={id} className="flex flex-col gap-1 text-xs text-gray-400">
+      <span>{label}</span>
+      <input
+        id={id}
+        type="number"
+        min={50}
+        max={99}
+        value={value ?? ''}
+        onChange={(e) => onChange(Number(e.target.value))}
+        className="bg-port-bg border border-port-border rounded px-2 py-1 text-sm text-white focus:outline-none focus:border-port-accent"
+      />
+    </label>
+  );
+}

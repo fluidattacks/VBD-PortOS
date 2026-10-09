@@ -1,0 +1,1764 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import express from 'express';
+import { request } from '../lib/testHelper.js';
+import { ServerError } from '../lib/errorHandler.js';
+import brainRoutes from './brain.js';
+
+// Mock the brain service
+const recordUserAction = vi.hoisted(() => vi.fn(async () => ({ id: 'evt' })));
+vi.mock('../services/userActions.js', () => ({ recordUserAction }));
+
+vi.mock('../services/brain.js', () => ({
+  // Capture & Inbox
+  captureThought: vi.fn(),
+  getInboxLog: vi.fn(),
+  getInboxPage: vi.fn(),
+  getInboxLogById: vi.fn(),
+  getInboxLogCounts: vi.fn(),
+  resolveReview: vi.fn(),
+  fixClassification: vi.fn(),
+  retryClassification: vi.fn(),
+  markInboxSentToCatalog: vi.fn(),
+  getEntityPage: vi.fn(),
+  toMemoryListItem: vi.fn((m) => m),
+  // People
+  getPeople: vi.fn(),
+  getPersonById: vi.fn(),
+  createPerson: vi.fn(),
+  updatePerson: vi.fn(),
+  deletePerson: vi.fn(),
+  // Projects
+  getProjects: vi.fn(),
+  getProjectById: vi.fn(),
+  createProject: vi.fn(),
+  updateProject: vi.fn(),
+  deleteProject: vi.fn(),
+  // Ideas
+  getIdeas: vi.fn(),
+  getIdeaById: vi.fn(),
+  createIdea: vi.fn(),
+  updateIdea: vi.fn(),
+  deleteIdea: vi.fn(),
+  // Admin
+  getAdminItems: vi.fn(),
+  getAdminById: vi.fn(),
+  createAdminItem: vi.fn(),
+  updateAdminItem: vi.fn(),
+  deleteAdminItem: vi.fn(),
+  // Memories
+  getMemoryEntries: vi.fn(),
+  getMemoryEntryById: vi.fn(),
+  createMemoryEntry: vi.fn(),
+  updateMemoryEntry: vi.fn(),
+  deleteMemoryEntry: vi.fn(),
+  // Digest & Review
+  getLatestDigest: vi.fn(),
+  getDigests: vi.fn(),
+  runDailyDigest: vi.fn(),
+  getLatestReview: vi.fn(),
+  getReviews: vi.fn(),
+  runWeeklyReview: vi.fn(),
+  // Settings & Summary
+  loadMeta: vi.fn(),
+  updateMeta: vi.fn(),
+  getSummary: vi.fn(),
+  // Links
+  getLinks: vi.fn(),
+  getLinksPage: vi.fn(),
+  listLinkIds: vi.fn(),
+  getLinkById: vi.fn(),
+  getLinkByUrl: vi.fn(),
+  createLinkFromUrl: vi.fn(),
+  cloneRepoInBackground: vi.fn(),
+  updateLink: vi.fn(),
+  reorderLinks: vi.fn(),
+  deleteLink: vi.fn(),
+  // Buckets
+  getBuckets: vi.fn(),
+  getBucketById: vi.fn(),
+  createBucket: vi.fn(),
+  createBucketAppended: vi.fn(),
+  updateBucket: vi.fn(),
+  reorderBuckets: vi.fn(),
+  deleteBucket: vi.fn(),
+  deleteBucketAndUnlinkChildren: vi.fn()
+}));
+
+vi.mock('../services/idealoomLists.js', () => ({
+  getSettings: vi.fn(),
+  updateSettings: vi.fn(),
+  listLists: vi.fn(),
+  getList: vi.fn(),
+  createList: vi.fn(),
+  updateList: vi.fn(),
+  deleteList: vi.fn()
+}));
+
+vi.mock('../services/idealoomAutoSync.js', () => ({ scheduleAutoSync: vi.fn() }));
+
+vi.mock('../services/idealoomObsidian.js', () => ({
+  importFromObsidian: vi.fn(),
+  exportToObsidian: vi.fn(),
+}));
+
+// Mock the brain graph service
+vi.mock('../services/brainGraph.js', () => ({
+  getBrainGraphSearchIndex: vi.fn(),
+  getBrainGraphOverview: vi.fn(),
+  getBrainGraphNeighborhood: vi.fn()
+}));
+
+// Mock the brain memory bridge
+vi.mock('../services/brainMemoryBridge.js', () => ({
+  syncAllBrainData: vi.fn(),
+  getEmbeddingCoverage: vi.fn()
+}));
+
+// Mock the brain sync log service
+vi.mock('../services/brainSyncLog.js', () => ({
+  getChangesSince: vi.fn()
+}));
+
+// Mock the brain sync service
+vi.mock('../services/brainSync.js', () => ({
+  applyRemoteChanges: vi.fn()
+}));
+
+// Mock the brain anti-entropy reconcile service (#1077). Only the two read
+// endpoints are exposed over HTTP; applyBrainSnapshot is orchestrator-only.
+vi.mock('../services/brainReconcile.js', () => ({
+  getBrainChecksum: vi.fn(),
+  getBrainSnapshot: vi.fn()
+}));
+
+// Mock the brain journal service
+vi.mock('../services/brainJournal.js', () => ({
+  listJournals: vi.fn(),
+  getJournal: vi.fn(),
+  appendJournal: vi.fn(),
+  setJournalContent: vi.fn(),
+  deleteJournal: vi.fn(),
+  getSettings: vi.fn(),
+  updateSettings: vi.fn(),
+  resyncAllToObsidian: vi.fn(),
+  getToday: vi.fn(() => Promise.resolve('2026-04-17')),
+  resolveDate: vi.fn((d) => Promise.resolve(d && /^\d{4}-\d{2}-\d{2}$/.test(d) ? d : '2026-04-17')),
+  isIsoDate: vi.fn((date) => {
+    if (typeof date !== 'string') return false;
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date);
+    if (!match) return false;
+    const [, y, m, d] = match.map((v, i) => (i === 0 ? v : Number(v)));
+    const parsed = new Date(Date.UTC(y, m - 1, d));
+    return parsed.getUTCFullYear() === y
+      && parsed.getUTCMonth() === m - 1
+      && parsed.getUTCDate() === d;
+  })
+}));
+
+// Import mocked modules
+import * as brainService from '../services/brain.js';
+import * as ideaLoomLists from '../services/idealoomLists.js';
+import * as ideaLoomObsidian from '../services/idealoomObsidian.js';
+import { scheduleAutoSync } from '../services/idealoomAutoSync.js';
+import { getBrainGraphSearchIndex, getBrainGraphOverview, getBrainGraphNeighborhood } from '../services/brainGraph.js';
+import { syncAllBrainData, getEmbeddingCoverage } from '../services/brainMemoryBridge.js';
+import { getChangesSince } from '../services/brainSyncLog.js';
+import { getBrainChecksum, getBrainSnapshot } from '../services/brainReconcile.js';
+import { applyRemoteChanges } from '../services/brainSync.js';
+import * as journal from '../services/brainJournal.js';
+
+describe('Brain Routes', () => {
+  let app;
+  const LIST_ID = 'c17c0284-b7de-4db6-a09c-7f735f0fd501';
+
+  beforeEach(() => {
+    app = express();
+    app.use(express.json());
+    app.use('/api/brain', brainRoutes);
+    vi.clearAllMocks();
+  });
+
+  describe('IdeaLoom local lists', () => {
+    const listInput = {
+      prompt: 'Find practical improvements', title: 'Practical improvements',
+      category: 'product', ideas: ['Improve empty states']
+    };
+
+    it('uses the static settings route before the native idea id route', async () => {
+      ideaLoomLists.getSettings.mockResolvedValue({ enabled: false, obsidianVaultId: null, autoSync: false });
+      const response = await request(app).get('/api/brain/ideas/idealoom/settings');
+      expect(response.status).toBe(200);
+      expect(response.body.enabled).toBe(false);
+      expect(brainService.getIdeaById).not.toHaveBeenCalled();
+    });
+
+    it('validates local list CRUD input and preserves native Brain ideas', async () => {
+      ideaLoomLists.createList.mockResolvedValue({ id: LIST_ID, ...listInput, status: 'draft' });
+      const created = await request(app).post('/api/brain/ideas/idealoom/lists').send(listInput);
+      expect(created.status).toBe(201);
+      expect(ideaLoomLists.createList).toHaveBeenCalledWith({ ...listInput, status: 'draft' });
+      expect(brainService.createIdea).not.toHaveBeenCalled();
+
+      const rejected = await request(app).post('/api/brain/ideas/idealoom/lists').send({ ...listInput, ideas: [''] });
+      expect(rejected.status).toBe(400);
+    });
+
+    it('reads, updates and deletes a list by id', async () => {
+      const stored = { id: LIST_ID, ...listInput, status: 'draft' };
+
+      ideaLoomLists.getList.mockResolvedValue(stored);
+      const read = await request(app).get(`/api/brain/ideas/idealoom/lists/${LIST_ID}`);
+      expect(read.status).toBe(200);
+      expect(read.body).toEqual(stored);
+      expect(ideaLoomLists.getList).toHaveBeenCalledWith(LIST_ID);
+      expect(brainService.getIdeaById).not.toHaveBeenCalled();
+
+      ideaLoomLists.updateList.mockResolvedValue({ ...stored, title: 'Renamed' });
+      const updated = await request(app)
+        .put(`/api/brain/ideas/idealoom/lists/${LIST_ID}`)
+        .send({ title: 'Renamed' });
+      expect(updated.status).toBe(200);
+      expect(ideaLoomLists.updateList).toHaveBeenCalledWith(LIST_ID, { title: 'Renamed' });
+      expect(brainService.updateIdea).not.toHaveBeenCalled();
+
+      // deleteList resolving true is what makes this a 204 rather than a 404 —
+      // the service must report whether the record actually existed.
+      ideaLoomLists.deleteList.mockResolvedValue(true);
+      const removed = await request(app).delete(`/api/brain/ideas/idealoom/lists/${LIST_ID}`);
+      expect(removed.status).toBe(204);
+      expect(ideaLoomLists.deleteList).toHaveBeenCalledWith(LIST_ID);
+      expect(brainService.deleteIdea).not.toHaveBeenCalled();
+    });
+
+    it('answers 404 for an unknown id on every id-addressed route', async () => {
+      ideaLoomLists.getList.mockResolvedValue(null);
+      ideaLoomLists.updateList.mockResolvedValue(null);
+      ideaLoomLists.deleteList.mockResolvedValue(false);
+
+      // The service is mocked here, so this pins the ROUTE contract: a falsy
+      // service result becomes a 404 on every id-addressed verb, for a
+      // well-formed id and a malformed one alike. That the service itself
+      // returns falsy for a bad id is covered against the live store in
+      // services/idealoomLists.test.js.
+      for (const id of [LIST_ID, 'not-a-uuid']) {
+        expect((await request(app).get(`/api/brain/ideas/idealoom/lists/${id}`)).status).toBe(404);
+        expect((await request(app).put(`/api/brain/ideas/idealoom/lists/${id}`).send({ title: 'x' })).status).toBe(404);
+        expect((await request(app).delete(`/api/brain/ideas/idealoom/lists/${id}`)).status).toBe(404);
+      }
+    });
+  });
+
+  describe('IdeaLoom Obsidian exchange', () => {
+    it('validates explicit import and export actions and returns their results', async () => {
+      ideaLoomObsidian.importFromObsidian.mockResolvedValue({ counts: { imported: 1 } });
+      ideaLoomObsidian.exportToObsidian.mockResolvedValue({ counts: { exported: 1 } });
+
+      const imported = await request(app).post('/api/brain/ideas/idealoom/import').send({});
+      expect(imported.status).toBe(200);
+      expect(imported.body.counts.imported).toBe(1);
+      expect(ideaLoomObsidian.importFromObsidian).toHaveBeenCalledOnce();
+
+      const exported = await request(app)
+        .post('/api/brain/ideas/idealoom/sync')
+        .send({ listId: LIST_ID });
+      expect(exported.status).toBe(200);
+      expect(exported.body.counts.exported).toBe(1);
+      // recreateMissing defaults to false: an export that does not ASK to
+      // recover a deleted note must never be handed a truthy switch.
+      expect(ideaLoomObsidian.exportToObsidian).toHaveBeenCalledWith({ listId: LIST_ID, recreateMissing: false });
+
+      const recovered = await request(app)
+        .post('/api/brain/ideas/idealoom/sync')
+        .send({ listId: LIST_ID, recreateMissing: true });
+      expect(recovered.status).toBe(200);
+      expect(ideaLoomObsidian.exportToObsidian).toHaveBeenLastCalledWith({ listId: LIST_ID, recreateMissing: true });
+    });
+
+    it('schedules automatic sync from local edits only, never from an exchange', async () => {
+      const input = {
+        prompt: 'Find practical improvements', title: 'Practical improvements',
+        category: 'product', ideas: ['Improve empty states']
+      };
+      ideaLoomLists.createList.mockResolvedValue({ id: LIST_ID, ...input });
+      ideaLoomLists.updateList.mockResolvedValue({ id: LIST_ID, ...input, title: 'Renamed' });
+      ideaLoomLists.deleteList.mockResolvedValue(true);
+      ideaLoomObsidian.importFromObsidian.mockResolvedValue({ counts: { imported: 1 } });
+      ideaLoomObsidian.exportToObsidian.mockResolvedValue({ counts: { exported: 1 } });
+
+      await request(app).post('/api/brain/ideas/idealoom/lists').send(input);
+      await request(app).put(`/api/brain/ideas/idealoom/lists/${LIST_ID}`).send({ title: 'Renamed' });
+      expect(scheduleAutoSync).toHaveBeenCalledTimes(2);
+      expect(scheduleAutoSync).toHaveBeenCalledWith(LIST_ID);
+
+      scheduleAutoSync.mockClear();
+      // Deleting a list must not schedule a write — the vault note is the
+      // user's to remove. Import/export must not either, or the two halves of
+      // the exchange would keep re-triggering each other.
+      await request(app).delete(`/api/brain/ideas/idealoom/lists/${LIST_ID}`);
+      await request(app).post('/api/brain/ideas/idealoom/import').send({});
+      await request(app).post('/api/brain/ideas/idealoom/sync').send({});
+      expect(scheduleAutoSync).not.toHaveBeenCalled();
+    });
+
+    it('rejects unknown exchange request fields', async () => {
+      expect((await request(app).post('/api/brain/ideas/idealoom/import').send({ force: true })).status).toBe(400);
+      expect((await request(app).post('/api/brain/ideas/idealoom/sync').send({ direction: 'both' })).status).toBe(400);
+      expect(ideaLoomObsidian.importFromObsidian).not.toHaveBeenCalled();
+      expect(ideaLoomObsidian.exportToObsidian).not.toHaveBeenCalled();
+    });
+  });
+
+  // ===========================================================================
+  // CAPTURE & INBOX
+  // ===========================================================================
+
+  describe('POST /api/brain/capture', () => {
+    it('should capture a thought and return result', async () => {
+      const mockResult = {
+        inboxLog: {
+          id: 'inbox-001',
+          capturedText: 'Test thought',
+          status: 'filed',
+          classification: {
+            destination: 'ideas',
+            confidence: 0.9,
+            title: 'Test Idea'
+          }
+        },
+        filedRecord: { id: 'idea-001', title: 'Test Idea' },
+        message: 'Filed to ideas: Test Idea'
+      };
+      brainService.captureThought.mockResolvedValue(mockResult);
+
+      const response = await request(app)
+        .post('/api/brain/capture')
+        .send({ text: 'Test thought' });
+
+      expect(response.status).toBe(200);
+      expect(response.body.inboxLog.id).toBe('inbox-001');
+      expect(brainService.captureThought).toHaveBeenCalledWith('Test thought', undefined, undefined, { creative: undefined });
+      expect(recordUserAction).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'brain.capture',
+        target: 'inbox-001',
+        summary: 'captured thought',
+        payload: { id: 'inbox-001' },
+      }));
+      expect(JSON.stringify(recordUserAction.mock.calls[0][0])).not.toContain('Test thought');
+    });
+
+    it('should return 400 if text is missing', async () => {
+      const response = await request(app)
+        .post('/api/brain/capture')
+        .send({});
+
+      expect(response.status).toBe(400);
+    });
+
+    it('should pass provider and model overrides', async () => {
+      brainService.captureThought.mockResolvedValue({ inboxLog: { id: 'inbox-002' } });
+
+      await request(app)
+        .post('/api/brain/capture')
+        .send({ text: 'Test', providerOverride: 'openai', modelOverride: 'gpt-4' });
+
+      expect(brainService.captureThought).toHaveBeenCalledWith('Test', 'openai', 'gpt-4', { creative: undefined });
+    });
+
+    it('should forward the creative flag when set', async () => {
+      brainService.captureThought.mockResolvedValue({ inboxLog: { id: 'inbox-003' } });
+
+      await request(app)
+        .post('/api/brain/capture')
+        .send({ text: 'a sentient city', creative: true });
+
+      expect(brainService.captureThought).toHaveBeenCalledWith('a sentient city', undefined, undefined, { creative: true });
+    });
+
+    it('should forward a URL note to the capture service', async () => {
+      brainService.captureThought.mockResolvedValue({ inboxLog: { id: 'inbox-004' } });
+
+      await request(app)
+        .post('/api/brain/capture')
+        .send({ text: 'https://example.com', note: 'Share this with the team' });
+
+      expect(brainService.captureThought).toHaveBeenCalledWith(
+        'https://example.com', undefined, undefined,
+        { creative: undefined, note: 'Share this with the team' }
+      );
+    });
+  });
+
+  describe('GET /api/brain/inbox', () => {
+    it('should return inbox entries with counts', async () => {
+      const mockEntries = [
+        { id: 'inbox-001', status: 'filed' },
+        { id: 'inbox-002', status: 'needs_review' }
+      ];
+      const mockCounts = { total: 2, filed: 1, needs_review: 1 };
+      brainService.getInboxLog.mockResolvedValue(mockEntries);
+      brainService.getInboxLogCounts.mockResolvedValue(mockCounts);
+
+      const response = await request(app).get('/api/brain/inbox');
+
+      expect(response.status).toBe(200);
+      expect(response.body.entries).toHaveLength(2);
+      expect(response.body.counts.total).toBe(2);
+    });
+
+    it('should pass filters to service', async () => {
+      brainService.getInboxLog.mockResolvedValue([]);
+      brainService.getInboxLogCounts.mockResolvedValue({});
+
+      await request(app).get('/api/brain/inbox?status=needs_review&limit=50');
+
+      expect(brainService.getInboxLog).toHaveBeenCalledWith(
+        expect.objectContaining({ status: 'needs_review', limit: 50 })
+      );
+    });
+  });
+
+  describe('GET /api/brain/inbox/:id', () => {
+    it('should return inbox entry by ID', async () => {
+      brainService.getInboxLogById.mockResolvedValue({ id: 'inbox-001', capturedText: 'Test' });
+
+      const response = await request(app).get('/api/brain/inbox/inbox-001');
+
+      expect(response.status).toBe(200);
+      expect(response.body.id).toBe('inbox-001');
+    });
+
+    it('should return 404 if not found', async () => {
+      brainService.getInboxLogById.mockResolvedValue(null);
+
+      const response = await request(app).get('/api/brain/inbox/inbox-999');
+
+      expect(response.status).toBe(404);
+    });
+  });
+
+  describe('POST /api/brain/review/resolve', () => {
+    it('should resolve a needs_review item', async () => {
+      const testUuid = '550e8400-e29b-41d4-a716-446655440000';
+      brainService.resolveReview.mockResolvedValue({
+        inboxLog: { id: testUuid, status: 'filed' },
+        filedRecord: { id: 'project-001' }
+      });
+
+      const response = await request(app)
+        .post('/api/brain/review/resolve')
+        .send({
+          inboxLogId: testUuid,
+          destination: 'projects',
+          editedExtracted: { name: 'Test Project' }
+        });
+
+      expect(response.status).toBe(200);
+      expect(brainService.resolveReview).toHaveBeenCalledWith(
+        testUuid,
+        'projects',
+        { name: 'Test Project' }
+      );
+    });
+
+    it('should return 400 if required fields are missing', async () => {
+      const response = await request(app)
+        .post('/api/brain/review/resolve')
+        .send({ inboxLogId: '550e8400-e29b-41d4-a716-446655440000' });
+
+      expect(response.status).toBe(400);
+    });
+  });
+
+  describe('POST /api/brain/fix', () => {
+    it('should fix a filed classification', async () => {
+      const testUuid = '550e8400-e29b-41d4-a716-446655440001';
+      brainService.fixClassification.mockResolvedValue({
+        inboxLog: { id: testUuid, status: 'corrected' },
+        newRecord: { id: 'people-001' }
+      });
+
+      const response = await request(app)
+        .post('/api/brain/fix')
+        .send({
+          inboxLogId: testUuid,
+          newDestination: 'people',
+          updatedFields: { name: 'John Doe' },
+          note: 'Wrong category'
+        });
+
+      expect(response.status).toBe(200);
+      expect(brainService.fixClassification).toHaveBeenCalledWith(
+        testUuid,
+        'people',
+        { name: 'John Doe' },
+        'Wrong category'
+      );
+    });
+
+    it('should return 400 if required fields are missing', async () => {
+      const response = await request(app)
+        .post('/api/brain/fix')
+        .send({ inboxLogId: '550e8400-e29b-41d4-a716-446655440001' });
+
+      expect(response.status).toBe(400);
+    });
+  });
+
+  describe('POST /api/brain/inbox/:id/retry', () => {
+    it('should retry classification', async () => {
+      brainService.retryClassification.mockResolvedValue({
+        inboxLog: { id: 'inbox-001', status: 'filed' }
+      });
+
+      const response = await request(app)
+        .post('/api/brain/inbox/inbox-001/retry')
+        .send({});
+
+      expect(response.status).toBe(200);
+      expect(brainService.retryClassification).toHaveBeenCalledWith('inbox-001', undefined, undefined);
+    });
+  });
+
+  describe('POST /api/brain/inbox/sent-to-catalog', () => {
+    const id1 = '11111111-1111-4111-8111-111111111111';
+    const id2 = '22222222-2222-4222-8222-222222222222';
+
+    it('stamps the given creative notes consumed and returns the count', async () => {
+      brainService.markInboxSentToCatalog.mockResolvedValue([
+        { id: id1, sentToCatalogAt: 'x' },
+        { id: id2, sentToCatalogAt: 'x' }
+      ]);
+
+      const response = await request(app)
+        .post('/api/brain/inbox/sent-to-catalog')
+        .send({ ids: [id1, id2] });
+
+      expect(response.status).toBe(200);
+      expect(response.body.count).toBe(2);
+      expect(brainService.markInboxSentToCatalog).toHaveBeenCalledWith([id1, id2]);
+    });
+
+    it('rejects an empty id list', async () => {
+      const response = await request(app)
+        .post('/api/brain/inbox/sent-to-catalog')
+        .send({ ids: [] });
+
+      expect(response.status).toBe(400);
+      expect(brainService.markInboxSentToCatalog).not.toHaveBeenCalled();
+    });
+
+    it('rejects non-guid ids', async () => {
+      const response = await request(app)
+        .post('/api/brain/inbox/sent-to-catalog')
+        .send({ ids: ['_pending_1'] });
+
+      expect(response.status).toBe(400);
+      expect(brainService.markInboxSentToCatalog).not.toHaveBeenCalled();
+    });
+  });
+
+  // ===========================================================================
+  // PEOPLE CRUD
+  // ===========================================================================
+
+  describe('GET /api/brain/people', () => {
+    it('should return all people as a raw array when no pagination params are passed', async () => {
+      brainService.getPeople.mockResolvedValue([
+        { id: 'people-001', name: 'John' },
+        { id: 'people-002', name: 'Jane' }
+      ]);
+
+      const response = await request(app).get('/api/brain/people');
+
+      expect(response.status).toBe(200);
+      expect(Array.isArray(response.body)).toBe(true);
+      expect(response.body).toHaveLength(2);
+    });
+
+    it('should return a bounded envelope when limit/offset are passed', async () => {
+      brainService.getPeople.mockResolvedValue([
+        { id: 'people-001', name: 'John' },
+        { id: 'people-002', name: 'Jane' },
+        { id: 'people-003', name: 'Jim' }
+      ]);
+
+      const response = await request(app).get('/api/brain/people?limit=1&offset=1');
+
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({
+        people: [{ id: 'people-002', name: 'Jane' }],
+        total: 3,
+        limit: 1,
+        offset: 1
+      });
+    });
+
+    it('should treat limit=0 as a pagination request and clamp to the default limit', async () => {
+      brainService.getPeople.mockResolvedValue([
+        { id: 'people-001', name: 'John' },
+        { id: 'people-002', name: 'Jane' }
+      ]);
+
+      const response = await request(app).get('/api/brain/people?limit=0');
+
+      expect(response.status).toBe(200);
+      // limit=0 is invalid → falls back to the default (50), so all rows return
+      // inside the envelope (not the raw array, since pagination was requested).
+      expect(response.body.people).toHaveLength(2);
+      expect(response.body.total).toBe(2);
+      expect(response.body.limit).toBe(50);
+    });
+  });
+
+  describe('GET /api/brain/people/:id', () => {
+    it('should return person by ID', async () => {
+      brainService.getPersonById.mockResolvedValue({ id: 'people-001', name: 'John' });
+
+      const response = await request(app).get('/api/brain/people/people-001');
+
+      expect(response.status).toBe(200);
+      expect(response.body.name).toBe('John');
+    });
+
+    it('should return 404 if not found', async () => {
+      brainService.getPersonById.mockResolvedValue(null);
+
+      const response = await request(app).get('/api/brain/people/people-999');
+
+      expect(response.status).toBe(404);
+    });
+  });
+
+  describe('POST /api/brain/people', () => {
+    it('should create a person', async () => {
+      brainService.createPerson.mockResolvedValue({
+        id: 'people-001',
+        name: 'John Doe',
+        context: 'Work colleague'
+      });
+
+      const response = await request(app)
+        .post('/api/brain/people')
+        .send({ name: 'John Doe', context: 'Work colleague' });
+
+      expect(response.status).toBe(201);
+      expect(response.body.id).toBe('people-001');
+    });
+
+    it('should return 400 if name is missing', async () => {
+      const response = await request(app)
+        .post('/api/brain/people')
+        .send({ context: 'Test' });
+
+      expect(response.status).toBe(400);
+    });
+  });
+
+  describe('PUT /api/brain/people/:id', () => {
+    it('should update a person', async () => {
+      brainService.updatePerson.mockResolvedValue({ id: 'people-001', name: 'John Updated' });
+
+      const response = await request(app)
+        .put('/api/brain/people/people-001')
+        .send({ name: 'John Updated' });
+
+      expect(response.status).toBe(200);
+      expect(response.body.name).toBe('John Updated');
+    });
+
+    it('should return 404 if not found', async () => {
+      brainService.updatePerson.mockResolvedValue(null);
+
+      const response = await request(app)
+        .put('/api/brain/people/people-999')
+        .send({ name: 'Test' });
+
+      expect(response.status).toBe(404);
+    });
+  });
+
+  describe('DELETE /api/brain/people/:id', () => {
+    it('should delete a person', async () => {
+      brainService.deletePerson.mockResolvedValue(true);
+
+      const response = await request(app).delete('/api/brain/people/people-001');
+
+      expect(response.status).toBe(204);
+    });
+
+    it('should return 404 if not found', async () => {
+      brainService.deletePerson.mockResolvedValue(false);
+
+      const response = await request(app).delete('/api/brain/people/people-999');
+
+      expect(response.status).toBe(404);
+    });
+  });
+
+  // ===========================================================================
+  // PROJECTS CRUD
+  // ===========================================================================
+
+  describe('GET /api/brain/projects', () => {
+    it('should return all projects', async () => {
+      brainService.getProjects.mockResolvedValue([
+        { id: 'proj-001', name: 'Project A' }
+      ]);
+
+      const response = await request(app).get('/api/brain/projects');
+
+      expect(response.status).toBe(200);
+      expect(response.body).toHaveLength(1);
+    });
+
+    it('should filter by status', async () => {
+      brainService.getProjects.mockResolvedValue([]);
+
+      await request(app).get('/api/brain/projects?status=active');
+
+      expect(brainService.getProjects).toHaveBeenCalledWith({ status: 'active' });
+    });
+  });
+
+  describe('POST /api/brain/projects', () => {
+    it('should create a project', async () => {
+      brainService.createProject.mockResolvedValue({
+        id: 'proj-001',
+        name: 'New Project',
+        status: 'active'
+      });
+
+      const response = await request(app)
+        .post('/api/brain/projects')
+        .send({ name: 'New Project', status: 'active', nextAction: 'Define scope' });
+
+      expect(response.status).toBe(201);
+      expect(response.body.id).toBe('proj-001');
+    });
+
+    it('should return 400 if name is missing', async () => {
+      const response = await request(app)
+        .post('/api/brain/projects')
+        .send({ status: 'active' });
+
+      expect(response.status).toBe(400);
+    });
+  });
+
+  // ===========================================================================
+  // IDEAS CRUD
+  // ===========================================================================
+
+  describe('GET /api/brain/ideas', () => {
+    it('should return all ideas', async () => {
+      brainService.getIdeas.mockResolvedValue([
+        { id: 'idea-001', title: 'Great Idea' }
+      ]);
+
+      const response = await request(app).get('/api/brain/ideas');
+
+      expect(response.status).toBe(200);
+      expect(response.body).toHaveLength(1);
+    });
+  });
+
+  describe('POST /api/brain/ideas', () => {
+    it('should create an idea', async () => {
+      brainService.createIdea.mockResolvedValue({
+        id: 'idea-001',
+        title: 'New Idea',
+        oneLiner: 'A brief description'
+      });
+
+      const response = await request(app)
+        .post('/api/brain/ideas')
+        .send({ title: 'New Idea', oneLiner: 'A brief description' });
+
+      expect(response.status).toBe(201);
+      expect(response.body.id).toBe('idea-001');
+    });
+
+    it('should return 400 if title is missing', async () => {
+      const response = await request(app)
+        .post('/api/brain/ideas')
+        .send({ oneLiner: 'Test' });
+
+      expect(response.status).toBe(400);
+    });
+  });
+
+  // ===========================================================================
+  // ADMIN CRUD
+  // ===========================================================================
+
+  describe('GET /api/brain/admin', () => {
+    it('should return all admin items', async () => {
+      brainService.getAdminItems.mockResolvedValue([
+        { id: 'admin-001', title: 'Renew license' }
+      ]);
+
+      const response = await request(app).get('/api/brain/admin');
+
+      expect(response.status).toBe(200);
+      expect(response.body).toHaveLength(1);
+    });
+
+    it('should filter by status', async () => {
+      brainService.getAdminItems.mockResolvedValue([]);
+
+      await request(app).get('/api/brain/admin?status=open');
+
+      expect(brainService.getAdminItems).toHaveBeenCalledWith({ status: 'open' });
+    });
+  });
+
+  describe('POST /api/brain/admin', () => {
+    it('should create an admin item', async () => {
+      brainService.createAdminItem.mockResolvedValue({
+        id: 'admin-001',
+        title: 'Renew license',
+        status: 'open'
+      });
+
+      const response = await request(app)
+        .post('/api/brain/admin')
+        .send({ title: 'Renew license', status: 'open' });
+
+      expect(response.status).toBe(201);
+      expect(response.body.id).toBe('admin-001');
+    });
+
+    it('should return 400 if title is missing', async () => {
+      const response = await request(app)
+        .post('/api/brain/admin')
+        .send({ status: 'open' });
+
+      expect(response.status).toBe(400);
+    });
+  });
+
+  // ===========================================================================
+  // MEMORIES CRUD
+  // ===========================================================================
+
+  describe('GET /api/brain/memories', () => {
+    it('should return all memories', async () => {
+      brainService.getMemoryEntries.mockResolvedValue([
+        { id: 'mem-001', title: 'Morning jog' },
+        { id: 'mem-002', title: 'Dinner with family' }
+      ]);
+
+      const response = await request(app).get('/api/brain/memories');
+
+      expect(response.status).toBe(200);
+      expect(Array.isArray(response.body)).toBe(true);
+      expect(response.body).toHaveLength(2);
+    });
+
+    it('should return a bounded envelope when limit/offset are passed', async () => {
+      brainService.getMemoryEntries.mockResolvedValue([
+        { id: 'mem-001', title: 'Morning jog' },
+        { id: 'mem-002', title: 'Dinner with family' },
+        { id: 'mem-003', title: 'Late-night idea' }
+      ]);
+
+      const response = await request(app).get('/api/brain/memories?limit=2');
+
+      expect(response.status).toBe(200);
+      expect(response.body.memories).toHaveLength(2);
+      expect(response.body).toMatchObject({ total: 3, limit: 2, offset: 0 });
+    });
+  });
+
+  describe('GET /api/brain/memories/:id', () => {
+    it('should return memory by ID', async () => {
+      brainService.getMemoryEntryById.mockResolvedValue({
+        id: 'mem-001',
+        title: 'Morning jog',
+        content: 'Ran 5k in the park',
+        mood: 'energized',
+        tags: ['fitness']
+      });
+
+      const response = await request(app).get('/api/brain/memories/mem-001');
+
+      expect(response.status).toBe(200);
+      expect(response.body.title).toBe('Morning jog');
+    });
+
+    it('should return 404 if not found', async () => {
+      brainService.getMemoryEntryById.mockResolvedValue(null);
+
+      const response = await request(app).get('/api/brain/memories/mem-999');
+
+      expect(response.status).toBe(404);
+    });
+  });
+
+  describe('POST /api/brain/memories', () => {
+    it('should create a memory', async () => {
+      brainService.createMemoryEntry.mockResolvedValue({
+        id: 'mem-001',
+        title: 'Morning jog',
+        content: 'Ran 5k in the park',
+        mood: 'energized',
+        tags: ['fitness']
+      });
+
+      const response = await request(app)
+        .post('/api/brain/memories')
+        .send({ title: 'Morning jog', content: 'Ran 5k in the park', mood: 'energized', tags: ['fitness'] });
+
+      expect(response.status).toBe(201);
+      expect(response.body.id).toBe('mem-001');
+    });
+
+    it('should return 400 if title is missing', async () => {
+      const response = await request(app)
+        .post('/api/brain/memories')
+        .send({ content: 'No title provided' });
+
+      expect(response.status).toBe(400);
+    });
+  });
+
+  describe('PUT /api/brain/memories/:id', () => {
+    it('should update a memory', async () => {
+      brainService.updateMemoryEntry.mockResolvedValue({
+        id: 'mem-001',
+        title: 'Morning jog updated',
+        content: 'Ran 10k today'
+      });
+
+      const response = await request(app)
+        .put('/api/brain/memories/mem-001')
+        .send({ title: 'Morning jog updated' });
+
+      expect(response.status).toBe(200);
+      expect(response.body.title).toBe('Morning jog updated');
+    });
+
+    it('should return 404 if not found', async () => {
+      brainService.updateMemoryEntry.mockResolvedValue(null);
+
+      const response = await request(app)
+        .put('/api/brain/memories/mem-999')
+        .send({ title: 'Test' });
+
+      expect(response.status).toBe(404);
+    });
+  });
+
+  describe('DELETE /api/brain/memories/:id', () => {
+    it('should delete a memory', async () => {
+      brainService.deleteMemoryEntry.mockResolvedValue(true);
+
+      const response = await request(app).delete('/api/brain/memories/mem-001');
+
+      expect(response.status).toBe(204);
+    });
+
+    it('should return 404 if not found', async () => {
+      brainService.deleteMemoryEntry.mockResolvedValue(false);
+
+      const response = await request(app).delete('/api/brain/memories/mem-999');
+
+      expect(response.status).toBe(404);
+    });
+  });
+
+  // ===========================================================================
+  // DIGEST & REVIEW
+  // ===========================================================================
+
+  describe('GET /api/brain/digest/latest', () => {
+    it('should return latest digest', async () => {
+      brainService.getLatestDigest.mockResolvedValue({
+        id: 'digest-001',
+        digestText: 'Today summary...'
+      });
+
+      const response = await request(app).get('/api/brain/digest/latest');
+
+      expect(response.status).toBe(200);
+      expect(response.body.id).toBe('digest-001');
+    });
+  });
+
+  describe('GET /api/brain/digests', () => {
+    it('should return digest history', async () => {
+      brainService.getDigests.mockResolvedValue([
+        { id: 'digest-001' },
+        { id: 'digest-002' }
+      ]);
+
+      const response = await request(app).get('/api/brain/digests');
+
+      expect(response.status).toBe(200);
+      expect(response.body).toHaveLength(2);
+    });
+
+    it('should pass limit parameter', async () => {
+      brainService.getDigests.mockResolvedValue([]);
+
+      await request(app).get('/api/brain/digests?limit=5');
+
+      expect(brainService.getDigests).toHaveBeenCalledWith(5);
+    });
+  });
+
+  describe('POST /api/brain/digest/run', () => {
+    it('should run daily digest manually', async () => {
+      brainService.runDailyDigest.mockResolvedValue({
+        id: 'digest-001',
+        digestText: 'New digest...'
+      });
+
+      const response = await request(app)
+        .post('/api/brain/digest/run')
+        .send({});
+
+      expect(response.status).toBe(200);
+      expect(brainService.runDailyDigest).toHaveBeenCalled();
+    });
+  });
+
+  describe('GET /api/brain/review/latest', () => {
+    it('should return latest weekly review', async () => {
+      brainService.getLatestReview.mockResolvedValue({
+        id: 'review-001',
+        reviewText: 'Weekly summary...'
+      });
+
+      const response = await request(app).get('/api/brain/review/latest');
+
+      expect(response.status).toBe(200);
+      expect(response.body.id).toBe('review-001');
+    });
+  });
+
+  describe('GET /api/brain/reviews', () => {
+    it('should return review history', async () => {
+      brainService.getReviews.mockResolvedValue([{ id: 'review-001' }]);
+
+      const response = await request(app).get('/api/brain/reviews');
+
+      expect(response.status).toBe(200);
+      expect(response.body).toHaveLength(1);
+    });
+  });
+
+  describe('POST /api/brain/review/run', () => {
+    it('should run weekly review manually', async () => {
+      brainService.runWeeklyReview.mockResolvedValue({
+        id: 'review-001',
+        reviewText: 'New review...'
+      });
+
+      const response = await request(app)
+        .post('/api/brain/review/run')
+        .send({});
+
+      expect(response.status).toBe(200);
+      expect(brainService.runWeeklyReview).toHaveBeenCalled();
+    });
+  });
+
+  // ===========================================================================
+  // SETTINGS & SUMMARY
+  // ===========================================================================
+
+  describe('GET /api/brain/settings', () => {
+    it('should return brain settings', async () => {
+      brainService.loadMeta.mockResolvedValue({
+        confidenceThreshold: 0.6,
+        dailyDigestTime: '09:00',
+        defaultProvider: 'lmstudio'
+      });
+
+      const response = await request(app).get('/api/brain/settings');
+
+      expect(response.status).toBe(200);
+      expect(response.body.confidenceThreshold).toBe(0.6);
+    });
+  });
+
+  describe('PUT /api/brain/settings', () => {
+    it('should update brain settings', async () => {
+      brainService.updateMeta.mockResolvedValue({
+        confidenceThreshold: 0.8,
+        dailyDigestTime: '10:00'
+      });
+
+      const response = await request(app)
+        .put('/api/brain/settings')
+        .send({ confidenceThreshold: 0.8, dailyDigestTime: '10:00' });
+
+      expect(response.status).toBe(200);
+      expect(brainService.updateMeta).toHaveBeenCalledWith(
+        expect.objectContaining({ confidenceThreshold: 0.8 })
+      );
+    });
+  });
+
+  describe('GET /api/brain/summary', () => {
+    it('should return brain summary', async () => {
+      brainService.getSummary.mockResolvedValue({
+        peopleCount: 5,
+        projectsCount: 3,
+        ideasCount: 10,
+        adminCount: 2,
+        needsReviewCount: 1
+      });
+
+      const response = await request(app).get('/api/brain/summary');
+
+      expect(response.status).toBe(200);
+      expect(response.body.peopleCount).toBe(5);
+    });
+  });
+
+  // ===========================================================================
+  // CAPTURE FLOW - ALWAYS CREATES INBOX LOG
+  // ===========================================================================
+
+  describe('Capture Flow - Always Creates Inbox Log', () => {
+    it('should create inbox log even when AI classification fails', async () => {
+      // Simulate AI failure that still creates inbox log in needs_review state
+      brainService.captureThought.mockResolvedValue({
+        inboxLog: {
+          id: 'inbox-001',
+          capturedText: 'Test thought',
+          status: 'needs_review',
+          classification: {
+            destination: 'unknown',
+            confidence: 0
+          }
+        },
+        message: 'Thought captured but AI unavailable. Queued for manual review.'
+      });
+
+      const response = await request(app)
+        .post('/api/brain/capture')
+        .send({ text: 'Test thought' });
+
+      expect(response.status).toBe(200);
+      expect(response.body.inboxLog.id).toBeDefined();
+      expect(response.body.inboxLog.status).toBe('needs_review');
+    });
+  });
+
+  // ===========================================================================
+  // CONFIDENCE THRESHOLD GATING
+  // ===========================================================================
+
+  describe('Confidence Threshold Gating', () => {
+    it('should file directly when confidence is above threshold', async () => {
+      brainService.captureThought.mockResolvedValue({
+        inboxLog: {
+          id: 'inbox-001',
+          status: 'filed',
+          classification: { confidence: 0.9, destination: 'ideas' }
+        },
+        filedRecord: { id: 'idea-001' }
+      });
+
+      const response = await request(app)
+        .post('/api/brain/capture')
+        .send({ text: 'High confidence thought' });
+
+      expect(response.status).toBe(200);
+      expect(response.body.inboxLog.status).toBe('filed');
+    });
+
+    it('should send to needs_review when confidence is below threshold', async () => {
+      brainService.captureThought.mockResolvedValue({
+        inboxLog: {
+          id: 'inbox-002',
+          status: 'needs_review',
+          classification: { confidence: 0.4, destination: 'ideas' }
+        },
+        message: 'Thought captured but needs review. Confidence: 40%'
+      });
+
+      const response = await request(app)
+        .post('/api/brain/capture')
+        .send({ text: 'Low confidence thought' });
+
+      expect(response.status).toBe(200);
+      expect(response.body.inboxLog.status).toBe('needs_review');
+    });
+  });
+
+  // ===========================================================================
+  // FIX/MOVE BEHAVIOR
+  // ===========================================================================
+
+  describe('Fix/Move Behavior Updates Records', () => {
+    it('should update inbox log status to corrected after fix', async () => {
+      const testUuid = '550e8400-e29b-41d4-a716-446655440002';
+      brainService.fixClassification.mockResolvedValue({
+        inboxLog: {
+          id: testUuid,
+          status: 'corrected',
+          correction: {
+            previousDestination: 'ideas',
+            newDestination: 'projects',
+            note: 'Actually a project'
+          }
+        },
+        newRecord: { id: 'proj-001' }
+      });
+
+      const response = await request(app)
+        .post('/api/brain/fix')
+        .send({
+          inboxLogId: testUuid,
+          newDestination: 'projects',
+          updatedFields: { name: 'Test Project' },
+          note: 'Actually a project'
+        });
+
+      expect(response.status).toBe(200);
+      expect(response.body.inboxLog.status).toBe('corrected');
+      expect(response.body.inboxLog.correction.previousDestination).toBe('ideas');
+      expect(response.body.inboxLog.correction.newDestination).toBe('projects');
+    });
+  });
+
+  // ===========================================================================
+  // GRAPH
+  // ===========================================================================
+
+  describe('GET /api/brain/graph', () => {
+    it('returns the bounded overview when no focus is given', async () => {
+      const mockGraph = { nodes: [{ id: '1', label: 'Test' }], edges: [], hasEmbeddings: false, mode: 'overview' };
+      getBrainGraphOverview.mockResolvedValue(mockGraph);
+
+      const response = await request(app).get('/api/brain/graph');
+      expect(response.status).toBe(200);
+      expect(response.body.nodes).toHaveLength(1);
+      expect(response.body.hasEmbeddings).toBe(false);
+      expect(getBrainGraphOverview).toHaveBeenCalled();
+      expect(getBrainGraphNeighborhood).not.toHaveBeenCalled();
+    });
+
+    it('returns a node neighborhood when a focus is given', async () => {
+      getBrainGraphNeighborhood.mockResolvedValue({ nodes: [{ id: 'f' }], edges: [], hasEmbeddings: true, mode: 'neighborhood', focusId: 'f' });
+
+      const response = await request(app).get('/api/brain/graph?focus=f&limit=20');
+      expect(response.status).toBe(200);
+      expect(response.body.mode).toBe('neighborhood');
+      expect(getBrainGraphNeighborhood).toHaveBeenCalledWith({ focusId: 'f', limit: 20 });
+    });
+
+    it('should return 500 when service throws', async () => {
+      getBrainGraphOverview.mockRejectedValue(new Error('Graph build failed'));
+
+      const response = await request(app).get('/api/brain/graph');
+      expect(response.status).toBe(500);
+    });
+  });
+
+  describe('GET /api/brain/graph/search-index', () => {
+    it('returns the lightweight node index', async () => {
+      getBrainGraphSearchIndex.mockResolvedValue({ nodes: [{ id: '1', label: 'A', brainType: 'memories' }] });
+      const response = await request(app).get('/api/brain/graph/search-index');
+      expect(response.status).toBe(200);
+      expect(response.body.nodes).toHaveLength(1);
+    });
+  });
+
+  describe('GET /api/brain/embeddings/status', () => {
+    it('returns embedding coverage', async () => {
+      getEmbeddingCoverage.mockResolvedValue({ total: 10, missing: 3 });
+      const response = await request(app).get('/api/brain/embeddings/status');
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({ total: 10, missing: 3 });
+    });
+  });
+
+  // ===========================================================================
+  // BRIDGE SYNC (renamed from /sync)
+  // ===========================================================================
+
+  describe('POST /api/brain/bridge-sync', () => {
+    it('should return sync stats', async () => {
+      const mockStats = { synced: 5, skipped: 2, errors: 0 };
+      syncAllBrainData.mockResolvedValue(mockStats);
+
+      const response = await request(app).post('/api/brain/bridge-sync');
+      expect(response.status).toBe(200);
+      expect(response.body.synced).toBe(5);
+      expect(response.body.skipped).toBe(2);
+      expect(response.body.errors).toBe(0);
+      // No body → refresh + onlyMissing default false (issue #1080).
+      expect(syncAllBrainData).toHaveBeenCalledWith({ refresh: false, onlyMissing: false });
+    });
+
+    it('passes refresh:true through for the recovery re-embed path (issue #1080)', async () => {
+      syncAllBrainData.mockResolvedValue({ synced: 3, skipped: 0, errors: 0, archived: 1 });
+
+      const response = await request(app).post('/api/brain/bridge-sync').send({ refresh: true });
+      expect(response.status).toBe(200);
+      expect(response.body.archived).toBe(1);
+      expect(syncAllBrainData).toHaveBeenCalledWith({ refresh: true, onlyMissing: false });
+    });
+
+    it('passes onlyMissing:true through for the targeted backfill path', async () => {
+      syncAllBrainData.mockResolvedValue({ synced: 2, skipped: 8, errors: 0, archived: 0 });
+
+      const response = await request(app).post('/api/brain/bridge-sync').send({ onlyMissing: true });
+      expect(response.status).toBe(200);
+      expect(response.body.synced).toBe(2);
+      expect(syncAllBrainData).toHaveBeenCalledWith({ refresh: false, onlyMissing: true });
+    });
+
+    it('should return 500 when sync fails', async () => {
+      syncAllBrainData.mockRejectedValue(new Error('Sync failed'));
+
+      const response = await request(app).post('/api/brain/bridge-sync');
+      expect(response.status).toBe(500);
+    });
+  });
+
+  // ===========================================================================
+  // FEDERATION SYNC (peer-to-peer)
+  // ===========================================================================
+
+  describe('GET /api/brain/sync', () => {
+    it('should return changes since a given seq', async () => {
+      const mockResult = {
+        changes: [{ seq: 2, op: 'create', type: 'people', id: 'p1', record: { name: 'A' }, ts: '2026-01-01T00:00:00.000Z' }],
+        maxSeq: 2,
+        hasMore: false
+      };
+      getChangesSince.mockResolvedValue(mockResult);
+
+      const response = await request(app).get('/api/brain/sync?since=1');
+
+      expect(response.status).toBe(200);
+      expect(response.body.changes).toHaveLength(1);
+      expect(response.body.maxSeq).toBe(2);
+      expect(response.body.hasMore).toBe(false);
+      expect(getChangesSince).toHaveBeenCalledWith(1, 100);
+    });
+
+    it('should default since to 0', async () => {
+      getChangesSince.mockResolvedValue({ changes: [], maxSeq: 0, hasMore: false });
+
+      const response = await request(app).get('/api/brain/sync');
+
+      expect(response.status).toBe(200);
+      expect(getChangesSince).toHaveBeenCalledWith(0, 100);
+    });
+
+    it('should pass custom limit', async () => {
+      getChangesSince.mockResolvedValue({ changes: [], maxSeq: 0, hasMore: false });
+
+      await request(app).get('/api/brain/sync?since=0&limit=50');
+
+      expect(getChangesSince).toHaveBeenCalledWith(0, 50);
+    });
+  });
+
+  describe('GET /api/brain/reconcile/checksum (#1077)', () => {
+    it('returns the whole-brain reconcile checksum', async () => {
+      getBrainChecksum.mockResolvedValue('abc123');
+      const response = await request(app).get('/api/brain/reconcile/checksum');
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({ checksum: 'abc123' });
+    });
+  });
+
+  describe('GET /api/brain/reconcile/snapshot (#1077)', () => {
+    it('returns the raw record map + checksum', async () => {
+      const snap = { records: { links: { x: { id: 'x', updatedAt: '2026-01-01T00:00:00.000Z' } } }, checksum: 'abc123' };
+      getBrainSnapshot.mockResolvedValue(snap);
+      const response = await request(app).get('/api/brain/reconcile/snapshot');
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual(snap);
+    });
+  });
+
+  describe('POST /api/brain/sync', () => {
+    it('should apply remote changes and return stats', async () => {
+      const mockResult = { inserted: 2, updated: 1, deleted: 0, skipped: 1 };
+      applyRemoteChanges.mockResolvedValue(mockResult);
+
+      const response = await request(app)
+        .post('/api/brain/sync')
+        .send({
+          changes: [
+            { seq: 1, op: 'create', type: 'people', id: 'p1', record: { name: 'A' }, ts: '2026-01-01T00:00:00.000Z' },
+            { seq: 2, op: 'update', type: 'ideas', id: 'i1', record: { title: 'B' }, ts: '2026-01-01T00:00:00.000Z' }
+          ]
+        });
+
+      expect(response.status).toBe(200);
+      expect(response.body.inserted).toBe(2);
+      expect(response.body.updated).toBe(1);
+      expect(applyRemoteChanges).toHaveBeenCalledTimes(1);
+    });
+
+    it('should return 400 when changes array is empty', async () => {
+      const response = await request(app)
+        .post('/api/brain/sync')
+        .send({ changes: [] });
+
+      expect(response.status).toBe(400);
+    });
+
+    it('should return 400 when changes is missing', async () => {
+      const response = await request(app)
+        .post('/api/brain/sync')
+        .send({});
+
+      expect(response.status).toBe(400);
+    });
+  });
+
+  // ===========================================================================
+  // DAILY LOG
+  // ===========================================================================
+
+  describe('GET /api/brain/daily-log', () => {
+    it('lists entries', async () => {
+      journal.listJournals.mockResolvedValue({
+        records: [{ id: 'j1', date: '2026-04-17', content: 'hi', segments: [] }],
+        total: 1,
+      });
+      const res = await request(app).get('/api/brain/daily-log');
+      expect(res.status).toBe(200);
+      expect(res.body.total).toBe(1);
+      expect(res.body.records[0].date).toBe('2026-04-17');
+    });
+  });
+
+  describe('GET /api/brain/daily-log/:date', () => {
+    it('resolves "today" to current local date', async () => {
+      journal.getJournal.mockResolvedValue({ id: 'j1', date: '2026-04-17', content: 'x', segments: [] });
+      const res = await request(app).get('/api/brain/daily-log/today');
+      expect(res.status).toBe(200);
+      expect(res.body.date).toBe('2026-04-17');
+      expect(journal.getJournal).toHaveBeenCalledWith('2026-04-17');
+    });
+
+    it('returns null entry for unknown date', async () => {
+      journal.getJournal.mockResolvedValue(null);
+      const res = await request(app).get('/api/brain/daily-log/2020-01-01');
+      expect(res.status).toBe(200);
+      expect(res.body.entry).toBeNull();
+    });
+  });
+
+  describe('POST /api/brain/daily-log/:date/append', () => {
+    it('appends text', async () => {
+      journal.appendJournal.mockResolvedValue({
+        id: 'j1', date: '2026-04-17', content: 'hello', segments: [{ text: 'hello' }]
+      });
+      const res = await request(app)
+        .post('/api/brain/daily-log/today/append')
+        .send({ text: 'hello', source: 'voice' });
+      expect(res.status).toBe(200);
+      expect(journal.appendJournal).toHaveBeenCalledWith('2026-04-17', 'hello', { source: 'voice' });
+    });
+
+    it('rejects empty text', async () => {
+      const res = await request(app)
+        .post('/api/brain/daily-log/today/append')
+        .send({});
+      expect(res.status).toBe(400);
+    });
+  });
+
+  describe('PUT /api/brain/daily-log/:date', () => {
+    it('replaces content', async () => {
+      journal.setJournalContent.mockResolvedValue({ id: 'j1', date: '2026-04-17', content: 'replaced', segments: [] });
+      const res = await request(app)
+        .put('/api/brain/daily-log/today')
+        .send({ content: 'replaced' });
+      expect(res.status).toBe(200);
+      expect(res.body.entry.content).toBe('replaced');
+      expect(journal.setJournalContent).toHaveBeenCalledWith('2026-04-17', 'replaced', {
+        ifMatchUpdatedAt: null,
+      });
+    });
+
+    it('forwards ifMatchUpdatedAt to the service', async () => {
+      journal.setJournalContent.mockResolvedValue({ id: 'j1', date: '2026-04-17', content: 'x', segments: [] });
+      const res = await request(app)
+        .put('/api/brain/daily-log/2026-04-17')
+        .send({ content: 'x', ifMatchUpdatedAt: '2026-04-17T12:00:00.000Z' });
+      expect(res.status).toBe(200);
+      expect(journal.setJournalContent).toHaveBeenCalledWith('2026-04-17', 'x', {
+        ifMatchUpdatedAt: '2026-04-17T12:00:00.000Z',
+      });
+    });
+
+    it('surfaces STALE_JOURNAL as 409 with the current entry in context', async () => {
+      const current = {
+        id: 'j1',
+        date: '2026-04-17',
+        content: 'existing\n\nspoken',
+        updatedAt: '2026-04-17T12:01:00.000Z',
+        segments: [{ text: 'spoken', source: 'voice' }],
+      };
+      const err = new ServerError('Daily log was modified since you last loaded it', {
+        status: 409,
+        code: 'STALE_JOURNAL',
+        context: { entry: current },
+      });
+      journal.setJournalContent.mockRejectedValue(err);
+      const res = await request(app)
+        .put('/api/brain/daily-log/2026-04-17')
+        .send({ content: 'typed', ifMatchUpdatedAt: '2026-04-17T12:00:00.000Z' });
+      expect(res.status).toBe(409);
+      expect(res.body.code).toBe('STALE_JOURNAL');
+      expect(res.body.context.entry.content).toContain('spoken');
+    });
+  });
+
+  describe('daily-log settings', () => {
+    it('reads settings', async () => {
+      journal.getSettings.mockResolvedValue({ obsidianVaultId: null, obsidianFolder: 'Daily Log', autoSync: true });
+      const res = await request(app).get('/api/brain/daily-log/settings');
+      expect(res.status).toBe(200);
+      expect(res.body.obsidianFolder).toBe('Daily Log');
+    });
+
+    it('updates settings', async () => {
+      journal.updateSettings.mockResolvedValue({ obsidianVaultId: 'v1', obsidianFolder: 'Diary', autoSync: true });
+      const res = await request(app)
+        .put('/api/brain/daily-log/settings')
+        .send({ obsidianVaultId: 'v1', obsidianFolder: 'Diary' });
+      expect(res.status).toBe(200);
+      expect(res.body.obsidianVaultId).toBe('v1');
+    });
+  });
+
+  describe('DELETE /api/brain/daily-log/:date', () => {
+    it('deletes the entry for a valid date', async () => {
+      journal.deleteJournal.mockResolvedValue(true);
+      const res = await request(app).delete('/api/brain/daily-log/2026-04-17');
+      expect(res.status).toBe(204);
+      expect(journal.deleteJournal).toHaveBeenCalledWith('2026-04-17');
+    });
+
+    it('returns 404 when the entry is not found', async () => {
+      journal.deleteJournal.mockResolvedValue(false);
+      const res = await request(app).delete('/api/brain/daily-log/2026-04-17');
+      expect(res.status).toBe(404);
+    });
+  });
+
+  describe('POST /api/brain/daily-log/sync-obsidian', () => {
+    it('returns bulk sync stats', async () => {
+      journal.resyncAllToObsidian.mockResolvedValue({ synced: 3, skipped: 1 });
+      const res = await request(app).post('/api/brain/daily-log/sync-obsidian');
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ synced: 3, skipped: 1 });
+    });
+  });
+
+  describe('invalid date handling', () => {
+    // Previously any non-'today' string fell back to journal.resolveDate()
+    // which defaulted invalid input to today, so PUT /daily-log/not-a-date
+    // silently overwrote today's entry. Reject malformed dates with 400.
+    it('rejects malformed dates with 400 on GET', async () => {
+      const res = await request(app).get('/api/brain/daily-log/not-a-date');
+      expect(res.status).toBe(400);
+    });
+
+    it('rejects malformed dates with 400 on PUT', async () => {
+      const res = await request(app)
+        .put('/api/brain/daily-log/2026-13-40')
+        .send({ content: 'x' });
+      expect(res.status).toBe(400);
+      expect(journal.setJournalContent).not.toHaveBeenCalled();
+    });
+
+    it('rejects malformed dates with 400 on DELETE', async () => {
+      const res = await request(app).delete('/api/brain/daily-log/bogus');
+      expect(res.status).toBe(400);
+      expect(journal.deleteJournal).not.toHaveBeenCalled();
+    });
+
+    it('rejects impossible calendar days (2026-02-30)', async () => {
+      const res = await request(app).get('/api/brain/daily-log/2026-02-30');
+      expect(res.status).toBe(400);
+    });
+  });
+
+  // ===========================================================================
+  // BUCKETS
+  // ===========================================================================
+
+  describe('GET /api/brain/buckets', () => {
+    it('returns buckets sorted by order', async () => {
+      brainService.getBuckets.mockResolvedValue([
+        { id: 'b2', name: 'Second', order: 1 },
+        { id: 'b1', name: 'First', order: 0 }
+      ]);
+      const res = await request(app).get('/api/brain/buckets');
+      expect(res.status).toBe(200);
+      expect(res.body.buckets.map(b => b.id)).toEqual(['b1', 'b2']);
+    });
+  });
+
+  describe('POST /api/brain/buckets', () => {
+    it('delegates to createBucketAppended with the validated fields', async () => {
+      brainService.createBucketAppended.mockImplementation(async (data) => ({ id: 'b3', order: 2, ...data }));
+      const res = await request(app).post('/api/brain/buckets').send({ name: 'Disney' });
+      expect(res.status).toBe(201);
+      expect(brainService.createBucketAppended).toHaveBeenCalledWith({ name: 'Disney', color: undefined, icon: undefined });
+      expect(res.body.name).toBe('Disney');
+    });
+
+    it('rejects an empty name with 400', async () => {
+      const res = await request(app).post('/api/brain/buckets').send({ name: '' });
+      expect(res.status).toBe(400);
+      expect(brainService.createBucketAppended).not.toHaveBeenCalled();
+    });
+
+    it('rejects an invalid color with 400', async () => {
+      const res = await request(app).post('/api/brain/buckets').send({ name: 'X', color: 'neon' });
+      expect(res.status).toBe(400);
+    });
+  });
+
+  describe('POST /api/brain/buckets/reorder', () => {
+    it('persists order for all ids in one batch', async () => {
+      const id3 = '33333333-3333-4333-8333-333333333333';
+      const id1 = '11111111-1111-4111-8111-111111111111';
+      const id2 = '22222222-2222-4222-8222-222222222222';
+      brainService.reorderBuckets.mockResolvedValue([]);
+      brainService.getBuckets.mockResolvedValue([]);
+      const res = await request(app)
+        .post('/api/brain/buckets/reorder')
+        .send({ ids: [id3, id1, id2] });
+      expect(res.status).toBe(200);
+      expect(brainService.reorderBuckets).toHaveBeenCalledTimes(1);
+      expect(brainService.reorderBuckets).toHaveBeenCalledWith([
+        { id: id3, order: 0 },
+        { id: id1, order: 1 },
+        { id: id2, order: 2 },
+      ]);
+      expect(brainService.updateBucket).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('POST /api/brain/links/reorder', () => {
+    const idA = '11111111-1111-4111-8111-111111111111';
+    const idB = '22222222-2222-4222-8222-222222222222';
+    const bucket = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+
+    it('applies the whole batch in one atomic reorderLinks call', async () => {
+      const updates = [
+        { id: idB, bucketId: bucket, bucketOrder: 0 },
+        { id: idA, bucketId: bucket, bucketOrder: 1 }
+      ];
+      brainService.listLinkIds.mockResolvedValue([idA, idB]);
+      brainService.reorderLinks.mockResolvedValue(updates.map(u => ({ ...u, url: 'x' })));
+      const res = await request(app).post('/api/brain/links/reorder').send({ updates });
+      expect(res.status).toBe(200);
+      // One atomic call (not N concurrent updateLink PUTs).
+      expect(brainService.reorderLinks).toHaveBeenCalledTimes(1);
+      expect(brainService.reorderLinks).toHaveBeenCalledWith(updates);
+      expect(brainService.updateLink).not.toHaveBeenCalled();
+      expect(res.body.links).toHaveLength(2);
+    });
+
+    it('rejects an empty or malformed batch', async () => {
+      const res = await request(app).post('/api/brain/links/reorder').send({ updates: [] });
+      expect(res.status).toBe(400);
+      expect(brainService.reorderLinks).not.toHaveBeenCalled();
+    });
+
+    it('rejects the whole batch (no write) when any id is unknown', async () => {
+      brainService.listLinkIds.mockResolvedValue([idA]); // idB no longer exists
+      const res = await request(app).post('/api/brain/links/reorder').send({
+        updates: [
+          { id: idA, bucketId: bucket, bucketOrder: 0 },
+          { id: idB, bucketId: bucket, bucketOrder: 1 }
+        ]
+      });
+      expect(res.status).toBe(404);
+      expect(brainService.reorderLinks).not.toHaveBeenCalled();
+    });
+
+    it('is matched before /links/:id so "reorder" is not treated as an id', async () => {
+      brainService.listLinkIds.mockResolvedValue([idA]);
+      brainService.reorderLinks.mockResolvedValue([]);
+      const res = await request(app)
+        .post('/api/brain/links/reorder')
+        .send({ updates: [{ id: idA, bucketId: bucket, bucketOrder: 0 }] });
+      expect(res.status).toBe(200);
+      expect(brainService.reorderLinks).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('PUT /api/brain/buckets/:id', () => {
+    it('updates an existing bucket', async () => {
+      brainService.getBucketById.mockResolvedValue({ id: 'b1', name: 'Old' });
+      brainService.updateBucket.mockResolvedValue({ id: 'b1', name: 'New' });
+      const res = await request(app).put('/api/brain/buckets/b1').send({ name: 'New' });
+      expect(res.status).toBe(200);
+      expect(res.body.name).toBe('New');
+    });
+
+    it('returns 404 for an unknown bucket', async () => {
+      brainService.getBucketById.mockResolvedValue(null);
+      const res = await request(app).put('/api/brain/buckets/missing').send({ name: 'X' });
+      expect(res.status).toBe(404);
+    });
+  });
+
+  describe('DELETE /api/brain/buckets/:id', () => {
+    it('delegates to deleteBucketAndUnlinkChildren and returns its result', async () => {
+      brainService.getBucketById.mockResolvedValue({ id: 'b1', name: 'Disney' });
+      brainService.deleteBucketAndUnlinkChildren.mockResolvedValue({ deleted: true, unassigned: 2 });
+
+      const res = await request(app).delete('/api/brain/buckets/b1');
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ deleted: true, unassigned: 2 });
+      expect(brainService.deleteBucketAndUnlinkChildren).toHaveBeenCalledWith('b1');
+    });
+
+    it('returns 404 for an unknown bucket', async () => {
+      brainService.getBucketById.mockResolvedValue(null);
+      const res = await request(app).delete('/api/brain/buckets/missing');
+      expect(res.status).toBe(404);
+      expect(brainService.deleteBucketAndUnlinkChildren).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('POST /api/brain/links', () => {
+    it('delegates creation to the shared service with the validated options', async () => {
+      brainService.getLinkByUrl.mockResolvedValue(null);
+      brainService.createLinkFromUrl.mockImplementation(async (url, opts) => ({ id: 'l9', url, ...opts }));
+      const res = await request(app)
+        .post('/api/brain/links')
+        .send({
+          url: 'https://www.example.com/parks',
+          note: 'Share this with the team',
+          bucketId: '11111111-1111-4111-8111-111111111111'
+        });
+      expect(res.status).toBe(201);
+      expect(brainService.createLinkFromUrl).toHaveBeenCalledWith(
+        'https://www.example.com/parks',
+        expect.objectContaining({
+          note: 'Share this with the team',
+          bucketId: '11111111-1111-4111-8111-111111111111'
+        })
+      );
+    });
+
+    it('409s on a duplicate URL without creating anything', async () => {
+      brainService.getLinkByUrl.mockResolvedValue({ id: 'l1' });
+      const res = await request(app).post('/api/brain/links').send({ url: 'https://example.com' });
+      expect(res.status).toBe(409);
+      expect(brainService.createLinkFromUrl).not.toHaveBeenCalled();
+    });
+  });
+});

@@ -1,0 +1,367 @@
+import { useState, useEffect } from 'react';
+import { Brain, ChevronLeft, Plus, Trash2, BookOpen, Zap, FlaskConical, Eye, X, Save, CalendarClock } from 'lucide-react';
+import { getMemoryItems, createMemoryItem, deleteMemoryItem } from '../../../services/api';
+import ConfirmButtonPair from '../../ui/ConfirmButtonPair';
+import { FormField } from '../../ui/FormField';
+import { useConfirmDelete } from '../../../hooks/useConfirmDelete';
+
+const ITEM_TYPES = [
+  { id: 'song', label: 'Song' },
+  { id: 'poem', label: 'Poem' },
+  { id: 'speech', label: 'Speech' },
+  { id: 'sequence', label: 'Sequence' },
+  { id: 'text', label: 'Text' },
+];
+
+// An item is due when its spaced-repetition schedule says so. No/invalid
+// schedule = due (matches the server's `isMemoryItemDue`), so legacy items and
+// anything the migration hasn't stamped still surface for review.
+function isItemDue(item) {
+  const retention = item?.mastery?.retention;
+  if (retention?.status === 'attested' || retention?.status === 'mastered') {
+    if (retention.spotCheckCompletedAt) return false;
+    const spotCheckAt = Date.parse(retention.spotCheckAt ?? '');
+    return Number.isFinite(spotCheckAt) && spotCheckAt <= Date.now();
+  }
+  const nr = item?.schedule?.nextReview;
+  if (typeof nr !== 'string') return true;
+  const t = Date.parse(nr);
+  return Number.isNaN(t) || t <= Date.now();
+}
+
+// Most-overdue first: earliest (or missing/invalid) nextReview leads, so
+// "Review Next" picks the item that's waited longest — matching the server's
+// `getDueMemoryItems` ordering rather than raw list order.
+function mostOverdueFirst(a, b) {
+  const ka = Date.parse(a?.schedule?.nextReview ?? '');
+  const kb = Date.parse(b?.schedule?.nextReview ?? '');
+  const va = Number.isNaN(ka) ? -Infinity : ka;
+  const vb = Number.isNaN(kb) ? -Infinity : kb;
+  return va === vb ? 0 : va < vb ? -1 : 1;
+}
+
+// Practice selection is URL-driven (`/post/memory/:itemId`), so this component
+// only ever renders the list — `onSelectItem` navigates (issue #3249).
+export default function MemoryBuilder({ onBack, onSelectItem, onReviewItem = onSelectItem }) {
+  const [items, setItems] = useState([]);
+  const [creating, setCreating] = useState(false);
+
+  // Create form state
+  const [newTitle, setNewTitle] = useState('');
+  const [newType, setNewType] = useState('text');
+  const [newContent, setNewContent] = useState('');
+  const [saving, setSaving] = useState(false);
+  const { isConfirming, requestDelete, cancelDelete, confirmDelete } = useConfirmDelete();
+
+  useEffect(() => {
+    loadItems();
+  }, []);
+
+  // Returns true if the server list was fetched and applied, false if the
+  // fetch failed. null = fetch failed (request() already toasts the error) —
+  // keep the known-good list rather than blanking it; a real empty server
+  // response is `[]` and still clears. Callers (notably handleDelete) use the
+  // return value to fall back to a local update when the refresh fails.
+  async function loadItems() {
+    const data = await getMemoryItems().catch(err => { console.warn('⚠️ Failed to load memory items: ' + err.message); return null; });
+    if (!Array.isArray(data)) return false;
+    setItems(data);
+    return true;
+  }
+
+  async function handleDelete(id) {
+    await deleteMemoryItem(id);
+    // Reload from the server so the list reflects server truth (ordering,
+    // normalization, re-seeded built-ins). If the reload fails, the delete
+    // still succeeded server-side — splice the confirmed-deleted id out
+    // locally so the stale row can't linger (and can't be re-deleted into a
+    // 404); loadItems left the rest of the known-good list intact.
+    const reloaded = await loadItems();
+    if (!reloaded) setItems(prev => prev.filter(i => i.id !== id));
+  }
+
+  function resetCreateForm() {
+    setNewTitle('');
+    setNewType('text');
+    setNewContent('');
+    setCreating(false);
+  }
+
+  async function handleCreate() {
+    if (!newTitle.trim() || !newContent.trim()) return;
+    setSaving(true);
+
+    // Split content into lines, preserving blank lines for chunk detection
+    const rawLines = newContent.split('\n');
+    const lines = rawLines.map(text => ({ text }));
+
+    const item = await createMemoryItem({
+      title: newTitle.trim(),
+      type: newType,
+      lines,
+    }).catch(() => null);
+
+    setSaving(false);
+    if (item) {
+      setItems(prev => [...prev, item]);
+      resetCreateForm();
+    }
+  }
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <button aria-label="Back" onClick={onBack} className="text-gray-400 hover:text-white transition-colors">
+            <ChevronLeft size={20} />
+          </button>
+          <Brain size={24} className="text-emerald-400" />
+          <h2 className="text-xl font-bold text-white">Memory Builder</h2>
+        </div>
+        {!creating && (
+          <button
+            onClick={() => setCreating(true)}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-port-accent hover:bg-port-accent/80 text-white rounded-lg transition-colors"
+          >
+            <Plus size={14} />
+            Add Item
+          </button>
+        )}
+      </div>
+
+      <p className="text-gray-400 text-sm max-w-2xl">
+        Train your memory with songs, poems, speeches, and sequences. Track mastery and practice weak spots.
+      </p>
+
+      {/* Due Today — spaced repetition. Recomputes reactively as `items` update. */}
+      {(() => {
+        const dueItems = items.filter(isItemDue).sort(mostOverdueFirst);
+        if (dueItems.length === 0) {
+          return (
+            <div className="flex items-center gap-2 text-sm text-gray-500 max-w-2xl">
+              <CalendarClock size={16} className="text-gray-600" />
+              Nothing due for review right now — all caught up.
+            </div>
+          );
+        }
+        return (
+          <div className="bg-port-card border border-emerald-500/30 rounded-lg p-4 max-w-2xl flex items-center justify-between gap-3">
+            <div className="flex items-center gap-3 min-w-0">
+              <CalendarClock size={20} className="text-emerald-400 shrink-0" />
+              <div className="min-w-0">
+                <div className="text-white font-medium">Due Today ({dueItems.length})</div>
+                <div className="text-xs text-gray-500 truncate">
+                  {dueItems.map(i => i.title).join(', ')}
+                </div>
+              </div>
+            </div>
+            <button
+              onClick={() => onReviewItem(dueItems[0])}
+              className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 text-sm bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg transition-colors"
+            >
+              <BookOpen size={14} />
+              Review Next
+            </button>
+          </div>
+        );
+      })()}
+
+      {/* Create Form */}
+      {creating && (
+        <div className="bg-port-card border border-port-accent/30 rounded-lg p-5 space-y-4 max-w-2xl">
+          <div className="flex items-center justify-between">
+            <h3 className="text-white font-medium">Add Memory Item</h3>
+            <button aria-label="Close" onClick={resetCreateForm} className="text-gray-500 hover:text-white transition-colors min-h-[44px] min-w-[44px] flex items-center justify-center">
+              <X size={16} />
+            </button>
+          </div>
+
+          <FormField label="Title" labelClassName="block text-gray-400 text-xs mb-1.5">
+            <input
+              type="text"
+              value={newTitle}
+              onChange={e => setNewTitle(e.target.value)}
+              placeholder="e.g. The Raven, Gettysburg Address, Pi digits..."
+              maxLength={200}
+              className="w-full bg-port-bg border border-port-border rounded-lg px-3 py-2 text-white text-sm placeholder-gray-600 focus:border-port-accent focus:outline-none"
+            />
+          </FormField>
+
+          <div>
+            <span className="block text-gray-400 text-xs mb-1.5">Type</span>
+            <div className="flex flex-wrap gap-2">
+              {ITEM_TYPES.map(t => (
+                <button
+                  key={t.id}
+                  onClick={() => setNewType(t.id)}
+                  className={`px-3 py-1.5 text-xs rounded-lg border transition-colors ${
+                    newType === t.id
+                      ? 'bg-port-accent/20 border-port-accent text-port-accent'
+                      : 'bg-port-bg border-port-border text-gray-400 hover:text-white'
+                  }`}
+                >
+                  {t.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <FormField
+            label={<>Content <span className="text-gray-600">(one line per row; blank lines create chunk boundaries)</span></>}
+            labelClassName="block text-gray-400 text-xs mb-1.5"
+          >
+            <textarea
+              value={newContent}
+              onChange={e => setNewContent(e.target.value)}
+              placeholder={"Paste or type your content here.\nEach line becomes a learnable unit.\n\nBlank lines separate chunks/verses."}
+              rows={12}
+              className="w-full bg-port-bg border border-port-border rounded-lg px-3 py-2 text-white text-sm placeholder-gray-600 focus:border-port-accent focus:outline-none resize-y font-mono leading-relaxed"
+            />
+            {newContent.trim() && (
+              <ContentPreview content={newContent} />
+            )}
+          </FormField>
+
+          <div className="flex justify-end gap-3">
+            <button
+              onClick={resetCreateForm}
+              className="px-4 py-2 text-sm text-gray-400 hover:text-white transition-colors"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={handleCreate}
+              disabled={!newTitle.trim() || !newContent.trim() || saving}
+              className="flex items-center gap-1.5 px-4 py-2 text-sm bg-port-success hover:bg-port-success/80 disabled:opacity-50 text-white rounded-lg transition-colors"
+            >
+              <Save size={14} />
+              {saving ? 'Saving...' : 'Save Item'}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Memory Items */}
+      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+        {items.map(item => (
+          <div
+            key={item.id}
+            className="bg-port-card border border-port-border rounded-lg p-4 flex flex-col hover:border-port-accent/50 transition-colors"
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-center gap-3 flex-1 min-w-0">
+                <ItemIcon type={item.type} builtin={item.builtin} />
+                <div className="min-w-0">
+                  <h3 className="text-white font-medium truncate">{item.title}</h3>
+                  <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-gray-500 mt-0.5">
+                    <span>{item.type}</span>
+                    <span>{item.content?.lines?.length || 0} lines</span>
+                    <span>{item.content?.chunks?.length || 0} chunks</span>
+                    {item.builtin && <span className="text-emerald-500">built-in</span>}
+                  </div>
+                </div>
+              </div>
+              <div className="flex flex-col items-end gap-1 shrink-0">
+                <MasteryBadge pct={item.mastery?.overallPct || 0} retention={item.mastery?.retention} />
+                {isItemDue(item) && (
+                  <span className="flex items-center gap-1 text-[10px] uppercase tracking-wide text-emerald-400">
+                    <CalendarClock size={10} />
+                    Due
+                  </span>
+                )}
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2 mt-4">
+              <button
+                onClick={() => onSelectItem(item)}
+                className="flex-1 flex items-center justify-center gap-1.5 px-3 py-1.5 text-sm bg-port-accent hover:bg-port-accent/80 text-white rounded-lg transition-colors"
+              >
+                <BookOpen size={14} />
+                Practice
+              </button>
+              {!item.builtin && (
+                isConfirming(item.id) ? (
+                  <ConfirmButtonPair
+                    prompt="Delete?"
+                    confirmIcon={Trash2}
+                    ariaLabel={`Confirm delete ${item.title}`}
+                    onConfirm={() => confirmDelete(() => handleDelete(item.id))}
+                    onCancel={cancelDelete}
+                  />
+                ) : (
+                  <button
+                    onClick={() => requestDelete(item.id)}
+                    aria-label={`Delete ${item.title}`}
+                    className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center p-1.5 text-gray-500 hover:text-port-error transition-colors"
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                )
+              )}
+            </div>
+          </div>
+        ))}
+
+        {items.length === 0 && (
+          <div className="col-span-full bg-port-card border border-port-border rounded-lg p-8 text-center">
+            <Brain size={32} className="text-gray-600 mx-auto mb-3" />
+            <p className="text-gray-500">No memory items yet. The Elements Song will be added automatically.</p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ContentPreview({ content }) {
+  const rawLines = content.split('\n');
+  const nonEmptyLines = rawLines.filter(l => l.trim().length > 0);
+
+  // Count chunks (groups separated by blank lines)
+  let chunkCount = 0;
+  let inChunk = false;
+  for (const line of rawLines) {
+    if (line.trim()) {
+      if (!inChunk) { chunkCount++; inChunk = true; }
+    } else {
+      inChunk = false;
+    }
+  }
+  if (chunkCount < 2) chunkCount = Math.ceil(nonEmptyLines.length / 4);
+
+  return (
+    <div className="mt-2 flex gap-4 text-xs text-gray-500">
+      <span>{nonEmptyLines.length} lines</span>
+      <span>{chunkCount} chunks</span>
+    </div>
+  );
+}
+
+function ItemIcon({ type, builtin }) {
+  if (builtin) return <FlaskConical size={20} className="text-emerald-400 shrink-0" />;
+  switch (type) {
+    case 'song': return <Zap size={20} className="text-purple-400 shrink-0" />;
+    case 'poem': return <BookOpen size={20} className="text-blue-400 shrink-0" />;
+    case 'speech': return <Eye size={20} className="text-amber-400 shrink-0" />;
+    default: return <Brain size={20} className="text-gray-400 shrink-0" />;
+  }
+}
+
+function MasteryBadge({ pct, retention }) {
+  if (retention?.status === 'attested') {
+    return <div className="text-xs font-medium text-emerald-400">Attested</div>;
+  }
+  if (retention?.status === 'mastered') {
+    return <div className="text-xs font-medium text-port-success">Mastered</div>;
+  }
+  if (retention?.status === 'lapsed') {
+    return <div className="text-xs font-medium text-amber-400">Review resumed</div>;
+  }
+  const color = pct >= 80 ? 'text-port-success' : pct >= 40 ? 'text-port-warning' : 'text-gray-500';
+  return (
+    <div className={`text-sm font-mono font-medium ${color}`}>
+      {pct}%
+    </div>
+  );
+}

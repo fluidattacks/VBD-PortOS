@@ -1,0 +1,120 @@
+/**
+ * Creative Commission — output surfacing (#2657, Phase 2 — Autonomous Creation
+ * Engine feedback loop).
+ *
+ * When a scheduled commission fires and mints a run, surface it so the user
+ * knows a new piece is being created and can rate it once it lands. Surfacing is
+ * BEST-EFFORT and MUST NOT throw into the scheduler's fire handler — that handler
+ * runs outside the Express request lifecycle, where an uncaught throw crashes
+ * Node.
+ *
+ * WHY NOTIFICATION-ONLY (not the brain inbox). Commissions are machine-local in
+ * Phase 1/2 (a synced schedule would double-run on every peer — see store.js).
+ * The `notifications` store is a local file (never federated), so a
+ * commission-scoped, machine-local `/creative-commission/:id` deep link belongs
+ * there. The brain inbox, by contrast, IS federated (`inbox` ∈
+ * `BRAIN_ENTITY_TYPES`) — writing a reminder there would propagate a
+ * `needs_review` item pointing at a commission that doesn't exist on the peer,
+ * polluting its backlog. Brain-inbox surfacing rejoins once commissions
+ * themselves federate (the split-record follow-up, #2686).
+ *
+ * WHY "fired / generating" wording (not "created a result"). Surfacing happens
+ * at fire time — the CD project has only just been created; generation runs
+ * asynchronously afterward. The copy therefore describes a run that is *being
+ * created* and invites the user to rate it once it lands, rather than claiming a
+ * finished artifact already exists. (Completion-triggered surfacing + catalog
+ * seeding is the Phase 3 completion flow.)
+ *
+ * The notifications module is lazy-imported so this stays a light leaf a mocked
+ * test suite can stub without dragging its graph in.
+ */
+
+/**
+ * Surface a freshly-fired commission run via a local notification.
+ * @param {object} commission sanitized commission record
+ * @param {object} run the run entry just recorded (from recordCommissionRun)
+ */
+export async function surfaceCommissionRun(commission, run) {
+  if (!commission?.id || !run) return;
+  // Scope the deep link to THIS run (`?run=<runId>`) so the detail page focuses
+  // the render this notification announced — the gallery is newest-first, so
+  // without the param a later run would have pushed the announced render down by
+  // the time the user opens it.
+  const link = run.id
+    ? `/creative-commission/${encodeURIComponent(commission.id)}?run=${encodeURIComponent(run.id)}`
+    : `/creative-commission/${encodeURIComponent(commission.id)}`;
+  const ability = commission.targetAbility || 'video';
+  const name = commission.name || 'Commission';
+
+  try {
+    const { addNotification, NOTIFICATION_TYPES, PRIORITY_LEVELS } = await import('../notifications.js');
+    await addNotification({
+      type: NOTIFICATION_TYPES.CREATIVE_COMMISSION,
+      title: `“${name}” is creating a new ${ability}`,
+      description: 'Your standing commission fired — rate the result once it lands to steer the next run.',
+      priority: PRIORITY_LEVELS.LOW,
+      link,
+      metadata: { commissionId: commission.id, runId: run.id, projectId: run.projectId || null },
+    });
+  } catch (err) {
+    console.error(`❌ Commission notification surface failed (${commission.id}): ${err?.message || err}`);
+  }
+}
+
+/**
+ * Surface a run-history write that FAILED (#7529) — the degraded twin of
+ * surfaceCommissionRun above.
+ *
+ * Why this exists rather than the console line alone: a cron tick has no HTTP
+ * response to carry the outcome's `historyWarning` home in, so for the
+ * unattended case this fix is actually about, a log entry nobody reads would be
+ * the only signal. `surfaceCommissionRun` is already the persisted, machine-local
+ * channel for "your commission did something while you weren't looking" — it is
+ * just gated on a real run, which is precisely what a lost write does not have.
+ *
+ * MEDIUM rather than the fired-run LOW: this one needs a human. Nothing will
+ * retry it and the run row is gone for good, so the deep link to the Creative
+ * Director project is the only remaining route to work that is genuinely running.
+ *
+ * Same best-effort contract: never throws into the scheduler's fire handler. It
+ * names the commission exactly as surfaceCommissionRun above does — the
+ * notifications store is a machine-local file that never federates, so the name
+ * is what makes the alert identifiable to the one user who sees it. What it
+ * still must NOT carry, on this path or any other, is the directive, the prompt
+ * or any feedback: the metadata is local ids plus the bounded classification.
+ *
+ * @param {object} commission sanitized commission record, or `{ id }` when the
+ *   record itself could not be read (a pre-fire storage failure)
+ * @param {object} warning the `historyWarning` persistRun produced
+ */
+export async function surfaceCommissionHistoryLoss(commission, warning) {
+  if (!commission?.id || !warning) return;
+  const name = commission.name || 'A commission';
+  const link = warning.projectId
+    ? `/creative-director/${encodeURIComponent(warning.projectId)}`
+    : `/creative-commission/${encodeURIComponent(commission.id)}`;
+  const body = warning.projectId
+    ? 'The project is running, but this run was not saved to the commission’s history — it will not appear there or be ratable. Open the project to find the work.'
+    : 'The outcome of this fire was not saved to the commission’s history.';
+
+  try {
+    const { addNotification, NOTIFICATION_TYPES, PRIORITY_LEVELS } = await import('../notifications.js');
+    await addNotification({
+      type: NOTIFICATION_TYPES.CREATIVE_COMMISSION,
+      title: `“${name}” could not save its run history`,
+      description: body,
+      priority: PRIORITY_LEVELS.MEDIUM,
+      link,
+      metadata: {
+        commissionId: commission.id,
+        projectId: warning.projectId || null,
+        historyWarning: warning.code,
+        outcome: warning.outcome,
+        trigger: warning.trigger,
+        detail: warning.detail,
+      },
+    });
+  } catch (err) {
+    console.error(`❌ Commission history-loss surface failed (${commission.id}): ${err?.message || err}`);
+  }
+}

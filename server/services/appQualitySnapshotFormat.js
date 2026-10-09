@@ -1,0 +1,334 @@
+/**
+ * Checked-in `.quality.json` schema. This is not the peer wire payload.
+ *
+ * `PORTOS_SCHEMA_VERSIONS.appQuality` stays the v1 federation object. Writers
+ * emit only canonical file schema v2. v1 JSON and a historical
+ * `quality-snapshot.json` body normalize to the same records; a future schema
+ * is recognized and left for the publisher to report, not reinterpreted.
+ *
+ * `assessedAt` is a UTC date (`YYYY-MM-DD`); one row per day per category, latest
+ * run wins. Rows are `[assessedAt, categoryIndex, score, worstSeverity, coverageIndex,
+ * confidenceIndex, scannedFiles, totalFiles]`. `measurementId` is not stored.
+ * Same-timestamp selection uses the v1 id while a file still has one, otherwise
+ * a transient digest of the normalized row (`releaseTieId`). The digest is not
+ * written. PostgreSQL remains the history; this file is only the bounded
+ * projection the publisher already built.
+ */
+import { createHash } from 'node:crypto';
+import { z } from 'zod';
+import { AUDIT_DEFINITIONS, LEGACY_AUDIT_TASK_TYPE_ALIASES } from '../lib/auditCatalog.js';
+import { auditQualityReportSchema } from '../lib/auditQuality.js';
+
+export const APP_QUALITY_FILE_SCHEMA_VERSION = 2;
+export const APP_QUALITY_REPORT_VERSION = 1;
+export const APP_QUALITY_SNAPSHOT_FILENAME = '.quality.json';
+export const APP_QUALITY_LEGACY_SNAPSHOT_FILENAME = 'quality-snapshot.json';
+export const QUALITY_COVERAGE_VALUES = Object.freeze(['broad', 'partial', 'unavailable', 'not-applicable']);
+export const QUALITY_CONFIDENCE_VALUES = Object.freeze(['low', 'medium', 'high']);
+export const MAX_QUALITY_SNAPSHOT_ROWS = 10000;
+
+const REPOSITORY = /^[a-f0-9]{64}$/;
+const CATEGORIES = new Set(Object.keys(AUDIT_DEFINITIONS));
+const READABLE_CATEGORIES = new Set([...CATEGORIES, ...Object.keys(LEGACY_AUDIT_TASK_TYPE_ALIASES)]);
+const COVERAGE = new Set(QUALITY_COVERAGE_VALUES);
+const CONFIDENCE = new Set(QUALITY_CONFIDENCE_VALUES);
+const V1_KEYS = new Set(['schemaVersion', 'repository', 'measurements']);
+const V2_KEYS = new Set(['schemaVersion', 'repository', 'reportVersion', 'categories', 'coverage', 'confidence', 'measurements']);
+const MEASUREMENT_KEYS = new Set(['measurementId', 'assessedAt', 'report']);
+const REPORT_KEYS = new Set(['version', 'category', 'score', 'worstSeverity', 'coverage', 'confidence', 'summary', 'scannedFiles', 'totalFiles']);
+const PLACEHOLDER_SUMMARY = 'Numeric assessment';
+// Z and numeric offsets are both ISO instants. Zod's default datetime() rejects
+// offsets, which would treat one UTC day as two when the date prefix differs.
+const datetimeSchema = z.iso.datetime({ offset: true });
+// Rows are stored date-only; full instants are still read (v1 and older v2 files).
+const timestampSchema = { safeParse: value => (typeof value === 'string' && z.iso.date().safeParse(value).success
+  ? { success: true } : datetimeSchema.safeParse(value)) };
+
+function compareText(a, b) {
+  if (a < b) return -1;
+  if (a > b) return 1;
+  return 0;
+}
+
+function plainObject(value) {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function allowedKeys(value, keys) {
+  return plainObject(value) && Object.keys(value).every(key => keys.has(key));
+}
+
+function utcDay(iso) {
+  const time = Date.parse(iso);
+  return Number.isFinite(time) ? new Date(time).toISOString().slice(0, 10) : null;
+}
+
+function isInt(value, min, max) {
+  return typeof value === 'number' && Number.isInteger(value) && value >= min && value <= max;
+}
+
+/**
+ * One row per UTC day per category: the latest assessment that day wins, and a
+ * timestamp tie goes to the later-sorting row. Older files that stored several
+ * runs per day collapse here, on every parse and every write, so no install has
+ * to migrate. Returns null when a timestamp has no day.
+ */
+function collapseToDays(records) {
+  const latest = new Map();
+  for (const record of records) {
+    const day = utcDay(record.assessedAt);
+    if (!day) return null;
+    const key = `${day}|${record.category}`;
+    const kept = latest.get(key);
+    if (!kept || compareRecords(kept, record) < 0
+      || (compareRecords(kept, record) === 0 && compareText(releaseTieId(kept), releaseTieId(record)) < 0)) {
+      latest.set(key, record);
+    }
+  }
+  return [...latest.values()].map(record => ({ ...record, assessedAt: `${utcDay(record.assessedAt)}T00:00:00.000Z` }));
+}
+
+function numericReport(report) {
+  if (!allowedKeys(report, REPORT_KEYS)) return null;
+  const parsed = auditQualityReportSchema.safeParse({ ...report, summary: PLACEHOLDER_SUMMARY });
+  if (!parsed.success) return null;
+  const { summary: _summary, ...kept } = parsed.data;
+  return kept;
+}
+
+function normalizeRecord(record, measurementId = null) {
+  if (!plainObject(record) || !timestampSchema.safeParse(record.assessedAt).success) return null;
+  const report = numericReport({
+    version: 1,
+    category: record.category,
+    score: record.score,
+    worstSeverity: record.worstSeverity,
+    coverage: record.coverage,
+    confidence: record.confidence,
+    scannedFiles: record.scannedFiles,
+    totalFiles: record.totalFiles,
+  });
+  if (!report) return null;
+  return {
+    assessedAt: /^\d{4}-\d{2}-\d{2}$/.test(record.assessedAt) ? `${record.assessedAt}T00:00:00.000Z` : record.assessedAt,
+    category: report.category,
+    score: report.score,
+    worstSeverity: report.worstSeverity,
+    coverage: report.coverage,
+    confidence: report.confidence,
+    scannedFiles: report.scannedFiles,
+    totalFiles: report.totalFiles,
+    measurementId,
+  };
+}
+
+function compareRecords(a, b) {
+  return Date.parse(a.assessedAt) - Date.parse(b.assessedAt)
+    || compareText(a.assessedAt, b.assessedAt)
+    || compareText(a.category, b.category);
+}
+
+function formatArrayEntries(values) {
+  if (values.length === 0) return '[]';
+  // Keep each immutable snapshot item on one diff line, including each row.
+  return `[\n${values.map(value => `    ${JSON.stringify(value)}`).join(',\n')}\n  ]`;
+}
+
+function canonicalize(repository, records) {
+  const categories = [...new Set(records.map(record => record.category))].sort(compareText);
+  const categoryIndex = new Map(categories.map((category, index) => [category, index]));
+  const coverageIndex = new Map(QUALITY_COVERAGE_VALUES.map((value, index) => [value, index]));
+  const confidenceIndex = new Map(QUALITY_CONFIDENCE_VALUES.map((value, index) => [value, index]));
+  const measurements = [...records].sort(compareRecords).map(record => [
+    utcDay(record.assessedAt),
+    categoryIndex.get(record.category),
+    record.score,
+    record.worstSeverity,
+    coverageIndex.get(record.coverage),
+    confidenceIndex.get(record.confidence),
+    record.scannedFiles,
+    record.totalFiles,
+  ]);
+  return [
+    '{',
+    `  "schemaVersion": ${APP_QUALITY_FILE_SCHEMA_VERSION},`,
+    `  "repository": ${JSON.stringify(repository)},`,
+    `  "reportVersion": ${APP_QUALITY_REPORT_VERSION},`,
+    `  "categories": ${formatArrayEntries(categories)},`,
+    `  "coverage": ${formatArrayEntries(QUALITY_COVERAGE_VALUES)},`,
+    `  "confidence": ${formatArrayEntries(QUALITY_CONFIDENCE_VALUES)},`,
+    `  "measurements": ${formatArrayEntries(measurements)}`,
+    '}',
+    '',
+  ].join('\n');
+}
+
+/** Canonical v2 text, or null when the records are not a valid projection. */
+export function serializeQualitySnapshot(repository, records) {
+  if (typeof repository !== 'string' || !REPOSITORY.test(repository) || !Array.isArray(records)) return null;
+  if (records.length > MAX_QUALITY_SNAPSHOT_ROWS) return null;
+  const normalized = [];
+  for (const record of records) {
+    const measurementId = typeof record?.measurementId === 'string' && REPOSITORY.test(record.measurementId)
+      ? record.measurementId : null;
+    const next = normalizeRecord(record, measurementId);
+    if (!next) return null;
+    normalized.push(next);
+  }
+  const days = collapseToDays(normalized);
+  return days ? canonicalize(repository, days) : null;
+}
+
+/**
+ * The category dictionary may name categories a NEWER install added — the
+ * catalog grows, and a snapshot committed by an upgraded peer reaches installs
+ * that have not upgraded yet. Accept any well-formed name here; rows that use
+ * an unknown one are set aside by `parseV2` instead of failing the whole file.
+ */
+const MAX_CATEGORY_NAMES = 256;
+const CATEGORY_NAME = /^[a-z][a-z0-9-]{0,63}$/;
+const parseCategoryDictionary = values => parseDictionary(values, { max: MAX_CATEGORY_NAMES, accepts: value => CATEGORY_NAME.test(value) });
+
+/** A dictionary of unique strings, each passing `accepts`, at most `max` long — or null. */
+function parseDictionary(values, { max, accepts }) {
+  if (!Array.isArray(values) || values.length > max) return null;
+  if (values.some(value => typeof value !== 'string' || !accepts(value))) return null;
+  if (new Set(values).size !== values.length) return null;
+  return values;
+}
+
+function parseV1Measurement(measurement) {
+  if (!allowedKeys(measurement, MEASUREMENT_KEYS)) return null;
+  if (typeof measurement.measurementId !== 'string' || !REPOSITORY.test(measurement.measurementId)) return null;
+  if (!timestampSchema.safeParse(measurement.assessedAt).success) return null;
+  const report = numericReport(measurement.report);
+  if (!report) return null;
+  return normalizeRecord({ assessedAt: measurement.assessedAt, ...report }, measurement.measurementId);
+}
+
+function parseV1(value) {
+  if (!allowedKeys(value, V1_KEYS) || value.schemaVersion !== 1) return { status: 'malformed' };
+  if (typeof value.repository !== 'string' || !REPOSITORY.test(value.repository)) return { status: 'malformed' };
+  if (!Array.isArray(value.measurements) || value.measurements.length > MAX_QUALITY_SNAPSHOT_ROWS) return { status: 'malformed' };
+  const records = [];
+  for (const measurement of value.measurements) {
+    const record = parseV1Measurement(measurement);
+    if (!record) return { status: 'malformed' };
+    records.push(record);
+  }
+  const days = collapseToDays(records);
+  if (!days) return { status: 'malformed' };
+  const canonical = canonicalize(value.repository, days);
+  return canonical
+    ? { status: 'v1', repository: value.repository, records: days, canonical }
+    : { status: 'malformed' };
+}
+
+/** A well-formed row naming a category this install does not know yet. */
+const UNKNOWN_CATEGORY_ROW = Symbol('unknown-category-row');
+
+function parseV2Row(row, categories, coverage, confidence) {
+  if (!Array.isArray(row) || row.length !== 8) return null;
+  const [assessedAt, categoryIndex, score, worstSeverity, coverageIndex, confidenceIndex, scannedFiles, totalFiles] = row;
+  if (!timestampSchema.safeParse(assessedAt).success) return null;
+  if (!isInt(categoryIndex, 0, Math.max(categories.length - 1, 0)) || categoryIndex >= categories.length) return null;
+  if (!(score === null || isInt(score, 0, 100))) return null;
+  if (!isInt(worstSeverity, 0, 10)) return null;
+  if (!isInt(coverageIndex, 0, Math.max(coverage.length - 1, 0)) || coverageIndex >= coverage.length) return null;
+  if (!isInt(confidenceIndex, 0, Math.max(confidence.length - 1, 0)) || confidenceIndex >= confidence.length) return null;
+  if (!isInt(scannedFiles, 0, Number.MAX_SAFE_INTEGER) || !isInt(totalFiles, 0, Number.MAX_SAFE_INTEGER)) return null;
+  if (!READABLE_CATEGORIES.has(categories[categoryIndex])) return UNKNOWN_CATEGORY_ROW;
+  return normalizeRecord({
+    assessedAt,
+    category: categories[categoryIndex],
+    score,
+    worstSeverity,
+    coverage: coverage[coverageIndex],
+    confidence: confidence[confidenceIndex],
+    scannedFiles,
+    totalFiles,
+  });
+}
+
+function parseV2(value) {
+  if (!allowedKeys(value, V2_KEYS) || value.schemaVersion !== 2 || value.reportVersion !== APP_QUALITY_REPORT_VERSION) {
+    return { status: 'malformed' };
+  }
+  if (typeof value.repository !== 'string' || !REPOSITORY.test(value.repository)) return { status: 'malformed' };
+  const categories = parseCategoryDictionary(value.categories);
+  const coverage = parseDictionary(value.coverage, { max: COVERAGE.size, accepts: v => COVERAGE.has(v) });
+  const confidence = parseDictionary(value.confidence, { max: CONFIDENCE.size, accepts: v => CONFIDENCE.has(v) });
+  if (!categories || !coverage || !confidence) return { status: 'malformed' };
+  if (!Array.isArray(value.measurements) || value.measurements.length > MAX_QUALITY_SNAPSHOT_ROWS) return { status: 'malformed' };
+  if (value.measurements.length > 0 && (categories.length === 0 || coverage.length === 0 || confidence.length === 0)) {
+    return { status: 'malformed' };
+  }
+  const records = [];
+  let unknownRows = 0;
+  for (const row of value.measurements) {
+    const record = parseV2Row(row, categories, coverage, confidence);
+    if (!record) return { status: 'malformed' };
+    if (record === UNKNOWN_CATEGORY_ROW) {
+      unknownRows += 1;
+      continue;
+    }
+    records.push(record);
+  }
+  const days = collapseToDays(records);
+  if (!days) return { status: 'malformed' };
+  // Readable, but not ours to rewrite: canonicalizing would drop the rows a
+  // newer install wrote. Readers use the known records; writers leave the file.
+  if (unknownRows) return { status: 'future-categories', repository: value.repository, records: days, canonical: null };
+  const canonical = canonicalize(value.repository, days);
+  return canonical
+    ? { status: 'v2', repository: value.repository, records: days, canonical }
+    : { status: 'malformed' };
+}
+
+/**
+ * Classify a snapshot document. `canonical` is the only byte sequence writers
+ * emit for that repository and those records. Future schemas stay unparsed.
+ */
+export function classifyQualitySnapshot(body) {
+  if (typeof body !== 'string') return { status: 'unrecognized' };
+  let parsed;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return { status: 'unrecognized' };
+  }
+  if (!plainObject(parsed) || !Object.hasOwn(parsed, 'schemaVersion')) return { status: 'unrecognized' };
+  if (parsed.schemaVersion === 1) return parseV1(parsed);
+  if (parsed.schemaVersion === 2) return parseV2(parsed);
+  if (Number.isInteger(parsed.schemaVersion) && parsed.schemaVersion > APP_QUALITY_FILE_SCHEMA_VERSION) {
+    return { status: 'future' };
+  }
+  return { status: 'unrecognized' };
+}
+
+/** v1 wire object or v2 file object → canonical v2 text, or null. */
+export function qualityFileFromWireSnapshot(snapshot) {
+  const classified = classifyQualitySnapshot(JSON.stringify(snapshot ?? null));
+  return classified.status === 'v1' || classified.status === 'v2' ? classified.canonical : null;
+}
+
+/** Digest of the scoring row. Not stored in v2; used only to order timestamp ties. */
+export function snapshotTieKey(record) {
+  return createHash('sha256').update(JSON.stringify([
+    record.assessedAt,
+    record.category,
+    record.score,
+    record.worstSeverity,
+    record.coverage,
+    record.confidence,
+    record.scannedFiles,
+    record.totalFiles,
+  ])).digest('hex');
+}
+
+/** v1 files keep their stored id. v2 rows get the transient digest. */
+export function releaseTieId(record) {
+  return typeof record?.measurementId === 'string' && REPOSITORY.test(record.measurementId)
+    ? record.measurementId
+    : snapshotTieKey(record);
+}

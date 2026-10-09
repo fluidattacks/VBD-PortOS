@@ -1,0 +1,564 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import express from 'express';
+import { request } from '../../lib/testHelper.js';
+import taskTypeRoutes from './taskTypes.js';
+
+// Only the apps service is mocked; SELF_IMPROVEMENT_TASK_TYPES (taskScheduleRegistry) and
+// the shared cron validator (lib/cronValidation.js) run for real, as do the
+// sanitizeTaskMetadata validators.
+const recordUserAction = vi.hoisted(() => vi.fn(async () => ({ id: 'evt' })));
+vi.mock('../../services/userActions.js', () => ({ recordUserAction }));
+
+vi.mock('../../services/apps.js', () => ({
+  getAppById: vi.fn(),
+  updateAppTaskTypeOverride: vi.fn(),
+  getAppTaskTypeOverrides: vi.fn(),
+  getAppWorkTracker: vi.fn(),
+  getAppLayeredIntelligenceConfig: vi.fn(),
+  toggleAllAppTaskTypes: vi.fn(),
+  bulkUpdateAppTaskTypeOverride: vi.fn(),
+  PORTOS_APP_ID: 'portos-default'
+}));
+
+// The outcome STORE (file I/O) is mocked; the pure aggregators the route composes
+// (summarizeOutcomeStats + the rejection taxonomy) run for real so the test covers
+// the real merge-rate/rejection math, not a restated stub.
+vi.mock('../../services/layeredIntelligenceOutcomes.js', () => ({
+  listOutcomesResult: vi.fn()
+}));
+
+// The work-item picker composes the claim-work metadata resolver (so the preview
+// scans under the same author filter the run will) with the tracker lister.
+vi.mock('../../services/workItems.js', () => ({
+  listWorkItems: vi.fn()
+}));
+
+// The quality-schedule planner has its own suite (repo scanning, busy-window
+// collection, plan placement); here only the route's validation and wiring are
+// under test, so the service is a double.
+vi.mock('../../services/appQualitySchedule.js', () => ({
+  buildQualitySchedulePlan: vi.fn(),
+  applyQualitySchedulePlan: vi.fn()
+}));
+vi.mock('../../services/cosTaskClaimWork.js', async (importActual) => ({
+  ...(await importActual()),
+  resolveClaimWorkMetadata: vi.fn(),
+  resolveAppClaimReviewers: vi.fn()
+}));
+
+import * as appsService from '../../services/apps.js';
+import { listOutcomesResult } from '../../services/layeredIntelligenceOutcomes.js';
+import { listWorkItems } from '../../services/workItems.js';
+import { buildQualitySchedulePlan, applyQualitySchedulePlan } from '../../services/appQualitySchedule.js';
+import { resolveClaimWorkMetadata, resolveAppClaimReviewers } from '../../services/cosTaskClaimWork.js';
+
+describe('Apps Task-Type Routes', () => {
+  let app;
+
+  beforeEach(() => {
+    app = express();
+    app.use(express.json());
+    app.use('/api/apps', taskTypeRoutes);
+    vi.clearAllMocks();
+  });
+
+  describe('GET /api/apps/:id/work-items', () => {
+    beforeEach(() => {
+      appsService.getAppById.mockResolvedValue({ id: 'app-001', name: 'App' });
+      resolveClaimWorkMetadata.mockResolvedValue({ metadata: {}, interval: {} });
+      listWorkItems.mockResolvedValue({
+        tracker: 'github', source: 'origin', promptTaskType: 'claim-issue',
+        items: [{ ref: '7', title: 'Fix the thing' }], count: 1,
+        reason: 'actionable-issues', transient: false
+      });
+    });
+
+    it('scans with the app\'s configured author filter when the caller sends none', async () => {
+      resolveClaimWorkMetadata.mockResolvedValue({ metadata: { issueAuthorFilter: 'any' }, interval: {} });
+
+      const response = await request(app).get('/api/apps/app-001/work-items');
+
+      expect(response.status).toBe(200);
+      expect(listWorkItems).toHaveBeenCalledWith(expect.objectContaining({ id: 'app-001' }), { issueAuthorFilter: 'any', issueExcludeLabels: [] });
+      // Echoed back so the picker's select shows what was actually scanned.
+      expect(response.body.issueAuthorFilter).toBe('any');
+      expect(response.body.items).toEqual([{ ref: '7', title: 'Fix the thing' }]);
+      expect(response.body.tracker).toBe('github');
+    });
+
+    it('defaults to the self boundary when nothing is configured', async () => {
+      await request(app).get('/api/apps/app-001/work-items');
+      expect(listWorkItems).toHaveBeenCalledWith(expect.anything(), { issueAuthorFilter: 'self', issueExcludeLabels: [] });
+    });
+
+    it('lets an explicit query filter override the configured one', async () => {
+      resolveClaimWorkMetadata.mockResolvedValue({ metadata: { issueAuthorFilter: 'self' }, interval: {} });
+
+      const response = await request(app).get('/api/apps/app-001/work-items?issueAuthorFilter=owner');
+
+      expect(response.status).toBe(200);
+      expect(listWorkItems).toHaveBeenCalledWith(expect.anything(), { issueAuthorFilter: 'owner', issueExcludeLabels: [] });
+    });
+
+    it('ignores an out-of-vocabulary filter rather than passing it through', async () => {
+      resolveClaimWorkMetadata.mockResolvedValue({ metadata: { issueAuthorFilter: 'any' }, interval: {} });
+
+      await request(app).get('/api/apps/app-001/work-items?issueAuthorFilter=everyone');
+
+      expect(listWorkItems).toHaveBeenCalledWith(expect.anything(), { issueAuthorFilter: 'any', issueExcludeLabels: [] });
+    });
+
+    it('passes the app\'s configured issueExcludeLabels through to the picker', async () => {
+      resolveClaimWorkMetadata.mockResolvedValue({ metadata: { issueAuthorFilter: 'self', issueExcludeLabels: ['good first issue'] }, interval: {} });
+
+      const response = await request(app).get('/api/apps/app-001/work-items');
+
+      expect(response.status).toBe(200);
+      expect(listWorkItems).toHaveBeenCalledWith(expect.anything(), { issueAuthorFilter: 'self', issueExcludeLabels: ['good first issue'] });
+    });
+
+    it('returns 404 for an unknown app', async () => {
+      appsService.getAppById.mockResolvedValue(null);
+      const response = await request(app).get('/api/apps/app-999/work-items');
+      expect(response.status).toBe(404);
+      expect(listWorkItems).not.toHaveBeenCalled();
+    });
+  });
+
+  // The route's own job is narrow: map the resolver's `overridden` boolean to the
+  // `source` label the UI acts on, and publish only the fields a claim flow can
+  // honor. The reviewer RESOLUTION it previews (layer precedence, copilot guard,
+  // emitted CSV) belongs to `resolveAppClaimReviewers`, which the claim builder
+  // shares — covered in cosTaskClaimWork.test.js and reviewerConfig.test.js.
+  describe('GET /api/apps/:id/claim-reviewers', () => {
+    const RESOLVED = {
+      reviewers: ['codex', 'claude'], usernames: [], optionalReviewers: [],
+      reviewerMaxRounds: {}, reviewerModels: {}, reviewerEfforts: {}, csv: 'codex,claude',
+      prCompletion: 'review-then-merge',
+      // resolveClaimReviewerConfig also carries these two, and a claim flow has no
+      // slashdo flag string to put them in — the route must not publish them.
+      stopMode: 'all', reviewerApplies: false
+    };
+
+    beforeEach(() => {
+      appsService.getAppById.mockResolvedValue({ id: 'app-001', name: 'App' });
+    });
+
+    it('reports `task-override` so the UI sends the user to the override, not the defaults panel', async () => {
+      // The #6202 shape: the install default had been moved to `antigravity`, but a
+      // claim-work override saved months earlier still named codex + claude, so
+      // every manual claim reviewed with those while every reviewer control on
+      // screen showed `antigravity`.
+      resolveAppClaimReviewers.mockResolvedValue({ ...RESOLVED, overridden: true });
+
+      const response = await request(app).get('/api/apps/app-001/claim-reviewers');
+
+      expect(response.status).toBe(200);
+      expect(resolveAppClaimReviewers).toHaveBeenCalledWith({ id: 'app-001', name: 'App' });
+      expect(response.body).toMatchObject({
+        appId: 'app-001', source: 'task-override', reviewers: ['codex', 'claude'], csv: 'codex,claude', prCompletion: 'review-then-merge'
+      });
+    });
+
+    it('publishes prCompletion alongside reviewer details', async () => {
+      resolveAppClaimReviewers.mockResolvedValue({ ...RESOLVED, prCompletion: 'merge-on-green', reviewers: [], csv: '' });
+
+      const response = await request(app).get('/api/apps/app-001/claim-reviewers');
+
+      expect(response.status).toBe(200);
+      expect(response.body.prCompletion).toBe('merge-on-green');
+    });
+
+    it('reports `defaults` when nothing overrode them', async () => {
+      resolveAppClaimReviewers.mockResolvedValue({
+        ...RESOLVED, overridden: false, reviewers: ['antigravity'], csv: 'antigravity[gemini-3.8-flash]'
+      });
+
+      const response = await request(app).get('/api/apps/app-001/claim-reviewers');
+
+      expect(response.body.source).toBe('defaults');
+      expect(response.body.csv).toBe('antigravity[gemini-3.8-flash]');
+    });
+
+    it('does not publish the run flags a claim flow has nowhere to put', async () => {
+      resolveAppClaimReviewers.mockResolvedValue({ ...RESOLVED, overridden: false });
+
+      const response = await request(app).get('/api/apps/app-001/claim-reviewers');
+
+      expect(response.body.stopMode).toBeUndefined();
+      expect(response.body.reviewerApplies).toBeUndefined();
+    });
+  });
+
+  describe('GET /api/apps/:id/layered-intelligence', () => {
+    it('returns the effective config + isPortos flag', async () => {
+      appsService.getAppById.mockResolvedValue({ id: 'app-001', name: 'App' });
+      appsService.getAppLayeredIntelligenceConfig.mockResolvedValue({
+        enabled: false, intervalMs: 86400000, sources: { goals: true }, allowedScopes: ['app-improvement']
+      });
+
+      const response = await request(app).get('/api/apps/app-001/layered-intelligence');
+
+      expect(response.status).toBe(200);
+      expect(response.body.appId).toBe('app-001');
+      expect(response.body.isPortos).toBe(false);
+      expect(response.body.config.allowedScopes).toEqual(['app-improvement']);
+      expect(appsService.getAppLayeredIntelligenceConfig).toHaveBeenCalledWith('app-001');
+    });
+
+    it('flags the PortOS baseline app', async () => {
+      appsService.getAppById.mockResolvedValue({ id: 'portos-default', name: 'PortOS' });
+      appsService.getAppLayeredIntelligenceConfig.mockResolvedValue({ enabled: false, allowedScopes: ['app-improvement', 'loop-meta'] });
+
+      const response = await request(app).get('/api/apps/portos-default/layered-intelligence');
+
+      expect(response.status).toBe(200);
+      expect(response.body.isPortos).toBe(true);
+    });
+
+    it('returns 404 for an unknown app', async () => {
+      appsService.getAppById.mockResolvedValue(null);
+      const response = await request(app).get('/api/apps/app-999/layered-intelligence');
+      expect(response.status).toBe(404);
+    });
+  });
+
+  describe('GET /api/apps/:id/layered-intelligence/outcomes', () => {
+    it('composes stats + rejection tally + recent list from the store', async () => {
+      appsService.getAppById.mockResolvedValue({ id: 'app-001', name: 'App' });
+      appsService.getAppLayeredIntelligenceConfig.mockResolvedValue({ sources: { outcomes: true } });
+      listOutcomesResult.mockResolvedValue({
+        read: true,
+        outcomes: [
+          { slug: 'add-metrics', scope: 'app-improvement', outcome: 'merged', executionOutcome: 'success', executionAt: '2026-07-04T01:00:00.000Z', rejectionReason: null, issueRef: '#10', tracker: 'github', filedAt: '2026-07-04T00:00:00.000Z', outcomeAt: '2026-07-05T00:00:00.000Z' },
+          { slug: 'drop-feature', scope: 'app-improvement', outcome: 'rejected', rejectionReason: 'user-rejected', issueRef: '#11', tracker: 'github', filedAt: '2026-07-03T00:00:00.000Z', outcomeAt: '2026-07-04T00:00:00.000Z' },
+          { slug: 'vague-idea', scope: 'app-data-gap', outcome: 'abandoned', rejectionReason: 'unknown-reason', issueRef: '#12', tracker: 'github', filedAt: '2026-07-02T00:00:00.000Z', outcomeAt: '2026-07-03T00:00:00.000Z' },
+          { slug: 'open-one', scope: 'app-improvement', outcome: null, rejectionReason: null, issueRef: '#13', tracker: 'github', filedAt: '2026-07-01T00:00:00.000Z', outcomeAt: null }
+        ]
+      });
+
+      const response = await request(app).get('/api/apps/app-001/layered-intelligence/outcomes');
+
+      expect(response.status).toBe(200);
+      expect(response.body.read).toBe(true);
+      expect(response.body.stats).toMatchObject({ total: 4, merged: 1, rejected: 1, abandoned: 1, pending: 1, resolved: 3 });
+      expect(response.body.stats.mergeRate).toBeCloseTo(100 / 3, 5);
+      expect(response.body.execution).toMatchObject({
+        approved: 1, completed: 1, abandoned: 0, awaitingExecution: 0, attempted: 1, completionRate: 100,
+        duration: { count: 1, medianMs: 3_600_000 }
+      });
+      expect(response.body.execution.byScope['app-improvement']).toMatchObject({ completed: 1, completionRate: 100 });
+      // The composed li-outcomes effectiveness roll-up (#3014): approval → completion
+      // alongside the filing-side verdicts, with a per-scope breakdown that keeps a
+      // scope whose only proposal was abandoned rather than dropping it.
+      expect(response.body.metrics).toMatchObject({
+        totalFiled: 4, totalApproved: 1, totalCompleted: 1, totalRejected: 1,
+        totalAbandonedAtFiling: 1, totalPending: 1, totalAwaitingExecution: 0,
+        totalFailedExecution: 0, approvalToCompletionRate: 100
+      });
+      expect(response.body.metrics.byScope['app-improvement']).toMatchObject({
+        approved: 1, completed: 1, rejected: 1, pending: 1, approvalToCompletionRate: 100
+      });
+      expect(response.body.metrics.byScope['app-data-gap']).toMatchObject({
+        approved: 0, abandonedAtFiling: 1, approvalToCompletionRate: null
+      });
+      // The approval funnel (#3120): the human-review side of the same records. The
+      // fixture holds 3 decided + 1 pending, so the pending indicator is populated and
+      // the proposal-phase throughput is distinct from any agent-task rate.
+      expect(response.body.approvalFunnel.proposalPhase).toMatchObject({
+        totalFiled: 4, totalDecided: 3, totalPending: 1
+      });
+      expect(response.body.approvalFunnel.pending.count).toBe(1);
+      expect(response.body.approvalFunnel.windowDays).toBe(14);
+      // Real diagnoses only in entries; the undiagnosed abandoned row is `unknown`.
+      expect(response.body.rejections.entries).toEqual([{ reason: 'user-rejected', count: 1 }]);
+      expect(response.body.rejections.unknown).toBe(1);
+      expect(response.body.rejections.unclassified).toBe(0);
+      expect(response.body.recent).toHaveLength(4);
+      expect(response.body.recent[0]).toMatchObject({ slug: 'add-metrics', outcome: 'merged' });
+      expect(response.body.tracked).toBe(true);
+      expect(listOutcomesResult).toHaveBeenCalledWith({ appId: 'app-001' });
+    });
+
+    it('reports tracked:false when the outcomes source is off (records may be stale)', async () => {
+      appsService.getAppById.mockResolvedValue({ id: 'app-001', name: 'App' });
+      appsService.getAppLayeredIntelligenceConfig.mockResolvedValue({ sources: { outcomes: false } });
+      listOutcomesResult.mockResolvedValue({ read: true, outcomes: [] });
+
+      const response = await request(app).get('/api/apps/app-001/layered-intelligence/outcomes');
+
+      expect(response.status).toBe(200);
+      expect(response.body.read).toBe(true);
+      expect(response.body.tracked).toBe(false);
+    });
+
+    it('reports read:false when the store is unreadable (not an empty history)', async () => {
+      appsService.getAppById.mockResolvedValue({ id: 'app-001', name: 'App' });
+      listOutcomesResult.mockResolvedValue({ read: false, outcomes: [] });
+
+      const response = await request(app).get('/api/apps/app-001/layered-intelligence/outcomes');
+
+      expect(response.status).toBe(200);
+      expect(response.body.read).toBe(false);
+      expect(response.body.stats).toBeNull();
+      expect(response.body.execution).toBeNull();
+      // Null, not a zeroed roll-up: an unreadable store must not read as "LI has
+      // approved nothing and delivered nothing" — the same sentinel rule as `stats`.
+      expect(response.body.metrics).toBeNull();
+      // Same sentinel rule for the funnel: an unreadable store must not report "0
+      // proposals awaiting review" — that is indistinguishable from a clean queue.
+      expect(response.body.approvalFunnel).toBeNull();
+      expect(response.body.recent).toEqual([]);
+    });
+
+    it('returns a zero-total, null merge rate for an app that has filed nothing', async () => {
+      appsService.getAppById.mockResolvedValue({ id: 'app-001', name: 'App' });
+      listOutcomesResult.mockResolvedValue({ read: true, outcomes: [] });
+
+      const response = await request(app).get('/api/apps/app-001/layered-intelligence/outcomes');
+
+      expect(response.status).toBe(200);
+      expect(response.body.read).toBe(true);
+      expect(response.body.stats).toMatchObject({ total: 0, resolved: 0, mergeRate: null });
+    });
+
+    it('returns 404 for an unknown app', async () => {
+      appsService.getAppById.mockResolvedValue(null);
+      const response = await request(app).get('/api/apps/app-999/layered-intelligence/outcomes');
+      expect(response.status).toBe(404);
+    });
+  });
+
+  describe('PUT /api/apps/:id/task-types/:taskType', () => {
+    it('should accept valid taskMetadata with allowed boolean keys', async () => {
+      appsService.updateAppTaskTypeOverride.mockResolvedValue({
+        id: 'app-001',
+        name: 'Test App',
+        taskTypeOverrides: { 'feature-ideas': { taskMetadata: { useWorktree: true } } }
+      });
+
+      const response = await request(app)
+        .put('/api/apps/app-001/task-types/feature-ideas')
+        .send({ taskMetadata: { useWorktree: true, simplify: false } });
+
+      expect(response.status).toBe(200);
+      expect(response.body.success).toBe(true);
+      expect(recordUserAction).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'cos.schedule.update',
+        target: 'feature-ideas',
+        payload: expect.objectContaining({
+          keysChanged: ['taskMetadata'],
+          changes: { taskMetadata: { changed: true } },
+          appId: 'app-001',
+        }),
+      }));
+    });
+
+    it('should accept taskMetadata: null to clear metadata', async () => {
+      appsService.updateAppTaskTypeOverride.mockResolvedValue({
+        id: 'app-001',
+        name: 'Test App',
+        taskTypeOverrides: {}
+      });
+
+      const response = await request(app)
+        .put('/api/apps/app-001/task-types/feature-ideas')
+        .send({ taskMetadata: null });
+
+      expect(response.status).toBe(200);
+    });
+
+    it('should reject taskMetadata that is an array', async () => {
+      const response = await request(app)
+        .put('/api/apps/app-001/task-types/feature-ideas')
+        .send({ taskMetadata: [1, 2, 3] });
+
+      expect(response.status).toBe(400);
+    });
+
+    it('should reject taskMetadata with only unknown keys', async () => {
+      const response = await request(app)
+        .put('/api/apps/app-001/task-types/feature-ideas')
+        .send({ taskMetadata: { unknownKey: true } });
+
+      expect(response.status).toBe(400);
+      expect(response.body.error).toContain('unrecognized');
+    });
+
+    it('should reject taskMetadata with non-boolean values for allowed keys', async () => {
+      const response = await request(app)
+        .put('/api/apps/app-001/task-types/feature-ideas')
+        .send({ taskMetadata: { useWorktree: 'yes' } });
+
+      expect(response.status).toBe(400);
+    });
+
+    it('should return 400 when no valid fields provided', async () => {
+      const response = await request(app)
+        .put('/api/apps/app-001/task-types/feature-ideas')
+        .send({});
+
+      expect(response.status).toBe(400);
+    });
+
+    it('should reject an unknown taskType in the URL', async () => {
+      const response = await request(app)
+        .put('/api/apps/app-001/task-types/not-a-real-task-type')
+        .send({ enabled: true });
+
+      expect(response.status).toBe(400);
+      expect(response.body.code).toBe('INVALID_TASK_TYPE');
+    });
+
+    // #6634: this route used to call parseCronToNextRun and discard its result,
+    // on the belief that it throws for an out-of-range field. It returns null,
+    // so these were saved as enabled per-app cadences that never fire.
+    it('rejects an out-of-range cron interval before persisting it', async () => {
+      for (const interval of ['99 9 * * *', '0 25 * * *']) {
+        appsService.updateAppTaskTypeOverride.mockClear();
+        const response = await request(app)
+          .put('/api/apps/app-001/task-types/feature-ideas')
+          .send({ interval });
+        expect(response.status, interval).toBe(400);
+        expect(appsService.updateAppTaskTypeOverride).not.toHaveBeenCalled();
+      }
+    });
+
+    it('accepts a valid cron interval, a leap-day cron, a legacy cadence name, and null', async () => {
+      appsService.updateAppTaskTypeOverride.mockResolvedValue({
+        id: 'app-001', name: 'Test App', taskTypeOverrides: {}
+      });
+
+      // A leap-day cron has no occurrence in the scheduler's bounded two-year
+      // search window, but is syntactically valid and must still save.
+      for (const interval of [' 0 */6 * * * ', '0 0 29 2 *']) {
+        appsService.updateAppTaskTypeOverride.mockClear();
+        const ok = await request(app)
+          .put('/api/apps/app-001/task-types/feature-ideas')
+          .send({ interval });
+        expect(ok.status, interval).toBe(200);
+        expect(appsService.updateAppTaskTypeOverride).toHaveBeenCalledWith(
+          'app-001', 'feature-ideas', expect.objectContaining({ interval: interval.trim() })
+        );
+      }
+
+      // A retired cadence name from an older client is still decoded, not rejected.
+      appsService.updateAppTaskTypeOverride.mockClear();
+      const legacy = await request(app)
+        .put('/api/apps/app-001/task-types/feature-ideas')
+        .send({ interval: 'weekly' });
+      expect(legacy.status).toBe(200);
+      expect(appsService.updateAppTaskTypeOverride).toHaveBeenCalledWith(
+        'app-001', 'feature-ideas', expect.objectContaining({ interval: '0 7 * * 1' })
+      );
+
+      // null clears the override back to inheriting the global cadence.
+      appsService.updateAppTaskTypeOverride.mockClear();
+      const cleared = await request(app)
+        .put('/api/apps/app-001/task-types/feature-ideas')
+        .send({ interval: null });
+      expect(cleared.status).toBe(200);
+      expect(appsService.updateAppTaskTypeOverride).toHaveBeenCalledWith(
+        'app-001', 'feature-ideas', expect.objectContaining({ interval: null })
+      );
+    });
+  });
+
+  describe('PUT /api/apps/bulk-task-type/:taskType', () => {
+    it('should reject an unknown taskType in the URL', async () => {
+      const response = await request(app)
+        .put('/api/apps/bulk-task-type/not-a-real-task-type')
+        .send({ enabled: true });
+
+      expect(response.status).toBe(400);
+      expect(response.body.code).toBe('INVALID_TASK_TYPE');
+    });
+  });
+
+  describe('PUT /api/apps/:id/task-types/all', () => {
+    it('should toggle all task types for an app', async () => {
+      appsService.getAppById.mockResolvedValue({ id: 'app-001', name: 'Test App' });
+      appsService.toggleAllAppTaskTypes.mockResolvedValue({ id: 'app-001', name: 'Test App', taskTypeOverrides: { security: { enabled: true } } });
+
+      const response = await request(app)
+        .put('/api/apps/app-001/task-types/all')
+        .send({ enabled: true });
+
+      expect(response.status).toBe(200);
+      expect(response.body.success).toBe(true);
+      expect(response.body.appId).toBe('app-001');
+      expect(appsService.toggleAllAppTaskTypes).toHaveBeenCalledWith('app-001', true);
+    });
+
+    it('should return 400 when enabled is not a boolean', async () => {
+      appsService.getAppById.mockResolvedValue({ id: 'app-001', name: 'Test App' });
+
+      const response = await request(app)
+        .put('/api/apps/app-001/task-types/all')
+        .send({ enabled: 'yes' });
+
+      expect(response.status).toBe(400);
+      expect(response.body.code).toBe('VALIDATION_ERROR');
+    });
+
+    it('should return 404 when app not found', async () => {
+      appsService.getAppById.mockResolvedValue(null);
+
+      const response = await request(app)
+        .put('/api/apps/app-999/task-types/all')
+        .send({ enabled: true });
+
+      expect(response.status).toBe(404);
+    });
+  });
+
+  describe('quality schedule planning', () => {
+    const plan = { checksPerDay: 1, slots: [{ taskType: 'security', day: 1, hour: 9, cron: '0 9 * * 1', fileIssues: true }], claim: null, warnings: [], options: {} };
+    const payload = { appId: 'app-001', appName: 'App', plan, checks: [], capabilities: {}, scanned: 10, busySources: [], claimTaskTypes: ['claim-work'] };
+
+    beforeEach(() => {
+      appsService.getAppById.mockResolvedValue({ id: 'app-001', name: 'App' });
+      buildQualitySchedulePlan.mockResolvedValue(payload);
+      applyQualitySchedulePlan.mockResolvedValue({ ...payload, applied: 1, disabled: 25 });
+    });
+
+    it('serves the service payload verbatim, adding nothing of its own', async () => {
+      const response = await request(app).get('/api/apps/app-001/quality-schedule');
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual(payload);
+      expect(buildQualitySchedulePlan).toHaveBeenCalledWith({ id: 'app-001', name: 'App' });
+    });
+
+    it('routes a preview to the planner, never to the writer', async () => {
+      const response = await request(app)
+        .post('/api/apps/app-001/quality-schedule/preview')
+        .send({ taskTypes: ['security'], checksPerDay: 2, fileIssuesByType: { security: false } });
+      expect(response.status).toBe(200);
+      expect(buildQualitySchedulePlan.mock.calls[0][1]).toMatchObject({ taskTypes: ['security'], checksPerDay: 2, fileIssuesByType: { security: false } });
+      expect(applyQualitySchedulePlan).not.toHaveBeenCalled();
+    });
+
+    it('refuses a task type that is not an audit, so a form cannot rewrite the release cadence', async () => {
+      const response = await request(app)
+        .post('/api/apps/app-001/quality-schedule/apply')
+        .send({ taskTypes: ['do-release'] });
+      expect(response.status).toBe(400);
+      expect(applyQualitySchedulePlan).not.toHaveBeenCalled();
+    });
+
+    it('applies the plan and records the schedule change in the operator ledger', async () => {
+      const response = await request(app)
+        .post('/api/apps/app-001/quality-schedule/apply')
+        .send({ taskTypes: ['security'], claimBetween: false });
+      expect(response.status).toBe(200);
+      expect(response.body).toMatchObject({ success: true, applied: 1, disabled: 25 });
+      expect(applyQualitySchedulePlan.mock.calls[0][1]).toMatchObject({ taskTypes: ['security'], claimBetween: false });
+      // The ledger entry is the audit trail for a write that rewrote every
+      // audit cadence on the app — a bare "was called" would not notice the
+      // counts going missing.
+      expect(recordUserAction).toHaveBeenCalledWith(expect.objectContaining({
+        payload: expect.objectContaining({ qualityPlan: true, applied: 1, disabled: 25 }),
+      }));
+    });
+  });
+});

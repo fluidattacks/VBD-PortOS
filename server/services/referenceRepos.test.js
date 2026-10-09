@@ -1,0 +1,528 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { posixPath as toPosix } from '../lib/testHelper.js';
+
+// ─── mocks (must precede the import under test) ──────────────────────────────
+
+vi.mock('../lib/fileUtils.js', () => ({
+  tryReadFile: vi.fn().mockResolvedValue(null),
+  ensureDir: vi.fn(async () => {}),
+  expandHome: vi.fn((p) => p),
+  PATHS: { data: '/mock/data', root: '/mock/root' },
+  readJSONFile: vi.fn(async () => ({ apps: {} })),
+}));
+
+vi.mock('../lib/uuid.js', () => ({
+  v4: vi.fn(() => 'mock-uuid-1234'),
+}));
+
+// Stub apps.js so we can drive the per-app reference list without going
+// through the full apps registry / file I/O.
+const mockApps = new Map();
+vi.mock('./apps.js', () => ({
+  getAppById: vi.fn(async (id) => mockApps.get(id) || null),
+  updateApp: vi.fn(async (id, patch) => {
+    const cur = mockApps.get(id) || { id };
+    const next = { ...cur, ...patch };
+    mockApps.set(id, next);
+    return next;
+  }),
+}));
+
+// execGit is the one syscall every git operation funnels through. The mock
+// returns canned stdout per call so each describe block can assert
+// behavior without spawning real git. Tests pull `execGitMock` off the
+// module to queue per-call results.
+const execGitMock = vi.fn();
+vi.mock('../lib/execGit.js', () => ({
+  execGit: (args, cwd, opts) => {
+    const result = execGitMock(args, cwd, opts);
+    if (result?.error) return Promise.reject(result.error);
+    return Promise.resolve({ stdout: result?.stdout ?? '', stderr: '', exitCode: 0 });
+  },
+}));
+
+// Stubs for CoS task queuing — used by triggerReferenceAnalysis.
+const addTaskMock = vi.fn(async (task) => task);
+vi.mock('./cos.js', () => ({
+  addTask: (...args) => addTaskMock(...args),
+}));
+const getTaskPromptMock = vi.fn(async () => 'Analyze {appName} at {repoPath} for {appId} reviewer={reviewers}\n{referenceData}\n{planConstraint}\nTRACKER: {trackerInstructions}');
+vi.mock('./taskPromptService.js', () => ({
+  getTaskPrompt: (...args) => getTaskPromptMock(...args),
+}));
+
+// existsSync is hit when the service decides whether the managed clone
+// already exists. Default to false so first-touch goes through clone path;
+// individual tests override.
+const existsMock = vi.fn(() => false);
+const statMock = vi.fn(() => ({ isDirectory: () => true }));
+vi.mock('fs', () => ({
+  existsSync: (p) => existsMock(toPosix(p)),
+  statSync: (p) => statMock(toPosix(p)),
+}));
+
+// ─── module under test (after mocks) ─────────────────────────────────────────
+
+let svc;
+beforeEach(async () => {
+  vi.resetModules();
+  mockApps.clear();
+  execGitMock.mockReset();
+  addTaskMock.mockReset();
+  addTaskMock.mockImplementation(async (task) => task);
+  getTaskPromptMock.mockReset();
+  getTaskPromptMock.mockImplementation(async () => 'Analyze {appName} at {repoPath} for {appId} reviewer={reviewers}\n{referenceData}\n{planConstraint}\nTRACKER: {trackerInstructions}');
+  existsMock.mockReset();
+  existsMock.mockReturnValue(false);
+  svc = await import('./referenceRepos.js');
+});
+
+const seedApp = (id, refs = []) => {
+  mockApps.set(id, { id, name: 'TestApp', repoPath: '/mock/repo', referenceRepos: refs });
+};
+
+// ─── tests ───────────────────────────────────────────────────────────────────
+
+describe('addReferenceRepo', () => {
+  it('appends a ref with server-assigned id, default branch, and needs-clone status', async () => {
+    seedApp('app-1');
+    const ref = await svc.addReferenceRepo('app-1', {
+      name: 'phosphene',
+      repoUrl: 'https://github.com/mrbizarro/phosphene.git',
+      notes: 'LTX-2 video gen pipeline',
+    });
+    expect(ref).toMatchObject({
+      id: 'mock-uuid-1234',
+      name: 'phosphene',
+      repoUrl: 'https://github.com/mrbizarro/phosphene.git',
+      branch: 'main',
+      notes: 'LTX-2 video gen pipeline',
+      lastReviewedSha: null,
+      lastCheckedAt: null,
+      status: 'needs-clone',
+    });
+    const stored = mockApps.get('app-1');
+    expect(stored.referenceRepos).toHaveLength(1);
+  });
+
+  it('preserves existing refs when appending', async () => {
+    seedApp('app-1', [{ id: 'r1', name: 'A', repoUrl: 'x', branch: 'main', status: 'ok' }]);
+    await svc.addReferenceRepo('app-1', { name: 'B', repoUrl: 'y' });
+    expect(mockApps.get('app-1').referenceRepos.map((r) => r.name)).toEqual(['A', 'B']);
+  });
+
+  it('throws 404 when the app does not exist', async () => {
+    await expect(svc.addReferenceRepo('missing', { name: 'x', repoUrl: 'y' }))
+      .rejects.toThrow(/App not found/);
+  });
+});
+
+describe('updateReferenceRepo', () => {
+  it('updates allowed fields only and bumps lastCheckedAt when SHA is pinned manually', async () => {
+    seedApp('app-1', [{ id: 'r1', name: 'old', repoUrl: 'u', branch: 'main', notes: '', lastReviewedSha: null, status: 'ok' }]);
+    const updated = await svc.updateReferenceRepo('app-1', 'r1', {
+      name: 'new-name',
+      lastReviewedSha: 'a'.repeat(40),
+    });
+    expect(updated.name).toBe('new-name');
+    expect(updated.lastReviewedSha).toBe('a'.repeat(40));
+    expect(updated.lastCheckedAt).toBeTruthy(); // bumped because SHA was pinned
+  });
+
+  it('silently drops unknown fields (allow-list of writable keys)', async () => {
+    seedApp('app-1', [{ id: 'r1', name: 'a', repoUrl: 'u', status: 'ok' }]);
+    const updated = await svc.updateReferenceRepo('app-1', 'r1', { name: 'b', status: 'error' });
+    expect(updated.name).toBe('b');
+    expect(updated.status).toBe('ok'); // status not in allowed-update list
+  });
+
+  it('throws 404 for unknown ref id', async () => {
+    seedApp('app-1', [{ id: 'r1', name: 'a', repoUrl: 'u' }]);
+    await expect(svc.updateReferenceRepo('app-1', 'r99', { name: 'b' }))
+      .rejects.toThrow(/Reference repo not found/);
+  });
+
+  it('trims string fields (name/repoUrl/branch/notes) just like addReferenceRepo', async () => {
+    // Without trimming, " main " as a branch causes confusing git failures
+    // and " https://github.com/...  " in repoUrl would mismatch addRef shape.
+    seedApp('app-1', [{ id: 'r1', name: 'old', repoUrl: 'u', branch: 'main', notes: '', status: 'ok' }]);
+    const updated = await svc.updateReferenceRepo('app-1', 'r1', {
+      name: '  spaced  ',
+      branch: '  develop  ',
+      repoUrl: '  https://x/y.git  ',
+      notes: '  some notes  ',
+    });
+    expect(updated.name).toBe('spaced');
+    expect(updated.branch).toBe('develop');
+    expect(updated.repoUrl).toBe('https://x/y.git');
+    expect(updated.notes).toBe('some notes');
+  });
+
+  it('does not bump lastCheckedAt when lastReviewedSha is cleared to null', async () => {
+    // Clearing the SHA pin (lastReviewedSha=null) is a "reset", not a "review" —
+    // bumping lastCheckedAt would make the UI show a fresh-looking timestamp
+    // immediately after a reset, which is misleading.
+    seedApp('app-1', [{ id: 'r1', name: 'p', repoUrl: 'u', branch: 'main', lastReviewedSha: 'a'.repeat(40), lastCheckedAt: '2026-01-01T00:00:00Z', status: 'ok' }]);
+    const updated = await svc.updateReferenceRepo('app-1', 'r1', { lastReviewedSha: null });
+    expect(updated.lastReviewedSha).toBeNull();
+    expect(updated.lastCheckedAt).toBe('2026-01-01T00:00:00Z'); // unchanged
+  });
+});
+
+describe('deleteReferenceRepo', () => {
+  it('removes the ref from the app and leaves siblings intact', async () => {
+    seedApp('app-1', [
+      { id: 'r1', name: 'a', repoUrl: 'u' },
+      { id: 'r2', name: 'b', repoUrl: 'u' },
+    ]);
+    await svc.deleteReferenceRepo('app-1', 'r1');
+    expect(mockApps.get('app-1').referenceRepos.map((r) => r.id)).toEqual(['r2']);
+  });
+
+  it('throws 404 when the ref id is unknown', async () => {
+    seedApp('app-1', [{ id: 'r1', name: 'a', repoUrl: 'u' }]);
+    await expect(svc.deleteReferenceRepo('app-1', 'missing'))
+      .rejects.toThrow(/Reference repo not found/);
+  });
+});
+
+describe('checkReferenceRepo', () => {
+  // Wire execGitMock as a programmable sequence of git invocations.
+  // For URL-based refs the order is: clone (when missing), fetch, rev-parse,
+  // log. For local-path refs: rev-parse, log (no clone, no fetch).
+  it('clones on first run, fetches, computes commits, persists status=ok', async () => {
+    seedApp('app-1', [{ id: 'r1', name: 'phosphene', repoUrl: 'https://github.com/x/y.git', branch: 'main', lastReviewedSha: null, status: 'needs-clone' }]);
+    existsMock.mockImplementation(() => false); // clone doesn't exist yet
+    execGitMock
+      .mockReturnValueOnce({ stdout: '' })                            // git clone
+      .mockReturnValueOnce({ stdout: '' })                            // git fetch
+      .mockReturnValueOnce({ stdout: 'a'.repeat(40) })                // git rev-parse
+      .mockReturnValueOnce({ stdout: ['a'.repeat(40), 'Alice', 'a@x', '2026-05-01T00:00:00Z', 'first commit'].join('\t') }); // git log
+
+    const snapshot = await svc.checkReferenceRepo('app-1', 'r1');
+    expect(snapshot.head).toBe('a'.repeat(40));
+    expect(snapshot.commitCount).toBe(1);
+    expect(snapshot.commits[0].subject).toBe('first commit');
+
+    // The first execGitMock call should have been `git clone <url> <id>`
+    expect(execGitMock.mock.calls[0][0]).toEqual(['clone', 'https://github.com/x/y.git', 'r1']);
+    // Persisted status must reflect the successful run.
+    const persisted = mockApps.get('app-1').referenceRepos[0];
+    expect(persisted.status).toBe('ok');
+    expect(persisted.lastError).toBeNull();
+    expect(persisted.lastCheckedAt).toBeTruthy();
+    expect(persisted.lastKnownGoodSnapshot).toMatchObject({
+      schemaVersion: 1,
+      head: 'a'.repeat(40),
+      branch: 'main',
+      commitCount: 1,
+      fetchedAt: expect.any(String),
+    });
+    expect(persisted.lastKnownGoodSnapshot).not.toHaveProperty('cwd');
+    expect(persisted.lastKnownGoodSnapshot.commits[0]).not.toHaveProperty('email');
+  });
+
+  it('skips clone when .git already exists', async () => {
+    seedApp('app-1', [{ id: 'r1', name: 'p', repoUrl: 'https://github.com/x/y.git', branch: 'main', lastReviewedSha: null }]);
+    existsMock.mockImplementation((p) => String(p).endsWith('/.git'));
+    execGitMock
+      .mockReturnValueOnce({ stdout: '' })                            // git fetch
+      .mockReturnValueOnce({ stdout: 'b'.repeat(40) })                // git rev-parse
+      .mockReturnValueOnce({ stdout: '' });                           // git log (empty)
+
+    const snapshot = await svc.checkReferenceRepo('app-1', 'r1');
+    expect(snapshot.commitCount).toBe(0);
+    // First git call should be fetch, not clone.
+    expect(execGitMock.mock.calls[0][0][0]).toBe('fetch');
+  });
+
+  it('replaces the prior snapshot with bounded, credential-free commit metadata', async () => {
+    seedApp('app-1', [{
+      id: 'r1', name: 'p', repoUrl: 'https://github.com/x/y.git', branch: 'main', lastReviewedSha: null,
+      lastKnownGoodSnapshot: {
+        schemaVersion: 1, fetchedAt: '2026-01-01T00:00:00.000Z', head: 'a'.repeat(40),
+        commits: [], branch: 'main', commitCount: 0, truncated: false, totalCommitCount: null,
+      },
+    }]);
+    existsMock.mockImplementation((p) => String(p).endsWith('/.git'));
+    execGitMock
+      .mockReturnValueOnce({ stdout: '' }) // fetch
+      .mockReturnValueOnce({ stdout: 'b'.repeat(40) }) // rev-parse
+      .mockReturnValueOnce({ stdout: ['b'.repeat(40), 'A'.repeat(250), 'person@example.test', '2026-05-01T00:00:00Z', 'S'.repeat(550)].join('\t') }); // log
+
+    await svc.checkReferenceRepo('app-1', 'r1');
+
+    const persisted = mockApps.get('app-1').referenceRepos[0].lastKnownGoodSnapshot;
+    expect(persisted.head).toBe('b'.repeat(40));
+    expect(persisted.commits).toHaveLength(1);
+    expect(persisted.commits[0]).toMatchObject({ author: 'A'.repeat(200), subject: 'S'.repeat(500) });
+    expect(persisted.commits[0]).not.toHaveProperty('email');
+    expect(persisted).not.toHaveProperty('cwd');
+  });
+
+  it('uses lastReviewedSha as the lower bound when set', async () => {
+    seedApp('app-1', [{ id: 'r1', name: 'p', repoUrl: 'https://github.com/x/y.git', branch: 'main', lastReviewedSha: 'c'.repeat(40) }]);
+    existsMock.mockImplementation((p) => String(p).endsWith('/.git'));
+    execGitMock
+      .mockReturnValueOnce({ stdout: '' })                            // fetch
+      .mockReturnValueOnce({ stdout: 'd'.repeat(40) })                // rev-parse
+      .mockReturnValueOnce({ stdout: '' });                           // log
+
+    await svc.checkReferenceRepo('app-1', 'r1');
+    // After rev-parse, listCommits runs `rev-list --count <range>` before
+    // `log -n N <range>`. Both end with the same range arg, so checking
+    // the last positional in either call confirms the SHA gets plumbed
+    // through to git as a strict <sinceSha>..<headRef> bound.
+    const rangeCall = execGitMock.mock.calls[2][0];
+    const range = rangeCall[rangeCall.length - 1];
+    expect(range).toBe(`${'c'.repeat(40)}..origin/main`);
+  });
+
+  it('persists status=error and re-throws on git failure', async () => {
+    seedApp('app-1', [{ id: 'r1', name: 'p', repoUrl: 'https://github.com/x/y.git', branch: 'main', lastReviewedSha: null }]);
+    existsMock.mockImplementation((p) => String(p).endsWith('/.git'));
+    execGitMock.mockReturnValueOnce({ error: new Error('fatal: bad branch') });
+
+    await expect(svc.checkReferenceRepo('app-1', 'r1')).rejects.toThrow(/fatal: bad branch/);
+    const persisted = mockApps.get('app-1').referenceRepos[0];
+    expect(persisted.status).toBe('error');
+    expect(persisted.lastError).toMatch(/bad branch/);
+  });
+
+  it('returns a stale last-known-good snapshot after a failed refresh', async () => {
+    const savedSnapshot = {
+      schemaVersion: 1,
+      fetchedAt: '2026-01-01T00:00:00.000Z',
+      head: 'a'.repeat(40),
+      headShort: 'aaaaaaaa',
+      sinceSha: null,
+      sinceShort: null,
+      branch: 'main',
+      commitCount: 1,
+      truncated: false,
+      totalCommitCount: null,
+      commits: [{ sha: 'a'.repeat(40), author: 'Alice', date: '2026-01-01T00:00:00.000Z', subject: 'saved commit' }],
+    };
+    seedApp('app-1', [{
+      id: 'r1', name: 'p', repoUrl: 'https://github.com/x/y.git', branch: 'main',
+      lastReviewedSha: null, lastKnownGoodSnapshot: savedSnapshot,
+    }]);
+    existsMock.mockImplementation((p) => String(p).endsWith('/.git'));
+    execGitMock.mockReturnValueOnce({ error: new Error('fatal: temporary outage') });
+
+    const snapshot = await svc.checkReferenceRepo('app-1', 'r1');
+
+    expect(snapshot).toMatchObject({
+      ...savedSnapshot,
+      stale: true,
+      staleAgeMs: expect.any(Number),
+      error: { code: 'REFERENCE_REPO_GIT_FAILED', message: expect.stringContaining('temporary outage') },
+    });
+    const persisted = mockApps.get('app-1').referenceRepos[0];
+    expect(persisted.status).toBe('stale');
+    expect(persisted.lastKnownGoodSnapshot).toEqual(savedSnapshot);
+    expect(persisted.lastError).toContain('temporary outage');
+  });
+
+  it('skips clone+fetch for local-path refs and reads SHA via rev-parse on the user path', async () => {
+    seedApp('app-1', [{ id: 'r1', name: 'p', repoUrl: '/Users/me/phosphene', branch: 'main', lastReviewedSha: null }]);
+    existsMock.mockImplementation((p) => p === '/Users/me/phosphene' || p === '/Users/me/phosphene/.git'); // user path + git dir exist
+    execGitMock
+      .mockReturnValueOnce({ stdout: 'e'.repeat(40) })                // rev-parse main
+      .mockReturnValueOnce({ stdout: '' });                           // log
+
+    const snapshot = await svc.checkReferenceRepo('app-1', 'r1');
+    expect(snapshot.head).toBe('e'.repeat(40));
+    // No clone, no fetch — first call is rev-parse on the user path
+    expect(execGitMock.mock.calls[0][0]).toEqual(['rev-parse', 'main']);
+    expect(execGitMock.mock.calls[0][1]).toBe('/Users/me/phosphene');
+  });
+});
+
+describe('isLocalPath', () => {
+  it('classifies https / ssh-scheme / scp-style URLs as remote', () => {
+    const { isLocalPath } = svc.__test;
+    expect(isLocalPath('https://github.com/owner/repo.git')).toBe(false);
+    expect(isLocalPath('ssh://git@github.com/owner/repo.git')).toBe(false);
+    expect(isLocalPath('git@github.com:owner/repo.git')).toBe(false);
+    // scp-style with non-github user@host shape — must still be remote
+    expect(isLocalPath('user@example.com:owner/repo.git')).toBe(false);
+    // scp-style with NO user (`host:path`) — git accepts these too
+    expect(isLocalPath('github.com:owner/repo.git')).toBe(false);
+  });
+
+  it('classifies absolute paths and ~-paths as local', () => {
+    const { isLocalPath } = svc.__test;
+    expect(isLocalPath('/Users/me/phosphene')).toBe(true);
+    expect(isLocalPath('~/phosphene')).toBe(true);
+    expect(isLocalPath('./phosphene')).toBe(true);
+    // Windows drive paths must NOT be treated as scp-style remotes —
+    // single-char host segment + path starting with `\` or `/`.
+    expect(isLocalPath('C:\\Users\\me\\phosphene')).toBe(true);
+    expect(isLocalPath('C:/Users/me/phosphene')).toBe(true);
+  });
+});
+
+describe('formatReferenceForPrompt', () => {
+  it('renders a Markdown chunk with notes + commit list', () => {
+    const ref = { id: 'r1', name: 'phosphene', repoUrl: 'https://github.com/x/y.git', branch: 'main', lastReviewedSha: null, notes: 'video gen' };
+    const snapshot = {
+      head: 'f'.repeat(40),
+      headShort: 'ffffffff',
+      commitCount: 1,
+      commits: [{ sha: 'a'.repeat(40), subject: 'add new feature', author: 'Alice', date: '2026-05-01T00:00:00Z' }],
+      cwd: '/mock/clone',
+      branch: 'main',
+    };
+    const out = svc.formatReferenceForPrompt(ref, snapshot);
+    expect(out).toContain('## Reference: phosphene');
+    expect(out).toContain('Context (user-supplied');
+    expect(out).toContain('video gen');
+    expect(out).toContain('aaaaaaaa');
+    expect(out).toContain('add new feature');
+  });
+
+  it('shows "no new commits" line when commitCount is 0', () => {
+    const ref = { id: 'r1', name: 'phosphene', repoUrl: 'https://x', branch: 'main', notes: '' };
+    const snapshot = { head: 'f'.repeat(40), headShort: 'ffffffff', commitCount: 0, commits: [], cwd: '/x', branch: 'main' };
+    const out = svc.formatReferenceForPrompt(ref, snapshot);
+    expect(out).toContain('No new commits since last review');
+  });
+});
+
+describe('markReferenceRepoReviewed', () => {
+  it('rejects malformed SHA before touching state', async () => {
+    seedApp('app-1', [{ id: 'r1', name: 'p', repoUrl: 'u', branch: 'main' }]);
+    await expect(svc.markReferenceRepoReviewed('app-1', 'r1', 'too-short')).rejects.toThrow(/Invalid SHA/);
+  });
+
+  it('persists lastReviewedSha + lastCheckedAt on a valid SHA verified in the clone', async () => {
+    // Local-path ref so ensureClone() is a no-op other than the existsSync
+    // check; cat-file -e succeeds → SHA is treated as verified.
+    seedApp('app-1', [{ id: 'r1', name: 'p', repoUrl: '/Users/me/phosphene', branch: 'main', lastReviewedSha: null }]);
+    existsMock.mockImplementation((p) => p === '/Users/me/phosphene' || p === '/Users/me/phosphene/.git');
+    execGitMock.mockReturnValueOnce({ stdout: '' }); // git cat-file -e <sha>^{commit}
+    const out = await svc.markReferenceRepoReviewed('app-1', 'r1', 'a'.repeat(40));
+    expect(out.lastReviewedSha).toBe('a'.repeat(40));
+    expect(out.lastCheckedAt).toBeTruthy();
+    // Verify the actual git call shape so a future refactor can't silently
+    // drop SHA verification.
+    expect(execGitMock.mock.calls[0][0]).toEqual(['cat-file', '-e', `${'a'.repeat(40)}^{commit}`]);
+  });
+
+  it('rejects when the SHA does not resolve to a commit in the clone', async () => {
+    seedApp('app-1', [{ id: 'r1', name: 'p', repoUrl: '/Users/me/phosphene', branch: 'main', lastReviewedSha: null }]);
+    existsMock.mockImplementation((p) => p === '/Users/me/phosphene' || p === '/Users/me/phosphene/.git');
+    execGitMock.mockReturnValueOnce({ error: new Error('fatal: Not a valid object name') });
+    await expect(svc.markReferenceRepoReviewed('app-1', 'r1', 'a'.repeat(40)))
+      .rejects.toThrow(/not found in reference repo/);
+    // SHA must NOT have been persisted on a failed verification.
+    expect(mockApps.get('app-1').referenceRepos[0].lastReviewedSha).toBeNull();
+  });
+});
+
+describe('triggerReferenceAnalysis', () => {
+  const app = { id: 'app-1', name: 'TestApp', repoPath: '/mock/repo' };
+  const ref = { id: 'r1', name: 'phosphene', repoUrl: 'https://github.com/x/y.git', branch: 'main' };
+  const snapshot = { head: 'a'.repeat(40), headShort: 'aaaaaaaa', commitCount: 3, commits: [], cwd: '/mock/clone', branch: 'main' };
+
+  it('skips when snapshot has no new commits', async () => {
+    const result = await svc.triggerReferenceAnalysis(app, ref, { ...snapshot, commitCount: 0 });
+    expect(result).toEqual({ queued: false, reason: 'no-new-commits' });
+    expect(addTaskMock).not.toHaveBeenCalled();
+  });
+
+  it('skips when snapshot is null', async () => {
+    const result = await svc.triggerReferenceAnalysis(app, ref, null);
+    expect(result).toEqual({ queued: false, reason: 'no-new-commits' });
+  });
+
+  it('never queues an analysis from a stale snapshot', async () => {
+    const result = await svc.triggerReferenceAnalysis(app, ref, { ...snapshot, stale: true });
+    expect(result).toEqual({ queued: false, reason: 'stale-snapshot' });
+    expect(addTaskMock).not.toHaveBeenCalled();
+  });
+
+  it('skips when app is null', async () => {
+    const result = await svc.triggerReferenceAnalysis(null, ref, snapshot);
+    expect(result).toEqual({ queued: false, reason: 'app-not-found' });
+  });
+
+  it('queues a task with single-line description and full prompt in metadata.context', async () => {
+    const result = await svc.triggerReferenceAnalysis(app, ref, snapshot);
+    expect(result.queued).toBe(true);
+    expect(result.taskId).toBeTruthy();
+    expect(addTaskMock).toHaveBeenCalledTimes(1);
+    const taskArg = addTaskMock.mock.calls[0][0];
+    // Task ID must use a known internal prefix so taskParser doesn't rewrite it
+    expect(taskArg.id).toMatch(/^sys-ref-analysis-/);
+    // Description must be single-line and contain ref + app identifiers
+    expect(taskArg.description).not.toContain('\n');
+    expect(taskArg.description).toContain('phosphene');
+    expect(taskArg.description).toContain('TestApp');
+    expect(taskArg.description).toContain('github.com/x/y.git');
+    // Full prompt stored in metadata.context for COS-TASKS.md round-trip safety
+    expect(taskArg.metadata.context).toContain('Analyze TestApp');
+    expect(taskArg.metadata.context).toContain('/mock/repo');
+    // Must set autoApproved so CoS dequeues automatically
+    expect(taskArg.autoApproved).toBe(true);
+    expect(taskArg.section).toBe('pending');
+    // Task type markers
+    expect(addTaskMock.mock.calls[0][1]).toBe('internal');
+    expect(addTaskMock.mock.calls[0][2]).toEqual({ raw: true });
+    // readOnly must be false: the v3 reference-watch prompt records proposals in
+    // the resolved tracker (PLAN.md commit, or gh/glab issue create). readOnly:true
+    // would inject the "## Read-Only Task" guard into the system prompt and the
+    // agent would refuse to write — defeating the whole flow.
+    expect(taskArg.metadata.readOnly).toBe(false);
+    // With no configured tracker and no resolvable git origin (execGit mock
+    // returns empty stdout), the work tracker degrades to PLAN.md and the
+    // {trackerInstructions} block reflects that.
+    expect(taskArg.metadata.workTracker).toBe('plan');
+    expect(taskArg.metadata.context).toContain('PLAN.md');
+    // The PLAN.md path COMMITS checklist items, so a successful run dirties the
+    // worktree and the TUI idle-complete gate must stay armed (#3102).
+    expect(taskArg.metadata.worktreeChangesExpected).toBe(true);
+  });
+
+  it('injects the GitHub-issue tracker instructions when the app is configured for github', async () => {
+    const ghApp = { ...app, workTracker: 'github' };
+    const result = await svc.triggerReferenceAnalysis(ghApp, ref, snapshot);
+    expect(result.queued).toBe(true);
+    const taskArg = addTaskMock.mock.calls[0][0];
+    expect(taskArg.metadata.workTracker).toBe('github');
+    // The injected block drives `gh issue create`, not a PLAN.md append.
+    expect(taskArg.metadata.context).toContain('gh issue create');
+    expect(taskArg.metadata.context).toContain('GitHub Issues');
+    // The agent files ISSUES and edits no application code, so a successful run
+    // leaves a CLEAN worktree — the idle-complete gate must be opted out of, or
+    // the run is recorded as an `idle-no-changes` failure (#3102).
+    expect(taskArg.metadata.worktreeChangesExpected).toBe(false);
+  });
+
+  it.each([
+    ['gitlab', false],
+    ['jira', false],
+    ['plan', true],
+  ])('stamps worktreeChangesExpected off the same resolved tracker (%s → %s)', async (tracker, expected) => {
+    const result = await svc.triggerReferenceAnalysis({ ...app, workTracker: tracker }, ref, snapshot);
+    expect(result.queued).toBe(true);
+    const taskArg = addTaskMock.mock.calls[0][0];
+    expect(taskArg.metadata.workTracker).toBe(tracker);
+    expect(taskArg.metadata.worktreeChangesExpected).toBe(expected);
+  });
+
+  it('exposes formatTrackerInstructions and falls back to PLAN.md for an unknown tracker', () => {
+    expect(svc.formatTrackerInstructions('github')).toContain('gh issue create');
+    expect(svc.formatTrackerInstructions('gitlab')).toContain('glab issue create');
+    expect(svc.formatTrackerInstructions('jira')).toContain('JIRA');
+    expect(svc.formatTrackerInstructions('plan')).toContain('PLAN.md');
+    expect(svc.formatTrackerInstructions('nonsense')).toContain('PLAN.md');
+  });
+
+  it('returns duplicate when addTask signals a duplicate', async () => {
+    addTaskMock.mockResolvedValueOnce({ id: 'dup-1', duplicate: true });
+    const result = await svc.triggerReferenceAnalysis(app, ref, snapshot);
+    expect(result).toEqual({ queued: false, reason: 'duplicate', taskId: 'dup-1' });
+  });
+});

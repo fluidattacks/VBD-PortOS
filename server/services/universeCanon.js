@@ -1,0 +1,927 @@
+// Canon entities on the universe — characters, places, objects. Mirrors
+// `pipeline/series.js`'s extract+refine paths but writes into the universe
+// so multiple series can share a cast (Phase A of the Universe-as-canon
+// refactor). The series-side helpers stay live until Phase B migrates
+// series.cast → references into universe entities.
+
+import { getUniverse, updateUniverse, listUniverses, joinInfluenceList } from './universeBuilder.js';
+import { extractBible } from './bibleExtractor.js';
+import {
+  BIBLE_KIND, BIBLE_KINDS, BIBLE_FIELD, BIBLE_KEYS, BIBLE_SOURCE, BIBLE_LIMITS, mergeExtractedBible,
+  listSheetPointers, applySheetPointerToCharacter, isSeriesScopedCanonEntry,
+} from '../lib/storyBible.js';
+import { runStagedLLM } from './stageRunner.js';
+import { runPromptRefine } from './pipeline/refineHelpers.js';
+import { ServerError } from '../lib/errorHandler.js';
+import { shortId } from '../lib/fileUtils.js';
+
+// Every per-entry canon operation below is addressed by singular kind
+// ('character' | 'place' | 'object') and rejects anything else the same way.
+// The routes already validate the enum via `lockParamsSchema`, so this only
+// defends direct service callers — but it's the difference between a 400 and
+// an undefined `BIBLE_FIELD[kind]` silently reading the wrong array.
+const assertCanonKind = (kind) => {
+  if (BIBLE_KINDS.includes(kind)) return;
+  throw new ServerError(
+    `Invalid canon kind "${kind}" — expected one of: ${BIBLE_KINDS.join(', ')}`,
+    { status: 400, code: 'UNIVERSE_CANON_INVALID_KIND' },
+  );
+};
+
+export const peerForPrompt = (entry) => ({
+  id: entry.id,
+  name: entry.name,
+  aliases: Array.isArray(entry.aliases) ? entry.aliases : [],
+  role: entry.role || '',
+  physicalDescription: entry.physicalDescription || entry.description || '',
+});
+
+const targetForPrompt = (entry) => ({
+  ...peerForPrompt(entry),
+  evidence: Array.isArray(entry.evidence) ? entry.evidence : [],
+  firstAppearance: entry.firstAppearance || null,
+});
+
+/**
+ * Style context for an LLM TEXT prompt (canon refine / differentiate / expand).
+ * Free-text `styleNotes` belongs here — it is authored for the writing stages.
+ *
+ * IMAGE prompts must NOT use this: see `lib/universeVisualStyle.js`, which
+ * emits the curated `influences.embrace` tokens only.
+ */
+export const buildStyleClause = (universe) => {
+  const embraceTokens = joinInfluenceList(universe.influences?.embrace);
+  const bits = [
+    embraceTokens ? `Universe aesthetic: ${embraceTokens}` : null,
+    universe.styleNotes ? `Universe notes: ${universe.styleNotes}` : null,
+  ].filter(Boolean);
+  return bits.length ? bits.join('\n') : '(none provided — pick choices that fit the character\'s role and genre)';
+};
+
+/**
+ * Extract characters/places/objects from a prose corpus and merge into the
+ * universe's canon arrays. Mirrors `extractAndMergeIntoSeries` so callers
+ * can swap targets without changing prompt shapes.
+ *
+ * `opts.source` / `opts.autoLock` / `opts.sourceSeriesId` stamp NEW inserts
+ * only — existing entries are not touched by these options (locked existing
+ * entries are protected by mergeExtractedBible itself).
+ *
+ * `opts.providerOverride` / `opts.modelOverride` pick the LLM for every kind so
+ * the caller can retry a failed extraction with a different model.
+ *
+ * Returns `{ universe, results, failures }`. `failures` is `[{ kind, error }]`
+ * for kinds that threw — the successful kinds are still merged. Throws only
+ * when EVERY kind fails.
+ */
+export async function extractCanonFromProse(universeId, opts = {}) {
+  const universe = await getUniverse(universeId);
+  const rawKinds = (opts.kinds && opts.kinds.length)
+    ? opts.kinds
+    : [BIBLE_KIND.CHARACTER, BIBLE_KIND.PLACE, BIBLE_KIND.OBJECT];
+  const kinds = [...new Set(rawKinds)];
+  if (typeof opts.corpus !== 'string' || !opts.corpus.trim()) {
+    throw new ServerError('extractCanonFromProse: corpus is required', {
+      status: 400, code: 'UNIVERSE_CANON_NO_CORPUS',
+    });
+  }
+
+  const runOne = (kind) => extractBible({
+    kind,
+    corpus: opts.corpus,
+    existing: universe[BIBLE_FIELD[kind]] || [],
+    context: { universe: { id: universe.id, name: universe.name } },
+    providerOverride: opts.providerOverride,
+    modelOverride: opts.modelOverride,
+    source: `universe-canon-${kind}`,
+  }).then((result) => ({ kind, result }));
+
+  // Per-kind resilience: one kind failing (e.g. Codex safety-refusing
+  // `object`) must NOT discard the kinds that succeeded. Settle every kind,
+  // merge the successes, and report the rest as `failures` so the caller can
+  // persist what went wrong and let the user retry just the failed kinds with
+  // a different provider/model. Only throw when EVERY kind fails — a total
+  // wipe is a real error the caller should surface.
+  // Settle-shaped wrapper so parallel and serial paths produce the same
+  // `{ status, value | reason }` entries — runOne never rejects through this.
+  const runSettled = (kind) => runOne(kind).then(
+    (value) => ({ status: 'fulfilled', value }),
+    (reason) => ({ status: 'rejected', reason }),
+  );
+  const settled = opts.parallel
+    ? await Promise.all(kinds.map(runSettled))
+    : await kinds.reduce(
+      async (acc, kind) => [...(await acc), await runSettled(kind)],
+      Promise.resolve([]),
+    );
+
+  const completed = [];
+  const failures = [];
+  settled.forEach((outcome, i) => {
+    if (outcome.status === 'fulfilled') {
+      completed.push(outcome.value);
+    } else {
+      const err = outcome.reason;
+      failures.push({ kind: kinds[i], error: (err?.message || String(err)).slice(0, 2000) });
+    }
+  });
+  if (completed.length === 0) {
+    const detail = failures.map((f) => `${f.kind}: ${f.error}`).join(' | ');
+    throw new ServerError(`Canon extraction failed for all kinds — ${detail}`, {
+      status: 502, code: 'UNIVERSE_CANON_EXTRACT_ALL_FAILED',
+    });
+  }
+
+  const wantsLock = opts.autoLock !== false;
+  const mergeOpts = {
+    source: opts.source || BIBLE_SOURCE.SERIES_EXTRACT,
+    // Default to locked-on-insert. New canon entries are protected from AI
+    // overwrite from the moment they land so users don't have to chase a
+    // batch extract with a Lock All click. Callers can opt out with an
+    // explicit `autoLock: false` — in that case we still stamp `locked:
+    // false` on the new entries below so the universe-side
+    // lock-by-default contract (sanitizeTemplate.defaultLockCanon) doesn't
+    // silently re-lock them on the next read.
+    autoLock: wantsLock,
+    sourceSeriesId: opts.sourceSeriesId || null,
+  };
+  const results = {};
+  const patch = {};
+  for (const { kind, result } of completed) {
+    const field = BIBLE_FIELD[kind];
+    // Capture existing ids BEFORE the merge — mergeExtractedBible mutates the
+    // existing list in place via push(), so reading universe[field] after the
+    // merge already includes the new inserts and breaks the "is this an
+    // already-known entry?" check below.
+    const existingIds = wantsLock
+      ? null
+      : new Set((universe[field] || []).map((e) => e?.id).filter(Boolean));
+    const merged = mergeExtractedBible(universe[field] || [], result.extracted, kind, mergeOpts);
+    // Opt-out path: caller asked for unlocked inserts. The merge step left
+    // `locked` absent on new entries; sanitizeTemplate.defaultLockCanon
+    // would then read them back as locked. Force explicit `locked: false`
+    // on every new insert so the opt-out survives the round-trip — even
+    // if the extractor payload tried to set `locked: true`, `autoLock:
+    // false` is the explicit override. Existing entries are skipped via
+    // existingIds (they keep their current lock state).
+    if (!wantsLock) {
+      patch[field] = merged.map((e) => {
+        if (!e || typeof e !== 'object') return e;
+        if (existingIds.has(e.id)) return e;
+        return { ...e, locked: false };
+      });
+    } else {
+      patch[field] = merged;
+    }
+    results[field] = {
+      extracted: result.extracted, runId: result.runId,
+      providerId: result.providerId, model: result.model,
+    };
+  }
+  const updated = await updateUniverse(universe.id, patch);
+  return { universe: updated, results, failures };
+}
+
+// All three canon kinds, used when a hard (all-kinds) failure leaves us
+// without per-kind detail. Mirrors the BIBLE_KIND values stamped on `failures`.
+const ALL_CANON_KINDS = [BIBLE_KIND.CHARACTER, BIBLE_KIND.PLACE, BIBLE_KIND.OBJECT];
+
+/**
+ * Collapse an `extractCanonFromProse` outcome into the persisted
+ * `stage.canonExtraction` marker (sanitized by issues.sanitizeCanonExtraction).
+ * Pass `error` for a hard failure (the whole call threw); otherwise pass the
+ * `{ results, failures }` from a resolved call. `provider`/`model` record what
+ * was actually used so the UI banner can say "failed with X".
+ */
+export function summarizeCanonExtraction({ results, failures, provider, model, error } = {}) {
+  const at = new Date().toISOString();
+  const base = { provider: provider || '', model: model || '', at };
+  if (error) {
+    return {
+      ...base,
+      status: 'failed',
+      error: (error?.message || String(error)).slice(0, 4000),
+      failedKinds: ALL_CANON_KINDS,
+      extracted: { characters: 0, places: 0, objects: 0 },
+    };
+  }
+  const failedKinds = (failures || []).map((f) => f.kind);
+  const extracted = {
+    characters: results?.characters?.extracted?.length || 0,
+    places: results?.places?.extracted?.length || 0,
+    objects: results?.objects?.extracted?.length || 0,
+  };
+  return {
+    ...base,
+    status: failedKinds.length ? 'partial' : 'ok',
+    error: failedKinds.length
+      ? (failures || []).map((f) => `${f.kind}: ${f.error}`).join(' | ').slice(0, 4000)
+      : '',
+    failedKinds,
+    extracted,
+  };
+}
+
+// Which field holds a kind's renderable description. Characters carry
+// `physicalDescription` (legacy `description` is the read-fallback);
+// places/objects use `description`. Mirrors NounsStage's `descFor` source.
+export const DESC_FIELD = Object.freeze({
+  [BIBLE_KIND.CHARACTER]: 'physicalDescription',
+  [BIBLE_KIND.PLACE]: 'description',
+  [BIBLE_KIND.OBJECT]: 'description',
+});
+export const DESC_LIMIT = Object.freeze({
+  [BIBLE_KIND.CHARACTER]: BIBLE_LIMITS.PHYSICAL_DESCRIPTION_MAX,
+  [BIBLE_KIND.PLACE]: BIBLE_LIMITS.PLACE_DESCRIPTION_MAX,
+  [BIBLE_KIND.OBJECT]: BIBLE_LIMITS.OBJECT_DESCRIPTION_MAX,
+});
+
+// True when an entry already carries a non-empty description (so the backfill
+// pass has nothing to do for it). Characters check both the canonical and the
+// legacy field so a pre-migration `description`-only entry isn't double-filled.
+const hasDescription = (kind, entry) => {
+  if (kind === BIBLE_KIND.CHARACTER) {
+    return !!(((entry.physicalDescription || '').trim()) || ((entry.description || '').trim()));
+  }
+  return !!((entry.description || '').trim());
+};
+
+/**
+ * Promote an existing image prompt into the canonical description field when
+ * that field is blank. Older Universe Builder expansion/promotion paths wrote
+ * rich `prompt` text but left `physicalDescription`/`description` empty, which
+ * made the same entry renderable from one screen and "not ready" from another.
+ *
+ * This is deliberately deterministic and fill-blanks-only: no provider call,
+ * no invented details, no kind changes, and no mutation of locked entries.
+ */
+export async function backfillCanonDescriptionsFromPrompts(universeId) {
+  const report = {
+    filled: 0,
+    byKind: Object.fromEntries(BIBLE_KINDS.map((kind) => [kind, 0])),
+    alreadyDescribed: 0,
+    missingPrompt: 0,
+    skippedLocked: 0,
+  };
+  const updated = await updateUniverse(universeId, (universe) => {
+    const patch = {};
+    for (const kind of BIBLE_KINDS) {
+      const field = BIBLE_FIELD[kind];
+      const list = Array.isArray(universe[field]) ? universe[field] : [];
+      let touched = false;
+      const next = list.map((entry) => {
+        if (hasDescription(kind, entry)) {
+          report.alreadyDescribed += 1;
+          return entry;
+        }
+        if (entry.locked === true) {
+          report.skippedLocked += 1;
+          return entry;
+        }
+        const prompt = typeof entry.prompt === 'string' ? entry.prompt.trim() : '';
+        if (!prompt) {
+          report.missingPrompt += 1;
+          return entry;
+        }
+        touched = true;
+        report.filled += 1;
+        report.byKind[kind] += 1;
+        return { ...entry, [DESC_FIELD[kind]]: prompt.slice(0, DESC_LIMIT[kind]) };
+      });
+      if (touched) patch[field] = next;
+    }
+    return Object.keys(patch).length ? patch : null;
+  });
+  console.log(`📝 Universe canon prompt backfill — universe=${shortId(universeId)} filled=${report.filled} character=${report.byKind.character} place=${report.byKind.place} object=${report.byKind.object} locked=${report.skippedLocked}`);
+  return { universe: updated, report };
+}
+
+/**
+ * Backfill descriptions for canon nouns that have none, using ONLY what the
+ * prose establishes. Unlike `extractCanonFromProse` (which is allowed to invent
+ * + flag renderable axes the prose omits, so it never leaves a blank), this
+ * pass is strictly prose-grounded: a noun the prose names but never describes
+ * comes back `none` with an empty description, so the gap surfaces as a
+ * manuscript-quality red flag rather than being papered over.
+ *
+ * `targets` is `[{ id, kind }]` — typically the appears-in-this-issue entries
+ * that lack a description. Unknown ids, already-described entries, and locked
+ * entries are dropped (locked ones are reported as `skippedLocked`).
+ *
+ * Returns `{ universe, report }` where `report` is
+ * `{ filled, sufficient[], thin[], none[], skippedLocked[], unmatched }`.
+ * Only `sufficient`/`thin` rows with a non-empty grounded description are
+ * written, and only into entries that are STILL empty + unlocked at write time.
+ */
+export async function describeCanonFromProse(universeId, opts = {}) {
+  const {
+    corpus, targets,
+    providerOverride, modelOverride,
+    providerDefault, modelDefault, effortDefault,
+    onRunCreated, onRunSettled,
+  } = opts;
+  if (typeof corpus !== 'string' || !corpus.trim()) {
+    throw new ServerError('describeCanonFromProse: corpus is required', {
+      status: 400, code: 'UNIVERSE_CANON_NO_CORPUS',
+    });
+  }
+  if (!Array.isArray(targets) || targets.length === 0) {
+    throw new ServerError('describeCanonFromProse: at least one target noun is required', {
+      status: 400, code: 'UNIVERSE_CANON_NO_TARGETS',
+    });
+  }
+  const universe = await getUniverse(universeId);
+
+  // Resolve each requested {id, kind} against the current canon. Drop unknown
+  // ids and already-described entries; hold locked ones aside to report.
+  const resolved = [];
+  const skippedLocked = [];
+  let unmatched = 0;
+  for (const t of (targets || [])) {
+    const kind = t?.kind;
+    if (!BIBLE_KINDS.includes(kind)) { unmatched += 1; continue; }
+    const list = Array.isArray(universe[BIBLE_FIELD[kind]]) ? universe[BIBLE_FIELD[kind]] : [];
+    const entry = list.find((e) => e.id === t.id);
+    if (!entry || hasDescription(kind, entry)) { unmatched += 1; continue; }
+    if (entry.locked === true) { skippedLocked.push({ id: entry.id, name: entry.name, kind }); continue; }
+    resolved.push({ kind, entry });
+  }
+
+  const report = { filled: 0, sufficient: [], thin: [], none: [], skippedLocked, unmatched };
+  if (resolved.length === 0) return { universe, report };
+
+  const targetsForPrompt = resolved.map(({ kind, entry }) => ({
+    id: entry.id,
+    kind,
+    name: entry.name,
+    aliases: Array.isArray(entry.aliases) ? entry.aliases : [],
+  }));
+
+  const result = await runStagedLLM('pipeline-canon-describe-from-prose', {
+    corpus,
+    targetsJson: JSON.stringify(targetsForPrompt, null, 2),
+  }, {
+    providerOverride,
+    modelOverride,
+    providerDefault,
+    modelDefault,
+    effortDefault,
+    onRunCreated,
+    onRunSettled,
+    returnsJson: true,
+    source: 'universe-canon-describe-from-prose',
+  });
+
+  const rows = Array.isArray(result.content?.descriptions) ? result.content.descriptions : [];
+  const byId = new Map();
+  for (const r of rows) {
+    if (r && typeof r === 'object' && typeof r.id === 'string') byId.set(r.id, r);
+  }
+
+  const SUFFICIENCY = new Set(['sufficient', 'thin', 'none']);
+  const fills = new Map(); // entryId -> { value }
+  for (const { kind, entry } of resolved) {
+    const row = byId.get(entry.id);
+    const name = entry.name;
+    if (!row) {
+      // LLM omitted this id entirely — treat as un-describable so it still
+      // surfaces to the writer rather than vanishing silently.
+      report.none.push({ id: entry.id, name, kind, note: 'The model returned no result for this noun.' });
+      continue;
+    }
+    const sufficiency = SUFFICIENCY.has(row.sufficiency) ? row.sufficiency : 'none';
+    const desc = typeof row.description === 'string' ? row.description.trim() : '';
+    const note = typeof row.note === 'string' ? row.note.trim().slice(0, 600) : '';
+    if ((sufficiency === 'sufficient' || sufficiency === 'thin') && desc) {
+      fills.set(entry.id, { value: desc.slice(0, DESC_LIMIT[kind]) });
+      report.filled += 1;
+      (sufficiency === 'sufficient' ? report.sufficient : report.thin).push({ id: entry.id, name, kind, note });
+    } else {
+      report.none.push({
+        id: entry.id, name, kind,
+        note: note || 'The manuscript names this but never describes how it looks.',
+      });
+    }
+  }
+
+  if (fills.size > 0) {
+    // Mutator form: re-read freshest persisted state and write only into entries
+    // that are STILL empty + unlocked (guards against an inline edit landing
+    // between our read and this write). Mirrors setCanonEntryLock. The DESC_FIELD
+    // lookup is per-kind, so the right field is written for each entry.
+    const updated = await updateUniverse(universe.id, (cur) => {
+      const patch = {};
+      for (const kind of BIBLE_KINDS) {
+        const field = BIBLE_FIELD[kind];
+        const list = Array.isArray(cur[field]) ? cur[field] : [];
+        let touched = false;
+        const nextList = list.map((e) => {
+          const fill = fills.get(e.id);
+          if (!fill || e.locked === true || hasDescription(kind, e)) return e;
+          touched = true;
+          return { ...e, [DESC_FIELD[kind]]: fill.value };
+        });
+        if (touched) patch[field] = nextList;
+      }
+      return Object.keys(patch).length ? patch : null;
+    });
+    console.log(`📝 Universe canon describe-from-prose — universe=${shortId(universeId)} filled=${report.filled} none=${report.none.length} thin=${report.thin.length} runId=${shortId(result.runId)}`);
+    return { universe: updated || universe, report, runId: result.runId };
+  }
+  console.log(`📝 Universe canon describe-from-prose — universe=${shortId(universeId)} filled=0 none=${report.none.length} thin=${report.thin.length} runId=${shortId(result.runId)}`);
+  return { universe, report, runId: result.runId };
+}
+
+/**
+ * Collapse a `describeCanonFromProse` report into the persisted
+ * `stage.descGaps` marker (sanitized by issues.sanitizeDescGaps). Records the
+ * counts + the nouns the prose couldn't describe (`none`) or only thinly
+ * described (`thin`) so the Nouns UI can render a persistent red-flag banner
+ * pointing the writer at manuscript gaps. `provider`/`model` record what ran.
+ */
+export function summarizeDescribeGaps({ report, provider, model } = {}) {
+  const mapGap = (arr) => (Array.isArray(arr) ? arr : []).map((g) => ({
+    id: String(g.id || ''),
+    name: String(g.name || '').slice(0, 200),
+    kind: g.kind,
+    note: String(g.note || '').slice(0, 600),
+  }));
+  return {
+    at: new Date().toISOString(),
+    provider: provider || '',
+    model: model || '',
+    filled: report?.filled || 0,
+    none: mapGap(report?.none),
+    thin: mapGap(report?.thin),
+    skippedLocked: mapGap(report?.skippedLocked),
+  };
+}
+
+/**
+ * Rewrite one character's `physicalDescription` so they render distinct
+ * from every peer. Same prompt as the series-side refine; just sourced from
+ * the universe.
+ */
+export async function refineUniverseCharacter(universeId, entryId, options = {}) {
+  const universe = await getUniverse(universeId);
+  const list = Array.isArray(universe.characters) ? universe.characters : [];
+  const idx = list.findIndex((e) => e.id === entryId);
+  if (idx < 0) {
+    throw new ServerError(`Character ${entryId} not found in universe`, {
+      status: 404, code: 'UNIVERSE_CANON_NOT_FOUND',
+    });
+  }
+  const target = list[idx];
+  // 409 (vs. silent overwrite) so the UI can render a clear "Unlock to edit"
+  // affordance for entries an active series depends on.
+  if (target.locked === true) {
+    throw new ServerError(
+      `Character "${target.name}" is locked — unlock it before refining`,
+      { status: 409, code: 'UNIVERSE_CANON_LOCKED' },
+    );
+  }
+  const peers = list.filter((_, i) => i !== idx);
+
+  const { refined, changes, rationale, runId, providerId, model } = await runPromptRefine({
+    templateName: 'pipeline-character-refine',
+    variables: {
+      targetJson: JSON.stringify(targetForPrompt(target), null, 2),
+      peersJson: JSON.stringify(peers.map(peerForPrompt), null, 2),
+      styleClause: buildStyleClause(universe),
+    },
+    options,
+    source: 'universe-character-refine',
+    logTag: `Universe character refine — universe=${shortId(universeId)} entry=${shortId(entryId)}`,
+    resultField: 'physicalDescription',
+    emptyError: { code: 'UNIVERSE_CANON_REFINE_EMPTY', message: 'LLM returned an empty physicalDescription' },
+    changesLimit: 12,
+  });
+
+  const nextList = list.map((e, i) => i === idx ? { ...e, physicalDescription: refined } : e);
+  const updated = await updateUniverse(universeId, { characters: nextList });
+  const updatedEntry = (updated.characters || []).find((e) => e.id === entryId) || null;
+  return { universe: updated, entry: updatedEntry, rationale, changes, runId, providerId, model };
+}
+
+/**
+ * Cast-wide differentiate. One LLM call rewrites every character's
+ * `physicalDescription` so the cast as a whole has no visually-colliding
+ * pairs. Returns counts + rationale; the updated universe carries the new
+ * descriptions on its `characters[]`.
+ */
+export async function differentiateUniverseCast(universeId, options = {}) {
+  const universe = await getUniverse(universeId);
+  const list = Array.isArray(universe.characters) ? universe.characters : [];
+  if (list.length === 0) {
+    throw new ServerError('Universe has no characters to differentiate — extract from issue prose first', {
+      status: 400, code: 'UNIVERSE_CANON_EMPTY_CAST',
+    });
+  }
+
+  // The LLM sees the FULL cast so unlocked rewrites are differentiated from
+  // locked descriptions too. Lock enforcement happens at apply time.
+  if (list.every((c) => c.locked === true)) {
+    throw new ServerError(
+      'All characters are locked — unlock at least one before differentiating the cast',
+      { status: 400, code: 'UNIVERSE_CANON_ALL_LOCKED' },
+    );
+  }
+  const castForPrompt = list.map(targetForPrompt);
+  const result = await runStagedLLM('pipeline-character-differentiate-cast', {
+    castJson: JSON.stringify(castForPrompt, null, 2),
+    styleClause: buildStyleClause(universe),
+  }, {
+    providerOverride: options.providerId,
+    modelOverride: options.model,
+    returnsJson: true,
+    source: 'universe-cast-differentiate',
+  });
+
+  const rewrites = Array.isArray(result.content?.characters) ? result.content.characters : [];
+  if (rewrites.length === 0) {
+    throw new ServerError('LLM returned no character rewrites', {
+      status: 502, code: 'UNIVERSE_CAST_DIFFERENTIATE_EMPTY',
+    });
+  }
+
+  const byId = new Map();
+  for (const r of rewrites) {
+    if (!r?.id || typeof r.physicalDescription !== 'string') continue;
+    const trimmed = r.physicalDescription.trim();
+    if (!trimmed) continue;
+    byId.set(r.id, {
+      physicalDescription: trimmed,
+      changes: Array.isArray(r.changes)
+        ? r.changes.map((c) => String(c).slice(0, 240)).filter(Boolean).slice(0, 8)
+        : [],
+    });
+  }
+
+  let touched = 0;
+  let skippedLocked = 0;
+  const nextList = list.map((entry) => {
+    const rewrite = byId.get(entry.id);
+    if (!rewrite) return entry;
+    if (entry.locked === true) {
+      skippedLocked += 1;
+      return entry;
+    }
+    touched += 1;
+    return { ...entry, physicalDescription: rewrite.physicalDescription };
+  });
+  if (touched === 0) {
+    throw new ServerError('LLM rewrites did not match any existing character ids', {
+      status: 502, code: 'UNIVERSE_CAST_DIFFERENTIATE_NO_MATCH',
+    });
+  }
+
+  const updated = await updateUniverse(universeId, { characters: nextList });
+  const rationale = typeof result.content?.rationale === 'string' ? result.content.rationale.trim() : '';
+  console.log(`✨ Universe cast differentiate — universe=${shortId(universeId)} touched=${touched}/${list.length} skippedLocked=${skippedLocked} runId=${shortId(result.runId)}`);
+  return {
+    universe: updated,
+    touched,
+    skipped: list.length - touched,
+    skippedLocked,
+    rationale,
+    runId: result.runId,
+    providerId: result.providerId,
+    model: result.model,
+  };
+}
+
+// Toggle the `locked` flag on a single canon entry. Locked entries are
+// protected from AI rewrite paths — see `mergeExtractedBible` (evidence-only
+// append) and the refine/differentiate runtime guards.
+export async function setCanonEntryLock(universeId, kind, entryId, locked) {
+  assertCanonKind(kind);
+  const field = BIBLE_FIELD[kind];
+  let found = false;
+  // Mutator form (same as setCanonKindLockAll) so the flip is computed from
+  // the freshest persisted state inside updateUniverse's write queue. A
+  // read-modify-write split (getUniverse → updateUniverse(patchObject))
+  // would replace the full canon array via PATCHABLE_SCALARS and could
+  // clobber a concurrent render-completion `imageRefs[]` append landing
+  // between the read and the write.
+  const updated = await updateUniverse(universeId, (cur) => {
+    const list = Array.isArray(cur[field]) ? cur[field] : [];
+    const idx = list.findIndex((e) => e.id === entryId);
+    if (idx < 0) return null;
+    found = true;
+    const target = list[idx];
+    // No-op short-circuit avoids a write + updatedAt churn on redundant toggles.
+    if ((target.locked === true) === (locked === true)) return null;
+    // applyCanonExtras now persists explicit locked:false (the universe-builder
+    // contract), so the bit survives the round-trip and the unlock sticks.
+    const nextList = list.map((e, i) => (i === idx ? { ...e, locked } : e));
+    return { [field]: nextList };
+  });
+  if (!found) {
+    throw new ServerError(
+      `Canon ${kind} ${entryId} not found in universe`,
+      { status: 404, code: 'UNIVERSE_CANON_NOT_FOUND' },
+    );
+  }
+  const entry = (updated[field] || []).find((e) => e.id === entryId) || null;
+  return { universe: updated, entry };
+}
+
+/**
+ * Apply a reviewed corrective-image analysis (`universeVisionDescribe.correctEntityFromImage`)
+ * to one canon entry: overwrite its descriptor field with the reviewed
+ * correction AND pin the analyzed image as the entry's `primaryImageRef` —
+ * assigning it as that noun's style/reference image so subsequent renders
+ * seed from it. Both writes land atomically via the mutator form, so a
+ * concurrent render-completion `imageRefs[]` append (landing between analyze
+ * and apply) can't be clobbered by a stale read.
+ */
+export async function applyCanonImageCorrection(universeId, kind, entryId, { description, imageFilename } = {}) {
+  assertCanonKind(kind);
+  const trimmedDescription = typeof description === 'string' ? description.trim().slice(0, DESC_LIMIT[kind]) : '';
+  if (!trimmedDescription) {
+    throw new ServerError('A corrected description is required', { status: 400, code: 'VALIDATION_ERROR' });
+  }
+  if (typeof imageFilename !== 'string' || !imageFilename.trim()) {
+    throw new ServerError('An image filename is required', { status: 400, code: 'VALIDATION_ERROR' });
+  }
+
+  const field = BIBLE_FIELD[kind];
+  const descField = DESC_FIELD[kind];
+  let found = false;
+  let wasLocked = false;
+  const updated = await updateUniverse(universeId, (cur) => {
+    const list = Array.isArray(cur[field]) ? cur[field] : [];
+    const idx = list.findIndex((e) => e.id === entryId);
+    if (idx < 0) return null;
+    found = true;
+    const target = list[idx];
+    if (target.locked === true) { wasLocked = true; return null; }
+    const imageRefs = Array.isArray(target.imageRefs) ? target.imageRefs : [];
+    const nextImageRefs = imageRefs.includes(imageFilename) ? imageRefs : [...imageRefs, imageFilename];
+    const nextList = list.map((e, i) => (i === idx
+      ? { ...e, [descField]: trimmedDescription, imageRefs: nextImageRefs, primaryImageRef: imageFilename }
+      : e));
+    return { [field]: nextList };
+  });
+  if (!found) {
+    throw new ServerError(`Canon ${kind} ${entryId} not found in universe`, {
+      status: 404, code: 'UNIVERSE_CANON_NOT_FOUND',
+    });
+  }
+  if (wasLocked) {
+    throw new ServerError(`This ${kind} is locked — unlock it before applying a correction`, {
+      status: 409, code: 'UNIVERSE_CANON_LOCKED',
+    });
+  }
+  const entry = (updated[field] || []).find((e) => e.id === entryId) || null;
+  return { universe: updated, entry };
+}
+
+/**
+ * Bulk-set the `locked` flag on every canon entry of a single kind. Returns
+ * the updated universe plus the count of entries whose lock state actually
+ * changed (no-op on entries already in the target state, so the response
+ * carries enough info for a toast like "Locked 7 characters").
+ */
+export async function setCanonKindLockAll(universeId, kind, locked) {
+  assertCanonKind(kind);
+  const field = BIBLE_FIELD[kind];
+  let changed = 0;
+  let total = 0;
+  // Run inside `updateUniverse`'s file-write queue (mutator form) so the
+  // patch is built from the freshest persisted state. A read-modify-write
+  // split (getUniverse → updateUniverse(patchObject)) would clobber a
+  // concurrent render-completion `imageRefs[]` append or an inline canon
+  // edit landing between the two calls — the patch's full-array shape
+  // replaces wholesale via PATCHABLE_SCALARS. Mirrors `setVariationsLockAll`.
+  const updated = await updateUniverse(universeId, (cur) => {
+    const list = Array.isArray(cur[field]) ? cur[field] : [];
+    total = list.length;
+    const nextList = list.map((e) => {
+      if ((e.locked === true) === (locked === true)) return e;
+      changed += 1;
+      return { ...e, locked };
+    });
+    if (changed === 0) return null; // no-op short-circuit
+    return { [field]: nextList };
+  });
+  return { universe: updated, kind, locked, changed, total };
+}
+
+/**
+ * Set the `locked` flag on every canon entry — across ALL kinds — that a given
+ * SERIES owns, leaving every other entry untouched. The series-scoped sibling
+ * of `setCanonKindLockAll`: same mutator-form write-queue contract, but the
+ * selector is ownership (`isSeriesScopedCanonEntry`) rather than kind, and it
+ * covers all three buckets in ONE patch instead of one write per kind.
+ *
+ * `soleSeries` is the caller's assertion that this series is the universe's
+ * only one — the condition under which an entry carrying no `sourceSeriesId`
+ * (universe-authored / legacy) is safe to touch. Entries owned by another
+ * series are never touched, and are reported back as `foreignKept` so the
+ * caller can say what it deliberately left alone.
+ *
+ * `clearWorldLocks` additionally clears the universe's OWN `locked` map (the
+ * world-field locks: logline / premise / styleNotes / influence lists), except
+ * for keys named in `preserveWorldLockKeys`. It
+ * rides this call rather than a second `updateUniverse` because both land on
+ * the same record — a separate write would re-read and re-sanitize the whole
+ * universe and emit a second peer-sync `recordUpdated` for one user action.
+ * Those fields have no per-series owner, so only pass it with `soleSeries`.
+ *
+ * Non-destructive by construction: only `locked` bits are written. Nothing is
+ * removed from the universe — an entry that should leave is a catalog archive
+ * performed by a human, never a side effect of a bulk lock change.
+ *
+ * Returns `{ universe, changed, foreignKept }` (`changed` counts canon entries;
+ * the caller already knows how many world locks it asked to clear).
+ */
+export async function setCanonLocksForSeries(universeId, seriesId, locked, {
+  soleSeries = false,
+  clearWorldLocks = false,
+  preserveWorldLockKeys = [],
+} = {}) {
+  const scope = { seriesId, soleSeries };
+  let changed = 0;
+  let foreignKept = 0;
+  const universe = await updateUniverse(universeId, (cur) => {
+    changed = 0; // reset so a retried mutator can't double-count
+    foreignKept = 0;
+    const patch = {};
+    for (const key of BIBLE_KEYS) {
+      const list = Array.isArray(cur[key]) ? cur[key] : null;
+      if (!list) continue;
+      let keyTouched = false;
+      const nextList = list.map((entry) => {
+        if ((entry?.locked === true) === (locked === true)) return entry;
+        if (!isSeriesScopedCanonEntry(entry, scope)) {
+          if (entry?.locked === true) foreignKept += 1;
+          return entry;
+        }
+        changed += 1;
+        keyTouched = true;
+        return { ...entry, locked };
+      });
+      if (keyTouched) patch[key] = nextList;
+    }
+    if (clearWorldLocks && Object.values(cur.locked || {}).some((v) => v === true)) {
+      const preserved = new Set(Array.isArray(preserveWorldLockKeys) ? preserveWorldLockKeys : []);
+      patch.locked = Object.fromEntries(
+        Object.entries(cur.locked || {}).filter(([key, value]) => value === true && preserved.has(key)),
+      );
+    }
+    return Object.keys(patch).length > 0 ? patch : null;
+  });
+  return { universe, changed, foreignKept };
+}
+
+/**
+ * Remove ONE canon entry from a universe's characters/places/objects bucket.
+ *
+ * Deliberately narrow: this drops the entry from the universe's canon array
+ * and NOTHING else. It does NOT
+ *   - delete the entry's rendered `imageRefs[]` / `primaryImageRef` files or
+ *     its character reference-sheet PNGs (they stay in the gallery, reachable
+ *     from Media, and re-attachable to another entry), and
+ *   - delete or unlink the shared Catalog ingredient an entry may point at via
+ *     `ingredientId` (the catalog row is a universe-independent record; other
+ *     universes and series may embed the same ingredient).
+ * Clearing the removed character's in-memory pending sheet-render slot (so an
+ * in-flight sheet render doesn't stamp a pointer onto an entry that's gone) is
+ * NOT done here — `updateUniverse` diffs the character ids across every
+ * canon-touching write and runs that cascade generically.
+ *
+ * Uses the mutator form so the filter runs against the freshest persisted
+ * state inside `updateUniverse`'s write queue. A read-modify-write split
+ * (getUniverse → PATCH the filtered array) would replace the whole array via
+ * PATCHABLE_SCALARS from a stale read, clobbering whatever landed on a SIBLING
+ * entry in between. `preserveImageRefsById` + `mergePreservedSheetPointers`
+ * already shield `imageRefs[]` and sheet pointers on that path — but NOT
+ * `primaryImageRef`, `locked`, or a concurrent refine's rewritten description,
+ * so the stale-read window is real for those.
+ *
+ * Returns `{ universe, entry }` where `entry` is the removed record.
+ */
+export async function removeCanonEntry(universeId, kind, entryId) {
+  assertCanonKind(kind);
+  const field = BIBLE_FIELD[kind];
+  let removed = null;
+  const updated = await updateUniverse(universeId, (cur) => {
+    const list = Array.isArray(cur[field]) ? cur[field] : [];
+    removed = list.find((e) => e.id === entryId);
+    if (!removed) return null;
+    return { [field]: list.filter((e) => e !== removed) };
+  });
+  if (!removed) {
+    throw new ServerError(
+      `Canon ${kind} ${entryId} not found in universe`,
+      { status: 404, code: 'UNIVERSE_CANON_NOT_FOUND' },
+    );
+  }
+  console.log(`🗑️ Removed canon ${kind} "${removed.name}" from universe ${shortId(universeId)} (assets + catalog untouched)`);
+  return { universe: updated, entry: removed };
+}
+
+/**
+ * Strip a filename from every `imageRefs[]` across every universe's
+ * characters/places/objects, and from every top-level `styleReferences[]`
+ * entry. Mirror of the series-side purge so the image-delete route can clean
+ * both stores in one pass.
+ *
+ * A style reference's `imageRefs` is capped to exactly one image
+ * (`sanitizeStyleReference`), and the sanitizer drops the whole entry when
+ * that array is empty — so purging the image removes the entire reference
+ * rather than leaving a dangling title/prompt with no picture to show.
+ */
+export async function purgeImageRefFromAllUniverses(filename) {
+  if (!filename || typeof filename !== 'string') return { removed: 0 };
+  const universes = await listUniverses();
+  let removed = 0;
+  for (const universe of universes) {
+    let perUniverse = 0;
+    // Mutator form (reads `cur`, returns the trimmed arrays) so this intentional
+    // removal bypasses updateUniverse's imageRefs-preservation guard (#1395): a
+    // literal PATCH carrying FEWER refs looks "stale" to that guard and would be
+    // restored, undoing the purge. Reset the counter at the top so a retried
+    // mutator can't double-count. Returns null (no-op) when nothing matches.
+    await updateUniverse(universe.id, (cur) => {
+      perUniverse = 0;
+      const patch = {};
+      for (const key of BIBLE_KEYS) {
+        const list = Array.isArray(cur[key]) ? cur[key] : null;
+        if (!list) continue;
+        let keyTouched = false;
+        const nextList = list.map((entry) => {
+          const refs = Array.isArray(entry.imageRefs) ? entry.imageRefs : null;
+          if (!refs || !refs.includes(filename)) return entry;
+          const trimmed = refs.filter((f) => f !== filename);
+          perUniverse += refs.length - trimmed.length;
+          keyTouched = true;
+          return { ...entry, imageRefs: trimmed };
+        });
+        if (keyTouched) patch[key] = nextList;
+      }
+      const styleReferences = Array.isArray(cur.styleReferences) ? cur.styleReferences : null;
+      if (styleReferences) {
+        const nextStyleReferences = styleReferences.filter((ref) => {
+          const refs = Array.isArray(ref?.imageRefs) ? ref.imageRefs : [];
+          return !refs.includes(filename);
+        });
+        if (nextStyleReferences.length !== styleReferences.length) {
+          perUniverse += styleReferences.length - nextStyleReferences.length;
+          patch.styleReferences = nextStyleReferences;
+        }
+      }
+      return Object.keys(patch).length > 0 ? patch : null;
+    });
+    removed += perUniverse;
+  }
+  return { removed };
+}
+
+/**
+ * Null out any server-stamped sheet pointer (legacy `referenceSheetImageRef`
+ * field OR any key in the `referenceSheets` map) whose value matches
+ * `filename`, on every character across every universe. Mirrors
+ * `purgeImageRefFromAllUniverses` but targets per-variant sheet pointers and
+ * is variant-agnostic — the filename is the lookup key, the storage slot it
+ * happens to live in is implementation detail.
+ *
+ * Wired into the sheet-delete route so the eager pointer-clear lands the same
+ * moment the file is unlinked. The GET-time lazy `pruneStaleReferenceSheets`
+ * is still the safety net for files deleted out-of-band (filesystem cleanup,
+ * sample-data resets) — this helper is the eager path.
+ *
+ * Uses `updateUniverse`'s mutator form because both `referenceSheetImageRef`
+ * and `referenceSheets` are in `SERVER_OWNED_CHARACTER_FIELDS` — a literal-
+ * object PATCH would be guarded against clobbering the server-stamped value
+ * (the guard preserves cur's value when its file still resolves on disk).
+ * The purge IS the server-side writer, so it has to bypass that guard via
+ * the mutator form.
+ */
+export async function purgeReferenceSheetFromAllUniverses(filename) {
+  if (!filename || typeof filename !== 'string') return { cleared: 0 };
+  const universes = await listUniverses();
+  let cleared = 0;
+  // No pre-check: the mutator returns null when no characters matched, so
+  // updateUniverse skips the write. Single pass per universe instead of two.
+  for (const universe of universes) {
+    if (!Array.isArray(universe.characters)) continue;
+    await updateUniverse(universe.id, (cur) => {
+      const list = Array.isArray(cur.characters) ? cur.characters : [];
+      let touched = false;
+      const nextList = list.map((entry) => {
+        let next = entry;
+        for (const { variant, filename: f } of listSheetPointers(entry)) {
+          if (f !== filename) continue;
+          next = applySheetPointerToCharacter(next, variant, null);
+          cleared += 1;
+          touched = true;
+        }
+        return next;
+      });
+      return touched ? { characters: nextList } : null;
+    });
+  }
+  return { cleared };
+}

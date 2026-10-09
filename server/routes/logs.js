@@ -1,0 +1,107 @@
+import { Router } from 'express';
+import { getAppById } from '../services/apps.js';
+import { resolvePm2HomeForProcess } from '../services/appProcessStatus.js';
+import * as pm2Service from '../services/pm2.js';
+import { spawnPm2 } from '../services/pm2.js';
+import { asyncHandler, ServerError } from '../lib/errorHandler.js';
+import { openSseStream } from '../lib/sseDownload.js';
+import { createLineReader } from '../lib/streamLines.js';
+import { validateRequest, logsQuerySchema, pm2ProcessNameSchema } from '../lib/validation.js';
+
+const router = Router();
+
+// GET /api/logs/processes - List all PM2 processes for log selection
+router.get('/processes', asyncHandler(async (req, res) => {
+  const processes = await pm2Service.listProcesses().catch(() => []);
+  res.json(processes);
+}));
+
+// GET /api/logs/:processName - Get logs for a process (static or streaming)
+router.get('/:processName', asyncHandler(async (req, res) => {
+  const { processName } = req.params;
+  const { lines, follow } = validateRequest(logsQuerySchema, req.query);
+  const followBool = follow === 'true';
+
+  // Reject CLI options as well as unsupported process-name characters.
+  const parsedName = pm2ProcessNameSchema.safeParse(processName);
+  if (!parsedName.success) {
+    throw new ServerError('Invalid process name', { status: 400, code: 'INVALID_PROCESS_NAME' });
+  }
+
+  const safeProcessName = parsedName.data;
+  const pm2Home = await resolvePm2HomeForProcess(safeProcessName);
+
+  if (!followBool) {
+    // Static log fetch
+    const logs = await pm2Service.getLogs(safeProcessName, lines, pm2Home);
+    return res.json({ processName: safeProcessName, lines, logs });
+  }
+
+  // SSE streaming — shared header boilerplate via openSseStream; this route
+  // emits named `event:` frames directly so it uses safeEnd but not send.
+  const { safeEnd } = openSseStream(res);
+
+  // Send initial connection event
+  res.write(`event: connected\ndata: ${JSON.stringify({ processName: safeProcessName, timestamp: Date.now() })}\n\n`);
+
+  // Spawn pm2 logs with --raw flag for clean output
+  // Security: safeProcessName is validated above to only contain safe characters
+  const logProcess = spawnPm2(
+    ['logs', safeProcessName, '--raw', '--lines', String(lines)],
+    { env: pm2Service.buildEnv(pm2Home) }
+  );
+
+  const sendLine = (line, type = 'log') => {
+    if (res.writableEnded || res.destroyed) return;
+    if (line.trim()) {
+      res.write(`event: ${type}\ndata: ${JSON.stringify({
+        line,
+        timestamp: Date.now(),
+        type
+      })}\n\n`);
+    }
+  };
+
+  const stdoutReader = createLineReader(line => sendLine(line, 'stdout'));
+  const stderrReader = createLineReader(line => sendLine(line, 'stderr'));
+  logProcess.stdout.on('data', stdoutReader.push);
+  logProcess.stderr.on('data', stderrReader.push);
+
+  logProcess.on('error', (err) => {
+    res.write(`event: error\ndata: ${JSON.stringify({ error: err.message })}\n\n`);
+  });
+
+  logProcess.on('close', (code) => {
+    stdoutReader.flush();
+    stderrReader.flush();
+    if (!res.writableEnded && !res.destroyed) {
+      res.write(`event: close\ndata: ${JSON.stringify({ code })}\n\n`);
+      safeEnd();
+    }
+  });
+
+  // Cleanup on client disconnect
+  req.on('close', () => {
+    logProcess.kill('SIGTERM');
+  });
+}));
+
+// GET /api/logs/app/:appId - Get logs for all processes of an app
+router.get('/app/:appId', asyncHandler(async (req, res) => {
+  const app = await getAppById(req.params.appId);
+
+  if (!app) {
+    throw new ServerError('App not found', { status: 404, code: 'NOT_FOUND' });
+  }
+
+  const { lines } = validateRequest(logsQuerySchema, req.query);
+  const results = {};
+
+  for (const processName of app.pm2ProcessNames || []) {
+    results[processName] = await pm2Service.getLogs(processName, lines, app.pm2Home);
+  }
+
+  res.json({ app: app.name, processes: results });
+}));
+
+export default router;

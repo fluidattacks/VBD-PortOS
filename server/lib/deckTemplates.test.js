@@ -1,0 +1,171 @@
+import { describe, it, expect } from 'vitest';
+import {
+  CARD_STATUS, DECK_BACK_KEY, DECK_CARD_ORIENTATION, DECK_CARD_SIZE, DECK_CARD_SIZE_BY_KIND, DECK_KIND, DECK_KINDS,
+  DEFAULT_LAYOUT_PROMPT, cardStatus, composeCardRenderPrompt, deckCardAspectStyle, deckCardRoster, deckCardSize,
+  deckCompletion, defaultDeckCardOrientationPrompt,
+} from './deckTemplates.js';
+import { aspectRatioPhrase } from './aspectRatio.js';
+
+describe('deckCardRoster', () => {
+  it('mints a full playing deck (52 faces + 2 jokers + back) with unique keys', () => {
+    const roster = deckCardRoster(DECK_KIND.PLAYING);
+    expect(roster).toHaveLength(55);
+    expect(new Set(roster.map((c) => c.key)).size).toBe(55);
+    expect(roster.find((c) => c.key === 'hearts-Q')).toMatchObject({ name: 'Queen of Hearts', group: 'hearts', rank: 'Q' });
+    expect(roster.at(-1).key).toBe(DECK_BACK_KEY);
+  });
+
+  it('mints a full tarot deck (22 major + 56 minor + back) with motifs on the majors', () => {
+    const roster = deckCardRoster(DECK_KIND.TAROT);
+    expect(roster).toHaveLength(79);
+    expect(new Set(roster.map((c) => c.key)).size).toBe(79);
+    expect(roster.filter((c) => c.group === 'major')).toHaveLength(22);
+    expect(roster.find((c) => c.key === 'major-16')).toMatchObject({ name: 'XVI · The Tower', rank: 'XVI' });
+    expect(roster.find((c) => c.key === 'major-16').motif).toMatch(/lightning/);
+    expect(roster.find((c) => c.key === 'cups-knight')).toMatchObject({ name: 'Knight of Cups', group: 'cups' });
+  });
+
+  it('rejects an unknown kind', () => {
+    expect(() => deckCardRoster('uno')).toThrow(/Unknown deck kind/);
+  });
+});
+
+describe('composeCardRenderPrompt', () => {
+  const deck = {
+    influences: { embrace: ['copperplate engraving', ' aged paper '], avoid: ['blurry'] },
+    layoutPrompt: 'Full tarot card, framed border',
+  };
+
+  it('leads with the style tokens, then the layout, then the titled subject; negatives merge card-first', () => {
+    const out = composeCardRenderPrompt(deck, { name: 'XVII · The Star', prompt: 'a kneeling figure pouring water', negativePrompt: 'text' });
+    expect(out.prompt).toBe('copperplate engraving, aged paper. Full tarot card, framed border. XVII · The Star: a kneeling figure pouring water');
+    expect(out.negativePrompt).toBe('text, blurry');
+  });
+
+  it('degrades cleanly when the deck has no style guide yet', () => {
+    const out = composeCardRenderPrompt({}, { name: 'Ace of Spades', prompt: 'one large ornate spade' });
+    expect(out.prompt).toBe('Ace of Spades: one large ornate spade');
+    expect(out.negativePrompt).toBe('');
+    expect(out.parts).toEqual({ style: '', layout: '', orientation: '', subject: 'Ace of Spades: one large ornate spade' });
+  });
+
+  it('reports each contribution unjoined so the editor can attribute it', () => {
+    const out = composeCardRenderPrompt(deck, { name: 'XVII · The Star', prompt: 'a kneeling figure', negativePrompt: 'text' });
+    expect(out.parts).toEqual({
+      style: 'copperplate engraving, aged paper',
+      layout: 'Full tarot card, framed border',
+      orientation: '',
+      subject: 'XVII · The Star: a kneeling figure',
+    });
+  });
+
+  it('spells out the standard two-way rotation so a six cannot become a nine', () => {
+    const out = composeCardRenderPrompt(
+      { kind: DECK_KIND.PLAYING, layoutPrompt: 'Complete card' },
+      { name: 'Six of Hearts', prompt: 'six heart pips' },
+    );
+    expect(out.prompt).toContain('bottom-right index is an exact 180-degree rotation');
+    expect(out.prompt).toContain('a six remains a six and never becomes a nine');
+    expect(out.negativePrompt).toContain('six rendered as nine');
+    expect(out.parts.orientation).toBe(defaultDeckCardOrientationPrompt({ kind: DECK_KIND.PLAYING }));
+  });
+
+  it('pins a numbered card to its classic pip layout and total suit-symbol count, ahead of a scene that disguises pips', () => {
+    const out = composeCardRenderPrompt(
+      { kind: DECK_KIND.PLAYING },
+      { key: 'spades-6', name: 'Six of Spades', prompt: 'six spade pips as rooftop pennants along a parapet' },
+    );
+    expect(out.parts.subject).toMatch(/^Fixed identity: Six of Spades\. Exactly 6 large black spade pips/);
+    expect(out.parts.subject).toContain('two vertical columns of three pips');
+    expect(out.parts.subject).toContain('exactly 8 spade symbols in total (6 pips plus the 2 corner marks)');
+    expect(out.parts.subject).toContain('not objects in the scene');
+    expect(out.negativePrompt).toContain('pips disguised as scene objects');
+    expect(out.negativePrompt).toContain('suit symbols in the border or background');
+  });
+
+  it('supports one-way faces and a true authored prompt override', () => {
+    const oneWay = composeCardRenderPrompt(
+      { kind: DECK_KIND.PLAYING, cardOrientation: DECK_CARD_ORIENTATION.ONE_WAY },
+      { name: 'Six of Hearts', prompt: 'six heart pips' },
+    );
+    expect(oneWay.prompt).toContain('all rank, suit and title markings share one upright reading direction');
+    expect(oneWay.prompt).not.toContain('exact 180-degree rotation');
+
+    const custom = composeCardRenderPrompt(
+      { kind: DECK_KIND.PLAYING, cardOrientation: DECK_CARD_ORIENTATION.STANDARD, cardOrientationPrompt: 'Use a custom diagonal index treatment' },
+      { name: 'Six of Hearts', prompt: 'six heart pips' },
+    );
+    expect(custom.prompt).toContain('Use a custom diagonal index treatment');
+    expect(custom.prompt).not.toContain('a six remains a six and never becomes a nine');
+    expect(custom.negativePrompt).toBe('');
+  });
+});
+
+describe('cardStatus + deckCompletion', () => {
+  it('derives the render state from the persisted render record and image refs', () => {
+    expect(cardStatus({ prompt: '' })).toBe(CARD_STATUS.EMPTY);
+    expect(cardStatus({ prompt: 'x' })).toBe(CARD_STATUS.PROMPTED);
+    expect(cardStatus({ prompt: 'x', render: { status: 'queued' } })).toBe(CARD_STATUS.QUEUED);
+    expect(cardStatus({ prompt: 'x', render: { status: 'running' } })).toBe(CARD_STATUS.RUNNING);
+    // A prior image survives a later failed re-render — the card is still rendered.
+    expect(cardStatus({ prompt: 'x', imageRefs: ['a.png'], render: { status: 'failed' } })).toBe(CARD_STATUS.RENDERED);
+    expect(cardStatus({ prompt: 'x', imageRefs: [], render: { status: 'canceled' } })).toBe(CARD_STATUS.FAILED);
+  });
+
+  it('counts rendered / prompted / in-flight / failed and a whole-deck percent', () => {
+    const counts = deckCompletion([
+      { prompt: 'a', imageRefs: ['1.png'] },
+      { prompt: 'b', render: { status: 'running' } },
+      { prompt: 'c', render: { status: 'failed' } },
+      { prompt: '' },
+    ]);
+    expect(counts).toEqual({ total: 4, prompted: 3, rendered: 1, inFlight: 1, failed: 1, percent: 25 });
+    expect(deckCompletion([]).percent).toBe(0);
+  });
+});
+
+describe('deckCardSize', () => {
+  it('prefers the persisted canvas over the kind default', () => {
+    expect(deckCardSize({ kind: DECK_KIND.PLAYING, cardSize: { width: 800, height: 1200 } }))
+      .toEqual({ width: 800, height: 1200 });
+  });
+
+  it('falls back to each kind\'s true trim, not the generic 2:3 box', () => {
+    expect(deckCardSize({ kind: DECK_KIND.PLAYING })).toEqual(DECK_CARD_SIZE_BY_KIND[DECK_KIND.PLAYING]);
+    expect(deckCardSize({ kind: DECK_KIND.TAROT })).toEqual(DECK_CARD_SIZE_BY_KIND[DECK_KIND.TAROT]);
+    expect(deckCardSize({})).toEqual(DECK_CARD_SIZE);
+  });
+
+  it('ignores a half-set or non-positive cardSize rather than inventing a ratio', () => {
+    expect(deckCardSize({ kind: DECK_KIND.TAROT, cardSize: { width: 800 } }))
+      .toEqual(DECK_CARD_SIZE_BY_KIND[DECK_KIND.TAROT]);
+    expect(deckCardSize({ kind: DECK_KIND.PLAYING, cardSize: { width: 0, height: 1536 } }))
+      .toEqual(DECK_CARD_SIZE_BY_KIND[DECK_KIND.PLAYING]);
+  });
+
+  it('exposes the CSS aspect-ratio the thumbnail box must use', () => {
+    expect(deckCardAspectStyle({ kind: DECK_KIND.PLAYING }).aspectRatio).toBe('1096 / 1536');
+    expect(deckCardAspectStyle({ kind: DECK_KIND.TAROT }).aspectRatio).toBe('888 / 1536');
+  });
+});
+
+describe('DEFAULT_LAYOUT_PROMPT', () => {
+  it('states the framing its own canvas actually renders at', () => {
+    // The defect this pins: both clauses said "2:3 portrait" while the per-kind
+    // canvases had moved to each card's true trim, so every deck asked the model
+    // for one shape and gave it another. Derived from DECK_CARD_SIZE_BY_KIND, a
+    // canvas change rewrites the sentence with it.
+    for (const kind of DECK_KINDS) {
+      const { width, height } = DECK_CARD_SIZE_BY_KIND[kind];
+      expect(DEFAULT_LAYOUT_PROMPT[kind]).toContain(aspectRatioPhrase(width, height));
+    }
+    expect(DEFAULT_LAYOUT_PROMPT[DECK_KIND.PLAYING]).toContain('5:7 portrait');
+    expect(DEFAULT_LAYOUT_PROMPT[DECK_KIND.TAROT]).toContain('11:19 portrait');
+  });
+
+  it('keeps a clause for every deck kind, with its kind-specific layout intact', () => {
+    expect(Object.keys(DEFAULT_LAYOUT_PROMPT).sort()).toEqual([...DECK_KINDS].sort());
+    expect(DEFAULT_LAYOUT_PROMPT[DECK_KIND.PLAYING]).toContain('rank and suit index');
+    expect(DEFAULT_LAYOUT_PROMPT[DECK_KIND.TAROT]).toContain('card title lettered in a banner');
+  });
+});

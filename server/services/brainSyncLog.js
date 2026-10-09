@@ -1,0 +1,550 @@
+/**
+ * Brain Sync Log
+ *
+ * Append-only JSONL log tracking all brain mutations with monotonic sequence numbers.
+ * Used for peer-to-peer brain sync protocol.
+ *
+ * A `seq → byte offset` index is kept in module state so a peer pull reads only
+ * the window it asked for. Without it, every `GET /api/brain/sync?since=N` read
+ * and JSON-parsed the whole file — under the same mutex that guards every brain
+ * write — so one lagging peer stalled local writes once per sync cycle (#5441).
+ */
+
+import { readFile, stat } from 'fs/promises';
+import { existsSync, createReadStream } from 'fs';
+import { join } from 'path';
+import { createMutex } from '../lib/asyncMutex.js';
+import { appendFileGuarded, ensureDir, safeJSONParse, PATHS, atomicWrite } from '../lib/fileUtils.js';
+
+const DATA_DIR = PATHS.brain;
+const SYNC_LOG_FILE = join(DATA_DIR, 'sync_log.jsonl');
+
+const NEWLINE = 0x0a;
+
+const withLock = createMutex();
+let currentSeq = 0;
+// Ascending `{ seq, offset }` for every indexed entry. `offset` is the byte
+// position of that entry's line within SYNC_LOG_FILE.
+let offsets = [];
+// Byte length of the file as this module last observed it — the offset the next
+// appended line will land at.
+let fileSize = 0;
+// The file ends mid-line (a crash during a previous append). The next append
+// must terminate that fragment first, or it would swallow the new entry.
+let pendingNewline = false;
+let indexLoaded = false;
+// True until a compactLog() pass actually reads the file. Set whenever the log
+// could have changed underneath the last recorded pass (an append landing, or
+// the index being rebuilt) so the next compaction call can't wrongly skip.
+let appendedSinceCompaction = true;
+// The floor compactLog() resolved on the last pass that completed (read the
+// file, whether or not it dropped lines). A repeat call with an unchanged
+// floor and nothing appended since can only reproduce the same result.
+let lastCompactionFloor = null;
+// Operation identity (see opKey) of every entry in the log. Lets a relay append
+// skip an operation the log already carries, so a peer delta retried after a
+// crash — or re-pulled because its append failed — relays exactly once (#8316).
+let loggedOps = new Set();
+
+/**
+ * Identity of the state a log entry publishes: the record, its LWW clock, and
+ * whether it is a delete. Two entries with the same key are interchangeable to
+ * a pulling peer, so the second is redundant. Null for an unkeyable entry.
+ */
+function opKey(entry) {
+  const updatedAt = entry?.record?.updatedAt;
+  if (!entry?.type || !entry?.id || updatedAt == null) return null;
+  return `${entry.type}/${entry.id}@${updatedAt}${entry.op === 'delete' ? '#delete' : ''}`;
+}
+
+function trackLoggedOp(entry) {
+  const key = opKey(entry);
+  if (key) loggedOps.add(key);
+}
+
+async function ensureBrainDir() {
+  await ensureDir(DATA_DIR);
+}
+
+/**
+ * Yield every newline-terminated line of `path` starting at byte `start`, with
+ * the byte offset and byte length of each. Operates on raw buffers so multi-byte
+ * UTF-8 split across chunk boundaries can't corrupt the offset arithmetic, and
+ * so the offsets are real file positions rather than character counts.
+ *
+ * A trailing line with no newline (a crash mid-append) is not yielded — it is
+ * not a complete entry.
+ */
+async function* streamLines(path, start = 0) {
+  const stream = createReadStream(path, { start });
+  let pending = null;
+  let offset = start;
+  for await (const chunk of stream) {
+    pending = pending ? Buffer.concat([pending, chunk]) : chunk;
+    let nl = pending.indexOf(NEWLINE);
+    while (nl !== -1) {
+      const byteLength = nl + 1;
+      yield { text: pending.subarray(0, nl).toString('utf8'), offset, byteLength };
+      offset += byteLength;
+      pending = pending.subarray(byteLength);
+      nl = pending.indexOf(NEWLINE);
+    }
+  }
+}
+
+/**
+ * Rebuild `offsets` / `fileSize` / `currentSeq` by streaming the log once.
+ * Streaming rather than `readFile` keeps boot off a 2-3x file-size string.
+ */
+async function loadIndex() {
+  offsets = [];
+  loggedOps = new Set();
+  fileSize = 0;
+  currentSeq = 0;
+  pendingNewline = false;
+  indexLoaded = true;
+  // A rebuild (boot, or recovery from a stale index) means the last recorded
+  // compaction pass no longer describes the current file — always run the
+  // next one regardless of what it recorded.
+  appendedSinceCompaction = true;
+  if (!existsSync(SYNC_LOG_FILE)) return;
+
+  let terminatedBytes = 0;
+  for await (const { text, offset, byteLength } of streamLines(SYNC_LOG_FILE)) {
+    terminatedBytes = offset + byteLength;
+    const entry = safeJSONParse(text, null);
+    if (typeof entry?.seq !== 'number') continue;
+    offsets.push({ seq: entry.seq, offset });
+    trackLoggedOp(entry);
+    currentSeq = entry.seq;
+  }
+  // Real byte size, not the offset past the last complete line: an unterminated
+  // tail still occupies bytes, so the next append lands after it.
+  fileSize = (await stat(SYNC_LOG_FILE)).size;
+  pendingNewline = fileSize > terminatedBytes;
+}
+
+async function ensureIndex() {
+  if (!indexLoaded) await loadIndex();
+}
+
+/**
+ * Write `lines` to the log and index them at the offsets they landed on.
+ *
+ * A crash fragment left by a previous append is terminated first, so the new
+ * entries stay on lines of their own — otherwise the fragment would swallow the
+ * first one and a later boot would re-mint its seq for a different record.
+ *
+ * On a failed (possibly partial) write the index is marked stale rather than
+ * advanced: `fileSize` can no longer be trusted, so the next call rescans.
+ */
+async function writeIndexedLines(lines) {
+  // Set before the write: a partially failed append can still land bytes on
+  // disk, so the next compaction pass must not be skipped either way.
+  appendedSinceCompaction = true;
+  const payload = (pendingNewline ? '\n' : '') + lines.map(({ text }) => text).join('\n') + '\n';
+  await appendFileGuarded(SYNC_LOG_FILE, payload).catch((err) => {
+    indexLoaded = false;
+    throw err;
+  });
+  if (pendingNewline) {
+    fileSize += 1;
+    pendingNewline = false;
+  }
+  for (const { seq, text, entry } of lines) {
+    offsets.push({ seq, offset: fileSize });
+    trackLoggedOp(entry);
+    fileSize += Buffer.byteLength(text, 'utf8') + 1;
+  }
+}
+
+/**
+ * Index of the first entry with `seq > sinceSeq`, or -1 when none qualifies.
+ * `offsets` is ascending by construction (seq is monotonic and append-only).
+ */
+function firstIndexAfter(sinceSeq) {
+  let lo = 0;
+  let hi = offsets.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (offsets[mid].seq > sinceSeq) hi = mid;
+    else lo = mid + 1;
+  }
+  return lo < offsets.length ? lo : -1;
+}
+
+/**
+ * Load the last sequence number from the JSONL file at startup
+ */
+export async function initSyncLog() {
+  await ensureBrainDir();
+  indexLoaded = false;
+  // A fresh process holds no queued retries; a re-init (tests) drops any
+  // left from a previous one, the same way a restart would.
+  pendingAppends = [];
+  await loadIndex();
+  console.log(`🔄 Sync log initialized at seq ${currentSeq} (${offsets.length} entries)`);
+}
+
+/**
+ * Get the current sequence number
+ */
+export function getCurrentSeq() {
+  return currentSeq;
+}
+
+/**
+ * Append a change entry to the sync log (mutex-guarded)
+ */
+export async function appendChange(op, type, id, record, originInstanceId) {
+  return withLock(async () => {
+    await ensureBrainDir();
+    await ensureIndex();
+    currentSeq++;
+    const entry = {
+      seq: currentSeq,
+      op,
+      type,
+      id,
+      record,
+      originInstanceId,
+      ts: new Date().toISOString()
+    };
+    await writeIndexedLines([{ seq: entry.seq, text: JSON.stringify(entry), entry }]);
+    return entry;
+  });
+}
+
+/**
+ * Append multiple change entries in a single mutex-guarded batch (reduces lock contention)
+ *
+ * `skipLogged` makes the append idempotent for relays: an entry whose operation
+ * (record + updatedAt + delete-ness) the log already carries is dropped, as is
+ * a repeat within the batch. The check and the write share one lock hold, so a
+ * retried relay can never mint a second entry for the same operation (#8316).
+ * Returns only the entries actually written.
+ */
+export async function appendChanges(entries, { skipLogged = false } = {}) {
+  if (!entries?.length) return [];
+  return withLock(async () => {
+    await ensureBrainDir();
+    await ensureIndex();
+    const startSeq = currentSeq;
+    const results = [];
+    const lines = [];
+    const batchKeys = new Set();
+    let nextSeq = startSeq;
+    for (const { op, type, id, record, originInstanceId } of entries) {
+      if (skipLogged) {
+        const key = opKey({ op, type, id, record });
+        if (key && (loggedOps.has(key) || batchKeys.has(key))) continue;
+        if (key) batchKeys.add(key);
+      }
+      nextSeq++;
+      const entry = { seq: nextSeq, op, type, id, record, originInstanceId, ts: new Date().toISOString() };
+      lines.push({ seq: nextSeq, text: JSON.stringify(entry), entry });
+      results.push(entry);
+    }
+    // Reserve sequence numbers before write to avoid reuse on partial failure
+    // (matches appendChange semantics where currentSeq advances pre-write)
+    if (lines.length === 0) return results;
+    currentSeq = nextSeq;
+    await writeIndexedLines(lines);
+    return results;
+  });
+}
+
+// Local-write relays whose append failed (#8351). A local brain write must
+// succeed for the user even when the log append rejects, so the entry waits
+// here and is retried — deduplicated, so an append that landed bytes before
+// throwing never mints a second entry — before the next local append and on
+// every sync-orchestrator cycle. In memory only: a restart loses the list, and
+// the boot sweep (brainReconcile.relayUnloggedRecords) recovers those ops from
+// the stored records instead. The cap bounds memory while the disk stays
+// broken; the sweep also covers anything dropped past it.
+const MAX_PENDING_APPENDS = 1000;
+let pendingAppends = [];
+
+// Oldest first. A retried batch goes back in FRONT of anything queued while it
+// was in flight (it is older); a fresh local write joins at the back.
+function queuePendingAppends(entries, { retried = false } = {}) {
+  pendingAppends = retried ? [...entries, ...pendingAppends] : [...pendingAppends, ...entries];
+  const overflow = pendingAppends.length - MAX_PENDING_APPENDS;
+  if (overflow > 0) {
+    pendingAppends = pendingAppends.slice(overflow);
+    console.warn(`⚠️ Brain sync log retry queue full: dropped ${overflow} oldest entries (the boot sweep relays them)`);
+  }
+}
+
+/**
+ * Retry the local-write relays a failed append left behind. Never rejects: a
+ * batch that fails again goes back on the queue for the next attempt.
+ * Resolves to the number of entries written.
+ */
+export async function retryPendingAppends() {
+  if (pendingAppends.length === 0) return 0;
+  const batch = pendingAppends;
+  pendingAppends = [];
+  return appendChanges(batch, { skipLogged: true }).then(
+    (written) => {
+      console.log(`🔄 Brain sync log retry relayed ${written.length} of ${batch.length} queued entries`);
+      return written.length;
+    },
+    (err) => {
+      queuePendingAppends(batch, { retried: true });
+      console.error(`❌ Brain sync log retry failed (${batch.length} entries queued): ${err.message}`);
+      return 0;
+    },
+  );
+}
+
+/**
+ * Append the relay entries of a LOCAL brain write. Never rejects — the record
+ * is already saved, so a failed append is queued for retry instead of failing
+ * the user's write. Earlier failures are retried first so local ops mostly keep
+ * their order in the log; while those still fail, the new entries queue behind
+ * them. Order is not load-bearing — peers and compaction resolve by the LWW
+ * clock, never by log position — so concurrent writers are not serialized here.
+ */
+export async function appendLocalChanges(entries) {
+  if (!entries?.length) return;
+  if (pendingAppends.length > 0) await retryPendingAppends();
+  if (pendingAppends.length > 0) {
+    queuePendingAppends(entries);
+    return;
+  }
+  await appendChanges(entries).catch((err) => {
+    queuePendingAppends(entries);
+    console.error(`❌ Brain sync log append failed (${entries.length} entries queued for retry): ${err.message}`);
+  });
+}
+
+/**
+ * Get changes since a given sequence number
+ */
+// Mutex-guarded so a concurrent compactLog() can't move offsets under the read.
+// Bounded by periodic compactLog() in syncOrchestrator.
+export async function getChangesSince(sinceSeq, limit = 100) {
+  return withLock(async () => {
+    await ensureBrainDir();
+    await ensureIndex();
+    if (!existsSync(SYNC_LOG_FILE)) {
+      return { changes: [], maxSeq: currentSeq, hasMore: false };
+    }
+
+    const start = firstIndexAfter(sinceSeq);
+    const lastIndexedSeq = offsets.length > 0 ? offsets[offsets.length - 1].seq : null;
+    if (start === -1) {
+      return { changes: [], maxSeq: sinceSeq, hasMore: false };
+    }
+
+    const changes = [];
+    for await (const { text } of streamLines(SYNC_LOG_FILE, offsets[start].offset)) {
+      const entry = safeJSONParse(text, null);
+      // A line without a numeric seq is unsequenceable — shipping it would set
+      // the peer's cursor to undefined on the next maxSeq.
+      if (typeof entry?.seq !== 'number' || entry.seq <= sinceSeq) continue;
+      changes.push(entry);
+      if (changes.length >= limit) break;
+    }
+
+    const maxSeq = changes.length > 0 ? changes[changes.length - 1].seq : sinceSeq;
+    const hasMore = lastIndexedSeq !== null ? maxSeq < lastIndexedSeq : false;
+
+    return { changes, maxSeq, hasMore };
+  });
+}
+
+/**
+ * Replay entries for a single (type, id) according to runtime LWW rules,
+ * returning the surviving terminal entry.
+ *
+ * Incumbent wins ties (same timestamp) matching applyRemoteRecord.
+ * Entries missing updatedAt are skipped.
+ */
+function replayTerminal(entries) {
+  let accepted = null;
+  for (const e of [...entries].sort((a, b) => a.seq - b.seq)) {
+    const ts = e?.record?.updatedAt;
+    if (ts == null) continue;
+    if (accepted == null || ts > accepted.record.updatedAt) accepted = e;
+  }
+  return accepted;
+}
+
+/**
+ * Compact the sync log using a compatibility-preserving compaction representation.
+ *
+ * Deltas at or above `minSeq` (unconsumed by at least one active peer) are
+ * preserved verbatim in sequence order.
+ *
+ * For history below `minSeq` (or all entries when minSeq is 0, e.g. on installs
+ * with no brain-sync peers), redundant intermediate updates are pruned by
+ * retaining only the surviving terminal LWW entry per (type, id).
+ *
+ * The durable sequence counter (maxSeq) is always determined from disk state
+ * under the log mutex, preventing index skew after a failed append, and is
+ * preserved so initSyncLog recovers the monotonic sequence counter across
+ * restarts.
+ *
+ * Skips the read entirely when nothing has been appended since the last
+ * completed pass and `minSeq` resolves to the same floor as that pass — a
+ * compaction can only drop lines when the log grew or the floor moved. Pass
+ * `{ force: true }` for an unconditional pass (manual/CLI callers, tests).
+ */
+export async function compactLog(minSeq = 0, { force = false } = {}) {
+  return withLock(async () => {
+    await ensureBrainDir();
+    // Load first: the rebuild below marks the index loaded, so skipping this
+    // would strand currentSeq at 0 on an install that compacted before booting.
+    await ensureIndex();
+    if (!existsSync(SYNC_LOG_FILE)) return 0;
+
+    // currentSeq mirrors the durable on-disk max seq (loadIndex, every append,
+    // and every completed compaction pass all keep it in sync), so it stands
+    // in for a freshly parsed maxDurableSeq here without paying for a read.
+    const floor = Number.isFinite(minSeq) ? Math.max(0, Math.min(minSeq, currentSeq)) : 0;
+    if (!force && !appendedSinceCompaction && floor === lastCompactionFloor) return 0;
+
+    async function runPass() {
+      const content = await readFile(SYNC_LOG_FILE, 'utf-8');
+      const rawLines = content.trim().split('\n').filter(l => l.trim());
+      if (rawLines.length === 0) return 0;
+
+      const parsedLines = [];
+      let maxDurableSeq = 0;
+      let maxSeqEntry = null;
+
+      for (const rawLine of rawLines) {
+        const entry = safeJSONParse(rawLine, null);
+        if (entry && typeof entry.seq === 'number') {
+          if (entry.seq > maxDurableSeq) {
+            maxDurableSeq = entry.seq;
+            maxSeqEntry = entry;
+          }
+          parsedLines.push({ rawLine, entry, seq: entry.seq });
+        } else {
+          // Line without numeric seq (e.g. malformed or unindexed note)
+          parsedLines.push({ rawLine, entry: null, seq: null });
+        }
+      }
+
+      const passFloor = typeof minSeq === 'number' && Number.isFinite(minSeq)
+        ? Math.max(0, Math.min(minSeq, maxDurableSeq))
+        : 0;
+
+      const preservedTail = [];
+      const tailEntriesByKey = new Map();
+      const olderEntriesByKey = new Map();
+      const unindexedOrUntypedOlder = [];
+
+      for (const item of parsedLines) {
+        const { entry, seq } = item;
+        if (seq !== null && passFloor > 0 && seq >= passFloor) {
+          preservedTail.push(item);
+          if (entry?.type && entry?.id) {
+            const key = `${entry.type}/${entry.id}`;
+            if (!tailEntriesByKey.has(key)) tailEntriesByKey.set(key, []);
+            tailEntriesByKey.get(key).push(item);
+          }
+        } else if (entry?.type && entry?.id) {
+          const key = `${entry.type}/${entry.id}`;
+          if (!olderEntriesByKey.has(key)) olderEntriesByKey.set(key, []);
+          olderEntriesByKey.get(key).push(item);
+        } else {
+          if (passFloor === 0 || seq === null) {
+            unindexedOrUntypedOlder.push(item);
+          }
+        }
+      }
+
+      // Replay terminal winning state for older keys
+      const keptOlder = [];
+      const olderWinnersByKey = new Map();
+      for (const [key, items] of olderEntriesByKey) {
+        const entries = items.map(i => i.entry);
+        const olderWinner = replayTerminal(entries);
+        if (!olderWinner) continue;
+
+        // If this key also appears in the preserved tail, check whether any tail
+        // operation strictly supersedes the pre-floor LWW winner (updatedAt > olderWinner.updatedAt).
+        // If the tail carries ONLY stale/losing operations (e.g. olderWinner is a Jan-02 delete
+        // and tail has an echoed Jan-01 create), we MUST retain olderWinner before the verbatim
+        // tail so fresh / delta-only peers do not accept the stale create and resurrect the record.
+        const tailItems = tailEntriesByKey.get(key);
+        if (tailItems) {
+          const supersededByTail = tailItems.some(i => {
+            const tailTs = i.entry?.record?.updatedAt;
+            return tailTs != null && olderWinner.record?.updatedAt != null && tailTs > olderWinner.record.updatedAt;
+          });
+          if (supersededByTail) {
+            continue;
+          }
+        }
+
+        const matchingItem = items.find(i => i.entry === olderWinner)
+          || { rawLine: JSON.stringify(olderWinner), entry: olderWinner, seq: olderWinner.seq };
+        keptOlder.push(matchingItem);
+        olderWinnersByKey.set(key, matchingItem);
+      }
+
+      const kept = [...unindexedOrUntypedOlder, ...keptOlder, ...preservedTail];
+
+      // Ensure the durable max sequence is preserved so restart recovery and cursors hold
+      if (maxSeqEntry && !kept.some(i => i.seq === maxSeqEntry.seq)) {
+        if (!maxSeqEntry.type || !maxSeqEntry.id) {
+          kept.push({ rawLine: JSON.stringify(maxSeqEntry), entry: maxSeqEntry, seq: maxSeqEntry.seq });
+        } else {
+          const key = `${maxSeqEntry.type}/${maxSeqEntry.id}`;
+          const winner = olderWinnersByKey.get(key);
+          if (winner && winner.entry) {
+            winner.entry.seq = maxSeqEntry.seq;
+            winner.seq = maxSeqEntry.seq;
+            winner.rawLine = JSON.stringify(winner.entry);
+          } else {
+            kept.push({ rawLine: JSON.stringify(maxSeqEntry), entry: maxSeqEntry, seq: maxSeqEntry.seq });
+          }
+        }
+      }
+
+      // Sort kept entries: items with numeric seq sorted by seq
+      kept.sort((a, b) => {
+        if (a.seq !== null && b.seq !== null) return a.seq - b.seq;
+        return 0;
+      });
+
+      const dropped = rawLines.length - kept.length;
+      if (dropped <= 0) return 0;
+
+      const newContent = kept.map(i => i.rawLine).join('\n') + '\n';
+      await atomicWrite(SYNC_LOG_FILE, newContent);
+
+      // Rebuild index offsets from what was written
+      offsets = [];
+      loggedOps = new Set();
+      let offset = 0;
+      for (const { rawLine, seq, entry } of kept) {
+        if (typeof seq === 'number') {
+          offsets.push({ seq, offset });
+          trackLoggedOp(entry);
+        }
+        offset += Buffer.byteLength(rawLine, 'utf8') + 1;
+      }
+      fileSize = offset;
+      currentSeq = maxDurableSeq;
+      pendingNewline = false;
+      indexLoaded = true;
+
+      console.log(`🔄 Compacted sync log: dropped ${dropped}, kept ${kept.length}`);
+      return dropped;
+    }
+
+    const dropped = await runPass();
+    // Record only once the pass has actually completed (whether or not it
+    // dropped lines) — a pass that throws (e.g. an atomicWrite failure) skips
+    // these and leaves the flag set, so the next tick retries.
+    appendedSinceCompaction = false;
+    lastCompactionFloor = floor;
+    return dropped;
+  });
+}

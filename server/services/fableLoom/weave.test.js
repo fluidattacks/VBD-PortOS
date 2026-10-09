@@ -1,0 +1,1667 @@
+import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
+import { mkdtempSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+
+const TEST_DATA_ROOT = mkdtempSync(join(tmpdir(), 'fableloom-weave-test-'));
+
+vi.mock('../../lib/fileUtils.js', async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    PATHS: { ...actual.PATHS, data: TEST_DATA_ROOT },
+  };
+});
+
+const runStagedLLM = vi.hoisted(() => vi.fn());
+vi.mock('../stageRunner.js', () => ({ runStagedLLM }));
+
+const getUniverseMock = vi.hoisted(() => vi.fn(async () => null));
+vi.mock('../universeBuilder.js', () => ({ getUniverse: getUniverseMock }));
+// records.js validates soft refs at write time through these services.
+const getSeriesMock = vi.hoisted(() => vi.fn(async () => null));
+vi.mock('../pipeline/series.js', () => ({ getSeries: getSeriesMock }));
+
+const {
+  createLoom, addEpisode, addNode, mutateLoom, updateEpisode, updateLoom, updateNode, getLoom,
+} = await import('./records.js');
+const { _resetFableLoomBackend } = await import('./store.js');
+const { aiStatusEvents } = await import('../aiStatusEvents.js');
+const {
+  branchNode, buildCanonDigest, feedbackEpisode, feedbackSeriesPlan, generateEpisodeOutline, generateSeriesPlan,
+  mapGeneratedGraph, playTurn, reformatEpisodeScenes, reviewEpisode, reviewEpisodeOutline, reviewSeriesPlan,
+  validateEpisodeOutline, reviewSeriesTeleplay, weaveEpisode,
+} = await import('./weave.js');
+
+beforeEach(() => {
+  rmSync(join(TEST_DATA_ROOT, 'fableloom'), { recursive: true, force: true });
+  _resetFableLoomBackend();
+  runStagedLLM.mockReset();
+  getUniverseMock.mockReset().mockResolvedValue(null);
+});
+
+afterAll(() => {
+  rmSync(TEST_DATA_ROOT, { recursive: true, force: true });
+});
+
+const setup = async () => {
+  // createLoom validates the universe ref exists before persisting it.
+  getUniverseMock.mockResolvedValueOnce({ id: 'uni-1' });
+  const loom = await createLoom({ name: 'The Hollow Crown', universeId: 'uni-1' });
+  const withEp = await addEpisode(loom.id, { title: 'Pilot', synopsis: 'A crown wakes.' });
+  return { loomId: loom.id, episodeId: withEp.episodes[0].id };
+};
+
+const generatedGraph = () => ({
+  startKey: 's1',
+  nodes: [
+    { key: 's1', title: 'The Gate', prose: 'You stand before it.', imagePrompt: 'a vast gate at dusk', transitions: [
+      { targetKey: 's2', intent: 'enter', triggers: ['go in'], description: 'Step through.' },
+      { targetKey: 's3', intent: 'walk away', triggers: [], description: 'Leave.' },
+      { targetKey: 'missing', intent: 'dangling — dropped' },
+    ] },
+    { key: 's2', title: 'Inside', prose: 'Torchlight.', transitions: [{ targetKey: 's3', intent: 'give up' }] },
+    { key: 's3', title: 'The Road Home', isEnding: true, endingLabel: 'Turned back', transitions: [] },
+  ],
+});
+
+const generatedOutline = () => ({
+  startKey: 's1',
+  scenes: [
+    { key: 's1', title: 'Signal', summary: 'A signal proves the missing ship is alive.', playbackMode: 'cut', transitions: [{ targetKey: 's2', intent: 'follow the signal' }] },
+    { key: 's2', title: 'The choice', summary: 'The signal offers two routes with different costs.', playbackMode: 'decision', transitions: [{ targetKey: 's3', intent: 'protect the survivors' }, { targetKey: 's4', intent: 'take the shortcut' }] },
+    { key: 's3', title: 'Rescue', summary: 'The rescue succeeds but strands the protagonist.', isEnding: true, endingLabel: 'The long way home' },
+    { key: 's4', title: 'Shortcut', summary: 'The shortcut opens a door and leaves a voice behind.', isEnding: true, endingLabel: 'The open door' },
+  ],
+});
+
+const generatedGraphFromOutline = () => ({
+  startKey: 's1',
+  nodes: [
+    {
+      key: 's1', title: 'Signal', prose: 'The signal breaks through the static.',
+      playbackMode: 'cut', audienceConnection: 'disconnected', protagonistPresence: 'onscreen',
+      transitions: [{ targetKey: 's2', intent: 'follow the signal' }],
+    },
+    {
+      key: 's2', title: 'The choice', prose: 'Two routes demand different costs.',
+      playbackMode: 'decision', audienceConnection: 'disconnected', protagonistPresence: 'onscreen',
+      transitions: [
+        { targetKey: 's3', intent: 'protect the survivors' },
+        { targetKey: 's4', intent: 'take the shortcut' },
+      ],
+    },
+    {
+      key: 's3', title: 'Rescue', prose: 'The survivors escape.',
+      playbackMode: 'decision', audienceConnection: 'disconnected', protagonistPresence: 'onscreen',
+      isEnding: true, endingLabel: 'The long way home', transitions: [],
+    },
+    {
+      key: 's4', title: 'Shortcut', prose: 'The door opens.',
+      playbackMode: 'decision', audienceConnection: 'disconnected', protagonistPresence: 'onscreen',
+      isEnding: true, endingLabel: 'The open door', transitions: [],
+    },
+  ],
+});
+
+const generatedChallengeOutline = () => ({
+  startKey: 'setup',
+  scenes: [
+    {
+      key: 'setup', title: 'The keypad', summary: 'A prior scene planted the code now needed at the sealed door.',
+      plotPointId: 'plot-challenge', challengePhase: 'setup', playbackMode: 'cut',
+      transitions: [{ targetKey: 'decision', intent: 'try the lock' }],
+    },
+    {
+      key: 'decision', title: 'Recall the code', summary: 'The viewer chooses which remembered code the courier enters.',
+      plotPointId: 'plot-challenge', challengePhase: 'decision', playbackMode: 'decision',
+      transitions: [
+        { targetKey: 'success', intent: 'enter the remembered code' },
+        { targetKey: 'failure', intent: 'guess before the guard returns' },
+      ],
+    },
+    {
+      key: 'success', title: 'Quiet entry', summary: 'The right code opens the door without alerting the guard.',
+      plotPointId: 'plot-challenge', challengePhase: 'success', playbackMode: 'cut',
+      transitions: [{ targetKey: 'recovery', intent: 'slip inside' }],
+    },
+    {
+      key: 'failure', title: 'Alarm chirp', summary: 'The wrong code alerts the guard but leaves a costly escape.',
+      plotPointId: 'plot-challenge', challengePhase: 'failure', playbackMode: 'cut',
+      transitions: [{ targetKey: 'recovery', intent: 'create a distraction' }],
+    },
+    {
+      key: 'recovery', title: 'Past the blockade', summary: 'Both outcomes continue inside with their different costs intact.',
+      plotPointId: 'plot-challenge', challengePhase: 'recovery', playbackMode: 'cut',
+      transitions: [{ targetKey: 'ending', intent: 'move deeper inside' }],
+    },
+    {
+      key: 'ending', title: 'Inside', summary: 'The courier reaches the next obstacle.',
+      isEnding: true, endingLabel: 'Through the door', transitions: [],
+    },
+  ],
+});
+
+const generatedChallengeGraph = () => ({
+  startKey: 'setup',
+  nodes: generatedChallengeOutline().scenes.map((scene) => ({
+    key: scene.key,
+    title: scene.title,
+    prose: `Teleplay for ${scene.title}.`,
+    playbackMode: scene.playbackMode || 'decision',
+    audienceConnection: 'disconnected',
+    protagonistPresence: 'onscreen',
+    isEnding: scene.isEnding === true,
+    endingLabel: scene.endingLabel || '',
+    transitions: scene.transitions || [],
+  })),
+});
+
+const finiteSeriesDesign = () => ({
+  mode: 'finite',
+  episodeActivity: 'Mara decodes one royal summons per episode.',
+  conflictSource: 'Every summons asks her to protect the crown at a personal cost.',
+  audiencePromise: 'A complete mystery and one irreversible choice each episode.',
+  continuingTensions: 'Mara distrusts the council that still needs her.',
+  endingCondition: 'Mara chooses whether the city deserves a restored crown.',
+});
+
+describe('mapGeneratedGraph', () => {
+  it('mints server ids, remaps targets, and drops unknown-target transitions', () => {
+    const { nodes, startNodeId } = mapGeneratedGraph(generatedGraph());
+    expect(nodes).toHaveLength(3);
+    expect(nodes.every((n) => n.id.startsWith('node-'))).toBe(true);
+    expect(startNodeId).toBe(nodes[0].id);
+    expect(nodes[0].transitions).toHaveLength(2);
+    expect(nodes[0].transitions.map((t) => t.targetNodeId)).toEqual([nodes[1].id, nodes[2].id]);
+  });
+
+  it('keeps only the first node when the model repeats a key', () => {
+    const graph = generatedGraph();
+    graph.nodes.push({ key: 's2', title: 'Duplicate Inside', isEnding: true, transitions: [] });
+    const { nodes } = mapGeneratedGraph(graph);
+    expect(nodes).toHaveLength(3);
+    expect(new Set(nodes.map((n) => n.id)).size).toBe(3);
+    expect(nodes.find((n) => n.title === 'Duplicate Inside')).toBeUndefined();
+  });
+
+  it('rejects graphs with too few scenes or no endings', () => {
+    expect(() => mapGeneratedGraph({ nodes: [{ key: 's1' }] })).toThrowError(/too few scenes/);
+    expect(() => mapGeneratedGraph({
+      startKey: 's1',
+      nodes: [{ key: 's1', transitions: [] }, { key: 's2', transitions: [] }],
+    })).toThrowError(/no endings/);
+  });
+});
+
+describe('weaveEpisode', () => {
+  it('replaces the episode graph from the LLM response', async () => {
+    const { loomId, episodeId } = await setup();
+    runStagedLLM.mockResolvedValue({ content: generatedGraph(), runId: 'run-1' });
+
+    const { loom, runId } = await weaveEpisode(loomId, episodeId, { guidance: 'darker' });
+    expect(runId).toBe('run-1');
+    const ep = loom.episodes[0];
+    expect(ep.nodes).toHaveLength(3);
+    expect(ep.startNodeId).toBe(ep.nodes[0].id);
+
+    const [stage, variables] = runStagedLLM.mock.calls[0];
+    expect(stage).toBe('fableloom-weave-episode');
+    expect(variables.storyContext).toContain('The Hollow Crown');
+    expect(variables.guidance).toBe('darker');
+    expect(variables.existingGraph).toContain('(none');
+    expect(variables.cameraMovementCatalog).toContain('slow-dolly-in');
+    expect(variables.participationContract).toContain('audience acts as the protagonist');
+    expect(variables).not.toHaveProperty('nodeTarget');
+    expect(variables).not.toHaveProperty('endingTarget');
+  });
+
+  it('refuses to clobber a non-empty episode without replace', async () => {
+    const { loomId, episodeId } = await setup();
+    await addNode(loomId, episodeId, { title: 'Handwritten' });
+    await expect(weaveEpisode(loomId, episodeId, {})).rejects.toMatchObject({ code: 'EPISODE_NOT_EMPTY' });
+    expect(runStagedLLM).not.toHaveBeenCalled();
+
+    runStagedLLM.mockResolvedValue({ content: generatedGraph(), runId: 'run-2' });
+    const { loom } = await weaveEpisode(loomId, episodeId, { replace: true });
+    expect(loom.episodes[0].nodes).toHaveLength(3);
+  });
+
+  it('rejects a helper weave that offers decisions before establishing its audience channel', async () => {
+    const { loomId, episodeId } = await setup();
+    await updateLoom(loomId, {
+      participationMode: 'helper',
+      audienceCommunicationMedium: 'A pocket radio.',
+    });
+    runStagedLLM.mockResolvedValue({ content: generatedGraph(), runId: 'run-disconnected' });
+
+    await expect(weaveEpisode(loomId, episodeId))
+      .rejects.toMatchObject({ code: 'AI_RESPONSE_INVALID' });
+    expect((await getLoom(loomId)).episodes[0].nodes).toEqual([]);
+  });
+
+  it('persists the first helper invitation and its connected decision scenes', async () => {
+    const { loomId, episodeId } = await setup();
+    await updateLoom(loomId, {
+      participationMode: 'helper',
+      audienceCommunicationMedium: 'A pocket radio.',
+    });
+    const graph = generatedGraph();
+    graph.nodes[0].playbackMode = 'cut';
+    graph.nodes[0].audienceConnection = 'disconnected';
+    graph.nodes[0].transitions = [graph.nodes[0].transitions[0]];
+    graph.nodes[1].playbackMode = 'decision';
+    graph.nodes[1].audienceConnection = 'connected';
+    runStagedLLM.mockResolvedValue({ content: graph, runId: 'run-connected' });
+
+    const result = await weaveEpisode(loomId, episodeId);
+    expect(result.loom.episodes[0].nodes.map((node) => node.audienceConnection))
+      .toEqual(['disconnected', 'connected', 'disconnected']);
+  });
+
+  it('requires a validated beat outline before expansion', async () => {
+    const { loomId, episodeId } = await setup();
+    await expect(weaveEpisode(loomId, episodeId, { expandFromOutline: true }))
+      .rejects.toMatchObject({ code: 'OUTLINE_INVALID' });
+    expect(runStagedLLM).not.toHaveBeenCalled();
+  });
+
+  it('drafts, validates, and expands an outline without losing its story contract', async () => {
+    const { loomId, episodeId } = await setup();
+    runStagedLLM.mockResolvedValueOnce({ content: generatedOutline(), runId: 'outline-run' });
+    const drafted = await generateEpisodeOutline(loomId, episodeId, { guidance: 'Make the choice costly.' });
+    expect(drafted.runId).toBe('outline-run');
+    expect(drafted.outline.scenes).toHaveLength(4);
+    expect(drafted.outline.validation.status).toBe('draft');
+
+    const checked = await validateEpisodeOutline(loomId, episodeId);
+    expect(checked.validation.issues).toEqual([]);
+    expect(checked.outline.validation.status).toBe('valid');
+
+    const expandedDraft = generatedGraphFromOutline();
+    expandedDraft.nodes[0].title = 'A reworded title';
+    expandedDraft.nodes[0].transitions[0].intent = 'A reworded label';
+    runStagedLLM.mockResolvedValueOnce({ content: expandedDraft, runId: 'expand-run' });
+    const expanded = await weaveEpisode(loomId, episodeId, {
+      guidance: 'Write the full teleplay now.', replace: false, expandFromOutline: true,
+    });
+    expect(expanded.runId).toBe('expand-run');
+    expect(expanded.loom.episodes[0].nodes[0].title).toBe(drafted.outline.scenes[0].title);
+    expect(expanded.loom.episodes[0].nodes[0].transitions[0].intent).toBe(drafted.outline.scenes[0].transitions[0].intent);
+    expect(expanded.loom.episodes[0].nodes).toHaveLength(4);
+    expect(expanded.loom.episodes[0].storyOutline.scenes.map((scene) => scene.key))
+      .toEqual(expanded.loom.episodes[0].nodes.map((node) => node.id));
+    expect(expanded.loom.episodes[0].storyOutline.startKey)
+      .toBe(expanded.loom.episodes[0].startNodeId);
+    expect(runStagedLLM.mock.calls[1][0]).toBe('fableloom-weave-episode');
+    expect(runStagedLLM.mock.calls[1][1].outlineDigest).toContain('[s1] Signal');
+  });
+
+  it('replaces an old teleplay after a structurally valid outline rewrite', async () => {
+    const { loomId, episodeId } = await setup();
+    runStagedLLM.mockResolvedValueOnce({ content: generatedOutline(), runId: 'outline-run' });
+    await generateEpisodeOutline(loomId, episodeId, {});
+    await validateEpisodeOutline(loomId, episodeId);
+    runStagedLLM.mockResolvedValueOnce({ content: generatedGraphFromOutline(), runId: 'first-expand' });
+    await weaveEpisode(loomId, episodeId, { expandFromOutline: true });
+
+    const expanded = await getLoom(loomId);
+    const expandedEpisode = expanded.episodes[0];
+    const revisedOutline = {
+      ...expandedEpisode.storyOutline,
+      scenes: expandedEpisode.storyOutline.scenes.map((scene, index) => (
+        index === 0 ? { ...scene, title: 'Revised signal' } : scene
+      )),
+    };
+    await updateEpisode(loomId, episodeId, { storyOutline: revisedOutline });
+    const checked = await validateEpisodeOutline(loomId, episodeId);
+
+    expect(checked.outline.validation.status).toBe('invalid');
+    expect(checked.validation.issues.every((issue) => (
+      issue.code.startsWith('TELEPLAY_')
+    ))).toBe(true);
+
+    const replacementOutline = checked.outline;
+    const replacementGraph = {
+      startKey: replacementOutline.startKey,
+      nodes: replacementOutline.scenes.map((scene) => ({
+        key: scene.key,
+        title: scene.title,
+        prose: `${scene.title} in full teleplay form.`,
+        playbackMode: scene.playbackMode,
+        audienceConnection: scene.audienceConnection,
+        protagonistPresence: scene.protagonistPresence,
+        isEnding: scene.isEnding,
+        endingLabel: scene.endingLabel,
+        transitions: scene.transitions.map((transition) => ({
+          targetKey: transition.targetKey,
+          intent: transition.intent,
+        })),
+      })),
+    };
+    runStagedLLM.mockResolvedValueOnce({ content: replacementGraph, runId: 'replacement-expand' });
+
+    const replaced = await weaveEpisode(loomId, episodeId, {
+      replace: true,
+      expandFromOutline: true,
+    });
+
+    expect(replaced.runId).toBe('replacement-expand');
+    expect(replaced.loom.episodes[0].nodes[0].title).toBe('Revised signal');
+    expect(replaced.loom.episodes[0].storyOutline.validation).toMatchObject({
+      status: 'valid',
+      issues: [],
+    });
+  });
+
+  it('uses the loom participation mode when normalizing helper outline beats', async () => {
+    const { loomId, episodeId } = await setup();
+    await updateLoom(loomId, {
+      participationMode: 'helper',
+      audienceCommunicationMedium: 'A pocket radio.',
+    });
+    const outline = generatedOutline();
+    outline.scenes[1].audienceConnection = 'connected';
+    runStagedLLM.mockResolvedValueOnce({ content: outline, runId: 'helper-outline-run' });
+
+    const drafted = await generateEpisodeOutline(loomId, episodeId, {});
+
+    expect(drafted.outline.scenes[1].protagonistPresence).toBe('offscreen');
+  });
+
+  it('does not expand one episode until every episode in the series has a validated outline', async () => {
+    const { loomId, episodeId } = await setup();
+    const withSecond = await addEpisode(loomId, { title: 'Second', synopsis: 'The consequence.' });
+    runStagedLLM.mockResolvedValueOnce({ content: generatedOutline(), runId: 'outline-run' });
+    await generateEpisodeOutline(loomId, episodeId, {});
+    await validateEpisodeOutline(loomId, episodeId);
+
+    await expect(weaveEpisode(loomId, episodeId, { expandFromOutline: true }))
+      .rejects.toMatchObject({ code: 'SERIES_OUTLINE_INVALID' });
+    expect(withSecond.episodes).toHaveLength(2);
+    expect(runStagedLLM).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps remapped outlines ready while expanding episodes in series order', async () => {
+    const { loomId, episodeId } = await setup();
+    const withSecond = await addEpisode(loomId, { title: 'Second', synopsis: 'The consequence.' });
+    const secondEpisodeId = withSecond.episodes[1].id;
+
+    runStagedLLM.mockResolvedValueOnce({ content: generatedOutline(), runId: 'outline-1' });
+    await generateEpisodeOutline(loomId, episodeId, {});
+    await validateEpisodeOutline(loomId, episodeId);
+    runStagedLLM.mockResolvedValueOnce({ content: generatedOutline(), runId: 'outline-2' });
+    await generateEpisodeOutline(loomId, secondEpisodeId, {});
+    await validateEpisodeOutline(loomId, secondEpisodeId);
+
+    runStagedLLM.mockResolvedValueOnce({ content: generatedGraphFromOutline(), runId: 'expand-1' });
+    const firstExpanded = await weaveEpisode(loomId, episodeId, { expandFromOutline: true });
+    expect(firstExpanded.loom.episodes[0].storyOutline.validation.status).toBe('valid');
+
+    runStagedLLM.mockResolvedValueOnce({ content: generatedGraphFromOutline(), runId: 'expand-2' });
+    const secondExpanded = await weaveEpisode(loomId, secondEpisodeId, { expandFromOutline: true });
+    expect(secondExpanded.loom.episodes.every((item) => (
+      item.storyOutline.validation.status === 'valid'
+    ))).toBe(true);
+  });
+
+  it('marks validation invalid when an expanded teleplay has drifted from its outline', async () => {
+    const { loomId, episodeId } = await setup();
+    runStagedLLM.mockResolvedValueOnce({ content: generatedOutline(), runId: 'outline-run' });
+    await generateEpisodeOutline(loomId, episodeId, {});
+    await validateEpisodeOutline(loomId, episodeId);
+    runStagedLLM.mockResolvedValueOnce({ content: generatedGraphFromOutline(), runId: 'expand-run' });
+    await weaveEpisode(loomId, episodeId, { expandFromOutline: true });
+    await updateNode(loomId, episodeId, (await getLoom(loomId)).episodes[0].nodes[0].id, {
+      title: 'Changed after expansion',
+    });
+
+    const checked = await validateEpisodeOutline(loomId, episodeId);
+    expect(checked.outline.validation.status).toBe('invalid');
+    expect(checked.validation.issues).toContainEqual(expect.objectContaining({
+      code: 'TELEPLAY_SCENE_CONTRACT_MISMATCH',
+    }));
+  });
+});
+
+describe('episode outline AI review', () => {
+  it('withholds author context and blocks an unmotivated opening before the full review', async () => {
+    const { loomId, episodeId } = await setup();
+    runStagedLLM.mockResolvedValueOnce({ content: generatedOutline(), runId: 'outline-run' });
+    await generateEpisodeOutline(loomId, episodeId, {});
+    runStagedLLM.mockClear();
+    runStagedLLM.mockResolvedValueOnce({ content: { summary: 'A puzzle appears, but no personal goal is shown.', risks: ['Establish what the protagonist wants before the clue.'] }, runId: 'cold-review' });
+    const result = await reviewEpisodeOutline(loomId, episodeId, { planningGate: true, providerId: 'writer', model: 'small', effort: 'low' });
+    expect(result.analysis.risks).toEqual(['Establish what the protagonist wants before the clue.']);
+    expect(runStagedLLM).toHaveBeenCalledTimes(1);
+    const prompt = JSON.stringify(runStagedLLM.mock.calls[0]);
+    expect(prompt).toContain('COLD OPENING REVIEW ONLY');
+    expect(prompt).toContain('(withheld for first-time-viewer review)');
+    expect(prompt).not.toContain('CURRENT EPISODE ONLY');
+    expect(prompt).not.toContain('Series arc:');
+  });
+
+  it('cold-reads complete dramatic groups after camera cuts are split', async () => {
+    const { loomId, episodeId } = await setup();
+    await mutateLoom(loomId, (loom) => {
+      const ep = loom.episodes[0];
+      ep.nodes = Array.from({ length: 9 }, (_, index) => ({ id: `shot-${index}`, title: `Shot ${index}`, prose: `Action ${index}`, playbackMode: 'cut', isEnding: index === 8, shot: { dramaticSceneId: index < 4 ? 'opening' : index < 6 ? 'interruption' : index < 8 ? 'consequence' : 'later', durationSeconds: 8 }, transitions: index < 8 ? [{ targetNodeId: `shot-${index + 1}`, intent: 'continue' }] : [] }));
+      ep.startNodeId = 'shot-0';
+      ep.storyOutline = { startKey: 'shot-0', scenes: ep.nodes.map((node) => ({ key: node.id, title: node.title, summary: node.prose, playbackMode: 'cut', isEnding: node.isEnding, transitions: node.transitions.map((t) => ({ targetKey: t.targetNodeId, intent: t.intent })) })) };
+      return loom;
+    });
+    runStagedLLM.mockResolvedValueOnce({ content: { summary: 'Opening reviewed.', risks: ['Clarify the consequence.'] } });
+    await reviewEpisodeOutline(loomId, episodeId);
+    const opening = JSON.parse(runStagedLLM.mock.calls[0][1].outlineDigest);
+    expect(opening.map((beat) => beat.key)).toEqual(Array.from({ length: 8 }, (_, index) => `shot-${index}`));
+  });
+
+  it('does not treat a missing opening verdict as approval', async () => {
+    const { loomId, episodeId } = await setup();
+    runStagedLLM.mockResolvedValueOnce({ content: generatedOutline(), runId: 'outline-run' });
+    await generateEpisodeOutline(loomId, episodeId, {});
+    runStagedLLM.mockResolvedValueOnce({ content: { summary: 'Looks fine.' }, runId: 'incomplete-review' });
+    await expect(reviewEpisodeOutline(loomId, episodeId, {})).rejects.toThrow('explicit comprehension verdict');
+  });
+
+  it('requires an explicit full review verdict before the planning gate can pass', async () => {
+    const { loomId, episodeId } = await setup();
+    runStagedLLM.mockResolvedValueOnce({ content: generatedOutline() });
+    await generateEpisodeOutline(loomId, episodeId, {});
+    runStagedLLM.mockResolvedValueOnce({ content: { summary: 'The opening is clear.', risks: [] } });
+    runStagedLLM.mockResolvedValueOnce({ content: { summary: 'Looks fine.' } });
+    await expect(reviewEpisodeOutline(loomId, episodeId, { planningGate: true })).rejects.toMatchObject({ code: 'AI_RESPONSE_INVALID' });
+    runStagedLLM.mockResolvedValueOnce({ content: { summary: 'Looks fine.', risks: 'No problems' } });
+    await expect(reviewSeriesPlan(loomId, { planningOnly: true })).rejects.toMatchObject({ code: 'AI_RESPONSE_INVALID' });
+  });
+
+  it('returns deterministic findings alongside editorial analysis', async () => {
+    const { loomId, episodeId } = await setup();
+    runStagedLLM.mockResolvedValueOnce({ content: generatedOutline(), runId: 'outline-run' });
+    await generateEpisodeOutline(loomId, episodeId, {});
+    runStagedLLM.mockResolvedValueOnce({ content: { summary: 'A courier wants to get home; a closed gate threatens that goal.', risks: [] }, runId: 'cold-read' });
+    runStagedLLM.mockResolvedValueOnce({
+      content: { summary: 'The turn lands.', strengths: ['The endings diverge.'], risks: ['The handoff needs a sharper hook.'], recommendations: ['Make the final beat reveal the next threat.'] },
+      runId: 'outline-review-run',
+    });
+    const result = await reviewEpisodeOutline(loomId, episodeId, {});
+    expect(result).toMatchObject({
+      runId: 'outline-review-run',
+      structural: { stats: { errorCount: 0 } },
+      analysis: { summary: 'The turn lands.' },
+    });
+  });
+});
+
+describe('reviewSeriesTeleplay', () => {
+  it('reviews all expanded episodes together and returns per-episode structure', async () => {
+    const { loomId, episodeId } = await setup();
+    runStagedLLM.mockResolvedValueOnce({ content: generatedGraph(), runId: 'expand-1' });
+    await weaveEpisode(loomId, episodeId, {});
+    const second = await addEpisode(loomId, { title: 'Second', synopsis: 'The consequence.' });
+    runStagedLLM.mockResolvedValueOnce({ content: generatedGraph(), runId: 'expand-2' });
+    await weaveEpisode(loomId, second.episodes[1].id, {});
+    runStagedLLM.mockResolvedValueOnce({
+      content: { summary: 'The series escalates.', strengths: ['The protagonist changes.'], risks: [], recommendations: [] },
+      runId: 'teleplay-review-run',
+    });
+
+    const result = await reviewSeriesTeleplay(loomId, {});
+    expect(result).toMatchObject({
+      runId: 'teleplay-review-run',
+      structural: [
+        { episodeId, episodeNumber: 1 },
+        { episodeNumber: 2 },
+      ],
+      analysis: { summary: 'The series escalates.' },
+    });
+    expect(runStagedLLM.mock.calls[2][0]).toBe('fableloom-review-series-teleplay');
+    expect(runStagedLLM.mock.calls[2][1].teleplayDigest).toContain('## Episode 1: Pilot');
+  });
+
+  it('refuses a full-series review while an episode has not expanded', async () => {
+    const { loomId } = await setup();
+    await expect(reviewSeriesTeleplay(loomId, {})).rejects.toMatchObject({ code: 'TELEPLAY_INCOMPLETE' });
+    expect(runStagedLLM).not.toHaveBeenCalled();
+  });
+});
+
+describe('branchNode', () => {
+  it('adds new scenes wired as transitions from the source node', async () => {
+    const { loomId, episodeId } = await setup();
+    const withNode = await addNode(loomId, episodeId, { title: 'The Gate', prose: 'You stand before it.' });
+    const nodeId = withNode.episodes[0].nodes[0].id;
+
+    runStagedLLM.mockResolvedValue({
+      content: {
+        branches: [
+          { intent: 'scale the wall', triggers: ['climb'], description: 'Up and over.', node: { title: 'The Wall', prose: 'Cold stone.' } },
+          { intent: 'bribe the guard', node: { title: 'A Deal', prose: 'He smiles.', isEnding: true, endingLabel: 'Bought passage' } },
+          'garbage',
+        ],
+      },
+      runId: 'run-3',
+    });
+
+    const { loom } = await branchNode(loomId, episodeId, nodeId, { branchCount: 2 });
+    const ep = loom.episodes[0];
+    expect(ep.nodes).toHaveLength(3);
+    const source = ep.nodes.find((n) => n.id === nodeId);
+    expect(source.playbackMode).toBe('decision');
+    expect(source.transitions.map((t) => t.intent)).toEqual(['scale the wall', 'bribe the guard']);
+    const ending = ep.nodes.find((n) => n.title === 'A Deal');
+    expect(ending).toMatchObject({ isEnding: true, endingLabel: 'Bought passage' });
+    expect(ep.nodes.filter((n) => n.id !== nodeId).every((n) => n.playbackMode === 'decision')).toBe(true);
+  });
+
+  it('rejects when the model returns no usable branches', async () => {
+    const { loomId, episodeId } = await setup();
+    const withNode = await addNode(loomId, episodeId, { title: 'A' });
+    runStagedLLM.mockResolvedValue({ content: { branches: [] }, runId: 'r' });
+    await expect(branchNode(loomId, episodeId, withNode.episodes[0].nodes[0].id, {}))
+      .rejects.toMatchObject({ code: 'AI_RESPONSE_INVALID' });
+  });
+
+  it('does not create audience branches while a helper story is disconnected', async () => {
+    const { loomId, episodeId } = await setup();
+    await updateLoom(loomId, {
+      participationMode: 'helper',
+      audienceCommunicationMedium: 'A pocket radio.',
+    });
+    const withNode = await addNode(loomId, episodeId, { title: 'Silent opening', audienceConnection: 'disconnected' });
+
+    await expect(branchNode(loomId, episodeId, withNode.episodes[0].nodes[0].id, {}))
+      .rejects.toMatchObject({ code: 'AUDIENCE_DISCONNECTED' });
+    expect(runStagedLLM).not.toHaveBeenCalled();
+  });
+});
+
+describe('reviewEpisode', () => {
+  it('combines structural analysis with sanitized LLM findings', async () => {
+    const { loomId, episodeId } = await setup();
+    const withNode = await addNode(loomId, episodeId, { title: 'Lone scene' }); // dead end → structural error
+    const nodeId = withNode.episodes[0].nodes[0].id;
+    runStagedLLM.mockResolvedValue({
+      content: {
+        summary: 'Thin.',
+        findings: [
+          { severity: 'high', nodeId, problem: 'Only one scene', suggestion: 'Branch it' },
+          { severity: 'nonsense', nodeId: 'node-unknown', problem: 'Vague', suggestion: '' },
+          { problem: null },
+        ],
+      },
+      runId: 'run-4',
+    });
+
+    const result = await reviewEpisode(loomId, episodeId, {});
+    expect(result.structural.stats.errorCount).toBeGreaterThan(0);
+    expect(result.review.summary).toBe('Thin.');
+    expect(result.review.findings).toEqual([
+      { severity: 'high', nodeId, problem: 'Only one scene', suggestion: 'Branch it' },
+      { severity: 'medium', nodeId: null, problem: 'Vague', suggestion: '' },
+    ]);
+  });
+});
+
+describe('feedbackEpisode', () => {
+  it('reports the provider and shell lifecycle for an in-page operation', async () => {
+    const { loomId, episodeId } = await setup();
+    const events = [];
+    const handle = (event) => events.push(event);
+    aiStatusEvents.on('status', handle);
+    runStagedLLM.mockImplementation(async (_stage, _variables, options) => {
+      options.onRunCreated('run-feedback', {
+        providerId: 'codex-tui', providerName: 'Codex TUI', model: 'gpt-test', providerType: 'tui',
+      });
+      options.onRunReady({
+        runId: 'run-feedback', providerId: 'codex-tui', providerName: 'Codex TUI',
+        model: 'gpt-test', providerType: 'tui', shellReady: true,
+      });
+      options.onRunSettled('run-feedback');
+      return { content: { title: 'Revised' }, runId: 'run-feedback' };
+    });
+
+    await feedbackEpisode(loomId, episodeId, {
+      feedback: 'Revise the title.', operationId: '00000000-0000-4000-8000-000000000042',
+    });
+    aiStatusEvents.off('status', handle);
+
+    expect(events.map((event) => event.phase)).toEqual(['start', 'running', 'ready', 'applying', 'complete']);
+    expect(events.find((event) => event.phase === 'ready')).toMatchObject({
+      runId: 'run-feedback', shellReady: true, operationId: '00000000-0000-4000-8000-000000000042',
+    });
+  });
+
+  it('applies sparse metadata, scene, and existing-path edits without changing ids', async () => {
+    const { loomId, episodeId } = await setup();
+    let updated = await addNode(loomId, episodeId, { title: 'The Gate', prose: 'You wait.' });
+    const gate = updated.episodes[0].nodes[0];
+    updated = await addNode(loomId, episodeId, {
+      title: 'Inside', prose: 'Torchlight.', fromNodeId: gate.id, fromIntent: 'enter',
+    });
+    const inside = updated.episodes[0].nodes.find((node) => node.title === 'Inside');
+    const transitionId = (await getLoom(loomId)).episodes[0].nodes[0].transitions[0].id;
+    runStagedLLM.mockImplementation(async (stage, variables, options) => {
+      expect(stage).toBe('fableloom-feedback-episode');
+      expect(variables.feedback).toBe('Make the opening more urgent.');
+      expect(options).toMatchObject({
+        providerOverride: 'writer', modelOverride: 'writer-large', effortOverride: 'high',
+      });
+      return {
+        content: {
+          title: 'The Gate at Midnight',
+          synopsis: '',
+          scenes: [{
+            id: gate.id,
+            prose: 'The lock clicks before you touch it.',
+            transitions: [{ id: transitionId, intent: 'cross the threshold', triggers: ['go in'], description: 'Enter.' }],
+          }],
+        },
+        runId: 'feedback-run',
+      };
+    });
+
+    const result = await feedbackEpisode(loomId, episodeId, {
+      feedback: ' Make the opening more urgent. ',
+      providerId: 'writer', model: 'writer-large', effort: 'high',
+    });
+    const episode = result.loom.episodes[0];
+    const revisedGate = episode.nodes.find((node) => node.id === gate.id);
+    expect(result).toMatchObject({ episodeId, changedScenes: 1, runId: 'feedback-run' });
+    expect(episode.title).toBe('The Gate at Midnight');
+    expect(episode.synopsis).toBe('');
+    expect(revisedGate).toMatchObject({ id: gate.id, prose: 'The lock clicks before you touch it.' });
+    expect(revisedGate.transitions).toEqual([expect.objectContaining({ id: transitionId, intent: 'cross the threshold' })]);
+    expect(episode.nodes.map((node) => node.id)).toEqual([gate.id, inside.id]);
+    expect(episode.nodes.find((node) => node.id === inside.id).prose).toBe('Torchlight.');
+  });
+
+  it('preserves authored values when the model omits them and rejects unusable edits', async () => {
+    const { loomId, episodeId } = await setup();
+    const withNode = await addNode(loomId, episodeId, { title: 'Opening', prose: 'Original.' });
+    runStagedLLM.mockResolvedValueOnce({ content: { scenes: [{ id: 'node-unknown', prose: 'Nope.' }] } });
+    await expect(feedbackEpisode(loomId, episodeId, { feedback: 'Make it better.' }))
+      .rejects.toMatchObject({ code: 'AI_RESPONSE_INVALID' });
+    expect((await getLoom(loomId)).episodes[0].nodes[0]).toMatchObject({
+      id: withNode.episodes[0].nodes[0].id, title: 'Opening', prose: 'Original.',
+    });
+  });
+
+  it('preserves playback mode when feedback returns an invalid placeholder', async () => {
+    const { loomId, episodeId } = await setup();
+    const withNode = await addNode(loomId, episodeId, {
+      title: 'Opening', playbackMode: 'cut', cameraMovement: 'slow-dolly-in',
+    });
+    const nodeId = withNode.episodes[0].nodes[0].id;
+    runStagedLLM.mockResolvedValue({
+      content: { scenes: [{
+        id: nodeId,
+        playbackMode: 'cut or decision, only when changed',
+        cameraMovement: 'slow-dolly-in, only when changed',
+        title: 'Revised',
+      }] },
+    });
+
+    const result = await feedbackEpisode(loomId, episodeId, { feedback: 'Revise the title.' });
+
+    expect(result.loom.episodes[0].nodes[0]).toMatchObject({
+      title: 'Revised', playbackMode: 'cut', cameraMovement: 'slow-dolly-in',
+    });
+  });
+});
+
+describe('playTurn', () => {
+  const playSetup = async () => {
+    const { loomId, episodeId } = await setup();
+    let updated = await addNode(loomId, episodeId, { title: 'The Gate', prose: 'You stand before it.' });
+    const gateId = updated.episodes[0].nodes[0].id;
+    updated = await addNode(loomId, episodeId, { title: 'Inside', prose: 'Torchlight.', fromNodeId: gateId, fromIntent: 'enter the gate' });
+    const insideId = updated.episodes[0].nodes.find((n) => n.title === 'Inside').id;
+    await updateNode(loomId, episodeId, insideId, { isEnding: true, endingLabel: 'Within' });
+    const gate = (await getLoom(loomId)).episodes[0].nodes.find((n) => n.id === gateId);
+    return { loomId, episodeId, gate, insideId };
+  };
+
+  it('moves through the matched transition and flags endings', async () => {
+    const { loomId, episodeId, gate, insideId } = await playSetup();
+    runStagedLLM.mockResolvedValue({
+      content: { action: 'move', transitionId: gate.transitions[0].id, narration: 'You step through.' },
+    });
+
+    const result = await playTurn(loomId, episodeId, { nodeId: gate.id, message: 'go inside' });
+    expect(result).toMatchObject({
+      action: 'move', narration: 'You step through.', ended: true,
+    });
+    expect(result.node).toMatchObject({ id: insideId, isEnding: true, endingLabel: 'Within' });
+    // Reader-facing shape: choices carry intents only, no trigger phrases.
+    expect(result.node.choices).toEqual([]);
+
+    const [stage, variables] = runStagedLLM.mock.calls[0];
+    expect(stage).toBe('fableloom-play-turn');
+    expect(variables.readerMessage).toBe('go inside');
+    expect(variables.choicesDigest).toContain('enter the gate');
+  });
+
+  it('stays in place when the model declines or names an invalid transition', async () => {
+    const { loomId, episodeId, gate } = await playSetup();
+    runStagedLLM.mockResolvedValue({ content: { action: 'move', transitionId: 'tr-bogus', narration: 'Hmm.' } });
+    const result = await playTurn(loomId, episodeId, { nodeId: gate.id, message: 'fly to the moon' });
+    expect(result).toMatchObject({ action: 'stay', ended: false });
+    expect(result.node.id).toBe(gate.id);
+  });
+
+  it('short-circuits on ending nodes without calling the LLM', async () => {
+    const { loomId, episodeId, insideId } = await playSetup();
+    const result = await playTurn(loomId, episodeId, { nodeId: insideId, message: 'now what' });
+    expect(result).toMatchObject({ action: 'stay', ended: true });
+    expect(runStagedLLM).not.toHaveBeenCalled();
+  });
+
+  it('takes a named transition off the graph with no LLM call at all', async () => {
+    const { loomId, episodeId, gate, insideId } = await playSetup();
+    const result = await playTurn(loomId, episodeId, {
+      nodeId: gate.id, transitionId: gate.transitions[0].id,
+    });
+    expect(result).toMatchObject({
+      action: 'move', resolvedBy: 'choice', narration: '', ended: true,
+    });
+    expect(result.node.id).toBe(insideId);
+    expect(runStagedLLM).not.toHaveBeenCalled();
+  });
+
+  it('locks typed audience input out while a helper channel is disconnected but permits canon advance', async () => {
+    const { loomId, episodeId, gate: originalGate, insideId } = await playSetup();
+    await updateLoom(loomId, {
+      participationMode: 'helper',
+      audienceCommunicationMedium: 'A pocket radio.',
+    });
+    await updateNode(loomId, episodeId, originalGate.id, {
+      playbackMode: 'cut', audienceConnection: 'disconnected',
+    });
+    // `elsewhereId` deliberately targets a DIFFERENT node than transitions[0]
+    // (insideId): a non-interactive scene resolves via the graph's own first
+    // transition, not the caller's requested transitionId, and asserting
+    // against insideId only pins that if the alternate path leads somewhere
+    // else — otherwise both paths land on the same node and the assertion
+    // can't distinguish "used transitions[0]" from "honored transitionId".
+    const withElsewhere = await addNode(loomId, episodeId, { title: 'Elsewhere', prose: 'Fog.', fromNodeId: originalGate.id, fromIntent: 'go the other way' });
+    const elsewhereId = withElsewhere.episodes[0].nodes.find((n) => n.title === 'Elsewhere').id;
+    await mutateLoom(loomId, (loom) => {
+      const gate = loom.episodes[0].nodes.find((node) => node.id === originalGate.id);
+      gate.transitions = gate.transitions.filter((t) => t.targetNodeId !== elsewhereId);
+      gate.transitions.push({ id: 'alternate-path', targetNodeId: elsewhereId, intent: 'Choose a different route' });
+      return loom;
+    });
+    const gate = (await getLoom(loomId)).episodes[0].nodes.find((node) => node.id === originalGate.id);
+    expect(gate.transitions[0].targetNodeId).toBe(insideId);
+
+    await expect(playTurn(loomId, episodeId, { nodeId: gate.id, message: 'Can you hear me?' }))
+      .rejects.toMatchObject({ code: 'AUDIENCE_DISCONNECTED' });
+    const advanced = await playTurn(loomId, episodeId, {
+      nodeId: gate.id, transitionId: 'alternate-path',
+    });
+    expect(advanced).toMatchObject({ action: 'move', resolvedBy: 'graph' });
+    expect(advanced.node.id).toBe(insideId);
+    expect(runStagedLLM).not.toHaveBeenCalled();
+  });
+
+  it('rejects a transition id that is not on the current scene', async () => {
+    const { loomId, episodeId, gate } = await playSetup();
+    await expect(playTurn(loomId, episodeId, { nodeId: gate.id, transitionId: 'tr-bogus' }))
+      .rejects.toMatchObject({ status: 400, code: 'INVALID_TRANSITION' });
+    expect(runStagedLLM).not.toHaveBeenCalled();
+  });
+
+  it("routes typed input through the loom's saved play settings, and lets a per-call pick win", async () => {
+    const { loomId, episodeId, gate } = await playSetup();
+    await updateLoom(loomId, { playSettings: { providerId: 'claude', model: 'opus', effort: 'high' } });
+    runStagedLLM.mockResolvedValue({ content: { action: 'stay', narration: 'Hmm.' } });
+
+    await playTurn(loomId, episodeId, { nodeId: gate.id, message: 'look around' });
+    expect(runStagedLLM.mock.calls[0][2]).toMatchObject({
+      providerOverride: 'claude', modelOverride: 'opus', effortOverride: 'high',
+    });
+
+    // Switching providers per call drops the pinned model and effort with it —
+    // both belong to the provider they were picked for.
+    await playTurn(loomId, episodeId, { nodeId: gate.id, message: 'look around', providerId: 'codex' });
+    expect(runStagedLLM.mock.calls[1][2]).toMatchObject({ providerOverride: 'codex' });
+    expect(runStagedLLM.mock.calls[1][2].modelOverride).toBeUndefined();
+    expect(runStagedLLM.mock.calls[1][2].effortOverride).toBeUndefined();
+
+    // ...but naming the same provider keeps them.
+    await playTurn(loomId, episodeId, { nodeId: gate.id, message: 'look around', providerId: 'claude' });
+    expect(runStagedLLM.mock.calls[2][2]).toMatchObject({
+      providerOverride: 'claude', modelOverride: 'opus', effortOverride: 'high',
+    });
+
+    // A per-call model beats the pinned one outright.
+    await playTurn(loomId, episodeId, { nodeId: gate.id, message: 'look around', model: 'sonnet' });
+    expect(runStagedLLM.mock.calls[3][2]).toMatchObject({
+      providerOverride: 'claude', modelOverride: 'sonnet', effortOverride: 'high',
+    });
+  });
+
+  it("renders the loom's format into the narration contract", async () => {
+    const { loomId, episodeId, gate } = await playSetup();
+    await updateLoom(loomId, { format: 'teleplay' });
+    runStagedLLM.mockResolvedValue({ content: { action: 'stay', narration: 'Hmm.' } });
+    await playTurn(loomId, episodeId, { nodeId: gate.id, message: 'look around' });
+    const [, variables] = runStagedLLM.mock.calls[0];
+    expect(variables.narrationFormatContract).toContain('teleplay');
+    expect(variables.storyContext).toContain('teleplay');
+  });
+});
+
+describe('reformatEpisodeScenes', () => {
+  const proseSetup = async () => {
+    const { loomId, episodeId } = await setup();
+    let updated = await addNode(loomId, episodeId, { title: 'The Gate', prose: 'You stand before it.' });
+    const gateId = updated.episodes[0].nodes[0].id;
+    updated = await addNode(loomId, episodeId, { title: 'Inside', prose: 'Torchlight.', fromNodeId: gateId, fromIntent: 'enter' });
+    const insideId = updated.episodes[0].nodes.find((n) => n.title === 'Inside').id;
+    return { loomId, episodeId, gateId, insideId };
+  };
+
+  it('rewrites every returned scene, pins the format, and leaves the graph alone', async () => {
+    const { loomId, episodeId, gateId, insideId } = await proseSetup();
+    runStagedLLM.mockImplementation(async (_stage, variables) => ({
+      content: {
+        scenes: JSON.parse(variables.scenesJson).map((sc) => ({ id: sc.id, prose: `INT. GATE - NIGHT\n\n${sc.prose}` })),
+      },
+      runId: 'run-1',
+    }));
+
+    const result = await reformatEpisodeScenes(loomId, episodeId, { format: 'teleplay' });
+    expect(result).toMatchObject({ format: 'teleplay', rewritten: 2 });
+    expect(result.loom.format).toBe('teleplay');
+    const nodes = result.loom.episodes[0].nodes;
+    expect(nodes.find((n) => n.id === gateId).prose).toContain('INT. GATE - NIGHT');
+    expect(nodes.find((n) => n.id === insideId).prose).toContain('Torchlight.');
+    // The rewrite is text-only: the authored edges survive it.
+    expect(nodes.find((n) => n.id === gateId).transitions[0].targetNodeId).toBe(insideId);
+    const [stage, variables] = runStagedLLM.mock.calls[0];
+    expect(stage).toBe('fableloom-reformat-scenes');
+    expect(variables.sceneFormatContract).toContain('slugline');
+  });
+
+  it('counts only scenes it actually wrote, not every id the model echoed back', async () => {
+    const { loomId, episodeId, gateId, insideId } = await proseSetup();
+    // Ids that are not in the batch: invented, or from another episode. The
+    // write applies none of them, so neither may be counted as rewritten.
+    runStagedLLM.mockResolvedValue({
+      content: { scenes: [{ id: 'node-invented', prose: 'INT. NOWHERE' }, { id: gateId, prose: 'INT. GATE' }] },
+    });
+    const result = await reformatEpisodeScenes(loomId, episodeId, { format: 'teleplay' });
+    expect(result.rewritten).toBe(1);
+    const nodes = result.loom.episodes[0].nodes;
+    expect(nodes.find((n) => n.id === gateId).prose).toBe('INT. GATE');
+    expect(nodes.find((n) => n.id === insideId).prose).toBe('Torchlight.');
+  });
+
+  it('leaves the format pin alone when the rewrite never landed a scene', async () => {
+    const { loomId, episodeId } = await proseSetup();
+    runStagedLLM.mockRejectedValue(new Error('provider unreachable'));
+    await expect(reformatEpisodeScenes(loomId, episodeId, { format: 'teleplay' })).rejects.toThrow('provider unreachable');
+    // Pinning before the rewrite would leave every later weave/branch/play
+    // generating teleplay against a story still written as prose.
+    expect((await getLoom(loomId)).format).toBe('prose');
+
+    runStagedLLM.mockReset().mockResolvedValue({ content: { scenes: [] } });
+    await expect(reformatEpisodeScenes(loomId, episodeId, { format: 'teleplay' })).rejects.toMatchObject({ code: 'AI_RESPONSE_INVALID' });
+    expect((await getLoom(loomId)).format).toBe('prose');
+  });
+
+  it('persists each chunk as it lands, so a later failure keeps the earlier work', async () => {
+    const { loomId, episodeId } = await setup();
+    // Six scenes = two chunks; the second one fails.
+    for (let i = 0; i < 6; i += 1) {
+      await addNode(loomId, episodeId, { title: `Scene ${i}`, prose: `Prose ${i}.` });
+    }
+    let call = 0;
+    runStagedLLM.mockImplementation(async (_stage, variables) => {
+      call += 1;
+      if (call > 1) throw new Error('provider died mid-run');
+      return { content: { scenes: JSON.parse(variables.scenesJson).map((sc) => ({ id: sc.id, prose: `INT. ${sc.prose}` })) } };
+    });
+    await expect(reformatEpisodeScenes(loomId, episodeId, { format: 'teleplay' })).rejects.toThrow('provider died mid-run');
+
+    const nodes = (await getLoom(loomId)).episodes[0].nodes;
+    expect(nodes.slice(0, 5).every((n) => n.prose.startsWith('INT. '))).toBe(true);
+    expect(nodes[5].prose).toBe('Prose 5.');
+  });
+
+  it('skips title-only scenes rather than asking the model to invent them', async () => {
+    const { loomId, episodeId } = await setup();
+    await addNode(loomId, episodeId, { title: 'Written', prose: 'You stand before it.' });
+    await addNode(loomId, episodeId, { title: 'Placeholder with no prose yet' });
+    runStagedLLM.mockImplementation(async (_stage, variables) => ({
+      content: { scenes: JSON.parse(variables.scenesJson).map((sc) => ({ id: sc.id, prose: 'INT. SOMEWHERE' })) },
+    }));
+
+    const result = await reformatEpisodeScenes(loomId, episodeId, { format: 'teleplay' });
+    expect(result.rewritten).toBe(1);
+    const sent = JSON.parse(runStagedLLM.mock.calls[0][1].scenesJson);
+    expect(sent).toHaveLength(1);
+    expect(result.loom.episodes[0].nodes.find((n) => n.title.startsWith('Placeholder')).prose).toBe('');
+  });
+
+  it('stops at the per-request ceiling, flags it, and continues where it stopped', async () => {
+    const { loomId, episodeId } = await setup();
+    // The ceiling is 4 chunks x 5 scenes = 20 per request. 25 scenes takes two
+    // requests: the first sends 20 and reports 5 it never got to.
+    await mutateLoom(loomId, (current) => {
+      const ep = current.episodes.find((e) => e.id === episodeId);
+      ep.nodes = Array.from({ length: 25 }, (_, i) => ({
+        id: `node-ceiling-${i}`, title: `Scene ${i}`, prose: `Prose ${i}.`, transitions: [],
+      }));
+      return current;
+    });
+    runStagedLLM.mockImplementation(async (_stage, variables) => ({
+      content: { scenes: JSON.parse(variables.scenesJson).map((sc) => ({ id: sc.id, prose: `INT. ${sc.prose}` })) },
+    }));
+
+    const first = await reformatEpisodeScenes(loomId, episodeId, { format: 'teleplay' });
+    expect(runStagedLLM.mock.calls).toHaveLength(4);
+    expect(first).toMatchObject({ rewritten: 20, episodeRemaining: 5, remaining: 5, capped: true });
+    // The loom is NOT pinned yet — 5 scenes are still prose.
+    expect(first.loom.format).toBe('prose');
+
+    const second = await reformatEpisodeScenes(loomId, episodeId, { format: 'teleplay' });
+    // Only the one leftover chunk is re-sent; the 20 already converted are skipped.
+    expect(runStagedLLM.mock.calls).toHaveLength(5);
+    expect(second).toMatchObject({ rewritten: 5, episodeRemaining: 0, remaining: 0, capped: false });
+    expect(second.loom.format).toBe('teleplay');
+    const allNodes = second.loom.episodes.flatMap((e) => e.nodes);
+    expect(allNodes).toHaveLength(25);
+    expect(allNodes.every((n) => n.prose.startsWith('INT. '))).toBe(true);
+    expect(allNodes.every((n) => n.format === 'teleplay')).toBe(true);
+  });
+
+  it('does not flag a run as capped when the model, not the ceiling, left scenes behind', async () => {
+    const { loomId, episodeId, gateId } = await proseSetup();
+    // One of two scenes comes back. Nothing went unsent, so re-requesting would
+    // only re-send a refusal — the caller must NOT loop on this.
+    runStagedLLM.mockResolvedValue({ content: { scenes: [{ id: gateId, prose: 'INT. GATE' }] } });
+    const result = await reformatEpisodeScenes(loomId, episodeId, { format: 'teleplay' });
+    expect(result).toMatchObject({ rewritten: 1, episodeRemaining: 1, capped: false });
+  });
+
+  it('holds the loom pin until EVERY episode is converted, not just the one it rewrote', async () => {
+    const { loomId, episodeId } = await proseSetup();
+    const withEp2 = await addEpisode(loomId, { title: 'Two' });
+    const episode2Id = withEp2.episodes[1].id;
+    await addNode(loomId, episode2Id, { title: 'Elsewhere', prose: 'Rain on the roof.' });
+    runStagedLLM.mockImplementation(async (_stage, variables) => ({
+      content: { scenes: JSON.parse(variables.scenesJson).map((sc) => ({ id: sc.id, prose: `INT. ${sc.prose}` })) },
+    }));
+
+    // Episode one is fully converted — but the loom still holds a prose scene in
+    // episode two, and pinning here would point every later weave/branch/play at
+    // a contract that scene isn't written in.
+    const first = await reformatEpisodeScenes(loomId, episodeId, { format: 'teleplay' });
+    expect(first).toMatchObject({ rewritten: 2, episodeRemaining: 0, remaining: 1 });
+    expect(first.loom.format).toBe('prose');
+
+    const second = await reformatEpisodeScenes(loomId, episode2Id, { format: 'teleplay' });
+    expect(second).toMatchObject({ rewritten: 1, episodeRemaining: 0, remaining: 0 });
+    expect(second.loom.format).toBe('teleplay');
+  });
+
+  it('is a no-op on an episode with nothing left to convert, and still pins the loom', async () => {
+    const { loomId, episodeId } = await proseSetup();
+    runStagedLLM.mockImplementation(async (_stage, variables) => ({
+      content: { scenes: JSON.parse(variables.scenesJson).map((sc) => ({ id: sc.id, prose: `INT. ${sc.prose}` })) },
+    }));
+    await reformatEpisodeScenes(loomId, episodeId, { format: 'teleplay' });
+    const callsAfterFirst = runStagedLLM.mock.calls.length;
+
+    // The caller walks every episode; one already converted must not cost a
+    // provider call, and must not be mistaken for "the model returned nothing".
+    const again = await reformatEpisodeScenes(loomId, episodeId, { format: 'teleplay' });
+    expect(runStagedLLM.mock.calls).toHaveLength(callsAfterFirst);
+    expect(again).toMatchObject({ rewritten: 0, remaining: 0, capped: false });
+    expect(again.loom.format).toBe('teleplay');
+  });
+
+  it('404s on an episode that is not in the loom', async () => {
+    const { loomId } = await proseSetup();
+    await expect(reformatEpisodeScenes(loomId, 'ep-not-here', { format: 'teleplay' }))
+      .rejects.toMatchObject({ status: 404 });
+    expect(runStagedLLM).not.toHaveBeenCalled();
+  });
+
+  it('reports scenes the model dropped as remaining, and holds the pin back', async () => {
+    const { loomId, episodeId, gateId, insideId } = await proseSetup();
+    // The model returns one of the two scenes it was given. The run is under
+    // the chunk ceiling, so nothing but the dropped scene is left over.
+    runStagedLLM.mockResolvedValue({ content: { scenes: [{ id: gateId, prose: 'INT. GATE' }] } });
+
+    const result = await reformatEpisodeScenes(loomId, episodeId, { format: 'teleplay' });
+    expect(result).toMatchObject({ rewritten: 1, remaining: 1 });
+    // Claiming teleplay here would point every later weave/branch/play at a
+    // contract the untouched scene isn't written in.
+    expect(result.loom.format).toBe('prose');
+    expect(result.loom.episodes[0].nodes.find((n) => n.id === insideId).format).toBeNull();
+
+    // Finishing the job pins it.
+    runStagedLLM.mockResolvedValue({ content: { scenes: [{ id: insideId, prose: 'INT. INSIDE' }] } });
+    const done = await reformatEpisodeScenes(loomId, episodeId, { format: 'teleplay' });
+    expect(done).toMatchObject({ rewritten: 1, remaining: 0 });
+    expect(done.loom.format).toBe('teleplay');
+  });
+
+  it('asks the model for the TARGET format, not the one the loom still holds', async () => {
+    const { loomId, episodeId } = await proseSetup();
+    runStagedLLM.mockImplementation(async (_stage, variables) => ({
+      content: { scenes: JSON.parse(variables.scenesJson).map((sc) => ({ id: sc.id, prose: 'INT. GATE' })) },
+    }));
+    await reformatEpisodeScenes(loomId, episodeId, { format: 'teleplay' });
+    const [, variables] = runStagedLLM.mock.calls[0];
+    // Asserting the source format here as fact would contradict the template's
+    // own "Target format" heading in the same prompt.
+    expect(variables.storyContext).toContain('teleplay');
+    expect(variables.storyContext).not.toContain('narrated prose');
+  });
+
+  it('ignores scenes the model dropped or blanked, and fails when it returns none', async () => {
+    const { loomId, episodeId, gateId, insideId } = await proseSetup();
+    runStagedLLM.mockResolvedValue({ content: { scenes: [{ id: gateId, prose: 'INT. GATE' }, { id: insideId, prose: '   ' }] } });
+    const kept = await reformatEpisodeScenes(loomId, episodeId, { format: 'teleplay' });
+    expect(kept.rewritten).toBe(1);
+    expect(kept.loom.episodes[0].nodes.find((n) => n.id === insideId).prose).toBe('Torchlight.');
+
+    runStagedLLM.mockResolvedValue({ content: { scenes: [] } });
+    await expect(reformatEpisodeScenes(loomId, episodeId, { format: 'prose' }))
+      .rejects.toMatchObject({ code: 'AI_RESPONSE_INVALID' });
+  });
+});
+
+// A synthetic authored cast used by the canon-digest boundary tests: the
+// causal Ghost/Wound/Lie/Want/Need chain the renderer used to drop entirely
+// (#6416). Obviously-fake placeholder content only.
+const authoredCanonUniverse = (over = {}) => ({
+  characters: [{
+    id: 'character-example',
+    name: 'Mara',
+    role: 'protagonist',
+    description: 'silver-eyed courier',
+    lie: 'Asking for help is how couriers get killed.',
+    want: 'Run the deep line alone and clear the debt.',
+    need: 'Let the harbour crew carry half the run.',
+    motivations: 'Clear the debt before the season closes.',
+    relationships: 'Owes the harbourmaster more than money.',
+    arcType: 'positive',
+  }],
+  places: [{ name: 'The Hollow' }],
+  objects: [],
+  ...over,
+});
+
+describe('buildCanonDigest', () => {
+  it('renders linked-universe canon via the shared renderer and returns empty for unlinked looms', async () => {
+    getUniverseMock.mockResolvedValue({
+      characters: [{ id: 'character-example', name: 'Mara', description: 'silver-eyed courier' }],
+      places: [{ name: 'The Hollow' }],
+      objects: [],
+    });
+    const digest = await buildCanonDigest({ universeId: 'uni-1', protagonistCharacterId: 'character-example' });
+    expect(digest).toContain('Verified Universe protagonist: id=character-example; name=Mara.');
+    expect(digest).toContain('characters:');
+    expect(digest).toContain('- Mara');
+    expect(digest).toContain('places:');
+    expect(digest).not.toContain('objects:');
+
+    expect(await buildCanonDigest({ universeId: null })).toBe('');
+  });
+
+  it('carries the authored belief, goal and internal alternative the old digest dropped', async () => {
+    getUniverseMock.mockResolvedValue(authoredCanonUniverse());
+    const digest = await buildCanonDigest({ universeId: 'uni-1', protagonistCharacterId: 'character-example' });
+    expect(digest).toContain('lie=Asking for help is how couriers get killed.');
+    expect(digest).toContain('want=Run the deep line alone and clear the debt.');
+    expect(digest).toContain('need=Let the harbour crew carry half the run.');
+    expect(digest).toContain('relationships=Owes the harbourmaster more than money.');
+  });
+
+  it('keeps a bound protagonist past the per-kind cast cap', async () => {
+    const crowd = Array.from({ length: 60 }, (_, index) => ({
+      id: `extra-${index}`, name: `Extra ${index}`, description: 'a face on the dock',
+    }));
+    getUniverseMock.mockResolvedValue(authoredCanonUniverse({
+      characters: [...crowd, ...authoredCanonUniverse().characters],
+    }));
+    const digest = await buildCanonDigest({ universeId: 'uni-1', protagonistCharacterId: 'character-example' });
+    expect(digest).toContain('- Mara [protagonist]');
+    expect(digest).toContain('lie=Asking for help is how couriers get killed.');
+    // The model is told the roster is incomplete rather than being left to
+    // assume it saw the whole ensemble.
+    expect(digest).toContain('not shown — prompt budget reached');
+  });
+
+  it('withholds a reveal-gated character\'s psychology from the generation digest', async () => {
+    getUniverseMock.mockResolvedValue(authoredCanonUniverse({
+      characters: [{
+        id: 'character-masked', name: 'The Auditor', role: 'antagonist', spoiler: true,
+        surfaceDescriptor: 'a clerk with a ledger',
+        lie: 'The ledger is the only honest thing left.',
+        ghost: 'Signed off on the collapse.',
+      }],
+    }));
+    const digest = await buildCanonDigest({ universeId: 'uni-1' });
+    expect(digest).toContain('The Auditor: (reveal-gated');
+    expect(digest).not.toContain('Signed off on the collapse.');
+    expect(digest).not.toContain('The ledger is the only honest thing left.');
+  });
+});
+
+describe('authored psychology at the FableLoom prompt boundary (#6416)', () => {
+  it('reaches the outline and expansion stage variables', async () => {
+    const { loomId, episodeId } = await setup();
+    getUniverseMock.mockResolvedValue(authoredCanonUniverse());
+    await updateLoom(loomId, { protagonistCharacterId: 'character-example' });
+
+    runStagedLLM.mockResolvedValueOnce({ content: generatedOutline(), runId: 'outline-run' });
+    await generateEpisodeOutline(loomId, episodeId, {});
+    const outlineVars = runStagedLLM.mock.calls[0][1];
+    expect(outlineVars.canonDigest).toContain('lie=Asking for help is how couriers get killed.');
+    expect(outlineVars.canonDigest).toContain('want=Run the deep line alone and clear the debt.');
+    expect(outlineVars.canonDigest).toContain('need=Let the harbour crew carry half the run.');
+
+    await validateEpisodeOutline(loomId, episodeId);
+    runStagedLLM.mockClear();
+    runStagedLLM.mockResolvedValueOnce({ content: generatedGraphFromOutline(), runId: 'expand-run' });
+    await weaveEpisode(loomId, episodeId, { expandFromOutline: true });
+    expect(runStagedLLM.mock.calls[0][1].canonDigest).toContain('need=Let the harbour crew carry half the run.');
+  });
+
+  it('still withholds every canon fact from the first-time-viewer cold read', async () => {
+    const { loomId, episodeId } = await setup();
+    getUniverseMock.mockResolvedValue(authoredCanonUniverse());
+    await updateLoom(loomId, { protagonistCharacterId: 'character-example' });
+    runStagedLLM.mockResolvedValueOnce({ content: generatedOutline(), runId: 'outline-run' });
+    await generateEpisodeOutline(loomId, episodeId, {});
+    runStagedLLM.mockClear();
+    runStagedLLM.mockResolvedValueOnce({ content: { summary: 'No personal goal is shown.', risks: ['Show what she wants.'] }, runId: 'cold-review' });
+
+    await reviewEpisodeOutline(loomId, episodeId, {});
+
+    const prompt = JSON.stringify(runStagedLLM.mock.calls[0]);
+    expect(prompt).toContain('(withheld for first-time-viewer review)');
+    expect(prompt).not.toContain('Asking for help is how couriers get killed.');
+    expect(prompt).not.toContain('character engines');
+  });
+
+  it('never renders canon into a reader-facing play turn', async () => {
+    const { loomId, episodeId } = await setup();
+    getUniverseMock.mockResolvedValue(authoredCanonUniverse());
+    await updateLoom(loomId, { protagonistCharacterId: 'character-example', participationMode: 'protagonist' });
+    runStagedLLM.mockResolvedValueOnce({ content: generatedGraph(), runId: 'weave-run' });
+    const woven = await weaveEpisode(loomId, episodeId, {});
+    const startNode = woven.loom.episodes[0].nodes.find((node) => node.id === woven.loom.episodes[0].startNodeId);
+    runStagedLLM.mockClear();
+    runStagedLLM.mockResolvedValueOnce({ content: { action: 'stay', narration: 'You wait.' }, runId: 'play-run' });
+
+    await playTurn(loomId, episodeId, { nodeId: startNode.id, message: 'look around' });
+
+    const prompt = JSON.stringify(runStagedLLM.mock.calls[0]);
+    expect(prompt).not.toContain('Asking for help is how couriers get killed.');
+    expect(prompt).not.toContain('character engines');
+  });
+});
+
+describe('descriptive canon reveal gate at the FableLoom prompt boundary (#6426)', () => {
+  // A spoiler character whose concealed origin lives in `background` — the
+  // field the descriptive block used to publish while the psychology block
+  // masked the same character. Obviously-fake placeholder content only.
+  const maskedCanonUniverse = () => authoredCanonUniverse({
+    characters: [{
+      id: 'character-masked',
+      name: 'The Auditor',
+      role: 'antagonist',
+      spoiler: true,
+      surfaceDescriptor: 'a clerk with a ledger',
+      background: 'LEAK-background signed off on the collapse',
+      personality: 'LEAK-personality outwardly meek, actually the signatory',
+      lie: 'LEAK-lie the ledger is the only honest thing left',
+    }],
+  });
+
+  it('keeps the concealed background out of the generation digest while still naming the character', async () => {
+    getUniverseMock.mockResolvedValue(maskedCanonUniverse());
+    const digest = await buildCanonDigest({ universeId: 'uni-1' });
+    expect(digest).toContain('- The Auditor [antagonist]: a clerk with a ledger — (reveal-gated');
+    expect(digest).not.toMatch(/LEAK-/);
+  });
+
+  it('never reaches the reader-facing play turn', async () => {
+    const { loomId, episodeId } = await setup();
+    getUniverseMock.mockResolvedValue(maskedCanonUniverse());
+    await updateLoom(loomId, { participationMode: 'protagonist' });
+    runStagedLLM.mockResolvedValueOnce({ content: generatedGraph(), runId: 'weave-run' });
+    const woven = await weaveEpisode(loomId, episodeId, {});
+    const startNode = woven.loom.episodes[0].nodes.find((node) => node.id === woven.loom.episodes[0].startNodeId);
+    runStagedLLM.mockClear();
+    runStagedLLM.mockResolvedValueOnce({ content: { action: 'stay', narration: 'You wait.' }, runId: 'play-run' });
+
+    await playTurn(loomId, episodeId, { nodeId: startNode.id, message: 'look around' });
+
+    const prompt = JSON.stringify(runStagedLLM.mock.calls[0]);
+    expect(prompt).not.toMatch(/LEAK-/);
+    // Not even the masked identity line: a play turn renders no canon at all,
+    // so piping any digest in here — gated or not — fails this.
+    expect(prompt).not.toContain('The Auditor');
+    expect(prompt).not.toContain('character engines');
+  });
+
+  it('never reaches the first-time-viewer cold read', async () => {
+    const { loomId, episodeId } = await setup();
+    getUniverseMock.mockResolvedValue(maskedCanonUniverse());
+    runStagedLLM.mockResolvedValueOnce({ content: generatedOutline(), runId: 'outline-run' });
+    await generateEpisodeOutline(loomId, episodeId, {});
+    runStagedLLM.mockClear();
+    runStagedLLM.mockResolvedValueOnce({ content: { summary: 'No personal goal is shown.', risks: ['Show what she wants.'] }, runId: 'cold-review' });
+
+    await reviewEpisodeOutline(loomId, episodeId, {});
+
+    const prompt = JSON.stringify(runStagedLLM.mock.calls[0]);
+    expect(prompt).toContain('(withheld for first-time-viewer review)');
+    expect(prompt).not.toMatch(/LEAK-/);
+  });
+});
+
+describe('series plan AI', () => {
+  it('passes the author-owned series design through every plan operation without rewriting it', async () => {
+    const { loomId } = await setup();
+    const seriesDesign = finiteSeriesDesign();
+    await updateLoom(loomId, { seriesPlan: { seriesDesign } });
+
+    runStagedLLM.mockResolvedValueOnce({
+      content: {
+        storyArc: 'Mara follows the summons to their source.',
+        plotPoints: [{ title: 'The first summons' }],
+        sideQuests: [{ title: 'The missing seal' }],
+      },
+      runId: 'design-draft',
+    });
+    const generated = await generateSeriesPlan(loomId);
+    expect(JSON.parse(runStagedLLM.mock.calls[0][1].seriesPlanJson).seriesDesign).toEqual(seriesDesign);
+    expect(generated.loom.seriesPlan.seriesDesign).toEqual(seriesDesign);
+
+    runStagedLLM.mockResolvedValueOnce({
+      content: { summary: 'The finite spine is coherent.', risks: [] },
+      runId: 'design-review',
+    });
+    await reviewSeriesPlan(loomId, { planningOnly: true });
+    expect(JSON.parse(runStagedLLM.mock.calls[1][1].seriesPlanJson).seriesDesign).toEqual(seriesDesign);
+
+    runStagedLLM.mockResolvedValueOnce({
+      content: { storyArc: 'Mara follows the summons and rejects the crown.', changes: ['Clarified the ending.'] },
+      runId: 'design-feedback',
+    });
+    const feedback = await feedbackSeriesPlan(loomId, { feedback: 'Clarify the ending.' });
+    expect(JSON.parse(runStagedLLM.mock.calls[2][1].seriesPlanJson).seriesDesign).toEqual(seriesDesign);
+    expect(feedback.loom.seriesPlan.seriesDesign).toEqual(seriesDesign);
+  });
+
+  it('rejects stale series-plan feedback when the author changes the series design in flight', async () => {
+    const { loomId } = await setup();
+    await updateLoom(loomId, { seriesPlan: { seriesDesign: finiteSeriesDesign() } });
+    let finishFeedback;
+    runStagedLLM.mockImplementationOnce(() => new Promise((resolve) => { finishFeedback = resolve; }));
+
+    const pending = feedbackSeriesPlan(loomId, { feedback: 'Tighten the arc.' });
+    await vi.waitFor(() => expect(runStagedLLM).toHaveBeenCalledOnce());
+    await updateLoom(loomId, { seriesPlan: {
+      seriesDesign: { ...finiteSeriesDesign(), endingCondition: 'Mara destroys the crown.' },
+    } });
+    finishFeedback({ content: { storyArc: 'A stale revision.' }, runId: 'stale-feedback' });
+
+    await expect(pending).rejects.toMatchObject({ code: 'LOOM_CHANGED_DURING_GENERATION' });
+    expect((await getLoom(loomId)).seriesPlan.seriesDesign.endingCondition).toBe('Mara destroys the crown.');
+  });
+
+  it('supplies the series design to outline, weave, outline review, and teleplay review', async () => {
+    const { loomId, episodeId } = await setup();
+    const seriesDesign = finiteSeriesDesign();
+    await updateLoom(loomId, { seriesPlan: { seriesDesign } });
+    const renderedDesign = 'Episode activity: Mara decodes one royal summons per episode.';
+
+    runStagedLLM.mockResolvedValueOnce({ content: generatedOutline(), runId: 'design-outline' });
+    await generateEpisodeOutline(loomId, episodeId);
+    expect(runStagedLLM.mock.calls[0][1].storyContext).toContain(renderedDesign);
+    await validateEpisodeOutline(loomId, episodeId);
+
+    runStagedLLM.mockResolvedValueOnce({ content: { summary: 'The opening is clear.', risks: [] }, runId: 'design-cold-review' });
+    runStagedLLM.mockResolvedValueOnce({ content: { summary: 'The outline fits.', risks: [] }, runId: 'design-outline-review' });
+    await reviewEpisodeOutline(loomId, episodeId, { planningGate: true });
+    expect(runStagedLLM.mock.calls[2][1].storyContext).toContain(renderedDesign);
+
+    runStagedLLM.mockResolvedValueOnce({ content: generatedGraphFromOutline(), runId: 'design-weave' });
+    await weaveEpisode(loomId, episodeId, { expandFromOutline: true });
+    expect(runStagedLLM.mock.calls[3][1].storyContext).toContain(renderedDesign);
+
+    runStagedLLM.mockResolvedValueOnce({
+      content: { summary: 'The finite series lands.', risks: [] },
+      runId: 'design-teleplay-review',
+    });
+    await reviewSeriesTeleplay(loomId);
+    expect(JSON.parse(runStagedLLM.mock.calls[4][1].seriesPlanJson).seriesDesign).toEqual(seriesDesign);
+  });
+
+  it('drafts and persists a complete scaffold while preserving episode records', async () => {
+    const { loomId, episodeId } = await setup();
+    getUniverseMock.mockResolvedValueOnce({
+      characters: [{ name: 'Mara', description: 'a courier who fears command' }],
+    });
+    runStagedLLM.mockResolvedValueOnce({
+      content: {
+        storyArc: 'Mara accepts responsibility for the city she once fled.',
+        plotPoints: [
+          { title: 'The summons', description: 'The crown chooses Mara.', episodeId },
+          { title: 'The false road', description: 'A tempting escape closes.', episodeId: 'invented-episode' },
+        ],
+        sideQuests: [{
+          title: 'The missing map', description: 'A rival becomes an ally.', status: 'planned',
+          startEpisodeId: episodeId, endEpisodeId: null,
+        }],
+      },
+      runId: 'run-draft',
+    });
+
+    const result = await generateSeriesPlan(loomId, {
+      providerId: 'writer', model: 'large', effort: 'high',
+    });
+
+    expect(result.runId).toBe('run-draft');
+    expect(result.loom.seriesPlan.storyArc).toContain('accepts responsibility');
+    expect(result.loom.seriesPlan.plotPoints).toHaveLength(2);
+    expect(result.loom.seriesPlan.plotPoints.every((item) => item.id.startsWith('plot-'))).toBe(true);
+    expect(result.loom.seriesPlan.plotPoints[1].episodeId).toBeNull();
+    expect(result.loom.seriesPlan.sideQuests[0]).toMatchObject({
+      title: 'The missing map', startEpisodeId: episodeId,
+    });
+    expect(result.loom.episodes).toHaveLength(1);
+    expect(result.loom.episodes[0]).toMatchObject({ id: episodeId, title: 'Pilot', synopsis: 'A crown wakes.' });
+    expect(runStagedLLM).toHaveBeenCalledWith('fableloom-generate-series-plan', expect.objectContaining({
+      storyContext: expect.stringContaining('The Hollow Crown'),
+      canonDigest: expect.stringContaining('Mara'),
+      seriesPlanJson: expect.stringContaining(episodeId),
+    }), expect.objectContaining({
+      providerOverride: 'writer', modelOverride: 'large', effortOverride: 'high',
+    }));
+  });
+
+  it('rejects an incomplete generated scaffold without replacing the saved plan', async () => {
+    const { loomId } = await setup();
+    await updateLoom(loomId, { seriesPlan: {
+      storyArc: 'Saved arc', plotPoints: [], sideQuests: [],
+    } });
+    runStagedLLM.mockResolvedValueOnce({
+      content: { storyArc: 'Partial arc', plotPoints: [{ title: 'A beat' }], sideQuests: [] },
+    });
+
+    await expect(generateSeriesPlan(loomId)).rejects.toMatchObject({ code: 'AI_RESPONSE_INVALID' });
+    expect((await getLoom(loomId)).seriesPlan.storyArc).toBe('Saved arc');
+  });
+
+  it('does not overwrite story inputs saved while the provider call is in flight', async () => {
+    const { loomId } = await setup();
+    let finishDraft;
+    runStagedLLM.mockImplementationOnce(() => new Promise((resolve) => { finishDraft = resolve; }));
+    const generation = generateSeriesPlan(loomId);
+    await vi.waitFor(() => expect(runStagedLLM).toHaveBeenCalledOnce());
+    await updateLoom(loomId, { premise: 'A newer premise saved during the draft.' });
+    finishDraft({
+      content: {
+        storyArc: 'A stale arc.',
+        plotPoints: [{ title: 'Old beat', description: 'Based on stale context.' }],
+        sideQuests: [{ title: 'Old thread', description: 'Also stale.' }],
+      },
+    });
+
+    await expect(generation).rejects.toMatchObject({ code: 'LOOM_CHANGED_DURING_GENERATION' });
+    const current = await getLoom(loomId);
+    expect(current.premise).toBe('A newer premise saved during the draft.');
+    expect(current.seriesPlan.storyArc).toBe('');
+  });
+
+  it('returns normalized holistic analysis without mutating the loom', async () => {
+    const { loomId } = await setup();
+    runStagedLLM.mockResolvedValueOnce({
+      content: { summary: 'Strong spine.', strengths: ['Clear goal'], risks: ['Late turn'], recommendations: ['Move the turn'] },
+      runId: 'run-review',
+    });
+    const result = await reviewSeriesPlan(loomId, { providerId: 'writer' });
+    expect(result).toEqual({
+      analysis: { summary: 'Strong spine.', strengths: ['Clear goal'], risks: ['Late turn'], recommendations: ['Move the turn'] },
+      runId: 'run-review',
+    });
+    expect(runStagedLLM).toHaveBeenCalledWith('fableloom-review-series-plan', expect.objectContaining({
+      seriesPlanJson: expect.stringContaining('episodes'),
+    }), expect.objectContaining({ providerOverride: 'writer' }));
+  });
+
+  it('sends no evolution block, and a byte-identical plan digest, when no lens is authored', async () => {
+    // The epic's non-negotiable: with the lens unset the review must be exactly
+    // the pre-#6443 review. The gated section renders nothing only if the
+    // variable is '' — and `seriesPlanDigest` must not have grown a field.
+    const { loomId } = await setup();
+    runStagedLLM.mockResolvedValueOnce({ content: { summary: 'Strong spine.', risks: [] }, runId: 'run-a' });
+    await reviewSeriesPlan(loomId, { planningOnly: true });
+    const variables = runStagedLLM.mock.calls[0][1];
+    expect(variables.characterEvolutions).toBe('');
+    expect(JSON.parse(variables.seriesPlanJson)).not.toHaveProperty('characterEvolutions');
+  });
+
+  it('feeds the authored lens to the plan review and never presents a dead anchor as proof', async () => {
+    const { loomId, episodeId } = await setup();
+    await updateLoom(loomId, {
+      seriesPlan: {
+        characterEvolutions: [
+          {
+            characterName: 'Mara',
+            evolution: {
+              outcome: 'full-change',
+              stages: [
+                { stageId: 'control-strategy-failing', testedBelief: 'Only leverage keeps her safe.' },
+                { stageId: 'final-proof', characterChoice: 'She hands the ledger back.', evidence: { episodeId } },
+              ],
+            },
+          },
+          {
+            characterName: 'Joss',
+            evolution: {
+              outcome: 'tragic-refusal',
+              stages: [{ stageId: 'cost-tested', causalConsequence: 'He keeps the ledger.', evidence: { episodeId: 'ep-deleted-0000' } }],
+            },
+          },
+        ],
+      },
+    });
+    runStagedLLM.mockResolvedValueOnce({ content: { summary: 'The proof lands.', risks: [] }, runId: 'run-b' });
+    await reviewSeriesPlan(loomId, { planningOnly: true });
+    const block = runStagedLLM.mock.calls[0][1].characterEvolutions;
+    expect(block).toContain('- Mara');
+    expect(block).toContain('declared outcome: full-change');
+    expect(block).toContain('declared outcome: tragic-refusal');
+    // Mara's anchor names a live episode; Joss's names a deleted one. Resolving
+    // against the loom is what keeps the dead pointer from reading as proof.
+    expect(block).toContain(`episode ${episodeId} [anchored]`);
+    expect(block).toContain('episode ep-deleted-0000 [stale]');
+  });
+
+  it('accepts an empty risks array from a lens-satisfied plan under the planning gate', async () => {
+    // `editorialAutopilot.runPlanning()` loops while `risks` is non-empty, so a
+    // lens the plan satisfies has to be able to END that loop — the verdict
+    // contract must not read "no evolution risk" as a missing verdict.
+    const { loomId } = await setup();
+    await updateLoom(loomId, {
+      seriesPlan: {
+        characterEvolutions: [{
+          characterName: 'Mara',
+          evolution: { outcome: 'flat-testing', stages: [{ stageId: 'final-proof', characterChoice: 'She holds the line.' }] },
+        }],
+      },
+    });
+    runStagedLLM.mockResolvedValueOnce({
+      content: {
+        summary: 'Every authored stage pays off.',
+        strengths: ['The refusal costs her the crew.'],
+        risks: [],
+        recommendations: [],
+      },
+    });
+    const result = await reviewSeriesPlan(loomId, { planningOnly: true });
+    expect(result.analysis.risks).toEqual([]);
+  });
+
+  it('passes complete challenge outcomes and arc endings to review without duplicate plan context', async () => {
+    const { loomId, episodeId } = await setup();
+    const storyArc = `${'An established turn. '.repeat(340)}The final reconciliation.`;
+    const description = `${'A planted clue. '.repeat(60)}FAILURE: Lose the original. RECOVERY: Keep the proof.`;
+    await updateLoom(loomId, { seriesPlan: { storyArc, plotPoints: [{ title: 'The lock', kind: 'challenge', description, episodeId }], sideQuests: [] } });
+    runStagedLLM.mockResolvedValueOnce({ content: { summary: 'The complete contract is visible.', risks: [], recommendations: [] } });
+    await reviewSeriesPlan(loomId, { planningOnly: true });
+    const variables = runStagedLLM.mock.calls[0][1];
+    const plan = JSON.parse(variables.seriesPlanJson);
+    expect(plan.storyArc).toBe(storyArc);
+    expect(plan.plotPoints[0].description).toBe(description);
+    expect(variables.storyContext).not.toContain(storyArc);
+    expect(variables.storyContext).toContain('PRE-OUTLINE REVIEW');
+  });
+
+  it('applies sparse series-plan feedback and preserves omitted collections', async () => {
+    const { loomId, episodeId } = await setup();
+    await addNode(loomId, episodeId, { title: 'Keep this scene', prose: 'The gate opens.' });
+    const before = await getLoom(loomId);
+    await updateLoom(loomId, { seriesPlan: {
+      storyArc: 'Old arc',
+      plotPoints: [{ id: 'plot-1', title: 'Turn', description: 'Old', episodeId }],
+      sideQuests: [],
+    } });
+    runStagedLLM.mockResolvedValueOnce({
+      content: { storyArc: 'New arc', episodeSynopsisEdits: [{ id: episodeId, synopsis: 'The new consequence.', title: 'Do not replace', nodes: [] }, { id: 'unknown', synopsis: 'Ignored' }], changes: ['Raised the stakes'] },
+      runId: 'run-feedback',
+    });
+    const result = await feedbackSeriesPlan(loomId, { feedback: 'Raise the stakes.' });
+    expect(result.loom.seriesPlan.storyArc).toBe('New arc');
+    expect(result.loom.seriesPlan.plotPoints).toHaveLength(1);
+    expect(result.loom.episodes[0]).toMatchObject({ id: episodeId, title: 'Pilot', synopsis: 'The new consequence.' });
+    expect(result.loom.episodes).toHaveLength(1);
+    expect(result.loom.episodes[0].nodes).toEqual(before.episodes[0].nodes);
+    expect(result.changes).toEqual(['Raised the stakes']);
+  });
+
+  it('preserves plan items outside the AI digest and patches existing items by id', async () => {
+    const { loomId, episodeId } = await setup();
+    const plotPoints = Array.from({ length: 35 }, (_, index) => ({
+      id: `plot-${index + 1}`, title: `Beat ${index + 1}`, description: `Purpose ${index + 1}`, episodeId,
+    }));
+    await updateLoom(loomId, { seriesPlan: { storyArc: 'Arc', plotPoints, sideQuests: [] } });
+    runStagedLLM.mockResolvedValueOnce({
+      content: { plotPointEdits: [{ id: 'plot-1', description: 'A sharper purpose.' }] },
+      runId: 'run-feedback',
+    });
+    const result = await feedbackSeriesPlan(loomId, { feedback: 'Sharpen the opening beat.' });
+    expect(result.loom.seriesPlan.plotPoints).toHaveLength(35);
+    expect(result.loom.seriesPlan.plotPoints[0].description).toBe('A sharper purpose.');
+    expect(result.loom.seriesPlan.plotPoints[34].title).toBe('Beat 35');
+  });
+
+  it('annotates and prioritizes episode-assigned plan beats in episode AI context', async () => {
+    const { loomId, episodeId } = await setup();
+    const manyBeats = Array.from({ length: 13 }, (_, index) => ({
+      id: `plot-${index}`, title: `Beat ${index}`, description: '', episodeId: null,
+    }));
+    manyBeats.push({ id: 'plot-relevant', title: 'Episode turn', description: '', episodeId });
+    await updateLoom(loomId, { seriesPlan: { storyArc: '', plotPoints: manyBeats, sideQuests: [] } });
+    runStagedLLM.mockResolvedValueOnce({ content: generatedGraph(), runId: 'run-weave' });
+    await weaveEpisode(loomId, episodeId, { replace: true });
+    expect(runStagedLLM).toHaveBeenCalledWith('fableloom-weave-episode', expect.objectContaining({
+      storyContext: expect.stringContaining('Plot point 1 id=plot-relevant kind=beat [planned for Episode 1: Pilot]: Episode turn'),
+    }), expect.anything());
+  });
+
+  it('rejects a later episode payoff before expanding the current episode', async () => {
+    const { loomId, episodeId } = await setup();
+    const withSecond = await addEpisode(loomId, { title: 'Second' });
+    await updateLoom(loomId, { seriesPlan: { storyArc: 'Two distinct acts.', plotPoints: [
+      { id: 'plot-later', kind: 'challenge', title: 'Later revelation', description: 'Reserved for the second act.', episodeId: withSecond.episodes[1].id },
+    ], sideQuests: [] } });
+    const outline = generatedChallengeOutline();
+    outline.scenes.forEach((scene) => { scene.plotPointId = 'plot-later'; });
+    runStagedLLM.mockResolvedValueOnce({ content: outline });
+    const draft = await generateEpisodeOutline(loomId, episodeId);
+    expect(draft.validation.issues).toContainEqual(expect.objectContaining({ code: 'WRONG_EPISODE_PLOT_POINT', severity: 'error' }));
+    expect(runStagedLLM.mock.calls[0][1].storyContext).toContain('CURRENT EPISODE ONLY');
+    expect(runStagedLLM.mock.calls[0][1].storyContext).not.toContain('PLAYABLE CHALLENGE CONTRACT');
+    expect((await validateEpisodeOutline(loomId, episodeId)).outline.validation.status).toBe('invalid');
+    await expect(weaveEpisode(loomId, episodeId, { expandFromOutline: true })).rejects.toThrow();
+    expect(runStagedLLM).toHaveBeenCalledTimes(1);
+  });
+
+  it('expands explicitly-authored challenges into a multi-scene interactive contract', async () => {
+    const { loomId, episodeId } = await setup();
+    await updateLoom(loomId, { seriesPlan: {
+      storyArc: 'A courier earns a dangerous passage.',
+      plotPoints: [{
+        id: 'plot-challenge',
+        kind: 'challenge',
+        title: 'Recall the gate code',
+        description: 'SETUP: Plant the code. VIEWER DECISION LOOP: Recall it. FAILURE: Trigger pursuit.',
+        episodeId,
+      }],
+      sideQuests: [],
+    } });
+    runStagedLLM.mockResolvedValueOnce({ content: generatedChallengeOutline(), runId: 'outline-challenge' });
+    await generateEpisodeOutline(loomId, episodeId, {});
+
+    expect(runStagedLLM).toHaveBeenCalledWith('fableloom-outline-episode', expect.objectContaining({
+      storyContext: expect.stringContaining('PLAYABLE CHALLENGE CONTRACT'),
+    }), expect.anything());
+    expect(runStagedLLM.mock.calls[0][1].storyContext).toContain('Failure continues with a visible cost');
+    expect((await validateEpisodeOutline(loomId, episodeId)).outline.validation.status).toBe('valid');
+
+    runStagedLLM.mockResolvedValueOnce({ content: generatedChallengeGraph(), runId: 'expand-challenge' });
+    const expanded = await weaveEpisode(loomId, episodeId, { expandFromOutline: true });
+    const challengeNodes = expanded.loom.episodes[0].nodes.filter((node) => (
+      node.plotPointId === 'plot-challenge'
+    ));
+    expect(challengeNodes.map((node) => node.challengePhase).sort()).toEqual([
+      'decision', 'failure', 'recovery', 'setup', 'success',
+    ]);
+    expect(expanded.loom.episodes[0].storyOutline.validation.status).toBe('valid');
+  });
+
+  it('carries enabled series delivery beats into episode context and preserves them during plan drafting', async () => {
+    const { loomId, episodeId } = await setup();
+    const delivery = {
+      deliveryOptions: { overnightVoicemails: true, nextSeasonTeaser: true },
+      interEpisodeVoicemails: [{
+        id: 'vm-1', fromEpisodeId: episodeId, toEpisodeId: null,
+        title: 'Night call', transcript: 'Keep the receiver warm.',
+      }],
+      nextSeasonTeaser: { title: 'Beyond', transcript: 'Something answers.' },
+    };
+    await updateLoom(loomId, { seriesPlan: {
+      storyArc: 'A courier learns to listen.', plotPoints: [], sideQuests: [], ...delivery,
+    } });
+    runStagedLLM.mockResolvedValueOnce({ content: generatedGraph(), runId: 'run-weave-delivery' });
+    await weaveEpisode(loomId, episodeId, {});
+    expect(runStagedLLM.mock.calls[0][1].storyContext).toContain('authored overnight voicemail');
+    expect(runStagedLLM.mock.calls[0][1].storyContext).toContain('Keep the receiver warm.');
+  });
+
+  it('tells episode expansion to frame unseen obstacles for off-screen helper scenes', async () => {
+    const { loomId, episodeId } = await setup();
+    runStagedLLM.mockResolvedValueOnce({ content: generatedGraph(), runId: 'run-offscreen-framing' });
+
+    await weaveEpisode(loomId, episodeId, {});
+
+    expect(runStagedLLM.mock.calls[0][1].storyContext)
+      .toContain('frame the obstacle or space the protagonist cannot see');
+    expect(runStagedLLM.mock.calls[0][1].storyContext)
+      .toContain('never make a standalone comms device the subject');
+  });
+});

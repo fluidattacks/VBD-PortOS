@@ -1,0 +1,321 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { act, renderHook, waitFor } from '@testing-library/react';
+
+vi.mock('../services/api', () => ({ getProviders: vi.fn(), getProviderCatalog: vi.fn() }));
+
+import * as api from '../services/api';
+import useProviderModels from './useProviderModels';
+import { __resetProviderCatalogCache } from './useProviderCatalog.js';
+
+// The catalog `agy models` prints — the shipped provider list mirrors it, and
+// its defaultModel is the "use the CLI's own model" sentinel.
+const AGY = {
+  id: 'antigravity-cli',
+  name: 'Antigravity CLI',
+  type: 'cli',
+  command: 'agy',
+  enabled: true,
+  defaultModel: 'antigravity-configured-default',
+  models: [
+    'antigravity-configured-default',
+    'gemini-3.6-flash-high', 'gemini-3.6-flash-medium', 'gemini-3.6-flash-low',
+    'gemini-3.1-pro-high', 'gemini-3.1-pro-low',
+    'claude-sonnet-4-6', 'gpt-oss-120b-medium',
+  ],
+};
+
+const CODEX = {
+  id: 'codex',
+  name: 'Codex',
+  type: 'cli',
+  command: 'codex',
+  enabled: true,
+  defaultModel: 'gpt-5',
+  models: ['gpt-5', 'gpt-5-high'],
+};
+
+// `withEffort` is what opts a picker into base models — it declares that the
+// caller also renders an effort control, so the tiers aren't lost.
+const mountWith = async (providers, options = { withEffort: true }) => {
+  api.getProviders.mockResolvedValue({ providers });
+  const hook = renderHook(() => useProviderModels(options));
+  await waitFor(() => expect(hook.result.current.loading).toBe(false));
+  return hook;
+};
+
+describe('useProviderModels — Antigravity base models', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('preselects the active provider default for session overrides and preserves deliberate Auto', async () => {
+    api.getProviders.mockResolvedValue({ activeProvider: 'codex', providers: [AGY, CODEX] });
+    const { result } = renderHook(() => useProviderModels({ allowDefault: true, preselectDefaults: true }));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.selectedProviderId).toBe('codex');
+    expect(result.current.selectedModel).toBe(CODEX.defaultModel);
+    act(() => result.current.setSelectedProviderId(''));
+    expect(result.current.selectedProviderId).toBe('');
+    expect(result.current.selectedModel).toBe('');
+  });
+
+  // A picker with no Auto option (the Quality runner) opens on the configured
+  // default instead of whichever provider the registry happens to list first.
+  it('opens a required picker on the configured default provider and its default model', async () => {
+    const CLAUDE_TUI = { id: 'claude-code-tui', type: 'tui', enabled: true, defaultModel: 'example-model', models: ['example-model'] };
+    api.getProviders.mockResolvedValue({ activeProvider: 'claude-code-tui', providers: [CODEX, CLAUDE_TUI] });
+    const { result } = renderHook(() => useProviderModels());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.selectedProviderId).toBe('claude-code-tui');
+    expect(result.current.selectedModel).toBe('example-model');
+  });
+
+  it('falls back to a TUI provider, not list order, when a required picker filters out the default', async () => {
+    const TUI = { id: 'example-tui', type: 'tui', enabled: true, defaultModel: 'm', models: ['m'] };
+    api.getProviders.mockResolvedValue({ activeProvider: 'example-api', providers: [CODEX, TUI] });
+    const { result } = renderHook(() => useProviderModels());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.selectedProviderId).toBe('example-tui');
+  });
+
+  it('does not substitute another provider when the active default is filtered out', async () => {
+    api.getProviders.mockResolvedValue({ activeProvider: 'missing', providers: [CODEX] });
+    const { result } = renderHook(() => useProviderModels({ allowDefault: true, preselectDefaults: true }));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.selectedProviderId).toBe('');
+  });
+
+  it('collapses the effort-suffixed catalog into base models', async () => {
+    const { result } = await mountWith([AGY]);
+    expect(result.current.availableModels).toEqual([
+      'gemini-3.6-flash',
+      'gemini-3.1-pro',
+      'claude-sonnet-4-6',
+      'gpt-oss-120b',
+    ]);
+  });
+
+  it('does not re-surface the configured-default sentinel as the auto-selected pin', async () => {
+    const { result } = await mountWith([AGY]);
+    // The sentinel is the provider's defaultModel, so it IS the selected value —
+    // but filterSelectableModels exists to keep it out of the options.
+    expect(result.current.selectedModel).toBe('antigravity-configured-default');
+    expect(result.current.availableModels).not.toContain('antigravity-configured-default');
+  });
+
+  it('keeps a legacy effort-suffixed pin visible instead of blanking the select', async () => {
+    const { result } = await mountWith([AGY]);
+    act(() => result.current.setSelectedModel('gemini-3.6-flash-high'));
+    await waitFor(() => {
+      expect(result.current.availableModels).toContain('gemini-3.6-flash-high');
+    });
+    // The base list is still there — the stale pin is appended, not substituted.
+    expect(result.current.availableModels).toContain('gemini-3.6-flash');
+  });
+
+  it('leaves other providers\' model lists untouched', async () => {
+    const { result } = await mountWith([CODEX]);
+    // `gpt-5-high` is NOT an Antigravity id, so its `-high` is not a tier suffix.
+    expect(result.current.availableModels).toEqual(['gpt-5', 'gpt-5-high']);
+  });
+
+  it('keeps the per-tier ids for a picker with no effort control (the default)', async () => {
+    // Without an effort select, the suffixed ids are the ONLY way to pick a
+    // tier — collapsing them there would strip the capability, not relocate it.
+    const { result } = await mountWith([AGY], {});
+    expect(result.current.availableModels).toEqual([
+      'gemini-3.6-flash-high', 'gemini-3.6-flash-medium', 'gemini-3.6-flash-low',
+      'gemini-3.1-pro-high', 'gemini-3.1-pro-low',
+      'claude-sonnet-4-6', 'gpt-oss-120b-medium',
+    ]);
+  });
+});
+
+describe('useProviderModels — provider envelope metadata', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('exposes the configured active provider alongside the catalog', async () => {
+    api.getProviders.mockResolvedValue({ activeProvider: 'codex', providers: [CODEX] });
+    const { result } = renderHook(() => useProviderModels({ allowDefault: true }));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.activeProviderId).toBe('codex');
+  });
+});
+
+describe('useProviderModels — lazy loading', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('does not fetch while disabled and fetches when enabled', async () => {
+    api.getProviders.mockResolvedValue({ providers: [CODEX] });
+    const hook = renderHook(
+      ({ enabled }) => useProviderModels({ allowDefault: true, enabled }),
+      { initialProps: { enabled: false } },
+    );
+
+    expect(hook.result.current.loading).toBe(false);
+    expect(api.getProviders).not.toHaveBeenCalled();
+
+    hook.rerender({ enabled: true });
+    await waitFor(() => expect(hook.result.current.loading).toBe(false));
+    expect(api.getProviders).toHaveBeenCalledTimes(1);
+    expect(hook.result.current.providers).toEqual([CODEX]);
+  });
+
+  it('ignores a provider response from a load invalidated by disable and re-enable', async () => {
+    const deferred = () => {
+      let resolve;
+      const promise = new Promise((res) => { resolve = res; });
+      return { promise, resolve };
+    };
+    const first = deferred();
+    const second = deferred();
+    api.getProviders.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+    const replacement = { ...CODEX, id: 'replacement', name: 'Replacement' };
+    const hook = renderHook(
+      ({ enabled }) => useProviderModels({ allowDefault: true, enabled }),
+      { initialProps: { enabled: true } },
+    );
+
+    await waitFor(() => expect(api.getProviders).toHaveBeenCalledTimes(1));
+    hook.rerender({ enabled: false });
+    await waitFor(() => expect(hook.result.current.loading).toBe(false));
+    hook.rerender({ enabled: true });
+    await waitFor(() => expect(api.getProviders).toHaveBeenCalledTimes(2));
+
+    await act(async () => { first.resolve({ providers: [CODEX] }); });
+    expect(hook.result.current.providers).toEqual([]);
+
+    await act(async () => { second.resolve({ providers: [replacement] }); });
+    await waitFor(() => expect(hook.result.current.providers).toEqual([replacement]));
+  });
+});
+
+// A capability-scoped picker (vision) starts on the client-side id regex and
+// widens once the server's authoritative list resolves, so its `modelFilter`
+// identity changes AFTER the first load. Stand-in filters here: the contract
+// under test is the identity change, not any particular capability rule.
+describe('useProviderModels — a modelFilter whose identity changes', () => {
+  const LOCAL = {
+    id: 'local-backend',
+    name: 'Local Backend',
+    type: 'api',
+    enabled: true,
+    defaultModel: 'text-a',
+    models: ['text-a', 'vlm-b', 'vlm-c'],
+  };
+  const OTHER = { ...LOCAL, id: 'other-backend', name: 'Other Backend', defaultModel: 'text-a' };
+
+  // The blind first pass: knows no vision family this backend has installed.
+  const matchesNothing = () => false;
+  const matchesB = (id) => id === 'vlm-b';
+  const matchesBandC = (id) => id === 'vlm-b' || id === 'vlm-c';
+
+  const mountFiltered = async (modelFilter, providers = [LOCAL], extra = {}) => {
+    api.getProviders.mockResolvedValue({ providers });
+    const hook = renderHook(
+      ({ filterFn }) => useProviderModels({ modelFilter: filterFn, ...extra }),
+      { initialProps: { filterFn: modelFilter } },
+    );
+    await waitFor(() => expect(hook.result.current.loading).toBe(false));
+    return hook;
+  };
+
+  beforeEach(() => vi.clearAllMocks());
+
+  it('re-picks the initial model once the filter widens', async () => {
+    const { result, rerender } = await mountFiltered(matchesNothing);
+    // The blind first pass finds nothing — the bug this guards is that the
+    // hook used to freeze here forever.
+    expect(result.current.selectedModel).toBe('');
+    expect(result.current.availableModels).toEqual([]);
+
+    rerender({ filterFn: matchesB });
+    await waitFor(() => expect(result.current.selectedModel).toBe('vlm-b'));
+    expect(result.current.availableModels).toEqual(['vlm-b']);
+  });
+
+  it('does not refetch the provider list for a filter identity change', async () => {
+    const { rerender, result } = await mountFiltered(matchesNothing);
+    expect(api.getProviders).toHaveBeenCalledTimes(1);
+
+    rerender({ filterFn: matchesB });
+    await waitFor(() => expect(result.current.selectedModel).toBe('vlm-b'));
+    expect(api.getProviders).toHaveBeenCalledTimes(1);
+  });
+
+  it('leaves a deliberate user clear alone when the filter widens', async () => {
+    const { result, rerender } = await mountFiltered(matchesB);
+    expect(result.current.selectedModel).toBe('vlm-b');
+
+    act(() => result.current.setSelectedModel(''));
+    rerender({ filterFn: matchesBandC });
+    // A clear and a "the filter matched nothing" both read as `''` — only the
+    // user-pick latch tells them apart, and the user's wins.
+    await waitFor(() => expect(result.current.availableModels).toEqual(['vlm-b', 'vlm-c']));
+    expect(result.current.selectedModel).toBe('');
+  });
+
+  it('leaves a user-picked model alone when the filter changes', async () => {
+    const { result, rerender } = await mountFiltered(matchesBandC);
+    act(() => result.current.setSelectedModel('vlm-c'));
+
+    rerender({ filterFn: matchesB });
+    await waitFor(() => expect(result.current.availableModels).toEqual(['vlm-b']));
+    expect(result.current.selectedModel).toBe('vlm-c');
+  });
+
+  it('re-arms the auto-pick after a provider change', async () => {
+    const { result, rerender } = await mountFiltered(matchesNothing, [LOCAL, OTHER]);
+    // A provider change picks through the CURRENT (still blind) filter…
+    act(() => result.current.setSelectedProviderId('other-backend'));
+    expect(result.current.selectedModel).toBe('');
+
+    // …so the widened filter must still get its say on that provider.
+    rerender({ filterFn: matchesB });
+    await waitFor(() => expect(result.current.selectedModel).toBe('vlm-b'));
+    expect(result.current.selectedProviderId).toBe('other-backend');
+  });
+
+  it('keeps the empty-model sentinel under allowDefault', async () => {
+    const { result, rerender } = await mountFiltered(matchesNothing, [LOCAL], { allowDefault: true });
+    expect(result.current.selectedProviderId).toBe('');
+    expect(result.current.selectedModel).toBe('');
+
+    rerender({ filterFn: matchesB });
+    await waitFor(() => expect(result.current.availableModels).toEqual([]));
+    // `''` is the "use the default model" choice here, never an auto-pick target.
+    expect(result.current.selectedModel).toBe('');
+  });
+});
+
+// A COMPOSITE selection (#7566) is not a `GET /api/providers` record: the hook
+// resolves it from the shared catalog and lists it beside the presets, so a
+// restored pin drives `availableModels`/`selectedProvider` like any preset.
+describe('useProviderModels — composite selection', () => {
+  const CATALOG = {
+    harnesses: [{ id: 'pi', label: 'Pi', modes: ['tui'], enabled: true, detected: true }],
+    services: [{ slug: 'nvidia-nim-free', label: 'NVIDIA NIM', plan: 'free', enabled: true, catalog: { models: ['nvidia/example', 'nvidia/other'] } }],
+    bootstraps: [], compatibility: { pi: ['nvidia-nim-free'] }, effortLevels: { pi: ['low', 'high'] }, effortLevelsByModel: {}, presets: [],
+  };
+
+  beforeEach(() => {
+    __resetProviderCatalogCache();
+    api.getProviderCatalog.mockReset().mockResolvedValue(CATALOG);
+  });
+
+  it('fetches the catalog only once a composite is selected, then lists the resolved record with its service models', async () => {
+    const preset = { id: 'other-backend', name: 'Other', type: 'api', enabled: true, models: ['text-a'] };
+    api.getProviders.mockResolvedValue({ activeProvider: 'other-backend', providers: [preset] });
+    const { result } = renderHook(() => useProviderModels({ allowDefault: true }));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(api.getProviderCatalog).not.toHaveBeenCalled();
+    expect(result.current.providers.map((p) => p.id)).toEqual(['other-backend']);
+
+    act(() => result.current.setSelectedProviderId('pi.tui@nvidia-nim-free'));
+    await waitFor(() => expect(result.current.providers.map((p) => p.id)).toEqual(['other-backend', 'pi.tui@nvidia-nim-free']));
+    expect(api.getProviderCatalog).toHaveBeenCalledTimes(1);
+    expect(result.current.availableModels).toEqual(['nvidia/example', 'nvidia/other']);
+    expect(result.current.resolveRef('pi.tui@nvidia-nim-free')).toMatchObject({ harnessId: 'pi', method: 'tui', composite: true });
+
+    act(() => result.current.setSelectedModel('nvidia/other'));
+    expect(result.current.selectedProvider).toEqual({ providerId: 'pi.tui@nvidia-nim-free', model: 'nvidia/other' });
+  });
+});

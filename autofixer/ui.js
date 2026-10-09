@@ -1,0 +1,268 @@
+import express from 'express';
+import { spawn } from 'child_process';
+import { readFile } from 'fs/promises';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
+import { createTailscaleServers, watchCertReload } from '../lib/tailscale-https.js';
+import { certPaths } from '../lib/certPaths.js';
+import { createSidecarAuthGate } from '../lib/sidecarAuthGate.js';
+import { createStagedFixStore } from './stagedFixes.js';
+import { PM2_BIN, execPm2, listProcessesStrict, DATA_DIR, AUTOFIXER_DIR, INDEX_FILE, loadApps } from './shared.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+const app = express();
+const PORT = process.env.PORT || 5560;
+
+// UI markup lives in a sibling template file so this module stays mostly logic.
+// The served document is fully static, so load it once at startup.
+const UI_TEMPLATE_FILE = join(__dirname, 'ui.template.html');
+const UI_HTML = await readFile(UI_TEMPLATE_FILE, 'utf8');
+
+const stagedFixes = createStagedFixStore({ root: AUTOFIXER_DIR, loadApps, execPm2 });
+
+// Load autofixer history
+async function loadHistory() {
+  const data = await readFile(INDEX_FILE, 'utf8').catch(() => '[]');
+  return stagedFixes.decorateHistory(JSON.parse(data));
+}
+
+// Reads honour the optional instance password. Process mutations additionally
+// require an operator session, or a genuine local connection without a password.
+// Reachability on the private network does not grant host-control authority.
+// `/` serves the static shell, which renders its own login overlay driven by
+// GET /api/auth/status — it carries no data, so it stays publicly reachable.
+const auth = createSidecarAuthGate({
+  dataDir: DATA_DIR,
+  cookieName: 'portos_autofixer_auth',
+  publicPaths: ['/'],
+});
+
+// The gate is mounted BEFORE the auth routes so its cross-origin (CSRF) check
+// covers them too — `publicPaths` is what lets them through, not route order.
+app.use(express.json({ limit: '16kb' }));
+app.use(auth.gate);
+app.get('/api/auth/status', auth.handleStatus);
+app.post('/api/auth/login', auth.handleLogin);
+app.post('/api/auth/logout', auth.handleLogout);
+
+// API: Get registered apps and their processes
+app.get('/api/apps', async (req, res) => {
+  const apps = await loadApps();
+  res.json(apps);
+});
+
+// API: Get autofixer history
+app.get('/api/history', async (req, res) => {
+  const history = await loadHistory();
+  res.json(history);
+});
+
+// Staged patches are data on reads; applying/discarding requires host authority.
+app.get('/api/fixes/:session', async (req, res) => {
+  const result = await stagedFixes.read(req.params.session);
+  res.status(result.status || 200).json(result);
+});
+for (const action of ['apply', 'discard']) {
+  app.post(`/api/fixes/:session/${action}`, auth.requireHostControl, async (req, res) => {
+    const result = await stagedFixes.mutate(req.params.session, action);
+    res.status(result.status || 200).json(result);
+  });
+}
+
+// API: Get PM2 status
+//
+// `listProcessesStrict()` returns `null` when the read itself FAILED (vs `[]`
+// for a successful read with no processes) — the absent-vs-empty contract
+// from issue #968, shared with `server/services/pm2.js` (#8164). A failed
+// read answers 503 rather than an empty array, so the dashboard doesn't
+// render "no processes" when PM2 was simply unreachable; the client handles
+// this status without breaking on `.forEach`.
+app.get('/api/status', async (req, res) => {
+  const processes = await listProcessesStrict();
+
+  if (processes === null) {
+    return res.status(503).json({ error: 'PM2 process read failed', code: 'PM2_UNAVAILABLE' });
+  }
+
+  res.json(processes.map(p => ({
+    name: p.name,
+    status: p.pm2_env?.status,
+    pid: p.pid,
+    restarts: p.pm2_env?.restart_time,
+    uptime: p.pm2_env?.pm_uptime,
+    memory: p.monit?.memory,
+    cpu: p.monit?.cpu
+  })));
+});
+
+// Validate process name against registered apps to prevent command injection
+async function isRegisteredProcess(processName) {
+  const apps = await loadApps();
+  return apps.some(app => (app.pm2ProcessNames || []).includes(processName));
+}
+
+// API: Restart a PM2 process
+app.post('/api/restart/:process', auth.requireHostControl, async (req, res) => {
+  const processName = req.params.process;
+  if (!(await isRegisteredProcess(processName))) {
+    return res.status(400).json({ success: false, error: 'Unknown process' });
+  }
+  console.log(`🔄 [Autofixer UI] Restarting process: ${processName}`);
+  const { stdout, stderr } = await execPm2(['restart', processName]).catch(err => ({
+    stdout: '',
+    stderr: err.message
+  }));
+  if (stderr && !stdout) {
+    console.error(`❌ [Autofixer UI] Restart failed for ${processName}: ${stderr}`);
+    return res.status(500).json({ success: false, error: stderr });
+  }
+  console.log(`✅ [Autofixer UI] Restarted ${processName}`);
+  res.json({ success: true });
+});
+
+// API: Stop a PM2 process
+app.post('/api/stop/:process', auth.requireHostControl, async (req, res) => {
+  const processName = req.params.process;
+  if (!(await isRegisteredProcess(processName))) {
+    return res.status(400).json({ success: false, error: 'Unknown process' });
+  }
+  console.log(`⏹️ [Autofixer UI] Stopping process: ${processName}`);
+  const { stdout, stderr } = await execPm2(['stop', processName]).catch(err => ({
+    stdout: '',
+    stderr: err.message
+  }));
+  if (stderr && !stdout) {
+    console.error(`❌ [Autofixer UI] Stop failed for ${processName}: ${stderr}`);
+    return res.status(500).json({ success: false, error: stderr });
+  }
+  console.log(`✅ [Autofixer UI] Stopped ${processName}`);
+  res.json({ success: true });
+});
+
+// Serve main UI — the process list is populated client-side via /api/apps,
+// so this route just returns the static document loaded at startup.
+app.get('/', (req, res) => {
+  res.send(UI_HTML);
+});
+
+// Server-Sent Events endpoint for streaming logs
+app.get('/logs', async (req, res) => {
+  const processName = req.query.process || 'portos-autofixer';
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+
+  res.write(`: connected\n\n`);
+
+  let pm2Process = null;
+
+  const cleanup = () => {
+    if (pm2Process && !pm2Process.killed) {
+      pm2Process.kill();
+      pm2Process = null;
+    }
+  };
+
+  req.on('close', cleanup);
+  res.on('close', cleanup);
+
+  // Get initial logs via node pm2/bin/pm2 (bypasses pm2.cmd on Windows)
+  const initialChild = spawn(process.execPath, [PM2_BIN, 'logs', processName, '--lines', '50', '--nostream', '--raw'], { windowsHide: true });
+  let initialStdout = '';
+  initialChild.stdout.on('data', (d) => { initialStdout += d.toString(); });
+  initialChild.on('close', () => {
+    if (res.writableEnded) return;
+
+    if (initialStdout) {
+      const lines = initialStdout.split('\n').filter(line => line.trim());
+      lines.forEach(line => {
+        const event = {
+          type: 'log',
+          message: line,
+          stream: 'out',
+          timestamp: new Date().toISOString()
+        };
+        res.write(`data: ${JSON.stringify(event)}\n\n`);
+      });
+    }
+
+    // Stream new logs via node pm2/bin/pm2 (bypasses pm2.cmd on Windows)
+    pm2Process = spawn(process.execPath, [PM2_BIN, 'logs', processName, '--lines', '0', '--raw'], { windowsHide: true });
+
+    pm2Process.stdout.on('data', (data) => {
+      if (res.writableEnded) {
+        cleanup();
+        return;
+      }
+
+      const lines = data.toString().split('\n').filter(line => line.trim());
+      lines.forEach(line => {
+        res.write(`data: ${JSON.stringify({
+          type: 'log',
+          message: line,
+          stream: 'out',
+          timestamp: new Date().toISOString()
+        })}\n\n`);
+      });
+    });
+
+    pm2Process.stderr.on('data', (data) => {
+      if (res.writableEnded) {
+        cleanup();
+        return;
+      }
+
+      const lines = data.toString().split('\n').filter(line => line.trim());
+      lines.forEach(line => {
+        res.write(`data: ${JSON.stringify({
+          type: 'log',
+          message: line,
+          stream: 'err',
+          timestamp: new Date().toISOString()
+        })}\n\n`);
+      });
+    });
+
+    pm2Process.on('error', (error) => {
+      if (!res.writableEnded) {
+        res.write(`data: ${JSON.stringify({
+          type: 'log',
+          message: `[ERROR] Failed to spawn pm2: ${error.message}`,
+          stream: 'err',
+          timestamp: new Date().toISOString()
+        })}\n\n`);
+      }
+      cleanup();
+    });
+
+    pm2Process.on('exit', cleanup);
+  });
+});
+
+// Serve HTTPS with the same Tailscale cert the main PortOS server uses when one
+// is present, so the sidebar's `${window.location.protocol}//<host>:5560` link
+// (which inherits https:// on a cert-enabled install) hits a matching listener.
+// Falls back to plain HTTP when no cert is on disk.
+const { dir: CERT_DIR } = certPaths(DATA_DIR);
+const { server, httpsEnabled } = createTailscaleServers(app, { certDir: CERT_DIR, httpMirror: false });
+const scheme = httpsEnabled ? 'https' : 'http';
+server.listen(PORT, '0.0.0.0', async () => {
+  console.log(`🚀 [Autofixer UI] Running on ${scheme}://localhost:${PORT}`);
+  const gated = await auth.isEnabled().catch(() => true);
+  console.log(`🔐 [Autofixer UI] Password gate ${gated ? 'ENABLED (PortOS password required)' : 'off (no PortOS password set)'}`);
+});
+if (httpsEnabled) watchCertReload(server, CERT_DIR);
+
+process.on('SIGINT', () => {
+  console.log(`\n🛑 [Autofixer UI] Shutting down...`);
+  process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+  console.log(`\n🛑 [Autofixer UI] Shutting down...`);
+  process.exit(0);
+});

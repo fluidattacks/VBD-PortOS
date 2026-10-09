@@ -1,0 +1,367 @@
+import { useState, useCallback, useEffect, Fragment } from 'react';
+import { RefreshCw, Activity, XCircle, Cpu, MemoryStick, Terminal } from 'lucide-react';
+import * as api from '../services/api';
+import { useSocketResource } from '../hooks/useSocketResource';
+import socket from '../services/socket';
+import useMounted from '../hooks/useMounted';
+import { formatCount, formatDateTime, formatPercent } from '../utils/formatters';
+import PageSkeleton from '../components/ui/PageSkeleton';
+
+const AGENT_EVENTS = [];
+
+export function AgentsPage() {
+  const [killing, setKilling] = useState({});
+  const [expandedPid, setExpandedPid] = useState(null);
+  const mounted = useMounted();
+
+  const loadAgents = useCallback(() => api.getAgents({ silent: true }), []);
+  const { data, loading, refetch, updateData } = useSocketResource(loadAgents, {
+    namespace: 'agent-processes', events: AGENT_EVENTS,
+  });
+  const agents = data ?? [];
+
+  useEffect(() => {
+    const onSnapshot = frame => {
+      if (Array.isArray(frame?.agents)) updateData(frame.agents);
+    };
+    socket.on('agent-processes:changed', onSnapshot);
+    return () => socket.off('agent-processes:changed', onSnapshot);
+  }, [updateData]);
+
+  const handleKill = async (pid) => {
+    setKilling(prev => ({ ...prev, [pid]: true }));
+    const result = await api.killAgent(pid).catch(() => null);
+    if (!mounted.current) return;
+    if (result?.success) updateData(previous => (previous ?? []).filter(agent => agent.pid !== pid));
+    setKilling(prev => ({ ...prev, [pid]: false }));
+  };
+
+  const toggleExpand = (pid) => {
+    setExpandedPid(prev => prev === pid ? null : pid);
+  };
+
+  const totalCpu = agents.reduce((sum, a) => sum + (a.cpu || 0), 0);
+  const totalMemory = agents.reduce((sum, a) => sum + (a.memory || 0), 0);
+
+  if (loading) {
+    return (
+      <PageSkeleton
+        label="Scanning for AI agents"
+        headerRowClass="flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+        titleWidthClass="w-56"
+        cards={3}
+        sidebar={false}
+      />
+    );
+  }
+
+  return (
+    <div className="space-y-4 lg:space-y-6">
+      {/* Header */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div className="flex items-center gap-2 sm:gap-3">
+          <Activity size={24} className="sm:w-7 sm:h-7 text-port-accent-2" />
+          <h1 className="text-lg sm:text-2xl font-bold text-white font-mono">AI Agent Processes</h1>
+        </div>
+        <button
+          onClick={refetch}
+          className="flex items-center justify-center gap-2 px-3 py-1.5 sm:px-4 sm:py-2 bg-port-card border border-port-border hover:border-gray-500 text-white text-sm rounded-lg transition-colors"
+        >
+          <RefreshCw size={14} className="sm:w-4 sm:h-4" />
+          <span className="sm:inline">Refresh</span>
+        </button>
+      </div>
+
+      {/* Summary Cards */}
+      <div className="grid grid-cols-3 gap-2 sm:gap-4">
+        <div className="bg-port-card border border-port-border rounded-lg sm:rounded-xl p-2 sm:p-5 flex items-center justify-between">
+          <div>
+            <div className="text-gray-400 text-[10px] sm:text-sm mb-0.5 sm:mb-1">Processes</div>
+            <div className="text-lg sm:text-3xl font-bold text-white font-mono">{agents.length}</div>
+          </div>
+          <Terminal size={20} className="sm:w-8 sm:h-8 text-port-accent-2" />
+        </div>
+        <div className="bg-port-card border border-port-border rounded-lg sm:rounded-xl p-2 sm:p-5 flex items-center justify-between">
+          <div>
+            <div className="text-gray-400 text-[10px] sm:text-sm mb-0.5 sm:mb-1">CPU</div>
+            <div className="text-lg sm:text-3xl font-bold text-white font-mono">{formatPercent(totalCpu)}</div>
+          </div>
+          <Cpu size={20} className="sm:w-8 sm:h-8 text-port-accent" />
+        </div>
+        <div className="bg-port-card border border-port-border rounded-lg sm:rounded-xl p-2 sm:p-5 flex items-center justify-between">
+          <div>
+            <div className="text-gray-400 text-[10px] sm:text-sm mb-0.5 sm:mb-1">Memory</div>
+            <div className="text-lg sm:text-3xl font-bold text-white font-mono">{formatPercent(totalMemory)}</div>
+          </div>
+          <MemoryStick size={20} className="sm:w-8 sm:h-8 text-port-success" />
+        </div>
+      </div>
+
+      {/* Running Processes */}
+      <div className="bg-port-card border border-port-border rounded-lg sm:rounded-xl">
+        <div className="px-3 sm:px-6 py-3 sm:py-4 border-b border-port-border">
+          <h2 className="text-base sm:text-lg font-semibold text-white">Running Processes</h2>
+        </div>
+
+        {/* Mobile Card View */}
+        <div className="sm:hidden divide-y divide-port-border">
+          {agents.map(agent => (
+            <div key={agent.pid} className="p-3">
+              {/* Top row: Name, PID, Runtime, Kill button */}
+              <div className="flex items-center justify-between gap-2 mb-2">
+                <div className="flex items-center gap-2 min-w-0 flex-1">
+                  <span className="font-mono text-white text-sm truncate">{agent.agentName.toLowerCase()}</span>
+                  {agent.source === 'cos' && (
+                    <span className="px-1.5 py-0.5 text-[10px] bg-port-accent-2/20 text-port-accent-2 rounded shrink-0">CoS</span>
+                  )}
+                  <span className="text-gray-500 text-xs shrink-0">#{agent.pid}</span>
+                  <span className="font-mono text-port-accent text-xs shrink-0 whitespace-nowrap">{agent.runtimeFormatted}</span>
+                </div>
+                <button
+                  onClick={() => handleKill(agent.pid)}
+                  disabled={killing[agent.pid]}
+                  className="shrink-0 px-2 py-1 bg-port-error/20 text-port-error hover:bg-port-error/30 hover:text-port-error/80 disabled:opacity-50 rounded text-xs font-medium flex items-center gap-1"
+                >
+                  <XCircle size={14} className={killing[agent.pid] ? 'animate-pulse' : ''} />
+                  Kill
+                </button>
+              </div>
+              {/* Stats row: CPU & Memory */}
+              <div className="flex items-center gap-4 text-xs">
+                <div className="flex items-center gap-1">
+                  <span className="text-gray-500">CPU</span>
+                  <span className="font-mono text-port-success">{formatPercent(agent.cpu)}</span>
+                </div>
+                <div className="flex items-center gap-1">
+                  <span className="text-gray-500">Mem</span>
+                  <span className="font-mono text-port-accent">{formatPercent(agent.memory)}</span>
+                </div>
+              </div>
+              <button
+                onClick={() => toggleExpand(agent.pid)}
+                className="mt-2 text-xs text-gray-500 hover:text-white flex items-center gap-1"
+              >
+                <span className={`inline-block transition-transform ${expandedPid === agent.pid ? 'rotate-90' : ''}`}>▶</span>
+                {expandedPid === agent.pid ? 'Hide details' : 'Show details'}
+              </button>
+              {expandedPid === agent.pid && (
+                <div className="mt-3 pt-3 border-t border-port-border space-y-3">
+                  <div className="grid grid-cols-2 gap-3 text-xs">
+                    <div>
+                      <div className="text-gray-500 uppercase tracking-wide mb-0.5">Agent Type</div>
+                      <div className="text-port-accent-2">{agent.agentName}</div>
+                    </div>
+                    <div>
+                      <div className="text-gray-500 uppercase tracking-wide mb-0.5">Parent PID</div>
+                      <div className="text-gray-300 font-mono">{agent.ppid}</div>
+                    </div>
+                    {agent.model && (
+                      <div>
+                        <div className="text-gray-500 uppercase tracking-wide mb-0.5">Model</div>
+                        <div className="text-yellow-400 font-mono">{agent.model}</div>
+                      </div>
+                    )}
+                    {agent.taskId && (
+                      <div>
+                        <div className="text-gray-500 uppercase tracking-wide mb-0.5">Task ID</div>
+                        <div className="text-gray-300 font-mono truncate">{agent.taskId}</div>
+                      </div>
+                    )}
+                  </div>
+                  {agent.prompt && (
+                    <div>
+                      <div className="text-xs text-gray-500 uppercase tracking-wide mb-1">Task</div>
+                      <div className="bg-port-bg border border-port-border rounded p-2 text-xs text-gray-300 line-clamp-3">
+                        {agent.prompt}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          ))}
+          {agents.length === 0 && (
+            <div className="px-3 py-8 text-center text-gray-500 text-sm">
+              No AI agents currently running
+            </div>
+          )}
+        </div>
+
+        {/* Desktop Table View */}
+        <div className="hidden sm:block overflow-x-auto">
+        <table className="w-full min-w-[600px]" aria-label="Running AI agents">
+          <thead>
+            <tr className="border-b border-port-border">
+              <th scope="col" className="px-4 py-4 text-left text-sm font-semibold text-gray-400 w-8">
+                <span className="sr-only">Details</span>
+              </th>
+              <th scope="col" className="px-4 py-4 text-left text-sm font-semibold text-gray-400">PID</th>
+              <th scope="col" className="px-4 py-4 text-left text-sm font-semibold text-gray-400">Runtime</th>
+              <th scope="col" className="px-4 py-4 text-left text-sm font-semibold text-gray-400">CPU %</th>
+              <th scope="col" className="px-4 py-4 text-left text-sm font-semibold text-gray-400">Memory %</th>
+              <th scope="col" className="px-4 py-4 text-left text-sm font-semibold text-gray-400">Command</th>
+              <th scope="col" className="px-4 py-4 text-center text-sm font-semibold text-gray-400">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {agents.map(agent => (
+              <Fragment key={agent.pid}>
+                <tr className="border-b border-port-border/50 hover:bg-port-border/20">
+                  <td className="px-4 py-4">
+                    <button
+                      onClick={() => toggleExpand(agent.pid)}
+                      aria-expanded={expandedPid === agent.pid}
+                      aria-label={`${expandedPid === agent.pid ? 'Collapse' : 'Expand'} details for agent ${agent.pid}`}
+                      className="text-gray-400 hover:text-white transition-transform"
+                    >
+                      <span className={`inline-block transition-transform ${expandedPid === agent.pid ? 'rotate-90' : ''}`}>▶</span>
+                    </button>
+                  </td>
+                  <td className="px-4 py-4 font-mono text-white">{agent.pid}</td>
+                  <td className="px-4 py-4 font-mono text-port-accent">{agent.runtimeFormatted}</td>
+                  <td className="px-4 py-4 font-mono text-port-success">{formatPercent(agent.cpu)}</td>
+                  <td className="px-4 py-4 font-mono text-port-accent">{formatPercent(agent.memory)}</td>
+                  <td className="px-4 py-4 font-mono text-gray-300">
+                    {agent.agentName.toLowerCase()}
+                    {agent.source === 'cos' && (
+                      <span className="ml-2 px-1.5 py-0.5 text-[10px] bg-port-accent-2/20 text-port-accent-2 rounded">CoS</span>
+                    )}
+                  </td>
+                  <td className="px-4 py-4 text-center">
+                    <button
+                      onClick={() => handleKill(agent.pid)}
+                      disabled={killing[agent.pid]}
+                      className="px-3 py-1.5 bg-port-error/20 text-port-error hover:bg-port-error/30 hover:text-port-error/80 disabled:opacity-50 rounded text-sm font-medium inline-flex items-center gap-1.5 transition-colors"
+                      title="Kill process"
+                    >
+                      <XCircle size={16} className={killing[agent.pid] ? 'animate-pulse' : ''} />
+                      Kill
+                    </button>
+                  </td>
+                </tr>
+                {expandedPid === agent.pid && (
+                  <tr>
+                    <td colSpan={7} className="p-0">
+                      <div className="bg-port-bg border-t border-port-border">
+                        <div className="px-3 sm:px-6 py-4 space-y-4">
+                          {/* Process Details Grid */}
+                          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                            <div>
+                              <div className="text-xs text-gray-500 uppercase tracking-wide mb-1">Agent Type</div>
+                              <div className="text-sm text-port-accent-2 font-medium">
+                                {agent.agentName}
+                                {agent.source === 'cos' && <span className="ml-1 text-xs text-port-accent-2/80">(CoS)</span>}
+                              </div>
+                            </div>
+                            <div>
+                              <div className="text-xs text-gray-500 uppercase tracking-wide mb-1">Parent PID</div>
+                              <div className="text-sm text-gray-300 font-mono">{agent.ppid}</div>
+                            </div>
+                            <div>
+                              <div className="text-xs text-gray-500 uppercase tracking-wide mb-1">Started At</div>
+                              <div className="text-sm text-gray-300">{formatDateTime(agent.startTime)}</div>
+                            </div>
+                            <div>
+                              <div className="text-xs text-gray-500 uppercase tracking-wide mb-1">Runtime (ms)</div>
+                              <div className="text-sm text-gray-300 font-mono">{formatCount(agent.runtime)}</div>
+                            </div>
+                            {agent.model && (
+                              <div>
+                                <div className="text-xs text-gray-500 uppercase tracking-wide mb-1">Model</div>
+                                <div className="text-sm text-yellow-400 font-mono">{agent.model}</div>
+                              </div>
+                            )}
+                            {agent.agentId && (
+                              <div>
+                                <div className="text-xs text-gray-500 uppercase tracking-wide mb-1">Agent ID</div>
+                                <div className="text-sm text-gray-300 font-mono">{agent.agentId}</div>
+                              </div>
+                            )}
+                            {agent.taskId && (
+                              <div>
+                                <div className="text-xs text-gray-500 uppercase tracking-wide mb-1">Task ID</div>
+                                <div className="text-sm text-gray-300 font-mono">{agent.taskId}</div>
+                              </div>
+                            )}
+                            {agent.workspacePath && (
+                              <div>
+                                <div className="text-xs text-gray-500 uppercase tracking-wide mb-1">Workspace</div>
+                                <div className="text-sm text-gray-300 font-mono truncate" title={agent.workspacePath}>
+                                  {agent.workspacePath.split('/').pop()}
+                                </div>
+                              </div>
+                            )}
+                          </div>
+
+                          {/* Full Command */}
+                          <div>
+                            <div className="text-xs text-gray-500 uppercase tracking-wide mb-2">Full Command</div>
+                            <div className="bg-port-card border border-port-border rounded-lg p-3 overflow-x-auto">
+                              <code className="text-sm text-port-accent/90 font-mono whitespace-pre-wrap break-all">
+                                {agent.command}
+                              </code>
+                            </div>
+                          </div>
+
+                          {/* Task Prompt (for CoS agents) */}
+                          {agent.prompt && (
+                            <div>
+                              <div className="text-xs text-gray-500 uppercase tracking-wide mb-2">Task Prompt</div>
+                              <div className="bg-port-card border border-port-border rounded-lg p-3 overflow-x-auto max-h-48 overflow-y-auto">
+                                <p className="text-sm text-gray-300 whitespace-pre-wrap">
+                                  {agent.prompt}
+                                </p>
+                              </div>
+                            </div>
+                          )}
+
+                          {/* Resource Usage Bar */}
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                            <div>
+                              <div className="flex items-center justify-between text-xs mb-1">
+                                <span className="text-gray-500 uppercase tracking-wide">CPU Usage</span>
+                                <span className="text-port-success font-mono">{formatPercent(agent.cpu)}</span>
+                              </div>
+                              <div className="h-2 bg-port-border rounded-full overflow-hidden">
+                                <div
+                                  className="h-full bg-port-success rounded-full transition-all"
+                                  style={{ width: `${Math.min(agent.cpu || 0, 100)}%` }}
+                                />
+                              </div>
+                            </div>
+                            <div>
+                              <div className="flex items-center justify-between text-xs mb-1">
+                                <span className="text-gray-500 uppercase tracking-wide">Memory Usage</span>
+                                <span className="text-port-accent font-mono">{formatPercent(agent.memory)}</span>
+                              </div>
+                              <div className="h-2 bg-port-border rounded-full overflow-hidden">
+                                <div
+                                  className="h-full bg-port-accent rounded-full transition-all"
+                                  style={{ width: `${Math.min(agent.memory || 0, 100)}%` }}
+                                />
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    </td>
+                  </tr>
+                )}
+              </Fragment>
+            ))}
+            {agents.length === 0 && (
+              <tr>
+                <td colSpan={7} className="px-6 py-12 text-center text-gray-500">
+                  No AI agents currently running
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default AgentsPage;

@@ -1,0 +1,333 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { Lock, ShieldCheck, ShieldOff } from 'lucide-react';
+import toast from '../ui/Toast';
+import Banner from '../ui/Banner';
+import FormField from '../ui/FormField';
+import BrailleSpinner from '../BrailleSpinner';
+import AgentKeyCard from './AgentKeyCard';
+import { getAuthStatus, setAuthPassword, clearAuthPassword, listAuthSessions, revokeAuthSession } from '../../services/api';
+import { formatDateShort } from '../../utils/formatters';
+
+// PortOS is single-user and normally trusted because it's tailnet-only — auth
+// here is opt-in defense against an attacker on the same network (a sidecar
+// on the same tailnet, an unattended workstation). When off, every request
+// is accepted as it always was. When on, every /api request needs a valid
+// session cookie obtained by /api/auth/login.
+export function SecurityTab() {
+  const [loading, setLoading] = useState(true);
+  const [enabled, setEnabled] = useState(null);
+  const [loadError, setLoadError] = useState(false);
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [showDisable, setShowDisable] = useState(false);
+  const [disablePassword, setDisablePassword] = useState('');
+  const [disabling, setDisabling] = useState(false);
+  const statusRequestRef = useRef(0);
+  const [agentSessions, setAgentSessions] = useState([]);
+  const [revokingId, setRevokingId] = useState(null);
+  const sessionsRequestRef = useRef(0);
+
+  const loadAuthStatus = useCallback(() => {
+    const requestId = ++statusRequestRef.current;
+    setLoading(true);
+    setLoadError(false);
+    setEnabled(null);
+    getAuthStatus({ silent: true })
+      .then((status) => {
+        if (requestId !== statusRequestRef.current) return;
+        if (typeof status?.enabled !== 'boolean') {
+          setLoadError(true);
+          return;
+        }
+        setEnabled(status.enabled);
+      })
+      .catch(() => {
+        if (requestId === statusRequestRef.current) setLoadError(true);
+      })
+      .finally(() => {
+        if (requestId === statusRequestRef.current) setLoading(false);
+      });
+  }, []);
+
+  useEffect(() => {
+    loadAuthStatus();
+  }, [loadAuthStatus]);
+
+  const loadSessions = useCallback(() => {
+    if (!enabled) {
+      setAgentSessions([]);
+      return;
+    }
+    const requestId = ++sessionsRequestRef.current;
+    listAuthSessions({ silent: true })
+      .then((res) => {
+        if (requestId !== sessionsRequestRef.current) return;
+        const sessions = Array.isArray(res?.sessions) ? res.sessions : [];
+        setAgentSessions(sessions.filter((s) => s?.label === 'agent'));
+      })
+      // Listing is a nice-to-have here — a failed fetch just hides the panel
+      // rather than blocking the password form above it.
+      .catch(() => {
+        if (requestId === sessionsRequestRef.current) setAgentSessions([]);
+      });
+  }, [enabled]);
+
+  // Sessions only exist while auth is on (agentApiAuth only mints a token
+  // when isAuthEnabled(), and disabling clears every session) — skip the
+  // fetch otherwise, and drop any list left over from a prior enabled state.
+  useEffect(() => {
+    loadSessions();
+  }, [loadSessions]);
+
+  const handleRevokeSession = async (id) => {
+    setRevokingId(id);
+    const result = await revokeAuthSession(id).catch((err) => err);
+    setRevokingId(null);
+    if (result instanceof Error) {
+      toast.error(result.message || 'Revoke failed');
+      return;
+    }
+    setAgentSessions((prev) => prev.filter((s) => s.id !== id));
+    toast.success('Session revoked');
+  };
+
+  const handleSubmit = async (event) => {
+    event.preventDefault();
+    if (saving) return;
+    if (newPassword.length < 8) {
+      toast.error('Password must be at least 8 characters');
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      toast.error('Passwords do not match');
+      return;
+    }
+    if (enabled && !currentPassword) {
+      toast.error('Enter your current password to change it');
+      return;
+    }
+    setSaving(true);
+    const result = await setAuthPassword({
+      newPassword,
+      currentPassword: enabled ? currentPassword : undefined,
+    }).catch((err) => err);
+    setSaving(false);
+    if (result instanceof Error) {
+      toast.error(result.code === 'AUTH_BAD_CURRENT' ? 'Current password is incorrect' : (result.message || 'Save failed'));
+      return;
+    }
+    setEnabled(true);
+    window.dispatchEvent(new Event('portos:auth-changed'));
+    setCurrentPassword('');
+    setNewPassword('');
+    setConfirmPassword('');
+    loadSessions();
+    toast.success(enabled ? 'Password updated' : 'Login password enabled');
+  };
+
+  const handleDisable = async () => {
+    if (!disablePassword) {
+      toast.error('Enter your current password to disable auth');
+      return;
+    }
+    setDisabling(true);
+    const result = await clearAuthPassword({ currentPassword: disablePassword }).catch((err) => err);
+    setDisabling(false);
+    if (result instanceof Error) {
+      toast.error(result.code === 'AUTH_BAD_CURRENT' ? 'Current password is incorrect' : (result.message || 'Disable failed'));
+      return;
+    }
+    setEnabled(false);
+    window.dispatchEvent(new Event('portos:auth-changed'));
+    setShowDisable(false);
+    setDisablePassword('');
+    toast.success('Login password disabled');
+  };
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center py-16">
+        <BrailleSpinner text="Loading" />
+      </div>
+    );
+  }
+
+  if (loadError || enabled === null) {
+    return (
+      <Banner
+        tone="error"
+        size="md"
+        title="Authentication status unknown"
+        role="alert"
+        actions={
+          <button
+            type="button"
+            onClick={loadAuthStatus}
+            className="min-h-11 px-4 py-2 text-sm font-medium bg-port-error/20 hover:bg-port-error/30 text-port-error rounded transition-colors"
+          >
+            Retry
+          </button>
+        }
+      >
+        PortOS could not confirm whether login protection is enabled. Retry before changing security settings.
+      </Banner>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      <div className="bg-port-card border border-port-border rounded-lg p-4">
+        <div className="flex items-start gap-3">
+          {enabled
+            ? <ShieldCheck className="w-6 h-6 text-port-success shrink-0" />
+            : <ShieldOff className="w-6 h-6 text-port-warning shrink-0" />}
+          <div>
+            <h2 className="text-lg font-semibold text-white">
+              Login password {enabled ? 'enabled' : 'disabled'}
+            </h2>
+            <p className="text-sm text-gray-400 mt-1">
+              PortOS can execute commands and access files on this computer.
+              Without a password, any reachable LAN or Tailscale device, including
+              a compromised peer, may use its APIs to control this host. Set a strong,
+              unique password to reduce that risk. Keep PortOS private: a password
+              does not make public tunnels, gateways, or port forwarding safe.
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-start">
+      <form onSubmit={handleSubmit} className="bg-port-card border border-port-border rounded-lg p-4 space-y-4">
+        <h3 className="text-md font-semibold text-white flex items-center gap-2">
+          <Lock className="w-4 h-4" /> {enabled ? 'Change password' : 'Set a password'}
+        </h3>
+        {enabled && (
+          <FormField label="Current password" labelClassName="block text-sm text-gray-300 mb-1">
+            <input
+              id="security-current"
+              type="password"
+              autoComplete="current-password"
+              value={currentPassword}
+              onChange={(e) => setCurrentPassword(e.target.value)}
+              className="w-full bg-port-bg border border-port-border rounded px-3 py-2 text-white focus:border-port-accent focus:outline-none"
+            />
+          </FormField>
+        )}
+        <FormField label="New password" labelClassName="block text-sm text-gray-300 mb-1">
+          <input
+            id="security-new"
+            type="password"
+            autoComplete="new-password"
+            minLength={8}
+            value={newPassword}
+            onChange={(e) => setNewPassword(e.target.value)}
+            className="w-full bg-port-bg border border-port-border rounded px-3 py-2 text-white focus:border-port-accent focus:outline-none"
+          />
+          <p className="text-xs text-gray-500 mt-1">Minimum 8 characters.</p>
+        </FormField>
+        <FormField label="Confirm new password" labelClassName="block text-sm text-gray-300 mb-1">
+          <input
+            id="security-confirm"
+            type="password"
+            autoComplete="new-password"
+            value={confirmPassword}
+            onChange={(e) => setConfirmPassword(e.target.value)}
+            className="w-full bg-port-bg border border-port-border rounded px-3 py-2 text-white focus:border-port-accent focus:outline-none"
+          />
+        </FormField>
+        <button
+          type="submit"
+          disabled={saving || !newPassword || !confirmPassword || (enabled && !currentPassword)}
+          className="bg-port-accent text-white px-4 py-2 rounded font-medium disabled:opacity-50 disabled:cursor-not-allowed hover:opacity-90"
+        >
+          {saving ? 'Saving…' : (enabled ? 'Update password' : 'Enable login')}
+        </button>
+      </form>
+
+      {enabled && (
+        <div className="bg-port-card border border-port-border rounded-lg p-4 space-y-3">
+          <h3 className="text-md font-semibold text-white">Disable login password</h3>
+          <p className="text-sm text-gray-400">
+            Turn auth back off. PortOS will be reachable without a password again.
+          </p>
+          {!showDisable ? (
+            <button
+              type="button"
+              onClick={() => setShowDisable(true)}
+              className="bg-port-bg border border-port-border text-port-error px-3 py-2 rounded hover:border-port-error"
+            >
+              Disable login
+            </button>
+          ) : (
+            <div className="space-y-3">
+              <FormField label="Enter current password to confirm" labelClassName="block text-sm text-gray-300 mb-1">
+                <input
+                  id="security-disable"
+                  type="password"
+                  autoComplete="current-password"
+                  value={disablePassword}
+                  onChange={(e) => setDisablePassword(e.target.value)}
+                  className="w-full bg-port-bg border border-port-border rounded px-3 py-2 text-white focus:border-port-accent focus:outline-none"
+                />
+              </FormField>
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={handleDisable}
+                  disabled={disabling || !disablePassword}
+                  className="bg-port-error text-white px-3 py-2 rounded disabled:opacity-50 hover:opacity-90"
+                >
+                  {disabling ? 'Disabling…' : 'Confirm disable'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { setShowDisable(false); setDisablePassword(''); }}
+                  className="bg-port-bg border border-port-border text-gray-300 px-3 py-2 rounded"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+      </div>
+
+      {enabled && <AgentKeyCard />}
+
+      {enabled && agentSessions.length > 0 && (
+        <div className="bg-port-card border border-port-border rounded-lg p-4 space-y-3">
+          <h3 className="text-md font-semibold text-white">
+            {agentSessions.length} agent session{agentSessions.length === 1 ? '' : 's'}
+          </h3>
+          <p className="text-sm text-gray-400">
+            Loopback API credentials PortOS minted for spawned agents. Revoking one does not
+            sign you out of the browser.
+          </p>
+          <ul className="space-y-2">
+            {agentSessions.map((session) => (
+              <li
+                key={session.id}
+                className="flex items-center justify-between gap-3 bg-port-bg border border-port-border rounded px-3 py-2"
+              >
+                <span className="text-sm text-gray-300">
+                  Agent session, expires {formatDateShort(session.expiresAt)}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => handleRevokeSession(session.id)}
+                  disabled={revokingId === session.id}
+                  className="min-h-9 text-sm bg-port-bg border border-port-border text-port-error px-3 py-1.5 rounded hover:border-port-error disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {revokingId === session.id ? 'Revoking…' : 'Revoke'}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}

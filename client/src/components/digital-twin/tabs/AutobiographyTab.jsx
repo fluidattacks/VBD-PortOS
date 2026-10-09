@@ -1,0 +1,820 @@
+import { useState, useEffect, useCallback } from 'react';
+import { useSearchParams } from 'react-router';
+import {BookOpen,
+  PenLine,
+  Clock,
+  ChevronDown,
+  ChevronUp,
+  Trash2,
+  Save,
+  Send,
+  Settings,
+  SkipForward,
+  X,
+  Sparkles,
+  Link2,
+  MessageCircle,
+  ScrollText,
+  HelpCircle,
+  Lightbulb,
+  Gauge} from 'lucide-react';
+import BrailleSpinner from '../../BrailleSpinner';
+import InlineConfirmRow from '../../ui/InlineConfirmRow';
+import StoryCraftPanel from '../StoryCraftPanel';
+import * as api from '../../../services/api';
+import { copyToClipboard } from '../../../lib/clipboard';
+import { countWords } from '../../../lib/textUtils';
+import toast from '../../ui/Toast';
+import { useConfirmDelete } from '../../../hooks/useConfirmDelete';
+import { formatCount, formatDateTime, formatDateNumeric } from '../../../utils/formatters';
+import { isValidTimeString } from '../../../utils/timeWindow';
+
+// Mirrors the server's reminder default (server/services/autobiography.js
+// DEFAULT_CONFIG). The strict HH:MM check comes from the shared, parity-tested
+// `isValidTimeString` rather than a private copy of the pattern.
+const DEFAULT_REMINDER_TIME = '09:00';
+// Matches CUSTOM_PROMPT_ID in server/services/autobiography.js — the promptId a
+// story written against the user's own question is saved under.
+const CUSTOM_PROMPT_ID = 'custom';
+
+export default function AutobiographyTab({ onRefresh }) {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [stats, setStats] = useState(null);
+  const [stories, setStories] = useState([]);
+  const [themes, setThemes] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [filterTheme, setFilterTheme] = useState(null);
+
+  // Writing state
+  const [currentPrompt, setCurrentPrompt] = useState(null);
+  const [writing, setWriting] = useState(false);
+  const [storyContent, setStoryContent] = useState('');
+  const [saving, setSaving] = useState(false);
+
+  // Story ideas — the same menu the daily prompt notification offers
+  const [suggestions, setSuggestions] = useState([]);
+  const [ownQuestion, setOwnQuestion] = useState('');
+
+  // Storytelling-craft evaluation, keyed by story id while it runs
+  const [evaluatingStoryId, setEvaluatingStoryId] = useState(null);
+
+  // Config state
+  const [showConfig, setShowConfig] = useState(false);
+  const [config, setConfig] = useState(null);
+  const [reminderTimeDraft, setReminderTimeDraft] = useState(DEFAULT_REMINDER_TIME);
+
+  // Edit state
+  const [editingStory, setEditingStory] = useState(null);
+  const [editContent, setEditContent] = useState('');
+
+  // Expanded story
+  const [expandedStory, setExpandedStory] = useState(null);
+
+  // Follow-up state
+  const [followUps, setFollowUps] = useState(null); // { storyId, prompts[] }
+  const [generatingFollowUps, setGeneratingFollowUps] = useState(false);
+  const [parentStoryId, setParentStoryId] = useState(null); // when writing a follow-up
+
+  // Woven-narrative state
+  const [narrative, setNarrative] = useState(null); // { storyId, text, storyCount }
+  const [weavingStoryId, setWeavingStoryId] = useState(null);
+
+  const { isConfirming, requestDelete, cancelDelete, confirmDelete } = useConfirmDelete();
+
+  const loadData = useCallback(async () => {
+    const [statsData, storiesData, themesData, configData] = await Promise.all([
+      api.getAutobiographyStats().catch(() => null),
+      api.getAutobiographyStories(filterTheme).catch(() => []),
+      api.getAutobiographyThemes().catch(() => []),
+      api.getAutobiographyConfig().catch(() => null)
+    ]);
+    setStats(statsData);
+    setStories(storiesData);
+    setThemes(themesData);
+    setConfig(configData);
+    setReminderTimeDraft(configData?.reminder?.time || DEFAULT_REMINDER_TIME);
+    setLoading(false);
+  }, [filterTheme]);
+
+  // Suggestions come from the prompt bank and what's already been written —
+  // never from the theme filter, so this stays out of `loadData` and its
+  // filterTheme dependency. It refreshes on mount and after a save, which is
+  // exactly when the set can actually change.
+  const refreshSuggestions = useCallback(async () => {
+    setSuggestions(await api.getAutobiographySuggestions({ silent: true }).catch(() => []));
+  }, []);
+
+  useEffect(() => {
+    loadData();
+  }, [loadData]);
+
+  useEffect(() => {
+    refreshSuggestions();
+  }, [refreshSuggestions]);
+
+  // Auto-load prompt from URL param (when arriving from notification)
+  useEffect(() => {
+    const promptParam = searchParams.get('prompt');
+    if (promptParam && !loading) {
+      loadPromptById(promptParam);
+      setSearchParams({}, { replace: true });
+    }
+  }, [loading, searchParams, setSearchParams]);
+
+  // The one place a writing session starts. Every entry point below just
+  // produces the question to answer and hands it here, so per-session state
+  // can't drift between them — which it already had: two of the five reset
+  // `parentStoryId` and the other two didn't, leaving a fresh bank prompt
+  // saved as a follow-up of whatever was last open.
+  const beginWriting = (prompt, { parentStoryId: parent = null } = {}) => {
+    setCurrentPrompt(prompt);
+    setParentStoryId(parent);
+    setWriting(true);
+    setStoryContent('');
+  };
+
+  const loadPromptById = async (promptId) => {
+    const prompt = await api.getAutobiographyPromptById(promptId).catch(() => null);
+    if (prompt) beginWriting(prompt);
+  };
+
+  const startWriting = async () => {
+    const prompt = await api.getAutobiographyPrompt(undefined, { silent: true }).catch((err) => {
+      toast.error(err.message);
+      return null;
+    });
+    if (prompt) beginWriting(prompt);
+  };
+
+  // Write against a question the user typed themselves. The story still answers
+  // a question — it's just theirs rather than one from the bank.
+  const startOwnQuestion = () => {
+    const question = ownQuestion.trim();
+    if (!question) {
+      toast.error('Write a question first');
+      return;
+    }
+    beginWriting({
+      id: CUSTOM_PROMPT_ID,
+      themeId: CUSTOM_PROMPT_ID,
+      themeLabel: 'Your Own Question',
+      text: question
+    });
+    setOwnQuestion('');
+  };
+
+  const skipPrompt = async () => {
+    const prompt = await api.getAutobiographyPrompt(currentPrompt?.id).catch(() => null);
+    if (prompt && prompt.id !== currentPrompt?.id) {
+      setCurrentPrompt(prompt);
+      setStoryContent('');
+    } else {
+      toast('No more prompts available right now', { icon: 'ℹ️' });
+    }
+  };
+
+  const saveStory = async () => {
+    if (!storyContent.trim()) {
+      toast.error('Write something before saving');
+      return;
+    }
+    setSaving(true);
+    // A follow-up and a user-written question both carry their question text in
+    // customPromptText — neither has a bank prompt the server could look it up from.
+    const opts = (parentStoryId || currentPrompt.id === CUSTOM_PROMPT_ID)
+      ? { parentStoryId: parentStoryId || undefined, customPromptText: currentPrompt.text }
+      : {};
+    const result = await api.saveAutobiographyStory(currentPrompt.id, storyContent.trim(), opts, { silent: true })
+      .catch((err) => { toast.error(err.message); return null; });
+
+    if (result) {
+      toast.success(`Story saved (${result.wordCount} words)`);
+      setWriting(false);
+      setCurrentPrompt(null);
+      setStoryContent('');
+      setParentStoryId(null);
+      // Show follow-ups from the saved story if it already has them, otherwise offer to generate
+      setFollowUps({ storyId: result.id, prompts: result.followUpPrompts || null });
+      setExpandedStory(result.id);
+      loadData();
+      // The prompt just used drops out of the bank, so the menu changes here.
+      refreshSuggestions();
+      onRefresh?.();
+    }
+    setSaving(false);
+  };
+
+  const handleGenerateFollowUps = async (storyId) => {
+    setGeneratingFollowUps(true);
+    const result = await api.generateAutobiographyFollowUps(storyId, undefined, { silent: true })
+      .catch((err) => { toast.error(err.message); return null; });
+
+    if (result?.followUps) {
+      setFollowUps({ storyId, prompts: result.followUps });
+      // Update the story in local state
+      setStories(prev => prev.map(s =>
+        s.id === storyId ? { ...s, followUpPrompts: result.followUps } : s
+      ));
+      toast.success('Follow-up questions generated');
+    }
+    setGeneratingFollowUps(false);
+  };
+
+  const handleEvaluateStory = async (storyId) => {
+    setEvaluatingStoryId(storyId);
+    const result = await api.evaluateAutobiographyStory(storyId, undefined, { silent: true })
+      .catch((err) => { toast.error(err.message); return null; });
+    if (result?.evaluation) {
+      setStories(prev => prev.map(s => (s.id === storyId ? { ...s, evaluation: result.evaluation } : s)));
+      toast.success(`Storytelling score: ${result.evaluation.overallScore}/${result.evaluation.maxScore}`);
+    }
+    setEvaluatingStoryId(prev => (prev === storyId ? null : prev));
+  };
+
+  const handleWeaveNarrative = async (storyId) => {
+    setWeavingStoryId(storyId);
+    // request() already toasts on failure; the catch only swallows so the
+    // loading state still resets (avoids the double-toast in AGENTS.md).
+    const result = await api.weaveAutobiographyNarrative(storyId).catch(() => null);
+    if (result?.narrative) {
+      setNarrative({ storyId, text: result.narrative, storyCount: result.storyCount });
+    }
+    setWeavingStoryId(null);
+  };
+
+  // A story's chain is "weavable" once it links to at least one other story
+  // (it's part of a follow-up chain as either parent or child).
+  const isChainable = useCallback((story) => (
+    !!story.parentStoryId || stories.some(s => s.parentStoryId === story.id)
+  ), [stories]);
+
+  const startFollowUp = (parentId, questionText, themeId, themeLabel) => {
+    beginWriting(
+      { id: `followup-${parentId}`, themeId, themeLabel, text: questionText },
+      { parentStoryId: parentId }
+    );
+    setFollowUps(null);
+  };
+
+  const handleUpdateStory = async (storyId) => {
+    if (!editContent.trim()) return;
+    const result = await api.updateAutobiographyStory(storyId, editContent.trim(), { silent: true })
+      .catch((err) => { toast.error(err.message); return null; });
+    if (result) {
+      toast.success('Story updated');
+      setEditingStory(null);
+      setEditContent('');
+      loadData();
+    }
+  };
+
+  const handleDeleteStory = async (storyId) => {
+    const result = await api.deleteAutobiographyStory(storyId, { silent: true })
+      .catch((err) => { toast.error(err.message); return null; });
+    if (result) {
+      toast.success('Story deleted');
+      loadData();
+    }
+  };
+
+  // A `type="time"` input fires onChange for every intermediate keystroke,
+  // including the empty string while the hour is being retyped — PATCHing each
+  // one would 400 against the server's strict HH:MM schema mid-edit, restamp
+  // the reminder's updatedAt, and re-register the cron on every partial value.
+  // So the field is a local draft that commits on blur, and an unusable value
+  // reverts to what is saved rather than being sent.
+  const commitReminderTime = async () => {
+    const saved = config?.reminder?.time || DEFAULT_REMINDER_TIME;
+    if (!isValidTimeString(reminderTimeDraft)) {
+      setReminderTimeDraft(saved);
+      return;
+    }
+    if (reminderTimeDraft === saved) return;
+    // A rejected save must snap the field back too. Leaving the typed value on
+    // screen after a failed PATCH shows a wake-up time that is not the one
+    // registered, and the user has no reason to re-save it.
+    const result = await handleConfigUpdate({ reminder: { time: reminderTimeDraft } });
+    if (!result) setReminderTimeDraft(saved);
+  };
+
+  const handleConfigUpdate = async (updates) => {
+    const result = await api.updateAutobiographyConfig(updates, { silent: true })
+      .catch((err) => { toast.error(err.message); return null; });
+    if (result) {
+      setConfig(result);
+      toast.success('Settings updated');
+    }
+    return result;
+  };
+
+  const wordCount = countWords(storyContent);
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center py-12">
+        <BrailleSpinner text="Loading" />
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6 max-w-4xl">
+      {/* Header Stats */}
+      <div className="flex flex-wrap items-center gap-4">
+        <div className="flex items-center gap-2">
+          <BookOpen className="w-5 h-5 text-amber-400" />
+          <span className="text-lg font-semibold text-white">Autobiography</span>
+        </div>
+        {stats && (
+          <div className="flex flex-wrap gap-3 text-sm text-gray-400">
+            <span>{stats.totalStories} stories</span>
+            <span>{formatCount(stats.totalWords, { fallback: '0' })} words</span>
+            <span>{stats.promptsRemaining} prompts remaining</span>
+          </div>
+        )}
+        <div className="ml-auto flex items-center gap-2">
+          <button
+            onClick={() => setShowConfig(!showConfig)}
+            className="p-2 rounded text-gray-400 hover:text-white hover:bg-port-card transition-colors"
+            title="Settings" aria-label="Settings"
+          >
+            <Settings size={16} />
+          </button>
+          <button
+            onClick={startWriting}
+            className="flex items-center gap-2 px-3 py-2 bg-port-accent text-white rounded text-sm font-medium hover:bg-port-accent/80 transition-colors"
+          >
+            <PenLine size={14} />
+            Write a Story
+          </button>
+        </div>
+      </div>
+
+      {/* Config Panel */}
+      {showConfig && config && (
+        <div className="bg-port-card border border-port-border rounded-lg p-4 space-y-3">
+          <h3 className="text-sm font-medium text-white">Prompt Settings</h3>
+          <div className="flex flex-wrap items-center gap-4">
+            <label className="flex items-center gap-2 text-sm text-gray-300">
+              <input
+                type="checkbox"
+                checked={config.enabled}
+                onChange={(e) => handleConfigUpdate({ enabled: e.target.checked })}
+                className="rounded border-port-border"
+              />
+              Enable automatic prompts
+            </label>
+            <label className="flex items-center gap-2 text-sm text-gray-300">
+              Prompt every
+              <select
+                value={config.intervalHours}
+                onChange={(e) => handleConfigUpdate({ intervalHours: parseInt(e.target.value, 10) })}
+                className="bg-port-bg border border-port-border rounded px-2 py-1 text-sm text-white"
+              >
+                <option value="12">12 hours</option>
+                <option value="24">24 hours</option>
+                <option value="48">2 days</option>
+                <option value="72">3 days</option>
+                <option value="168">Weekly</option>
+              </select>
+            </label>
+          </div>
+          <div className="flex flex-wrap items-center gap-4 pt-3 border-t border-port-border">
+            <label className="flex items-center gap-2 text-sm text-gray-300" htmlFor="autobiography-reminder-enabled">
+              <input
+                id="autobiography-reminder-enabled"
+                type="checkbox"
+                checked={config.reminder?.enabled === true}
+                onChange={(e) => handleConfigUpdate({ reminder: { enabled: e.target.checked } })}
+                className="rounded border-port-border"
+              />
+              Daily story prompt
+            </label>
+            <label className="flex items-center gap-2 text-sm text-gray-300" htmlFor="autobiography-reminder-time">
+              at
+              <input
+                id="autobiography-reminder-time"
+                type="time"
+                value={reminderTimeDraft}
+                onChange={(e) => setReminderTimeDraft(e.target.value)}
+                onBlur={commitReminderTime}
+                onKeyDown={(e) => { if (e.key === 'Enter' && !e.repeat) commitReminderTime(); }}
+                disabled={config.reminder?.enabled !== true}
+                className="bg-port-bg border border-port-border rounded px-2 py-1 text-sm text-white disabled:opacity-50"
+              />
+            </label>
+          </div>
+          {config.reminder?.enabled === true && (
+            <p className="text-xs text-gray-500">
+              Skipped on any day you already wrote a story.
+            </p>
+          )}
+          {config.lastPromptAt && (
+            <p className="text-xs text-gray-500">
+              Last prompt: {formatDateTime(config.lastPromptAt)}
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* Story ideas — the same menu the daily prompt offers, plus your own question */}
+      {!writing && (
+        <div className="bg-port-card border border-port-border rounded-lg p-5 space-y-4">
+          <div className="flex items-center gap-2">
+            <Lightbulb className="w-4 h-4 text-amber-400" />
+            <span className="text-sm font-medium text-white">Story ideas</span>
+            <span className="text-xs text-gray-500">Every story answers a question</span>
+          </div>
+          {suggestions.length > 0 && (
+            <div className="space-y-2">
+              {suggestions.map((prompt) => (
+                <button
+                  key={prompt.id}
+                  onClick={() => beginWriting(prompt)}
+                  className="w-full text-left p-3 rounded-lg bg-port-bg border border-port-border hover:border-port-accent/50 transition-colors group"
+                >
+                  <div className="flex items-start gap-2">
+                    <PenLine size={14} className="mt-0.5 text-port-accent/60 group-hover:text-port-accent shrink-0" />
+                    <span className="text-sm text-gray-300 group-hover:text-white">
+                      <span className="text-xs text-port-accent mr-2">{prompt.themeLabel}</span>
+                      {prompt.text}
+                    </span>
+                  </div>
+                </button>
+              ))}
+            </div>
+          )}
+          <div className="space-y-2">
+            <label htmlFor="autobiography-own-question" className="flex items-center gap-1.5 text-xs text-gray-400">
+              <HelpCircle size={12} />
+              Or answer your own question
+            </label>
+            <div className="flex flex-col sm:flex-row gap-2">
+              <input
+                id="autobiography-own-question"
+                type="text"
+                value={ownQuestion}
+                maxLength={500}
+                onChange={(e) => setOwnQuestion(e.target.value)}
+                // !e.repeat: a held Enter would otherwise auto-repeat into the story
+                // textarea that mounts autoFocused (client/src/AGENTS.md).
+                onKeyDown={(e) => { if (e.key === 'Enter' && !e.repeat) startOwnQuestion(); }}
+                placeholder="Why do I like black licorice?"
+                className="flex-1 bg-port-bg border border-port-border rounded px-3 py-2 text-sm text-white placeholder-gray-600 focus:outline-hidden focus:border-port-accent/50"
+              />
+              <button
+                onClick={startOwnQuestion}
+                disabled={!ownQuestion.trim()}
+                className="px-3 py-2 bg-port-accent text-white rounded text-sm font-medium hover:bg-port-accent/80 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                Answer it
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Follow-up Suggestions (shown after saving a story) */}
+      {followUps && !writing && (
+        <div className="bg-port-card border border-amber-500/30 rounded-lg p-5 space-y-3">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Sparkles className="w-4 h-4 text-amber-400" />
+              <span className="text-sm font-medium text-amber-300">Go Deeper</span>
+            </div>
+            <button
+              onClick={() => setFollowUps(null)}
+              aria-label="Close"
+              className="p-1 text-gray-500 hover:text-white min-h-[44px] min-w-[44px] flex items-center justify-center"
+            >
+              <X size={14} />
+            </button>
+          </div>
+          {followUps.prompts ? (
+            <div className="space-y-2">
+              <p className="text-xs text-gray-400">Click a question to continue writing about this story:</p>
+              {followUps.prompts.map((question, i) => {
+                const story = stories.find(s => s.id === followUps.storyId);
+                return (
+                  <button
+                    key={i}
+                    onClick={() => startFollowUp(
+                      followUps.storyId,
+                      question,
+                      story?.themeId || 'unknown',
+                      story?.themeLabel || 'Unknown'
+                    )}
+                    className="w-full text-left p-3 rounded-lg bg-port-bg border border-port-border hover:border-amber-500/50 transition-colors group"
+                  >
+                    <div className="flex items-start gap-2">
+                      <MessageCircle size={14} className="mt-0.5 text-amber-400/60 group-hover:text-amber-400 shrink-0" />
+                      <span className="text-sm text-gray-300 group-hover:text-white">{question}</span>
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          ) : (
+            <button
+              onClick={() => handleGenerateFollowUps(followUps.storyId)}
+              disabled={generatingFollowUps}
+              className="flex items-center gap-2 px-3 py-2 bg-amber-500/10 text-amber-300 rounded text-sm hover:bg-amber-500/20 transition-colors disabled:opacity-50"
+            >
+              {generatingFollowUps
+                ? <BrailleSpinner />
+                : <Sparkles size={14} />}
+              {generatingFollowUps ? 'Generating...' : 'Generate follow-up questions'}
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Writing Mode */}
+      {writing && currentPrompt && (
+        <div className="bg-port-card border border-port-accent/30 rounded-lg p-6 space-y-4">
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              {parentStoryId && (
+                <div className="flex items-center gap-1 mb-1">
+                  <Link2 size={12} className="text-amber-400" />
+                  <span className="text-xs text-amber-400">Follow-up</span>
+                </div>
+              )}
+              <span className="text-xs font-medium text-port-accent uppercase tracking-wide">
+                {currentPrompt.themeLabel}
+              </span>
+              <p className="text-white text-lg mt-1">{currentPrompt.text}</p>
+            </div>
+            <button
+              onClick={() => { setWriting(false); setCurrentPrompt(null); setStoryContent(''); setParentStoryId(null); }}
+              aria-label="Close"
+              className="p-1 text-gray-500 hover:text-white min-h-[44px] min-w-[44px] flex items-center justify-center"
+            >
+              <X size={16} />
+            </button>
+          </div>
+
+          <textarea
+            aria-label="Your story"
+            value={storyContent}
+            onChange={(e) => setStoryContent(e.target.value)}
+            placeholder="Start writing your story... Take about 5 minutes."
+            className="w-full h-64 bg-port-bg border border-port-border rounded-lg p-4 text-white text-sm resize-y focus:outline-hidden focus:border-port-accent/50 placeholder-gray-600"
+            autoFocus
+          />
+
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3 text-sm text-gray-400">
+              <span>{formatCount(wordCount)} words</span>
+              <Clock size={14} />
+              <span>~{Math.max(1, Math.round(wordCount / 150))} min read</span>
+            </div>
+            <div className="flex items-center gap-2">
+              {/* Skip swaps in a different BANK prompt — meaningless for a
+                  follow-up or a question the user wrote themselves. */}
+              {!parentStoryId && currentPrompt.id !== CUSTOM_PROMPT_ID && (
+                <button
+                  onClick={skipPrompt}
+                  className="flex items-center gap-1 px-3 py-2 text-sm text-gray-400 hover:text-white transition-colors"
+                  title="Get a different prompt"
+                >
+                  <SkipForward size={14} />
+                  Skip
+                </button>
+              )}
+              <button
+                onClick={saveStory}
+                disabled={saving || !storyContent.trim()}
+                className="flex items-center gap-2 px-4 py-2 bg-port-accent text-white rounded text-sm font-medium hover:bg-port-accent/80 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {saving ? <BrailleSpinner /> : <Send size={14} />}
+                Save Story
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Theme Filter */}
+      {stories.length > 0 && (
+        <div className="flex flex-wrap gap-2">
+          <button
+            onClick={() => setFilterTheme(null)}
+            className={`px-3 py-1 rounded-full text-xs font-medium transition-colors ${
+              !filterTheme
+                ? 'bg-port-accent text-white'
+                : 'bg-port-card text-gray-400 hover:text-white border border-port-border'
+            }`}
+          >
+            All
+          </button>
+          {themes.map((theme) => (
+            <button
+              key={theme.id}
+              onClick={() => setFilterTheme(filterTheme === theme.id ? null : theme.id)}
+              className={`px-3 py-1 rounded-full text-xs font-medium transition-colors ${
+                filterTheme === theme.id
+                  ? 'bg-port-accent text-white'
+                  : 'bg-port-card text-gray-400 hover:text-white border border-port-border'
+              }`}
+            >
+              {theme.label}
+              {stats?.byTheme?.[theme.id] ? ` (${stats.byTheme[theme.id]})` : ''}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* Stories List */}
+      {stories.length === 0 && !writing && (
+        <div className="text-center py-12 text-gray-500">
+          <BookOpen className="w-12 h-12 mx-auto mb-3 opacity-50" />
+          <p className="text-lg">No stories yet</p>
+          <p className="text-sm mt-1">Click "Write a Story" to get your first prompt</p>
+        </div>
+      )}
+
+      {stories.map((story) => {
+        const isExpanded = expandedStory === story.id;
+        const isEditing = editingStory === story.id;
+
+        return (
+          <div
+            key={story.id}
+            className="bg-port-card border border-port-border rounded-lg overflow-hidden"
+          >
+            <button
+              onClick={() => setExpandedStory(isExpanded ? null : story.id)}
+              className="w-full flex items-center justify-between p-4 text-left hover:bg-port-bg/50 transition-colors"
+            >
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2 mb-1">
+                  <span className="text-xs font-medium text-port-accent">{story.themeLabel}</span>
+                  {story.parentStoryId && (
+                    <span className="flex items-center gap-0.5 text-xs text-amber-400">
+                      <Link2 size={10} />
+                      follow-up
+                    </span>
+                  )}
+                  <span className="text-xs text-gray-500">{formatCount(story.wordCount)} words</span>
+                  <span className="text-xs text-gray-600">
+                    {formatDateNumeric(story.createdAt)}
+                  </span>
+                </div>
+                <p className="text-sm text-gray-300 truncate">{story.promptText}</p>
+              </div>
+              {isExpanded ? <ChevronUp size={16} className="text-gray-500 shrink-0" /> : <ChevronDown size={16} className="text-gray-500 shrink-0" />}
+            </button>
+
+            {isExpanded && (
+              <div className="border-t border-port-border p-4 space-y-3">
+                {isEditing ? (
+                  <>
+                    <textarea
+                      aria-label="Edit story"
+                      value={editContent}
+                      onChange={(e) => setEditContent(e.target.value)}
+                      className="w-full h-48 bg-port-bg border border-port-border rounded p-3 text-white text-sm resize-y focus:outline-hidden focus:border-port-accent/50"
+                    />
+                    <div className="flex items-center gap-2 justify-end">
+                      <button
+                        onClick={() => { setEditingStory(null); setEditContent(''); }}
+                        className="px-3 py-1.5 text-sm text-gray-400 hover:text-white"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        onClick={() => handleUpdateStory(story.id)}
+                        className="flex items-center gap-1 px-3 py-1.5 bg-port-accent text-white rounded text-sm hover:bg-port-accent/80"
+                      >
+                        <Save size={12} />
+                        Save
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <p className="text-sm text-white whitespace-pre-wrap leading-relaxed">
+                      {story.content}
+                    </p>
+
+                    {/* Follow-up prompts inline */}
+                    {story.followUpPrompts?.length > 0 && (
+                      <div className="mt-3 space-y-1.5">
+                        <p className="text-xs text-amber-400 flex items-center gap-1">
+                          <Sparkles size={12} />
+                          Follow-up questions
+                        </p>
+                        {story.followUpPrompts.map((q, i) => (
+                          <button
+                            key={i}
+                            onClick={() => startFollowUp(story.id, q, story.themeId, story.themeLabel)}
+                            className="w-full text-left p-2 rounded bg-port-bg/50 border border-port-border/50 hover:border-amber-500/40 transition-colors group"
+                          >
+                            <div className="flex items-start gap-2">
+                              <MessageCircle size={12} className="mt-0.5 text-amber-400/50 group-hover:text-amber-400 shrink-0" />
+                              <span className="text-xs text-gray-400 group-hover:text-gray-200">{q}</span>
+                            </div>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+
+                    {/* Storytelling-craft score */}
+                    <StoryCraftPanel evaluation={story.evaluation} />
+
+                    {/* Woven narrative for this chain */}
+                    {narrative?.storyId === story.id && (
+                      <div className="mt-3 bg-port-bg border border-amber-500/30 rounded-lg p-4 space-y-2">
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs text-amber-300 flex items-center gap-1">
+                            <ScrollText size={12} />
+                            Woven narrative ({narrative.storyCount} stories)
+                          </span>
+                          <div className="flex items-center gap-2">
+                            <button
+                              onClick={() => copyToClipboard(narrative.text, 'Narrative copied')}
+                              className="text-xs text-gray-400 hover:text-white transition-colors"
+                            >
+                              Copy
+                            </button>
+                            <button
+                              onClick={() => setNarrative(null)}
+                              className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center p-0.5 text-gray-500 hover:text-white"
+                              aria-label="Dismiss narrative"
+                            >
+                              <X size={12} />
+                            </button>
+                          </div>
+                        </div>
+                        <p className="text-sm text-white whitespace-pre-wrap leading-relaxed">
+                          {narrative.text}
+                        </p>
+                      </div>
+                    )}
+
+                    <div className="flex flex-wrap items-center gap-2 justify-end pt-2 border-t border-port-border/50">
+                      <button
+                        onClick={() => handleEvaluateStory(story.id)}
+                        disabled={evaluatingStoryId === story.id}
+                        className="flex items-center gap-1 px-2 py-1 text-xs text-emerald-400/70 hover:text-emerald-400 transition-colors disabled:opacity-50"
+                        title="Score this story against the seven storytelling moves and CART"
+                      >
+                        {evaluatingStoryId === story.id ? <BrailleSpinner /> : <Gauge size={12} />}
+                        {story.evaluation ? 'Re-score' : 'Score craft'}
+                      </button>
+                      {isChainable(story) && (
+                        <button
+                          onClick={() => handleWeaveNarrative(story.id)}
+                          disabled={weavingStoryId === story.id}
+                          className="flex items-center gap-1 px-2 py-1 text-xs text-amber-400/70 hover:text-amber-400 transition-colors disabled:opacity-50"
+                          title="Weave this chain of stories into one cohesive narrative"
+                        >
+                          {weavingStoryId === story.id ? <BrailleSpinner /> : <ScrollText size={12} />}
+                          Weave
+                        </button>
+                      )}
+                      {!story.followUpPrompts && (
+                        <button
+                          onClick={() => handleGenerateFollowUps(story.id)}
+                          disabled={generatingFollowUps}
+                          className="flex items-center gap-1 px-2 py-1 text-xs text-amber-400/70 hover:text-amber-400 transition-colors disabled:opacity-50"
+                        >
+                          {generatingFollowUps ? <BrailleSpinner /> : <Sparkles size={12} />}
+                          Follow-ups
+                        </button>
+                      )}
+                      <button
+                        onClick={() => { setEditingStory(story.id); setEditContent(story.content); }}
+                        className="flex items-center gap-1 px-2 py-1 text-xs text-gray-400 hover:text-white transition-colors"
+                      >
+                        <PenLine size={12} />
+                        Edit
+                      </button>
+                      <button
+                        onClick={() => requestDelete(story.id)}
+                        className="flex items-center gap-1 px-2 py-1 text-xs text-gray-400 hover:text-red-400 transition-colors"
+                      >
+                        <Trash2 size={12} />
+                        Delete
+                      </button>
+                    </div>
+                    {isConfirming(story.id) && (
+                      <InlineConfirmRow
+                        question="Delete this story? This cannot be undone."
+                        confirmTitle="Confirm delete"
+                        cancelTitle="Cancel delete"
+                        onConfirm={() => confirmDelete(() => handleDeleteStory(story.id))}
+                        onCancel={cancelDelete}
+                      />
+                    )}
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}

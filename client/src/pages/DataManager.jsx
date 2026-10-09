@@ -1,0 +1,757 @@
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { HardDrive, RefreshCw, Archive, Trash2, ChevronDown, ChevronRight, FolderOpen, File, Package } from 'lucide-react';
+import * as api from '../services/api';
+import { formatBytes, formatCount, formatDateNumeric } from '../utils/formatters';
+import { pluralize } from '../lib/textUtils';
+import PageSkeleton from '../components/ui/PageSkeleton';
+import { SkeletonRegion, SkeletonRows } from '../components/ui/Skeleton';
+import toast from '../components/ui/Toast';
+import socket from '../services/socket';
+import { useAsyncAction } from '../hooks/useAsyncAction';
+import { useConfirmDelete } from '../hooks/useConfirmDelete';
+import { useSocketSubscription } from '../hooks/useSocketSubscription';
+import useMounted from '../hooks/useMounted';
+import CollapsibleListItem from '../components/ui/CollapsibleListItem';
+import InlineConfirmRow from '../components/ui/InlineConfirmRow';
+import ConfirmButtonPair from '../components/ui/ConfirmButtonPair';
+import DataTreemap from '../components/dataManager/DataTreemap';
+import CosStoragePanel from '../components/dataManager/CosStoragePanel';
+import DataSelectionPanel from '../components/dataManager/DataSelectionPanel';
+import { DATA_KINDS, DATA_KIND_ORDER, HATCH_STYLE, dataKindOf } from '../components/dataManager/dataKinds';
+
+// Plural labels for tombstone record kinds — shared between the in-page
+// TombstoneGcSection toast and `scripts/gc-tombstones-now.js` (the CLI
+// echoes the same wording). The dedupe in the rendering call sites handles
+// the series/issue cohort coupling.
+const TOMBSTONE_KIND_PLURAL = { universe: 'universes', series: 'series', issue: 'issues', mediaCollection: 'media collections' };
+
+// Manual "GC tombstones now" trigger. The 60s orchestrator sweep keeps its
+// 24h grace — this button passes graceMs:0 so a user who just mass-deleted
+// doesn't wait a day for the bytes to leave disk. The button disables only
+// when every cohort is refused (snapshot-mode peer with no per-record sub
+// in both `universe` and `pipeline`): partial progress is still useful.
+function TombstoneGcSection() {
+  const [refused, setRefused] = useState(null); // null = still loading
+  const mountedRef = useMounted();
+  const backfillTimerRef = useRef(null);
+
+  const fetchStatus = useCallback(() => {
+    api.getTombstoneSweepStatus({ silent: true })
+      .then((r) => { if (mountedRef.current && Array.isArray(r?.refused)) setRefused(r.refused); })
+      .catch(() => { if (mountedRef.current) setRefused((prev) => prev ?? []); });
+  }, [mountedRef]);
+
+  // Subscribe to peer-state changes so toggling a snapshot-mode peer's
+  // sync category (or disabling it) re-evaluates the refusal status
+  // without a page reload — otherwise the button stays stuck disabled
+  // even after the user has resolved the underlying refusal condition.
+  //
+  // This is DataManager's only `instances:*` consumer, so it must hold its
+  // own `instances:subscribe` — it previously only listened for
+  // `instances:peers:updated` without ever subscribing, and the server sends
+  // that event only to the `instances` subscriber Set (registerSubscriber in
+  // server/services/socket.js), so the handler below could never fire; only
+  // the Instances page (which unsubscribes when you navigate away) held that
+  // subscription. `useSocketSubscription` also re-subscribes on reconnect and
+  // refetches via `onResubscribe`, so a peer change missed while disconnected
+  // is caught up on the next connect.
+  //
+  // `instances:peers:updated` fires from `updatePeer` BEFORE the async
+  // `autoSubscribePeerToAllRecords` backfill creates per-record subs, so an
+  // immediate fetch sees the pre-backfill state. Schedule a follow-up fetch
+  // after a short delay to capture the post-backfill subs; debounce so a
+  // rapid burst of peer updates collapses to one delayed fetch.
+  useSocketSubscription('instances', { onResubscribe: fetchStatus });
+
+  useEffect(() => {
+    const refreshAfterPeerChange = () => {
+      fetchStatus();
+      if (backfillTimerRef.current) clearTimeout(backfillTimerRef.current);
+      backfillTimerRef.current = setTimeout(() => {
+        backfillTimerRef.current = null;
+        if (mountedRef.current) fetchStatus();
+      }, 1500);
+    };
+    fetchStatus();
+    socket.on('instances:peers:updated', refreshAfterPeerChange);
+    return () => {
+      if (backfillTimerRef.current) clearTimeout(backfillTimerRef.current);
+      socket.off('instances:peers:updated', refreshAfterPeerChange);
+    };
+  }, [fetchStatus, mountedRef]);
+
+  const [runSweep, sweeping] = useAsyncAction(async () => {
+    const result = await api.sweepTombstonesNow({ graceMs: 0 }, { silent: true });
+    if (!result) return null;
+    const { universes = 0, series = 0, issues = 0, collections = 0, refused: refusedKinds = [] } = result;
+    const totalPruned = universes + series + issues + collections;
+    if (totalPruned > 0) {
+      const parts = [];
+      if (universes) parts.push(`${universes} universe${universes === 1 ? '' : 's'}`);
+      if (series) parts.push(`${series} series`);
+      if (issues) parts.push(`${issues} issue${issues === 1 ? '' : 's'}`);
+      if (collections) parts.push(`${collections} collection${collections === 1 ? '' : 's'}`);
+      toast.success(`Pruned ${parts.join(' / ')}`);
+    } else if (refusedKinds.length === 0) {
+      toast('Nothing is ready to clean up.');
+    }
+    if (refusedKinds.length > 0) {
+      const refusedLabel = [...new Set(refusedKinds.map((k) => TOMBSTONE_KIND_PLURAL[k] ?? k))].join(', ');
+      toast.warning(`Still waiting on ${refusedLabel}: open Instances, select the peer, and turn on that category under Sync Categories, or turn the peer off. Cleanup stays off so a peer that has not received the deletion cannot bring the record back.`);
+    }
+    setRefused(refusedKinds);
+    return result;
+  }, { errorMessage: 'Deleted-record cleanup failed' });
+
+  // Every cohort refused iff `universe` (its own cohort), `series` (the
+  // pipeline cohort representative — issues always travel with series), AND
+  // `mediaCollection` (its own cohort) are all in the refused set.
+  const allRefused = refused != null
+    && refused.includes('universe')
+    && refused.includes('series')
+    && refused.includes('mediaCollection');
+  const disabled = sweeping || refused == null || allRefused;
+  const refusedLabel = [...new Set((refused ?? []).map((k) => TOMBSTONE_KIND_PLURAL[k] ?? k))].join(', ');
+  const title = allRefused
+    ? `Still waiting on ${refusedLabel}: open Instances, select the peer, and turn on that category under Sync Categories, or turn the peer off so a peer that has not received the deletion cannot bring the record back.`
+    : 'Runs cleanup immediately instead of waiting 24 hours. It runs only for kinds every connected peer is already receiving.';
+
+  return (
+    <div className="bg-port-card border border-port-border rounded-xl p-4 space-y-3">
+      <div>
+        <div className="flex items-center gap-2">
+          <Trash2 size={14} className="text-gray-500" />
+          <h2 className="text-gray-400 uppercase tracking-wider text-[11px] font-medium">Deleted-record cleanup</h2>
+        </div>
+        <p className="mt-1 text-gray-500 text-xs">
+          Remove the leftover record of Universes, Pipeline series and issues, and Media Collections you already deleted. Automatic cleanup waits 24 hours. This runs it now.
+        </p>
+      </div>
+      <button
+        onClick={runSweep}
+        disabled={disabled}
+        title={title}
+        className="bg-port-accent hover:bg-port-accent/80 disabled:opacity-40 disabled:cursor-not-allowed text-white px-3 py-1.5 rounded text-xs font-medium transition-colors flex items-center gap-1.5"
+      >
+        <Trash2 size={12} />
+        {sweeping ? 'Cleaning up…' : 'Clean up deleted records now'}
+      </button>
+    </div>
+  );
+}
+
+function SizeBar({ size, maxSize, color }) {
+  const pct = maxSize > 0 ? Math.max(1, (size / maxSize) * 100) : 0;
+  return (
+    <div className="w-full h-1.5 bg-port-border/50 rounded-full overflow-hidden">
+      <div className={`h-full ${color} rounded-full transition-all`} style={{ width: `${Math.min(pct, 100)}%` }} />
+    </div>
+  );
+}
+
+function CategoryRow({ onMaintenanceComplete, cat, maxSize, onExpand, expanded, detail, onArchive, onPurge, onConfirmPurge, onCancelPurge, onDeleteItem, onRemoveItem, deletingItem, confirmingPurge, archiving, purging }) {
+  // Directories with no CATEGORIES entry come back with `classified: false` and
+  // no Archive/Purge flags. Say why the buttons are missing in outcome terms so
+  // the row reads as a deliberate safety stance, not a broken row (#3285).
+  // Older servers omit `classified`; treat only an explicit false as unknown.
+  const kindKey = dataKindOf(cat);
+  const kind = DATA_KINDS[kindKey];
+  const unclassified = kindKey === 'unclassified';
+  // `purgeScope: 'items'` categories hold the only copy of each file, so the
+  // whole-directory Purge button is replaced by a per-row delete in the detail
+  // table (#3327). Older servers omit `purgeScope` entirely — treat that as the
+  // legacy category-wide behavior rather than silently dropping the button.
+  const [removingItems, setRemovingItems] = useState(new Set());
+  const itemScoped = cat.deletable && cat.purgeScope === 'items';
+  const itemColumns = cat.deletable ? 'minmax(160px, 1fr) 80px 60px 120px' : 'minmax(160px, 1fr) 80px 60px';
+  const categoryPurgeable = cat.deletable && !itemScoped;
+  // Some reproducible-scratch categories hold the working state of a job that is
+  // running right now — the server refuses the whole-directory purge while that
+  // is true (409 CATEGORY_BUSY). Say why in place of the button so the page
+  // explains itself instead of failing on click (#3342). The detail fetch runs
+  // the same probe on expand, so prefer it: a job that started after the
+  // overview loaded would otherwise still be offered a Purge button. Older
+  // servers omit `busy` from both — only an explicit true withholds the button.
+  const busy = (detail?.busy ?? cat.busy) === true;
+  const busyReason = detail?.busyReason || cat.busyReason
+    || 'A job is using this directory right now — purge once it finishes.';
+  const { isConfirming, requestDelete, cancelDelete, confirmDelete } = useConfirmDelete();
+  return (
+    <div id={`data-category-${cat.key}`} className={`border rounded-lg overflow-hidden scroll-mt-4 ${expanded ? 'border-port-accent/60' : 'border-port-border'}`}>
+      <button
+        onClick={() => onExpand(cat.key)}
+        className="w-full flex items-center gap-3 p-3 hover:bg-port-card/50 transition-colors text-left"
+      >
+        {expanded ? <ChevronDown size={14} className="text-gray-500 shrink-0" /> : <ChevronRight size={14} className="text-gray-500 shrink-0" />}
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2">
+            <span className={`w-2 h-2 rounded-sm shrink-0 ${kind.swatch}`} title={kind.label} />
+            <span className="text-sm font-medium text-white">{cat.label}</span>
+            <span className={`text-xs ${unclassified ? 'text-port-warning' : 'text-gray-500'}`}>{cat.description}</span>
+          </div>
+          <div className="mt-1">
+            <SizeBar size={cat.size} maxSize={maxSize} color={kind.swatch} />
+          </div>
+        </div>
+        <div className="text-right shrink-0 ml-2">
+          <div className="text-sm font-mono text-white">{formatBytes(cat.size)}</div>
+          <div className="text-xs text-gray-500">{cat.fileCount == null ? 'File count unavailable — refresh to retry' : pluralize(cat.fileCount, 'file').replace(/^\d+/, formatCount(cat.fileCount))}</div>
+        </div>
+      </button>
+
+      {expanded && (
+        <div className="border-t border-port-border bg-port-bg/50">
+          {/* Actions */}
+          {confirmingPurge && !busy ? (
+            <InlineConfirmRow
+              variant="separator"
+              question={`Purge ${cat.fileCount == null ? 'all files' : `all ${pluralize(cat.fileCount, 'file', 'files').replace(/^\d+/, formatCount(cat.fileCount))}`} (${formatBytes(cat.size)}) in ${cat.label}? This permanently deletes the data and cannot be undone.`}
+              confirmText="Purge"
+              confirmTitle="Confirm purge"
+              cancelTitle="Cancel purge"
+              onConfirm={() => onConfirmPurge(cat.key)}
+              onCancel={onCancelPurge}
+            />
+          ) : (
+            <div className="flex flex-wrap items-center gap-2 p-3 border-b border-port-border/50">
+              {cat.archivable && (
+                <button
+                  onClick={() => onArchive(cat.key)}
+                  disabled={archiving || !!deletingItem || !!purging}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-port-accent/10 text-port-accent rounded hover:bg-port-accent/20 transition-colors disabled:opacity-50"
+                >
+                  <Archive size={12} />
+                  {cat.key === 'health'
+                    ? (archiving ? 'Archiving older days…' : 'Archive days older than 365 days')
+                    : (archiving ? 'Exporting backup…' : 'Export backup (keeps originals)')}
+                </button>
+              )}
+              {cat.archivable && cat.key === 'health' && (
+                <span className="basis-full sm:basis-auto sm:flex-1 min-w-0 text-xs text-gray-500">
+                  Moves days older than 365 days into a backup archive and removes them from active health history. Newer days stay in place. Download the archive from Backups to keep a separate copy.
+                </span>
+              )}
+              {categoryPurgeable && (busy ? (
+                <span className="text-xs text-port-warning">{busyReason}</span>
+              ) : (
+                <button
+                  onClick={() => onPurge(cat.key)}
+                  disabled={purging || !!deletingItem || !!archiving}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-port-error/10 text-port-error rounded hover:bg-port-error/20 transition-colors disabled:opacity-50"
+                >
+                  <Trash2 size={12} />
+                  {purging ? 'Purging...' : 'Purge'}
+                </button>
+              ))}
+              {itemScoped && (
+                <span className="text-xs text-gray-500">
+                  These files are the only copy, so there is no whole-category purge — delete individual entries from the list below.
+                </span>
+              )}
+              {!cat.archivable && !cat.deletable && (
+                <span className="text-xs text-gray-500">
+                  {unclassified
+                    ? 'PortOS has no classification for this directory, so it withholds Archive and Purge rather than risk deleting something irreplaceable. Inspect the contents below and remove it from a terminal if you know it is safe.'
+                    : 'This category is protected and cannot be archived or deleted'}
+                </span>
+              )}
+            </div>
+          )}
+
+          {cat.key === 'cos' && <CosStoragePanel onMaintenanceComplete={onMaintenanceComplete} />}
+          {/* Detail items */}
+          {detail ? (
+            <div className="max-h-64 overflow-auto">
+              {detail.items.length === 0 ? (
+                <div className="p-3 text-xs text-gray-500">Empty</div>
+              ) : (
+                <div role="table" aria-label={`${cat.label} contents`} className="w-full min-w-[460px] text-xs" tabIndex={-1}>
+                  <div role="rowgroup">
+                    <div role="row" tabIndex={-1} style={{ gridTemplateColumns: itemColumns }} className="grid text-gray-500 border-b border-port-border/30">
+                      <div role="columnheader" tabIndex={-1} className="text-left p-2 pl-3 font-medium">Name</div>
+                      <div role="columnheader" tabIndex={-1} className="text-right p-2 font-medium">Size</div>
+                      <div role="columnheader" tabIndex={-1} className="text-right p-2 pr-3 font-medium">Files</div>
+                      {cat.deletable && <div role="columnheader" tabIndex={-1} className="text-right p-2 pr-3 font-medium"><span className="sr-only">Delete</span></div>}
+                    </div>
+                  </div>
+                  <div role="rowgroup">
+                    {detail.items.map(item => (
+                      <CollapsibleListItem key={item.name} spacing="0" removing={removingItems.has(item.name)} onExited={() => {
+                        onRemoveItem(cat.key, item.name);
+                        setRemovingItems(prev => { const next = new Set(prev); next.delete(item.name); return next; });
+                      }}>
+                        <div role="row" tabIndex={-1} style={{ gridTemplateColumns: itemColumns }} className="grid border-b border-port-border/20 hover:bg-port-card/30">
+                          <div role="cell" className="p-2 pl-3 text-gray-300 flex items-center gap-1.5">
+                            {item.type === 'directory' ? <FolderOpen size={11} className="text-port-accent shrink-0" /> : <File size={11} className="text-gray-500 shrink-0" />}
+                            <div className="min-w-0">
+                              {item.sourceHref ? <a href={item.sourceHref} className="block truncate text-port-accent hover:underline" title={`Open source for ${item.name}`}>{item.label || item.name}</a> : <span className="block truncate">{item.label || item.name}</span>}
+                              {item.label && item.label !== item.name && <span className="block truncate text-gray-500" title={item.name}>{item.name}</span>}
+                              {(item.description || item.sourceUnavailable) && <span className="block text-gray-500">{item.description || item.sourceUnavailable}</span>}
+                            </div>
+                          </div>
+                          <div role="cell" className="p-2 text-right text-gray-400 font-mono">{formatBytes(item.size)}</div>
+                          <div role="cell" className="p-2 pr-3 text-right text-gray-500">{item.type === 'directory' ? (item.fileCount == null ? 'Unavailable' : formatCount(item.fileCount)) : '—'}</div>
+                          {cat.deletable && (
+                            <div role="cell" className="p-2 pr-3 text-right">
+                              {itemScoped && item.type === 'directory' ? (
+                                // Subdirectories of these categories are another
+                                // feature's working state (in-flight render
+                                // control dirs, scratch), not user assets — the
+                                // server refuses them too.
+                                <span className="text-gray-600" title="Directories here hold working files for other features and are not deletable from this page">—</span>
+                              ) : isConfirming(item.name) ? (
+                                <ConfirmButtonPair
+                                  className="justify-end flex-wrap"
+                                  prompt={item.type === 'directory' ? "Delete folder and contents?" : "Delete?"}
+                                  busy={busy || !!deletingItem || !!purging || !!archiving || confirmingPurge}
+                                  onConfirm={() => confirmDelete(async () => {
+                                    if (await onDeleteItem(cat.key, item.name)) setRemovingItems(prev => new Set(prev).add(item.name));
+                                  })}
+                                  onCancel={cancelDelete}
+                                  ariaLabel={`Confirm delete ${item.name} from ${cat.label}`}
+                                />
+                              ) : (
+                                <button
+                                  onClick={() => requestDelete(item.name)}
+                                  disabled={busy || !!deletingItem || !!purging || !!archiving || confirmingPurge}
+                                  className="text-gray-500 hover:text-port-error transition-colors disabled:opacity-50"
+                                  title={`Delete ${item.name}`}
+                                  aria-label={`Delete ${item.name} from ${cat.label}`}
+                                >
+                                  <Trash2 size={12} />
+                                </button>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      </CollapsibleListItem>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          ) : (
+            // Reserve the item table's rows and columns rather than centering a
+            // spinner in the panel (#4147). `max-h-64` matches the loaded
+            // scroller so expanding a category doesn't resize when it fills in.
+            <SkeletonRegion label={`Loading ${cat.label} contents`} className="max-h-64 overflow-hidden">
+              <SkeletonRows
+                rows={5}
+                columnWidthClasses={itemScoped
+                  ? ['flex-1', 'w-14', 'w-10', 'w-4']
+                  : ['flex-1', 'w-14', 'w-10']}
+              />
+            </SkeletonRegion>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function BackupsSection({ backups, loading, onDelete }) {
+  const { isConfirming, requestDelete, cancelDelete, confirmDelete } = useConfirmDelete();
+  if (loading) return null;
+  if (!backups?.length) return null;
+
+  return (
+    <div className="mt-6">
+      <div className="flex items-center gap-2 mb-3">
+        <Package size={16} className="text-port-accent" />
+        <h2 className="text-sm font-semibold text-white">Backup Archives</h2>
+        <span className="text-xs text-gray-500">{backups.length} archives</span>
+      </div>
+      <div className="border border-port-border rounded-lg overflow-hidden overflow-x-auto">
+        <table className="w-full text-xs min-w-[480px]">
+          <thead>
+            <tr className="text-gray-500 border-b border-port-border/30 bg-port-card/30">
+              <th className="text-left p-2 pl-3 font-medium">Archive</th>
+              <th className="text-right p-2 font-medium">Size</th>
+              <th className="text-right p-2 font-medium">Created</th>
+              <th className="text-right p-2 pr-3 font-medium"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {backups.map(b => (
+              <tr key={b.name} className="border-b border-port-border/20 hover:bg-port-card/30">
+                <td className="p-2 pl-3 text-gray-300 flex items-center gap-1.5">
+                  <Archive size={11} className="text-port-accent shrink-0" />
+                  <span className="truncate">{b.name}</span>
+                </td>
+                <td className="p-2 text-right text-gray-400 font-mono">{formatBytes(b.size)}</td>
+                <td className="p-2 text-right text-gray-500">{formatDateNumeric(b.created, '—')}</td>
+                <td className="p-2 pr-3 text-right">
+                  {isConfirming(b.name) ? (
+                    <ConfirmButtonPair
+                      className="justify-end"
+                      prompt="Delete?"
+                      onConfirm={() => confirmDelete(() => onDelete(b.name))}
+                      onCancel={cancelDelete}
+                      ariaLabel={`Confirm delete backup ${b.name}`}
+                    />
+                  ) : (
+                    <button
+                      onClick={() => requestDelete(b.name)}
+                      className="text-gray-500 hover:text-port-error transition-colors"
+                      title="Delete backup" aria-label="Delete backup"
+                    >
+                      <Trash2 size={12} />
+                    </button>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+export default function DataManager() {
+  const [overview, setOverview] = useState(null);
+  const [backups, setBackups] = useState(null);
+  const [overviewError, setOverviewError] = useState(false);
+  const [backupsError, setBackupsError] = useState(false);
+  const [overviewPending, setOverviewPending] = useState(false);
+  const [backupsPending, setBackupsPending] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [expandedCat, setExpandedCat] = useState(null);
+  const [detail, setDetail] = useState(null);
+  const [archiving, setArchiving] = useState(null);
+  const [purging, setPurging] = useState(null);
+  const [confirmPurge, setConfirmPurge] = useState(null);
+  const [deletingItem, setDeletingItem] = useState(null);
+  // Ref, not state: two clicks in one render would both read a stale state value.
+  const deletingBackupsRef = useRef(new Set());
+  const maintenanceInFlightRef = useRef(false);
+
+  const overviewRequestRef = useRef(0);
+  const overviewReadRef = useRef(null);
+  const backupsRequestRef = useRef(0);
+  const fetchStorageOverview = useCallback(() => {
+    const token = ++overviewRequestRef.current;
+    setOverviewPending(true);
+    const read = api.getDataOverview({ silent: true }).then(data => {
+      if (token !== overviewRequestRef.current) return;
+      setOverview(data);
+      setOverviewError(false);
+    }, () => {
+      if (token === overviewRequestRef.current) setOverviewError(true);
+    }).finally(() => {
+      if (token === overviewRequestRef.current) setOverviewPending(false);
+    });
+    overviewReadRef.current = read;
+    return read.finally(() => { if (overviewReadRef.current === read) overviewReadRef.current = null; });
+  }, []);
+
+  const fetchBackups = useCallback(() => {
+    const token = ++backupsRequestRef.current;
+    setBackupsPending(true);
+    return api.getDataBackups({ silent: true }).then(data => {
+      if (token !== backupsRequestRef.current) return;
+      setBackups(data);
+      setBackupsError(false);
+    }, () => {
+      if (token === backupsRequestRef.current) setBackupsError(true);
+    }).finally(() => {
+      if (token === backupsRequestRef.current) setBackupsPending(false);
+    });
+  }, []);
+
+  const fetchOverview = useCallback(() => Promise.all([
+    fetchStorageOverview(), fetchBackups()
+  ]).then(() => setLoading(false)), [fetchStorageOverview, fetchBackups]);
+
+  useEffect(() => {
+    fetchOverview();
+    return () => {
+      overviewRequestRef.current++;
+      backupsRequestRef.current++;
+    };
+  }, [fetchOverview]);
+
+  // Detail fetches are per-row and can land out of order — expanding A then B,
+  // or an archive/purge on A finishing after the user moved to B, could leave
+  // A's items (and, since #3342, A's busy state) rendered under B. Two guards:
+  // a token so only the newest fetch writes, and a ref mirroring the open row so
+  // a handler holding a stale `expandedCat` closure can't fetch for a row that
+  // is no longer open.
+  const detailRequestRef = useRef(0);
+  const expandedCatRef = useRef(null);
+
+  const openCategory = (key) => {
+    expandedCatRef.current = key;
+    setExpandedCat(key);
+    setDetail(null);
+  };
+
+  const loadDetail = async (key) => {
+    const token = (detailRequestRef.current += 1);
+    const d = await api.getDataCategory(key).catch(() => null);
+    if (detailRequestRef.current !== token || expandedCatRef.current !== key) return;
+    setDetail(d);
+  };
+
+  const handleExpand = async (key) => {
+    if (expandedCatRef.current === key) {
+      openCategory(null);
+      return;
+    }
+    openCategory(key);
+    await loadDetail(key);
+  };
+
+  // The shortlist and panel select without toggling — re-picking the open
+  // category keeps it open rather than collapsing it like a row click does.
+  const selectCategory = (key) => {
+    if (expandedCatRef.current !== key) handleExpand(key);
+  };
+
+  const showSelectedActions = () => {
+    document.getElementById(`data-category-${expandedCatRef.current}`)
+      ?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
+
+  const refreshAfterAction = async (key) => {
+    fetchOverview();
+    if (expandedCatRef.current === key) await loadDetail(key);
+  };
+
+  // A recording job changes this category plus disk space. Re-measure only
+  // CoS, preserving unrelated categories and the user's current selection.
+  const reconcileCosStorage = useCallback(async () => {
+    // Let full reads publish unrelated fields (including new backup exports)
+    // before this narrower measurement. A later full read still supersedes it.
+    while (overviewReadRef.current) await overviewReadRef.current;
+    const token = ++overviewRequestRef.current;
+    const detailToken = expandedCatRef.current === 'cos' ? ++detailRequestRef.current : null;
+    const refreshed = await api.getDataCategory('cos', { measure: true, silent: true }).catch(() => null);
+    if (!refreshed?.measurement || token !== overviewRequestRef.current) return;
+    if (expandedCatRef.current === 'cos' && detailToken === detailRequestRef.current) {
+      setDetail(refreshed);
+    }
+    const measurement = refreshed.measurement;
+    setOverview(previous => {
+      if (!previous) return previous;
+      const old = previous.categories.find(category => category.key === 'cos');
+      if (!old) return previous;
+      return {
+        ...previous,
+        totalSize: Math.max(0, previous.totalSize - old.size + measurement.size),
+        totalFileCount: previous.totalFileCount == null || old.fileCount == null || measurement.fileCount == null
+          ? null : previous.totalFileCount - old.fileCount + measurement.fileCount,
+        disk: measurement.disk,
+        categories: previous.categories.map(category => category.key === 'cos'
+          ? { ...category, size: measurement.size, fileCount: measurement.fileCount } : category),
+      };
+    });
+  }, []);
+
+  const handleArchive = async (key) => {
+    if (maintenanceInFlightRef.current) return;
+    maintenanceInFlightRef.current = true;
+    setArchiving(key);
+    const result = await api.archiveDataCategory(key).catch(() => null);
+    maintenanceInFlightRef.current = false;
+    setArchiving(null);
+    if (result) refreshAfterAction(key);
+  };
+
+  const executePurge = async (key) => {
+    if (maintenanceInFlightRef.current) return;
+    maintenanceInFlightRef.current = true;
+    setPurging(key);
+    setConfirmPurge(null);
+    await api.purgeDataCategory(key).catch(() => null);
+    maintenanceInFlightRef.current = false;
+    setPurging(null);
+    refreshAfterAction(key);
+  };
+
+  const handleDeleteItem = async (key, name) => {
+    if (maintenanceInFlightRef.current) return false;
+    maintenanceInFlightRef.current = true;
+    setDeletingItem(name);
+    const result = await api.purgeDataCategory(key, { subPath: name }).catch(() => null);
+    maintenanceInFlightRef.current = false;
+    setDeletingItem(null);
+    if (!result) return false;
+    fetchOverview();
+    return true;
+  };
+
+  const removeDeletedItem = (key, name) => {
+    setDetail(prev => {
+      if (prev?.key !== key) return prev;
+      const removed = prev.items.find(item => item.name === name);
+      return { ...prev, totalSize: Math.max(0, (prev.totalSize || 0) - (removed?.size || 0)), items: prev.items.filter(item => item.name !== name) };
+    });
+  };
+
+  const handleDeleteBackup = async (filename) => {
+    if (deletingBackupsRef.current.has(filename)) return;
+    deletingBackupsRef.current.add(filename);
+    // The API layer toasts the failure; keep the row on a rejected delete so
+    // the archive still on disk stays visible and the user can retry (#8922).
+    const deleted = await api.deleteDataBackup(filename).then(() => true, () => false);
+    deletingBackupsRef.current.delete(filename);
+    if (deleted) setBackups(prev => prev.filter(b => b.name !== filename));
+  };
+
+  // `fullHeight` + `padded` + the `p-4` bar/body mirror the loaded shell below,
+  // and stay correct now that `/data` is an `isFullWidthRoute` — its `<main>`
+  // supplies neither the scroll container nor the padding.
+  if (loading) {
+    return (
+      <PageSkeleton
+        header="bar"
+        label="Loading data manager"
+        fullHeight
+        padded
+        barClassName="p-4"
+        bodyClassName="p-4"
+        titleWidthClass="w-40"
+        showSubtitle
+        subtitleOnMobile
+        layout="grid"
+        gridColsClass="grid-cols-2 sm:grid-cols-4"
+        cards={4}
+      />
+    );
+  }
+
+  const categories = overview?.categories || [];
+  const maxSize = categories[0]?.size || 1;
+  const categoryBytes = categories.reduce((sum, c) => sum + (c.size || 0), 0);
+  const looseBytes = Math.max(0, (overview?.totalSize || 0) - categoryBytes);
+  // Older servers omit totalFileCount; the category sum then undercounts only
+  // the files sitting directly in data/.
+  const totalFiles = !overview ? null : overview.totalFileCount !== undefined ? overview.totalFileCount
+    : categories.some(c => c.fileCount == null) ? null : categories.reduce((sum, c) => sum + c.fileCount, 0);
+  const presentKinds = DATA_KIND_ORDER.filter((k) => categories.some((c) => dataKindOf(c) === k));
+  const selectedCat = categories.find((c) => c.key === expandedCat) || null;
+
+  // `/data` is an `isFullWidthRoute` (Layout.jsx), so `<main>` is a bare
+  // `relative overflow-hidden` and this shell owns the only scroll region.
+  // `min-h-0` on the column and on the body keeps a tall body scrolling instead
+  // of stretching the shell past `<main>` (#4145).
+  return (
+    <div className="flex flex-col h-full min-h-0">
+      {/* Header */}
+      <div className="shrink-0 flex items-center justify-between p-4 border-b border-port-border">
+        <div className="flex items-center gap-3">
+          <HardDrive className="w-8 h-8 text-port-accent" />
+          <div>
+            <h1 className="text-xl font-bold text-white">Data Manager</h1>
+            <p className="text-sm text-gray-500">Storage visibility, archiving, and cleanup</p>
+          </div>
+        </div>
+        <div className="flex items-center gap-4">
+          <div className="hidden sm:block text-right">
+            <div className="text-lg font-mono font-bold text-white">{overview ? formatBytes(overview.totalSize) : 'Storage unavailable'}</div>
+            <div className="text-xs text-gray-500">total in <code className="text-gray-400">{overview?.dataDir}/</code></div>
+          </div>
+          <button
+            onClick={fetchOverview}
+            disabled={overviewPending || backupsPending}
+            className="p-2 text-gray-400 hover:text-white hover:bg-port-card rounded transition-colors"
+            title="Refresh" aria-label="Refresh"
+          >
+            <RefreshCw size={16} />
+          </button>
+        </div>
+      </div>
+
+      {/* Content */}
+      <div className="flex-1 min-h-0 overflow-auto p-4">
+        {[
+          { failed: overviewError, snapshot: overview, label: 'Storage overview', pending: overviewPending, retry: fetchStorageOverview },
+          { failed: backupsError, snapshot: backups, label: 'Backups', pending: backupsPending, retry: fetchBackups },
+        ].filter(resource => resource.failed).map(resource => (
+          <div key={resource.label} role="alert" className="mb-3 flex flex-wrap items-center gap-3 rounded border border-port-warning/40 bg-port-card p-3 text-sm text-port-warning">
+            <span>{resource.label} unavailable.{resource.snapshot ? ' Showing last successful snapshot; values may be stale.' : ' No successful snapshot loaded.'}</span>
+            <button onClick={resource.retry} disabled={resource.pending} className="rounded border border-port-border px-3 py-1 disabled:opacity-50">
+              {resource.pending ? 'Retrying' : 'Retry'} {resource.label.toLowerCase()}
+            </button>
+          </div>
+        ))}
+
+        <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_20rem] items-start">
+          <div className="min-w-0 space-y-3">
+            {/* Totals + kind legend */}
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-xs">
+              <span className="text-gray-300">
+                <span className="font-mono text-white">{overview ? formatBytes(overview.totalSize) : 'Storage unavailable'}</span>
+                {' · '}{totalFiles == null ? 'File count unavailable' : pluralize(totalFiles, 'file').replace(/^\d+/, formatCount(totalFiles))}
+                {' · '}{overview ? `${formatCount(categories.length)} categories` : 'Category count unavailable'}
+                {' · '}{backups ? `${formatCount(backups.length)} backups` : 'Backup count unavailable'}
+              </span>
+              <span className="flex flex-wrap items-center gap-x-3 gap-y-1 sm:ml-auto">
+                {presentKinds.map((k) => (
+                  <span key={k} className="flex items-center gap-1.5 text-gray-400" title={DATA_KINDS[k].hint}>
+                    <span className={`w-2.5 h-2.5 rounded-sm ${DATA_KINDS[k].swatch}`} style={DATA_KINDS[k].hatch ? HATCH_STYLE : undefined} />
+                    {DATA_KINDS[k].label}
+                  </span>
+                ))}
+              </span>
+            </div>
+
+            {/* Disk-usage map — click a tile to select it and nest its entries */}
+            {overview && <DataTreemap
+              categories={categories}
+              looseBytes={looseBytes}
+              selectedKey={expandedCat}
+              detail={detail}
+              onSelect={handleExpand}
+            />}
+
+            {/* Category list — the action surface for the selection */}
+            <div className="space-y-2">
+              {categories.map(cat => (
+                <CategoryRow
+                  key={cat.key}
+                  cat={cat}
+                  maxSize={maxSize}
+                  expanded={expandedCat === cat.key}
+                  detail={expandedCat === cat.key ? detail : null}
+                  onExpand={handleExpand}
+                  onArchive={handleArchive}
+                  onMaintenanceComplete={reconcileCosStorage}
+                  onPurge={setConfirmPurge}
+                  onConfirmPurge={executePurge}
+                  onCancelPurge={() => setConfirmPurge(null)}
+                  onDeleteItem={handleDeleteItem}
+                  onRemoveItem={removeDeletedItem}
+                  deletingItem={expandedCat === cat.key ? deletingItem : null}
+                  confirmingPurge={confirmPurge === cat.key}
+                  archiving={archiving === cat.key}
+                  purging={purging === cat.key}
+                />
+              ))}
+            </div>
+
+            {/* Backups section */}
+            <BackupsSection
+              backups={backups}
+              loading={loading}
+              onDelete={handleDeleteBackup}
+            />
+          </div>
+
+          <div className="min-w-0 space-y-4 lg:sticky lg:top-0">
+            {overview && <DataSelectionPanel
+              overview={overview}
+              totalFiles={totalFiles}
+              selected={selectedCat}
+              detail={detail}
+              onSelect={selectCategory}
+              onShowActions={showSelectedActions}
+            />}
+            <TombstoneGcSection />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}

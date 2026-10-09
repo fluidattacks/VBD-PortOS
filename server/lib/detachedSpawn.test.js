@@ -1,0 +1,1280 @@
+// Lifecycle-specific suite; durable admission has its own subprocess contract.
+vi.mock('./databaseWriterRegistry.js', () => ({ reserveDatabaseWriter: () => ({
+  assertLaunchAllowed() {}, launched() {}, completed() {},
+}) }));
+
+import { describe, it, expect, beforeAll, afterEach, vi } from 'vitest';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'fs/promises';
+import { tmpdir } from 'os';
+import { EventEmitter } from 'events';
+import { basename, join } from 'path';
+import { execFile, spawn } from './childProcess.js';
+import * as childProcess from './childProcess.js';
+import { promisify } from 'util';
+import { pathToFileURL } from 'url';
+import { pinPlatform } from './testHelper.js';
+import { killProcessTree } from './bufferedSpawn.js';
+import { spawnDetached, reapDetached, reapAndCleanDetachedDirs, reattachDetached, isReattachable, isDetachedRunning, __detachedSpawnTesting } from './detachedSpawn.js';
+import { isProcessAlive } from '../test/processAlive.js';
+
+// Only a win32 cancel reaches killProcessTree, so stubbing it is inert for
+// every POSIX test here — and it lets the win32 tests assert the delegation on
+// a platform where `taskkill` doesn't exist. The one test that needs the real
+// tree-kill (a Windows host, killing a job with a live grandchild) restores it
+// for itself with `mockImplementationOnce`.
+vi.mock('./bufferedSpawn.js', async (importOriginal) => ({
+  ...(await importOriginal()),
+  killProcessTree: vi.fn(),
+}));
+
+const execFileAsync = promisify(execFile);
+
+// Both platforms produce the same control-dir contract (pid/exit sentinels,
+// reap, re-attach, survive-the-restart) — but by different mechanisms: a POSIX
+// `sh` double-fork, and a powershell launcher+supervisor on Windows. Tests that
+// assert one MECHANISM are gated on the platform that has it (`sh -c` fixtures
+// and PPID walks on IS_POSIX; the real powershell launcher on !IS_POSIX).
+// Tests of the shared handle CONTRACT run everywhere, driving `node -e`
+// fixtures rather than `sh -c` so they work on a Windows checkout too.
+const IS_POSIX = process.platform !== 'win32';
+const dirs = [];
+const tmpControlDir = async () => {
+  const d = await mkdtemp(join(tmpdir(), 'detached-spawn-'));
+  dirs.push(d);
+  return d;
+};
+
+// Collect a stream's 'data' chunks into a single string.
+const collect = (emitter) => {
+  let out = '';
+  emitter.on('data', (chunk) => { out += chunk.toString(); });
+  return () => out;
+};
+
+// Resolve when the handle emits 'close' (code, signal) or 'error'.
+const onClose = (handle) => new Promise((resolve, reject) => {
+  handle.on('close', (code, signal) => resolve({ code, signal }));
+  handle.on('error', reject);
+});
+
+// Wait for the OS-level state a test is actually about (the job is running, the
+// cleanup rm landed, the log holds a line) instead of sleeping a fixed budget
+// and hoping. These are real processes and real files, so there is no clock to
+// fake — but a condition wait returns the moment the state arrives, which is
+// typically ~1 tick rather than the 50–200ms the fixed sleeps it replaced cost
+// unconditionally. Bounded so a genuine regression fails the assertion below
+// rather than hanging the suite to the vitest timeout.
+const WAIT_POLL_MS = 5;
+const waitUntil = async (predicate, { timeoutMs = 5000 } = {}) => {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    // eslint-disable-next-line no-await-in-loop
+    if (await predicate()) return true;
+    if (Date.now() >= deadline) return false;
+    // eslint-disable-next-line no-await-in-loop
+    await new Promise((r) => setTimeout(r, WAIT_POLL_MS));
+  }
+};
+
+// `process.kill(pid, 0)` is the portable liveness probe; the `ps`-based helpers
+// below are POSIX-only and unusable in the win32 tests.
+const isAliveForTest = isProcessAlive;
+
+// Best-effort: kill whatever detached child a test left running under this
+// control dir, and WAIT for it to actually exit, before the control dir gets
+// removed. Skipping this races the rm against a still-open stderr.log handle:
+// the OS refuses the unlink with EBUSY (Windows) or ENOTEMPTY, and that
+// secondary cleanup failure was masking whatever assertion the test actually
+// failed on (#8138). Read the pid straight off disk and kill it directly with
+// `taskkill`/SIGKILL rather than going through `killProcessTree` — several
+// tests in this file mock that import, and a leftover process must still die
+// for real in cleanup regardless of what a given test stubbed.
+const killLeftoverChild = async (controlDir) => {
+  const pidRaw = await readFile(join(controlDir, 'pid'), 'utf8').catch(() => '');
+  const pid = Number.parseInt(pidRaw, 10);
+  if (!Number.isFinite(pid) || pid <= 0) return;
+  // A handful of fixtures write `process.pid` (this very worker) into a
+  // synthetic control dir to stand in for "some live process" — killing it
+  // would take the test runner down with it, not the job under test.
+  if (pid === process.pid) return;
+  // The supervisor's `exit` sentinel means the job already finished and this
+  // control dir's pid is stale — the OS is free to have handed that number to
+  // an unrelated process by the time cleanup runs (this suite spawns/reaps
+  // dozens of short-lived children per file). Only signal a pid whose own job
+  // is still marked running, exactly like reapDetached's own guard, so a
+  // best-effort cleanup can never SIGKILL a process this test never spawned.
+  const exitWritten = (await readFile(join(controlDir, 'exit'), 'utf8').catch(() => '')).length > 0;
+  if (exitWritten) return;
+  if (IS_POSIX) {
+    try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+  } else {
+    // `/T` takes the job's own descendants with it too, so a leftover
+    // ffmpeg/python fixture doesn't linger past the test that spawned it.
+    await execFileAsync('taskkill', ['/pid', String(pid), '/T', '/F']).catch(() => {});
+  }
+  await waitUntil(() => !isAliveForTest(pid), { timeoutMs: 5000 });
+};
+
+const cleanupControlDirs = async () => {
+  const pending = dirs.splice(0);
+  await Promise.all(pending.map(async (d) => {
+    await killLeftoverChild(d).catch(() => {});
+    // Retry on EBUSY/ENOTEMPTY (Windows can hold stderr.log open a beat after
+    // the process exits, and the wait above is best-effort) rather than
+    // letting cleanup itself throw and mask the real test failure alongside
+    // it.
+    await rm(d, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }));
+};
+afterEach(cleanupControlDirs);
+
+const ppidOf = async (pid) => {
+  const { stdout } = await execFileAsync('ps', ['-o', 'ppid=', '-p', String(pid)]).catch(() => ({ stdout: '' }));
+  const n = Number.parseInt(stdout.trim(), 10);
+  return Number.isFinite(n) ? n : 0;
+};
+const aliveByPs = async (pid) => {
+  const { stdout } = await execFileAsync('ps', ['-o', 'pid=', '-p', String(pid)]).catch(() => ({ stdout: '' }));
+  return stdout.trim().length > 0;
+};
+// Walk a process's ancestor chain to the root (PPID 1 / 0).
+const ancestorsOf = async (pid) => {
+  const chain = [];
+  let cur = await ppidOf(pid);
+  while (cur > 1 && chain.length < 50) {
+    chain.push(cur);
+    cur = await ppidOf(cur);
+  }
+  return chain;
+};
+
+// The job's stdout as the tailer sees it on disk.
+const readStdoutLog = (controlDir) => readFile(join(controlDir, 'stdout.log'), 'utf8').catch(() => '');
+
+// A `sh` fragment that blocks until the test writes `marker`. Replaces a fixed
+// `sleep N` in the fixtures below: the window a test needs open stays open for
+// exactly as long as the test needs it, and not a second longer.
+const blockUntil = (marker) => `while [ ! -f "${marker}" ]; do sleep 0.02; done`;
+
+// The first real PowerShell launcher on a fresh Windows runner pays a one-time
+// host cold start (loading PowerShell/.NET from a cold disk cache) that later
+// launches do not. The PID deadline starts as soon as the launcher is spawned,
+// so that cost was charged to whichever timed launch happened to run first —
+// in #10551 it took ~15s just to reach `starting-supervisor`. Pay it once,
+// here, with its own explicit budget and a real end-to-end assertion. One
+// launch, no retry: a warmup that fails fails the suite.
+const WINDOWS_WARMUP_PID_TIMEOUT_MS = 60_000;
+const WINDOWS_WARMUP_HOOK_TIMEOUT_MS = WINDOWS_WARMUP_PID_TIMEOUT_MS + 15_000;
+
+describe('spawnDetached', () => {
+  beforeAll(async () => {
+    if (IS_POSIX) return;
+    const controlDir = await tmpControlDir();
+    try {
+      const handle = await spawnDetached(process.execPath, ['-e', 'process.stdout.write("warm\\n");'], {
+        controlDir, pollMs: 25, pidTimeoutMs: WINDOWS_WARMUP_PID_TIMEOUT_MS,
+      });
+      const getOut = collect(handle.stdout);
+      const { code } = await onClose(handle);
+      expect(code).toBe(0);
+      expect(getOut()).toBe('warm\n');
+      // Same bounded projection the stream launches print; never raw files.
+      const [launcher, supervisor] = await Promise.all([
+        __detachedSpawnTesting.readBootstrapDiagnostic(controlDir, 'launcher-bootstrap.log'),
+        __detachedSpawnTesting.readBootstrapDiagnostic(controlDir, 'supervisor-bootstrap.log'),
+      ]);
+      process.stdout.write(`🪟 Windows detached warmup: launcher=${launcher}; supervisor=${supervisor}\n`);
+    } finally {
+      // afterEach never runs for a failed hook; clean up here either way.
+      await cleanupControlDirs();
+    }
+  }, WINDOWS_WARMUP_HOOK_TIMEOUT_MS);
+
+  // Independent launches, never retries: each launcher must satisfy all
+  // stream and exit assertions. Windows CI exercises the handoff three times.
+  it.each(IS_POSIX ? [1] : [1, 2, 3])('streams stdout and stderr, then closes with the exit code (launch %i)', async (launch) => {
+    const controlDir = await tmpControlDir();
+    // The beforeAll warmup absorbs the one-time host cold start, but a loaded
+    // Windows runner can still take longer than the 10s production default to
+    // run the launcher/supervisor PowerShell chain. Give it CI headroom
+    // without touching the production timeout.
+    const handle = await spawnDetached(
+      process.execPath,
+      ['-e', 'process.stdout.write("out-a\\nout-b\\n"); process.stderr.write("err-1\\n");'],
+      { controlDir, pollMs: 25, pidTimeoutMs: 30000 }
+    );
+    const getOut = collect(handle.stdout);
+    const getErr = collect(handle.stderr);
+    const { code, signal } = await onClose(handle);
+    expect(code).toBe(0);
+    expect(signal).toBeNull();
+    expect(getOut()).toBe('out-a\nout-b\n');
+    expect(getErr()).toBe('err-1\n');
+    expect(handle.exitCode).toBe(0);
+    if (!IS_POSIX) {
+      const diagnostic = await __detachedSpawnTesting.readBootstrapDiagnostic(controlDir, 'supervisor-bootstrap.log');
+      expect(diagnostic).toMatch(/^pid-written hresult=0 elapsed-ms=\d+; timeline=reading-job@\d+ms>starting-job@\d+ms>job-started@\d+ms>handle-acquired@\d+ms>pid-written@\d+ms$/);
+      // Keep passing-run evidence too, using the same bounded projection as
+      // production failures. CI's quiet setup replaces console methods, so
+      // write this bounded evidence directly. Never print raw control files.
+      process.stdout.write(`🪟 Windows detached stream launch ${launch}: ${diagnostic}\n`);
+    }
+  // Leave room beyond the 30s PID deadline for the handle's bounded error or
+  // close event to reach the test, especially on a loaded Windows runner.
+  }, 45_000);
+
+  it('preserves sanitized launcher failure evidence when cleanup removes its control directory', async () => {
+    const controlDir = await tmpControlDir();
+    const restorePlatform = pinPlatform('win32');
+    const launcher = new EventEmitter();
+    launcher.unref = () => {};
+    const spawnMock = vi.spyOn(childProcess, 'spawn').mockImplementationOnce(() => {
+      setImmediate(() => launcher.emit('error', Object.assign(
+        new Error('private launcher command and credential text'), { code: 'ENOENT' },
+      )));
+      return launcher;
+    });
+    try {
+      const handle = await spawnDetached('example-command', [], {
+        controlDir, cleanup: true, pollMs: 5, pidTimeoutMs: 1000,
+      });
+      const error = await onClose(handle).catch((err) => err);
+      expect(error.message).toContain('launcher=ENOENT');
+      expect(error.message).toContain('supervisor-stage=unavailable');
+      expect(error.message).not.toContain('private');
+      expect(handle.pid).toBeNull();
+      expect(await waitUntil(async () => !(await stat(controlDir).catch(() => null)))).toBe(true);
+    } finally {
+      spawnMock.mockRestore();
+      restorePlatform();
+    }
+  });
+
+  it('propagates a non-zero exit code', async () => {
+    const controlDir = await tmpControlDir();
+    const handle = await spawnDetached('sh', ['-c', 'exit 3'], { controlDir, pollMs: 25 });
+    const { code, signal } = await onClose(handle);
+    expect(code).toBe(3);
+    expect(signal).toBeNull();
+  });
+
+  it.runIf(IS_POSIX)('reparents the job out of the spawner tree (escapes pm2 TreeKill)', async () => {
+    const controlDir = await tmpControlDir();
+    const handle = await spawnDetached('sh', ['-c', 'sleep 30'], { controlDir, pollMs: 25 });
+    expect(handle.pid).toBeGreaterThan(0);
+    // The double-fork reparents the supervisor (the job's parent) to init once
+    // the outer sh exits. TreeKill walks DOWN from the spawner's PID, so the
+    // job escapes iff this test process is NOT an ancestor of the job. Poll
+    // briefly to let the outer sh exit, then assert the spawner is absent from
+    // the job's full ancestor chain.
+    let ancestors = [];
+    await waitUntil(async () => {
+      ancestors = await ancestorsOf(handle.pid);
+      return !ancestors.includes(process.pid);
+    });
+    expect(ancestors).not.toContain(process.pid);
+    handle.kill('SIGKILL');
+    await onClose(handle);
+  });
+
+  it.runIf(IS_POSIX)('kill() signals the reparented job and surfaces the signal on close', async () => {
+    const controlDir = await tmpControlDir();
+    const handle = await spawnDetached('sh', ['-c', 'sleep 30'], { controlDir, pollMs: 25 });
+    expect(handle.pid).toBeGreaterThan(0);
+    // Wait for the sleeper to actually be running under the recorded PID —
+    // signalling before then would test nothing.
+    await waitUntil(() => aliveByPs(handle.pid));
+    const killed = handle.kill('SIGKILL');
+    expect(killed).toBe(true);
+    const { code, signal } = await onClose(handle);
+    expect(signal).toBe('SIGKILL');
+    expect(code).toBeNull();
+    expect(handle.signalCode).toBe('SIGKILL');
+  });
+
+  it.runIf(IS_POSIX)('killProcessGroup terminates a wrapper and its runtime child', async () => {
+    const controlDir = await tmpControlDir();
+    const handle = await spawnDetached('python3', ['-c', [
+      'import os, subprocess, time',
+      'os.setpgid(0, 0)',
+      "child = subprocess.Popen(['sleep', '30'])",
+      'print(child.pid, flush=True)',
+      'time.sleep(30)',
+    ].join('; ')], { controlDir, pollMs: 25, killProcessGroup: true });
+    const getOut = collect(handle.stdout);
+    let runtimePid = 0;
+    await waitUntil(() => {
+      runtimePid = Number.parseInt(getOut().trim(), 10);
+      return runtimePid > 0;
+    });
+    expect(runtimePid).toBeGreaterThan(0);
+    expect(await aliveByPs(runtimePid)).toBe(true);
+    const closed = onClose(handle);
+    expect(handle.kill('SIGKILL')).toBe(true);
+    await closed;
+    let alive = true;
+    await waitUntil(async () => {
+      alive = await aliveByPs(runtimePid);
+      return !alive;
+    });
+    expect(alive).toBe(false);
+  });
+
+  it('rejects (via close=1) when the control dir is reused with stale files cleared', async () => {
+    const controlDir = await tmpControlDir();
+    // First run leaves pid/exit/logs behind.
+    const first = await spawnDetached('sh', ['-c', 'printf "first\\n"; exit 0'], { controlDir, pollMs: 25 });
+    await onClose(first);
+    // Second run on the SAME dir must not latch onto the first run's exit/pid.
+    const second = await spawnDetached('sh', ['-c', 'printf "second\\n"; exit 7'], { controlDir, pollMs: 25 });
+    const getOut = collect(second.stdout);
+    const { code } = await onClose(second);
+    expect(code).toBe(7);
+    expect(getOut()).toBe('second\n');
+  });
+
+  it.runIf(IS_POSIX)('removes the control dir after the job ends when cleanup is set', async () => {
+    const controlDir = await tmpControlDir();
+    const handle = await spawnDetached('sh', ['-c', 'printf "x\\n"; exit 0'], { controlDir, pollMs: 25, cleanup: true });
+    await onClose(handle);
+    // finish() fires the rm off unawaited after emitting close — wait for the
+    // dir to actually be gone rather than for a fixed budget.
+    await waitUntil(async () => !(await stat(controlDir).then(() => true).catch(() => false)));
+    const present = await stat(controlDir).then(() => true).catch(() => false);
+    expect(present).toBe(false);
+  });
+
+  it('keeps the control dir by default (logs retained for post-mortem)', async () => {
+    const controlDir = await tmpControlDir();
+    const handle = await spawnDetached('sh', ['-c', 'printf "x\\n"; exit 0'], { controlDir, pollMs: 25 });
+    await onClose(handle);
+    // No wait to burn: without `cleanup` nothing schedules a removal at all, so
+    // asserting immediately after close is the stronger check — a regression
+    // that starts removing the dir has no grace window to hide in.
+    const present = await stat(controlDir).then(() => true).catch(() => false);
+    expect(present).toBe(true);
+  });
+
+  it('requires a controlDir', async () => {
+    await expect(spawnDetached('sh', ['-c', 'true'], {})).rejects.toThrow(/controlDir/);
+  });
+
+  it.runIf(IS_POSIX)('surfaces a setup failure as an error event, not a rejection', async () => {
+    // controlDir under a regular FILE → ensureDir fails (ENOTDIR). spawnDetached
+    // must still resolve a handle and emit 'error' so the caller's on('error')
+    // finalization runs (rejecting would strand the run / leak temps).
+    const base = await tmpControlDir();
+    const filePath = join(base, 'not-a-dir');
+    await writeFile(filePath, 'x');
+    const handle = await spawnDetached('sh', ['-c', 'true'], { controlDir: join(filePath, 'sub') });
+    const err = await new Promise((resolve) => handle.on('error', resolve));
+    expect(err).toBeInstanceOf(Error);
+    expect(handle.pid).toBeNull();
+  });
+
+  // This shared quoted-argv/nonzero-exit contract runs locally on POSIX too;
+  // the actual PowerShell launcher still needs a real Windows CI host.
+  // Regression for #6169: the plain
+  // `spawn(..., { detached: true })` this replaced meant DETACHED_PROCESS,
+  // which denies a console host any console, so the job exited 0 in ~100ms
+  // having produced no output and run no part of the script. Asserting real
+  // streamed output plus the job's own exit code is what catches that.
+  const runWithLoaderInitRetry = async (runFn) => {
+    let result = await runFn();
+    if (__detachedSpawnTesting.isLoaderInitFailure({
+      code: result.code,
+      outBytes: result.outBytes,
+      errBytes: result.errBytes,
+      isWindows: !IS_POSIX,
+    })) {
+      process.stdout.write(`🪟 Windows detached job loader failure (${result.evidence}); retrying spawn once under runner load\n`);
+      result = await runFn();
+    }
+    return result;
+  };
+
+  // This shared quoted-argv/nonzero-exit contract runs locally on POSIX too;
+  // the actual PowerShell launcher still needs a real Windows CI host.
+  // Regression for #6169: the plain
+  // `spawn(..., { detached: true })` this replaced meant DETACHED_PROCESS,
+  // which denies a console host any console, so the job exited 0 in ~100ms
+  // having produced no output and run no part of the script. Asserting real
+  // streamed output plus the job's own exit code is what catches that.
+  it('runs the job and streams its output through the control dir', async () => {
+    const result = await runWithLoaderInitRetry(async () => {
+      const controlDir = await tmpControlDir();
+      const handle = await spawnDetached(
+        process.execPath,
+        // The spaced/quoted argv entry pins the Windows command-line quoting the
+        // supervisor needs: .NET Framework's ProcessStartInfo takes one flat
+        // argument STRING, so a mis-quoted path would silently split.
+        ['-e', 'process.stdout.write(process.argv[1] + "\\n"); process.exit(3);', 'a b "c"'],
+        { controlDir, pollMs: 25, pidTimeoutMs: 30000 }
+      );
+      const getOut = collect(handle.stdout);
+      const getErr = collect(handle.stderr);
+      expect(handle.pid).toBeGreaterThan(0);
+      const { code, signal } = await onClose(handle);
+      // A Windows loader failure can write a PID and exit sentinel without ever
+      // executing this fixture. Preserve the exact job-exit assertion, but include
+      // the bounded bootstrap timeline and stream lengths so CI distinguishes
+      // that failure from quoting/output regressions. Never print raw control files
+      // or stderr: either can contain private paths from the host runtime.
+      const bootstrap = IS_POSIX ? 'posix' : await __detachedSpawnTesting.readBootstrapDiagnostic(controlDir, 'supervisor-bootstrap.log');
+      const out = getOut();
+      const err = getErr();
+      const outBytes = Buffer.byteLength(out);
+      const errBytes = Buffer.byteLength(err);
+      const evidence = `detached job code=${code} signal=${signal}; stdout-bytes=${outBytes}; stderr-bytes=${errBytes}; supervisor=${bootstrap}`;
+      return { code, signal, out, err, outBytes, errBytes, evidence };
+    });
+
+    expect(result.code, result.evidence).toBe(3);
+    expect(result.signal).toBeNull();
+    expect(result.out).toBe('a b "c"\n');
+  }, 45_000);
+
+  describe('isLoaderInitFailure and runner retry contract', () => {
+    it('identifies 0xC0000142 and 0xC0000005 as loader failures when no output was produced on Windows', () => {
+      expect(__detachedSpawnTesting.isLoaderInitFailure({
+        code: 3221225794,
+        outBytes: 0,
+        errBytes: 0,
+        isWindows: true,
+      })).toBe(true);
+      expect(__detachedSpawnTesting.isLoaderInitFailure({
+        code: 3221225477,
+        outBytes: 0,
+        errBytes: 0,
+        isWindows: true,
+      })).toBe(true);
+    });
+
+    it('refuses to treat a crash after stdout or stderr as a loader-init failure', () => {
+      expect(__detachedSpawnTesting.isLoaderInitFailure({
+        code: 3221225794,
+        outBytes: 10,
+        errBytes: 0,
+        isWindows: true,
+      })).toBe(false);
+      expect(__detachedSpawnTesting.isLoaderInitFailure({
+        code: 3221225477,
+        outBytes: 0,
+        errBytes: 5,
+        isWindows: true,
+      })).toBe(false);
+    });
+
+    it('refuses non-loader exit codes and POSIX runs', () => {
+      for (const code of [0, 1, 2, 3, 127]) {
+        expect(__detachedSpawnTesting.isLoaderInitFailure({
+          code,
+          outBytes: 0,
+          errBytes: 0,
+          isWindows: true,
+        })).toBe(false);
+      }
+      expect(__detachedSpawnTesting.isLoaderInitFailure({
+        code: 3221225794,
+        outBytes: 0,
+        errBytes: 0,
+        isWindows: false,
+      })).toBe(false);
+    });
+
+    it('retries once on pre-output loader failure and preserves exact failure when retry fails or wrong code occurs', async () => {
+      let callCount = 0;
+      const fakeRunJob = async (attempts) => {
+        const run = attempts[callCount++];
+        return run;
+      };
+
+      // Case 1: First attempt hits loader failure, second succeeds with 3 -> succeeds
+      callCount = 0;
+      const retrySucceeds = async () => {
+        const attempts = [
+          { code: 3221225794, outBytes: 0, errBytes: 0, signal: null, out: '', evidence: 'loader-fail-1' },
+          { code: 3, outBytes: 8, errBytes: 0, signal: null, out: 'a b "c"\n', evidence: 'ok' },
+        ];
+        let res = await fakeRunJob(attempts);
+        if (__detachedSpawnTesting.isLoaderInitFailure({ ...res, isWindows: true })) {
+          res = await fakeRunJob(attempts);
+        }
+        expect(res.code, res.evidence).toBe(3);
+        expect(res.out).toBe('a b "c"\n');
+      };
+      await retrySucceeds();
+      expect(callCount).toBe(2);
+
+      // Case 2: Wrong exit code (e.g. 4) -> does NOT retry, fails assertion
+      callCount = 0;
+      const wrongExit = async () => {
+        const attempts = [
+          { code: 4, outBytes: 8, errBytes: 0, signal: null, out: 'a b "c"\n', evidence: 'wrong-exit' },
+        ];
+        let res = await fakeRunJob(attempts);
+        if (__detachedSpawnTesting.isLoaderInitFailure({ ...res, isWindows: true })) {
+          res = await fakeRunJob(attempts);
+        }
+        expect(res.code, res.evidence).toBe(3);
+      };
+      await expect(wrongExit()).rejects.toThrow();
+      expect(callCount).toBe(1);
+
+      // Case 3: Loader failure on attempt 1, but attempt 2 also fails -> fails assertion with evidence
+      callCount = 0;
+      const retryFails = async () => {
+        const attempts = [
+          { code: 3221225794, outBytes: 0, errBytes: 0, signal: null, out: '', evidence: 'loader-fail-1' },
+          { code: 3221225794, outBytes: 0, errBytes: 0, signal: null, out: '', evidence: 'loader-fail-2' },
+        ];
+        let res = await fakeRunJob(attempts);
+        if (__detachedSpawnTesting.isLoaderInitFailure({ ...res, isWindows: true })) {
+          res = await fakeRunJob(attempts);
+        }
+        expect(res.code, res.evidence).toBe(3);
+      };
+      await expect(retryFails()).rejects.toThrow(/loader-fail-2/);
+      expect(callCount).toBe(2);
+    });
+  });
+
+  it.skipIf(IS_POSIX).each([1, 2, 3])('reports a real supervisor bootstrap failure without private paths (launch %i)', async (launch) => {
+    const controlDir = await tmpControlDir();
+    // Each independent supervisor pays the cold PowerShell/Start-Process cost.
+    // Use the stream fixture's bounded CI budget so we test the command error,
+    // not host startup speed; a PID timeout still fails the assertions below.
+    const handle = await spawnDetached('portos-nonexistent-example-command', [], {
+      controlDir, pidTimeoutMs: 30000,
+    });
+    await expect(onClose(handle)).rejects.toThrow(/supervisor-stage=failed hresult=-?\d+/);
+    const diagnostic = await __detachedSpawnTesting.readBootstrapDiagnostic(controlDir, 'supervisor-bootstrap.log');
+    expect(diagnostic).toMatch(/^failed hresult=-?\d+ elapsed-ms=\d+; timeline=reading-job@\d+ms>starting-job@\d+ms>failed@\d+ms$/);
+    process.stdout.write(`🪟 Windows detached expected refusal ${launch}: ${diagnostic}\n`);
+  }, 45_000);
+
+  it.runIf(!IS_POSIX)('cancels a cold supervisor after PID acquisition times out', async () => {
+    const controlDir = await tmpControlDir();
+    const handle = await spawnDetached(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+      controlDir, pidTimeoutMs: 0,
+    });
+    await expect(onClose(handle)).rejects.toThrow(/failed to acquire PID/);
+    // Wait for the actual supervisor acknowledgement, not a guessed sleep.
+    expect(await waitUntil(async () => (
+      await readFile(join(controlDir, 'exit'), 'utf8').catch(() => '')
+    ).length > 0, { timeoutMs: 30000 })).toBe(true);
+    const pid = Number.parseInt(await readFile(join(controlDir, 'pid'), 'utf8').catch(() => ''), 10);
+    expect(Number.isFinite(pid) && isAliveForTest(pid)).toBe(false);
+  }, 45000);
+
+  // The whole POINT of the Windows launcher: pm2 kills on Windows with
+  // `taskkill /pid <app> /T /F`, which walks the parent tree, so a job spawned
+  // as a plain child of portos-server dies at update.sh's own `pm2-stop` step
+  // and leaves the install headless (#5976, and #6169 on Windows). Nothing in
+  // the streaming tests above would fail if someone "simplified" the launcher
+  // by dropping the launcher hop and starting the supervisor directly, so this
+  // asserts the survival itself: tree-kill the spawning process, and the job
+  // must still be running and still writing.
+  it.runIf(!IS_POSIX)('survives a tree-kill of the process that spawned it', async () => {
+    const controlDir = await tmpControlDir();
+    const marker = join(controlDir, 'go');
+    const heartbeat = join(controlDir, 'heartbeat');
+    // A stand-in for portos-server: it spawns the job and then just stays alive.
+    const spawnerPath = join(controlDir, 'spawner.mjs');
+    await writeFile(join(controlDir, '.portos-disposable-root'), '');
+    await writeFile(spawnerPath, [
+      `import { spawnDetached } from ${JSON.stringify(pathToFileURL(join(import.meta.dirname, 'detachedSpawn.js')).href)};`,
+      'await spawnDetached(process.execPath, [',
+      "  '-e',",
+      "  'const {existsSync,appendFileSync}=require(\"fs\");const t=setInterval(()=>{appendFileSync(process.argv[2],\"x\");if(existsSync(process.argv[1])){clearInterval(t);process.exit(0);}},20);',",
+      `  ${JSON.stringify(marker)},`,
+      `  ${JSON.stringify(heartbeat)},`,
+      `], { controlDir: ${JSON.stringify(controlDir)} });`,
+      'setInterval(() => {}, 1000);',
+    ].join('\n'));
+
+    // This is a standalone server surrogate, not a Vitest worker. Its real
+    // registry writes into the disposable install root above; inheriting
+    // VITEST would correctly trigger the test runner's real-data write guard.
+    const spawnerEnv = { ...process.env, PORTOS_DATA_ROOT: controlDir };
+    delete spawnerEnv.VITEST;
+    const spawner = spawn(process.execPath, [spawnerPath], {
+      stdio: 'ignore', env: spawnerEnv,
+    });
+    const pidFile = join(controlDir, 'pid');
+    const readPid = async () => Number.parseInt(await readFile(pidFile, 'utf8').catch(() => ''), 10);
+    expect(await waitUntil(async () => Number.isFinite(await readPid()))).toBe(true);
+    const jobPid = await readPid();
+
+    // Tree-kill the spawner exactly as pm2 would. `taskkill /T` walks the
+    // parent tree, so this is the real test: the job is only spared because the
+    // launcher that started its supervisor has already exited.
+    await execFileAsync('taskkill', ['/pid', String(spawner.pid), '/T', '/F']).catch(() => {});
+    expect(await waitUntil(() => spawner.exitCode !== null || spawner.killed)).toBe(true);
+
+    // Still alive, and still doing work — a job that survived the kill but was
+    // wedged would satisfy a liveness check alone.
+    const beats = async () => (await readFile(heartbeat, 'utf8').catch(() => '')).length;
+    const before = await beats();
+    expect(isAliveForTest(jobPid)).toBe(true);
+    expect(await waitUntil(async () => (await beats()) > before)).toBe(true);
+
+    await writeFile(marker, '1');
+    expect(await waitUntil(async () => (await readFile(join(controlDir, 'exit'), 'utf8').catch(() => '')).length > 0)).toBe(true);
+  });
+
+  // PowerShell's ExitCode is a SIGNED int, so an NTSTATUS crash status reads
+  // back negative — while Node's own ChildProcess, and the POSIX arm's raw wait
+  // status, report it unsigned. Without the mask the two platforms disagree
+  // about the same crash, and a caller classifying one by its code silently
+  // stops recognizing it on Windows.
+  it.runIf(!IS_POSIX)('reports a crash status unsigned, as Node does', async () => {
+    const controlDir = await tmpControlDir();
+    const handle = await spawnDetached(
+      'powershell',
+      ['-NoProfile', '-NonInteractive', '-Command', '[Environment]::Exit(-1073741819)'],
+      { controlDir }
+    );
+    const { code, signal } = await onClose(handle);
+    expect(code).toBe(3221225477); // 0xC0000005, not -1073741819
+    expect(signal).toBeNull();
+  });
+
+  it.runIf(!IS_POSIX)('identifies a live job by its executable', async () => {
+    const controlDir = await tmpControlDir();
+    const marker = join(controlDir, 'go');
+    const handle = await spawnDetached(
+      process.execPath,
+      ['-e', 'const {existsSync}=require("fs");const t=setInterval(()=>{if(existsSync(process.argv[1])){clearInterval(t);process.exit(0);}},5);', marker],
+      { controlDir }
+    );
+    const closed = onClose(handle);
+    expect(await isDetachedRunning(controlDir, { executable: process.execPath })).toBe(true);
+    // A PID some unrelated process inherited must not keep the control dir
+    // blocked — that would wedge every later update at "already running".
+    expect(await isDetachedRunning(controlDir, { executable: 'notepad' })).toBe(false);
+    await writeFile(marker, '1');
+    await closed;
+  });
+
+  // A job that runs until a marker file appears, then exits with a code and NO
+  // signal — the shape `taskkill /T /F` leaves behind on Windows, where the kill
+  // happens out of band so nothing records an exit_signal. Driven by `node -e`
+  // rather than `sh -c` because these tests are NOT gated on IS_POSIX: they run
+  // against the control-dir handle both platforms now return, and must work on a
+  // real Windows checkout, which has no guaranteed POSIX shell.
+  //
+  // The handle is built by whichever launcher the HOST has; only `kill`'s
+  // dispatch is platform-dependent. So each test spawns FIRST — pinning before
+  // the spawn would send a Linux runner at the supervisor's real powershell,
+  // which it has none of — then pins win32 and holds the pin through 'close',
+  // which decodes the exit status per-platform too. On a Windows host the pin
+  // is a no-op and these run against the real supervisor handle end to end.
+  const spawnMarkerJob = async (exitCode = 1, opts = {}) => {
+    const controlDir = await tmpControlDir();
+    const marker = join(controlDir, 'go');
+    const handle = await spawnDetached(
+      process.execPath,
+      ['-e', `const {existsSync}=require('fs');const t=setInterval(()=>{if(existsSync(process.argv[1])){clearInterval(t);process.exit(${exitCode});}},5);`, marker],
+      { controlDir, pollMs: 25, ...opts }
+    );
+    return { handle, controlDir, terminate: () => writeFile(marker, '1') };
+  };
+
+  it('win32 kill() tree-kills by pid so the runner\'s children die with it', async () => {
+    const { handle, terminate } = await spawnMarkerJob();
+    const restorePlatform = pinPlatform('win32');
+    try {
+      killProcessTree.mockClear();
+      const closed = onClose(handle);
+      expect(handle.kill('SIGKILL')).toBe(true);
+      expect(handle.killed).toBe(true);
+      expect(killProcessTree).toHaveBeenCalledTimes(1);
+      const [target, signal, opts, isWin32] = killProcessTree.mock.calls[0];
+      expect(signal).toBe('SIGKILL');
+      expect(opts).toEqual({ processGroup: false });
+      expect(isWin32).toBe(true);
+      // The job reparented away from this process, so a bare `{ pid }` is the
+      // only address there is — killProcessTree's taskkill branch has to accept
+      // it, or the cancel silently degrades to a leaf kill that orphans the
+      // ffmpeg/python the runner spawned (#4171).
+      expect(target).toEqual({ pid: handle.pid });
+      expect(target.kill).toBeUndefined();
+      await terminate();
+      await closed;
+    } finally {
+      restorePlatform();
+    }
+  });
+
+  it('win32 maps killProcessGroup onto the same tree-kill (no process groups there)', async () => {
+    const { handle, terminate } = await spawnMarkerJob(1, { killProcessGroup: true });
+    const restorePlatform = pinPlatform('win32');
+    try {
+      killProcessTree.mockClear();
+      const closed = onClose(handle);
+      expect(handle.kill('SIGTERM')).toBe(true);
+      const [target, , opts, isWin32] = killProcessTree.mock.calls[0];
+      // Forwarded as-is: killProcessTree's win32 branch runs BEFORE its
+      // process-group branch, so the flag can never reach a `process.kill(-pid)`
+      // that Windows has no meaning for.
+      expect(opts).toEqual({ processGroup: true });
+      expect(isWin32).toBe(true);
+      expect(target).toEqual({ pid: handle.pid });
+      await terminate();
+      await closed;
+    } finally {
+      restorePlatform();
+    }
+  });
+
+  it('win32 reports the requested signal on close (taskkill kills out of band)', async () => {
+    const { handle, terminate } = await spawnMarkerJob();
+    const restorePlatform = pinPlatform('win32');
+    try {
+      killProcessTree.mockClear();
+      const closed = onClose(handle);
+      handle.kill('SIGKILL');
+      // The stubbed tree-kill didn't terminate anything; let the job exit the
+      // way a taskkill'd one does — a plain non-zero code, no signal.
+      await terminate();
+      const { code, signal } = await closed;
+      // Without the re-stamp this is (1, null) and videoGen discards a finished
+      // render as "Exit code 1" instead of honoring the watchdog kill.
+      expect(code).toBeNull();
+      expect(signal).toBe('SIGKILL');
+      expect(handle.exitCode).toBeNull();
+      expect(handle.signalCode).toBe('SIGKILL');
+    } finally {
+      restorePlatform();
+    }
+  });
+
+  it('win32 leaves a clean exit alone when a cancel races completion', async () => {
+    const { handle, terminate } = await spawnMarkerJob(0);
+    const restorePlatform = pinPlatform('win32');
+    try {
+      killProcessTree.mockClear();
+      const closed = onClose(handle);
+      handle.kill('SIGTERM');
+      await terminate();
+      const { code, signal } = await closed;
+      expect(code).toBe(0);
+      expect(signal).toBeNull();
+    } finally {
+      restorePlatform();
+    }
+  });
+
+  it('win32 stamps a numeric signal as its NAME on close', async () => {
+    const { handle, terminate } = await spawnMarkerJob();
+    const restorePlatform = pinPlatform('win32');
+    try {
+      const closed = onClose(handle);
+      // kill() accepts a number; ChildProcess reports names, so a raw 9 would
+      // break every `signal === 'SIGKILL'` comparison downstream.
+      handle.kill(9);
+      await terminate();
+      const { code, signal } = await closed;
+      expect(code).toBeNull();
+      expect(signal).toBe('SIGKILL');
+      expect(handle.signalCode).toBe('SIGKILL');
+    } finally {
+      restorePlatform();
+    }
+  });
+
+  it('win32 refuses to tree-kill a job that already exited', async () => {
+    const { handle, terminate } = await spawnMarkerJob();
+    const restorePlatform = pinPlatform('win32');
+    try {
+      const closed = onClose(handle);
+      await terminate();
+      await closed;
+      // Windows recycles PIDs, so a late escalation (reapDetached's grace
+      // deadline) must not taskkill whatever inherited the number.
+      killProcessTree.mockClear();
+      expect(handle.kill('SIGKILL')).toBe(false);
+      expect(killProcessTree).not.toHaveBeenCalled();
+      // ...and the status the supervisor recorded survives the refused kill.
+      expect(handle.exitCode).toBe(1);
+      expect(handle.signalCode).toBeNull();
+    } finally {
+      restorePlatform();
+    }
+  });
+
+  it('win32 treats signal 0 as an existence probe, not a kill', async () => {
+    const { handle, terminate } = await spawnMarkerJob();
+    const restorePlatform = pinPlatform('win32');
+    try {
+      killProcessTree.mockClear();
+      const closed = onClose(handle);
+      expect(handle.kill(0)).toBe(true);
+      expect(killProcessTree).not.toHaveBeenCalled();
+      await terminate();
+      const { code, signal } = await closed;
+      // A probe is not a death: it must not stamp a signal onto the close.
+      expect(code).toBe(1);
+      expect(signal).toBeNull();
+    } finally {
+      restorePlatform();
+    }
+  });
+
+  it('win32 rejects an unknown signal instead of force-killing the tree', async () => {
+    const { handle, terminate } = await spawnMarkerJob();
+    const restorePlatform = pinPlatform('win32');
+    try {
+      killProcessTree.mockClear();
+      const closed = onClose(handle);
+      // ChildProcess.kill() throws ERR_UNKNOWN_SIGNAL on a typo'd name; the
+      // handle must not turn that into a silent whole-tree force-kill.
+      expect(() => handle.kill('SIGKLL')).toThrow(/Unknown signal/);
+      expect(killProcessTree).not.toHaveBeenCalled();
+      await terminate();
+      await closed;
+    } finally {
+      restorePlatform();
+    }
+  });
+
+  // The convergence itself (#6170): on a real Windows host, a cancel must take
+  // the job's OWN descendants with it — the ffmpeg mux a video runtime shells
+  // out to, the pip a trainer launches. `process.kill(pid)` there terminates the
+  // job leaf and orphans them still holding the output file and GPU memory,
+  // which is exactly why the supervisor path used to be opt-in. Needs the REAL
+  // killProcessTree, so restore it for this one call.
+  //
+  // The runner is POWERSHELL, not node: libuv assigns a Node-spawned child to a
+  // job object that closes (and kills the child) when its Node parent dies, so a
+  // node-parent fixture passes even against a leaf-only kill and asserts
+  // nothing. A real trainer/render runner — python, a shell — has no such tie,
+  // and its ffmpeg keeps running. That is the orphan under test.
+  it.runIf(!IS_POSIX)('cancels a Windows job together with the grandchild it spawned', async () => {
+    const { killProcessTree: realKillProcessTree } = await vi.importActual('./bufferedSpawn.js');
+    killProcessTree.mockImplementationOnce(realKillProcessTree);
+
+    const controlDir = await tmpControlDir();
+    const grandchildPidFile = join(controlDir, 'grandchild-pid');
+    const heartbeat = join(controlDir, 'heartbeat');
+    const grandchildPath = join(controlDir, 'grandchild.cjs');
+    const runnerPath = join(controlDir, 'runner.ps1');
+    // A heartbeat file rather than a pid probe: on Windows a terminated process
+    // stays openable while any handle to it is alive, so `kill(pid, 0)` can
+    // still answer for a process that is gone. Output that STOPS is unambiguous.
+    await writeFile(grandchildPath, [
+      "const { appendFileSync } = require('fs');",
+      "setInterval(() => appendFileSync(process.env.PORTOS_TEST_HEARTBEAT, 'x'), 20);",
+    ].join('\n'));
+    // The paths reach the grandchild through the environment, not argv: Windows
+    // PowerShell 5.1's `Start-Process -ArgumentList` joins its array on spaces
+    // without quoting, so a temp path under a user name containing a space
+    // would silently split.
+    await writeFile(runnerPath, [
+      'param([string]$NodeExe, [string]$ScriptPath, [string]$PidFile, [string]$Heartbeat)',
+      '$env:PORTOS_TEST_HEARTBEAT = $Heartbeat',
+      '$g = Start-Process -FilePath $NodeExe -ArgumentList @((\'"\' + $ScriptPath + \'"\')) -PassThru -NoNewWindow',
+      'Set-Content -LiteralPath $PidFile -Value $g.Id',
+      'while ($true) { Start-Sleep -Milliseconds 200 }',
+    ].join('\n'));
+
+    const handle = await spawnDetached(
+      'powershell',
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', runnerPath,
+        process.execPath, grandchildPath, grandchildPidFile, heartbeat],
+      { controlDir, pollMs: 25 }
+    );
+    const closed = onClose(handle);
+
+    const beats = async () => (await readFile(heartbeat, 'utf8').catch(() => '')).length;
+    // Two powershell hops plus a Start-Process, so this is slower than the
+    // node-only fixtures above. Heartbeat can land before Set-Content finishes
+    // writing grandchild-pid — wait for a parseable pid first (CI flake).
+    expect(await waitUntil(async () => {
+      const raw = await readFile(grandchildPidFile, 'utf8').catch(() => '');
+      return Number.parseInt(raw, 10) > 0;
+    }, { timeoutMs: 30000 })).toBe(true);
+    expect(await waitUntil(async () => (await beats()) > 0, { timeoutMs: 30000 })).toBe(true);
+    const grandchildPid = Number.parseInt(await readFile(grandchildPidFile, 'utf8'), 10);
+    expect(grandchildPid).toBeGreaterThan(0);
+
+    try {
+      expect(handle.kill('SIGKILL')).toBe(true);
+      await closed;
+      // Stopped writing — a leaf-only kill leaves it beating forever.
+      const settled = await waitUntil(async () => {
+        const before = await beats();
+        await new Promise((r) => setTimeout(r, 150));
+        return (await beats()) === before;
+      }, { timeoutMs: 10000 });
+      expect(settled).toBe(true);
+    } finally {
+      // Never leave a real orphan behind when the assertion above is what failed.
+      try { process.kill(grandchildPid, 'SIGKILL'); } catch { /* already gone */ }
+    }
+  });
+
+  it.runIf(IS_POSIX)('leaves the POSIX path on its own pid/group signalling (no tree-kill)', async () => {
+    killProcessTree.mockClear();
+    const controlDir = await tmpControlDir();
+    const handle = await spawnDetached('sh', ['-c', 'sleep 30'], { controlDir, pollMs: 25 });
+    // Attach the close listener BEFORE killing — the tail loop can fire 'close'
+    // as soon as the signal lands.
+    const closed = onClose(handle);
+    await waitUntil(() => aliveByPs(handle.pid));
+    expect(handle.kill('SIGKILL')).toBe(true);
+    expect(killProcessTree).not.toHaveBeenCalled();
+    await closed;
+  });
+
+  describe('reapDetached', () => {
+    it.runIf(IS_POSIX)('SIGTERMs a surviving orphan and reports it reaped', async () => {
+      const controlDir = await tmpControlDir();
+      const handle = await spawnDetached('sh', ['-c', 'sleep 30'], { controlDir, pollMs: 25 });
+      const pid = handle.pid;
+      expect(pid).toBeGreaterThan(0);
+      // Attach the close listener BEFORE reaping — the killed sleeper writes
+      // exit and the handle's own tail loop can fire 'close' before reap returns.
+      const closed = onClose(handle);
+      await waitUntil(() => aliveByPs(pid));
+      const res = await reapDetached(controlDir, { graceMs: 3000, pollMs: 25 });
+      expect(res.reaped).toBe(true);
+      expect(res.pid).toBe(pid);
+      expect(await aliveByPs(pid)).toBe(false);
+      await closed;
+    });
+
+    it('is a no-op when the job already recorded an exit', async () => {
+      const controlDir = await tmpControlDir();
+      const handle = await spawnDetached('sh', ['-c', 'exit 0'], { controlDir, pollMs: 25 });
+      await onClose(handle);
+      const res = await reapDetached(controlDir, { graceMs: 200, pollMs: 25 });
+      expect(res.reaped).toBe(false);
+    });
+
+    it('is a no-op when no pid was ever recorded', async () => {
+      const controlDir = await tmpControlDir();
+      const res = await reapDetached(controlDir, { graceMs: 200, pollMs: 25 });
+      expect(res.reaped).toBe(false);
+    });
+
+    // NOTE on why this is a source guard and not a behavioral one. The property
+    // is "elapsed wall-clock bounds the loop", and it only diverges from the old
+    // tick count when a pass costs MORE than pollMs in real time — i.e. on a
+    // loaded machine. Fake timers cannot express that: advancing N ms of fake
+    // time yields both N ms elapsed AND N/pollMs iterations, so the two
+    // implementations agree by construction (a first draft of this test passed
+    // against the tick-counting loop, which is how that was found). A real-time
+    // test cannot be cheap either — the hard cap's floor is graceMs + 5000, so
+    // any run to the cap costs 5s of wall-clock. So this pins the shape, in the
+    // spirit of lib/importScoping.test.js, rather than adding a 5s sleep.
+    it('bounds both poll loops on WALL-CLOCK deadlines, not accumulated poll ticks', async () => {
+      const raw = await readFile(
+        new URL('./detachedSpawn.js', import.meta.url),
+        'utf8',
+      );
+      // Scan CODE only. The comments above both loops name the shape they
+      // replaced — `waited += pollMs` — so a scan of the raw file matches the
+      // very prose explaining the fix and fails on a correct tree.
+      const source = raw
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/(^|[^:])\/\/[^\n]*/g, '$1');
+      // Positive control: the loops this guards still exist to be guarded.
+      expect(source).toContain('export async function reapDetached');
+      expect(source).toContain('const awaitPid = async () =>');
+      expect(source.match(/await sleep\(pollMs\)/g).length).toBeGreaterThanOrEqual(2);
+
+      // The regression shape: a counter advanced by the NOMINAL cadence, then
+      // compared against a duration. Under load each pass costs more than
+      // pollMs, so the real cap stretches by the oversubscription factor.
+      expect(
+        /waited\s*\+=\s*pollMs/.test(source),
+        'detachedSpawn.js is accumulating poll ticks again (`waited += pollMs`). That '
+          + 'measures the loop\'s own cadence, not elapsed time, so REAP_GRACE_MS and '
+          + 'pidTimeoutMs both stretch on a loaded machine — and the hard cap stops '
+          + 'bounding boot, which is the only reason it exists (#7951). Compare '
+          + 'Date.now() against a deadline instead.',
+      ).toBe(false);
+
+      // And the shape that replaced it, so deleting the loops does not pass.
+      expect(source).toContain('Date.now() < hardDeadline');
+      expect(source).toContain('Date.now() < pidDeadline');
+    });
+
+  });
+
+  describe('reapAndCleanDetachedDirs', () => {
+    it.runIf(IS_POSIX)('reaps every surviving orphan under the parent and removes the dirs', async () => {
+      const parent = await tmpControlDir();
+      const a = join(parent, 'job-a');
+      const b = join(parent, 'job-b');
+      const hA = await spawnDetached('sh', ['-c', 'sleep 30'], { controlDir: a, pollMs: 25 });
+      const hB = await spawnDetached('sh', ['-c', 'sleep 30'], { controlDir: b, pollMs: 25 });
+      const closedA = onClose(hA);
+      const closedB = onClose(hB);
+      await waitUntil(async () => (await aliveByPs(hA.pid)) && (await aliveByPs(hB.pid)));
+      // pollMs matches the per-job cadence the rest of this suite spawns with;
+      // the default 250ms sentinel poll costs a quarter-second per dir here.
+      // graceMs is explicit for the same reason the single-dir reap tests above
+      // set it (#7951): the sweep reaps SEQUENTIALLY, and each dir is capped at
+      // graceMs + 5000, so the 12s production default makes this one case cost
+      // up to 34s — past any sane testTimeout. It normally finishes in ~150ms
+      // because SIGTERM lands immediately, but on a machine loaded enough that
+      // the exit is not observed before the grace elapses, both dirs wait out
+      // the full escalation and the file times out with nothing wrong. What
+      // this test asserts is that the sweep reaps every dir and removes it, not
+      // how long production waits before SIGKILL — reapDetached's own tests
+      // cover the escalation.
+      const res = await reapAndCleanDetachedDirs(parent, { pollMs: 25, graceMs: 3000 });
+      expect(res.reaped).toBe(2);
+      expect(res.scanned).toBe(2);
+      expect(await stat(a).then(() => true).catch(() => false)).toBe(false);
+      expect(await stat(b).then(() => true).catch(() => false)).toBe(false);
+      // Settle the handles, but do NOT require 'close' (#7951). Every assertion
+      // above is already done; this only exists so the tailers are not left
+      // polling. It cannot be an unconditional await: the sweep REMOVES each
+      // control dir, and a handle learns its job ended by reading the `exit`
+      // sentinel inside that dir. If the tailer has not observed the sentinel
+      // before the rm — which is a race it wins on an idle machine and loses on
+      // a loaded one — 'close' can never fire, and the await hangs until the
+      // test times out no matter how large that budget is. That is what made
+      // this case blow a 60s allowance while asserting nothing slow.
+      await Promise.all([closedA, closedB].map((closed) => Promise.race([
+        closed.catch(() => {}),
+        new Promise((resolve) => { setTimeout(resolve, 1000); }),
+      ])));
+    // This case gets its own timeout because its worst case genuinely exceeds
+    // the suite's 30s budget — it is the heaviest case in the file, and the
+    // number below is derived, not padded (#7951):
+    //
+    //   2 x spawnDetached, each bounded by PID_TIMEOUT_MS ......... 20s
+    //   waitUntil(...) for both children to be live ...............  5s
+    //   reapAndCleanDetachedDirs, 2 dirs SEQUENTIALLY at
+    //     graceMs 3000 + the 5000 hard-cap margin .................. 16s
+    //   bounded settle of the two handles ......................... 1s
+    //                                                              ----
+    //                                                               42s
+    //
+    // Every term is now BOUNDED — that is the point. An earlier version of this
+    // case ended on an unconditional `await` for both 'close' events, which the
+    // dir removal above can make unreachable, so it could exceed any budget.
+    //
+    // It costs ~150ms when the machine is idle; every term above is a ceiling
+    // that only a heavily loaded box approaches. Raising the GLOBAL budget to
+    // cover this one case would blind every other test, so the allowance is
+    // scoped here. If this starts timing out again, the cost moved — measure
+    // which term grew rather than raising this number.
+    }, 60000);
+
+    it('returns zero for a missing or empty parent', async () => {
+      const parent = await tmpControlDir();
+      const res = await reapAndCleanDetachedDirs(join(parent, 'does-not-exist'));
+      expect(res).toEqual({ reaped: 0, scanned: 0 });
+    });
+  });
+});
+
+describe('isReattachable', () => {
+  it.runIf(IS_POSIX)('is true while the recorded child is still alive', async () => {
+    const controlDir = await tmpControlDir();
+    const handle = await spawnDetached('sh', ['-c', 'sleep 30'], { controlDir, pollMs: 25 });
+    expect(await isReattachable(controlDir)).toBe(true);
+    handle.kill('SIGKILL');
+    await onClose(handle);
+  });
+
+  it.runIf(IS_POSIX)('is true after the child exited (RESULT line still unprocessed on disk)', async () => {
+    const controlDir = await tmpControlDir();
+    const handle = await spawnDetached('sh', ['-c', 'printf "x\\n"; exit 0'], { controlDir, pollMs: 25 });
+    await onClose(handle);
+    expect(await isReattachable(controlDir)).toBe(true);
+  });
+
+  it('is false when no pid was ever recorded', async () => {
+    const controlDir = await tmpControlDir();
+    expect(await isReattachable(controlDir)).toBe(false);
+  });
+
+  it('is false for a dead pid with no exit sentinel (killed mid-run)', async () => {
+    const controlDir = await tmpControlDir();
+    // A reparented-then-tree-killed orphan: pid recorded, never alive again,
+    // and the supervisor never got to write `exit`. PID 2^31-1 is never live.
+    await writeFile(join(controlDir, 'pid'), '2147483647');
+    expect(await isReattachable(controlDir)).toBe(false);
+  });
+});
+
+describe('isDetachedRunning', () => {
+  it.each(['<defunct>', 'bash <defunct>', '[bash] <defunct>', 'bash <exiting>'])(
+    'keeps a zombie PID blocked until its supervisor writes the exit sentinel: %s',
+    (command) => {
+      expect(__detachedSpawnTesting.processCommandMatches(command, {
+        executable: 'bash',
+        args: ['/example/update.sh']
+      })).toBe(true);
+    }
+  );
+
+  it.runIf(IS_POSIX)('is true while the recorded child is still alive with no exit sentinel', async () => {
+    const controlDir = await tmpControlDir();
+    const handle = await spawnDetached('sh', ['-c', 'sleep 30'], { controlDir, pollMs: 25 });
+    expect(await isDetachedRunning(controlDir)).toBe(true);
+    handle.kill('SIGKILL');
+    await onClose(handle);
+  });
+
+  it.runIf(IS_POSIX)('is true when the live process matches the expected executable', async () => {
+    const controlDir = await tmpControlDir();
+    await writeFile(join(controlDir, 'pid'), String(process.pid));
+    expect(await isDetachedRunning(controlDir, { executable: basename(process.execPath) })).toBe(true);
+  });
+
+  it.runIf(IS_POSIX)('is false when a recycled live PID belongs to another process', async () => {
+    const controlDir = await tmpControlDir();
+    await writeFile(join(controlDir, 'pid'), String(process.pid));
+    expect(await isDetachedRunning(controlDir, {
+      executable: 'bash',
+      args: ['/example/update.sh']
+    })).toBe(false);
+  });
+
+  it('is false once the job recorded its exit', async () => {
+    const controlDir = await tmpControlDir();
+    const handle = await spawnDetached('sh', ['-c', 'exit 0'], { controlDir, pollMs: 25 });
+    await onClose(handle);
+    expect(await isDetachedRunning(controlDir)).toBe(false);
+  });
+
+  it('is false when no pid was ever recorded', async () => {
+    const controlDir = await tmpControlDir();
+    expect(await isDetachedRunning(controlDir)).toBe(false);
+  });
+
+  it('is false for a dead pid with no exit sentinel', async () => {
+    const controlDir = await tmpControlDir();
+    await writeFile(join(controlDir, 'pid'), '2147483647');
+    expect(await isDetachedRunning(controlDir)).toBe(false);
+  });
+
+  // Callers treat `false` as permission to act (spawn a second update, purge the
+  // job's directory), so an unreadable control file must surface rather than
+  // masquerade as "never launched" (#3342).
+  it('rejects when a control file exists but cannot be read', async () => {
+    const controlDir = await tmpControlDir();
+    // A directory where the file belongs reads back EISDIR, not ENOENT — and
+    // unlike chmod it behaves the same when the suite runs as root.
+    await mkdir(join(controlDir, 'pid'), { recursive: true });
+    await expect(isDetachedRunning(controlDir)).rejects.toThrow();
+  });
+});
+
+describe.runIf(IS_POSIX)('reattachDetached', () => {
+  it('replays a still-running survivor from the start and closes with its exit code', async () => {
+    const controlDir = await tmpControlDir();
+    const release = join(controlDir, 'go');
+    // early output, then a pause the TEST releases, then late output + a
+    // non-zero exit.
+    const original = await spawnDetached(
+      'sh', ['-c', `printf "early\\n"; ${blockUntil(release)}; printf "late\\n"; exit 5`],
+      { controlDir, pollMs: 25 }
+    );
+    // Attach the original's close listener NOW (before it can fire) — 'close' is
+    // one-shot, so a listener added after the child exits would never resolve.
+    const originalClosed = onClose(original);
+    // Let "early" land on disk, then re-attach as if the server had restarted.
+    await waitUntil(async () => (await readStdoutLog(controlDir)).includes('early'));
+    const reattached = await reattachDetached(controlDir, { pollMs: 25 });
+    expect(reattached).not.toBeNull();
+    expect(reattached.pid).toBe(original.pid);
+    const getOut = collect(reattached.stdout);
+    await writeFile(release, '1');
+    const { code, signal } = await onClose(reattached);
+    // The re-attached tailer reads from offset 0, so it sees the FULL output —
+    // including bytes written before it attached — and the terminal exit code.
+    expect(getOut()).toBe('early\nlate\n');
+    expect(code).toBe(5);
+    expect(signal).toBeNull();
+    await originalClosed.catch(() => {});
+  });
+
+  it('recovers a job that FINISHED during the downtime (replays its result + close)', async () => {
+    const controlDir = await tmpControlDir();
+    const original = await spawnDetached('sh', ['-c', 'printf "RESULT:ok\\n"; exit 0'], { controlDir, pollMs: 25 });
+    await onClose(original); // job already exited before we re-attach
+    const reattached = await reattachDetached(controlDir, { pollMs: 25 });
+    expect(reattached).not.toBeNull();
+    const getOut = collect(reattached.stdout);
+    const { code } = await onClose(reattached);
+    expect(getOut()).toBe('RESULT:ok\n');
+    expect(code).toBe(0);
+  });
+
+  it('emits a one-time "replayed" signal once the initial backlog is drained', async () => {
+    const controlDir = await tmpControlDir();
+    const release = join(controlDir, 'go');
+    const original = await spawnDetached(
+      'sh', ['-c', `printf "h1\\nh2\\n"; ${blockUntil(release)}; printf "live\\n"; exit 0`],
+      { controlDir, pollMs: 25 }
+    );
+    const originalClosed = onClose(original);
+    // let the backlog (h1/h2) land
+    await waitUntil(async () => (await readStdoutLog(controlDir)).includes('h2'));
+    const reattached = await reattachDetached(controlDir, { pollMs: 25 });
+    const getOut = collect(reattached.stdout);
+    let replayedCount = 0;
+    let outAtReplayed = null;
+    const replayed = new Promise((resolve) => {
+      reattached.on('replayed', () => { replayedCount += 1; outAtReplayed = getOut(); resolve(); });
+    });
+    // Release "live" only once the replay boundary has been observed. The old
+    // `sleep 1` made that ordering a race the test happened to win; gating on
+    // the event makes it the thing the fixture guarantees.
+    await replayed;
+    await writeFile(release, '1');
+    const { code } = await onClose(reattached);
+    // 'replayed' fires exactly once, AFTER the pre-existing backlog was emitted
+    // but BEFORE the post-restart "live" line — that's the boundary the stall
+    // detector uses to avoid arming on instantly-replayed step history.
+    expect(replayedCount).toBe(1);
+    expect(outAtReplayed).toBe('h1\nh2\n');
+    expect(getOut()).toBe('h1\nh2\nlive\n');
+    expect(code).toBe(0);
+    await originalClosed.catch(() => {});
+  });
+
+  it('returns null when there is no pid to attach to', async () => {
+    const controlDir = await tmpControlDir();
+    expect(await reattachDetached(controlDir, { pollMs: 25 })).toBeNull();
+  });
+
+  it('returns null for a dead pid with no exit sentinel', async () => {
+    const controlDir = await tmpControlDir();
+    await writeFile(join(controlDir, 'pid'), '2147483647');
+    expect(await reattachDetached(controlDir, { pollMs: 25 })).toBeNull();
+  });
+
+  it('can SIGTERM the survivor through the re-attached handle', async () => {
+    const controlDir = await tmpControlDir();
+    const original = await spawnDetached('sh', ['-c', 'sleep 30'], { controlDir, pollMs: 25 });
+    // Attach before the kill — the shared child's death closes BOTH handles, and
+    // 'close' is one-shot, so the original's listener has to be wired up front.
+    const originalClosed = onClose(original);
+    await waitUntil(() => aliveByPs(original.pid));
+    const reattached = await reattachDetached(controlDir, { pollMs: 25 });
+    const closed = onClose(reattached);
+    expect(reattached.kill('SIGTERM')).toBe(true);
+    const { signal } = await closed;
+    expect(signal).toBe('SIGTERM');
+    await originalClosed.catch(() => {});
+  });
+});
+
+describe.runIf(IS_POSIX)('snapshotProcesses', () => {
+  it('reports the ps state of each row and includes this process', async () => {
+    const { snapshotProcesses } = await import('./detachedSpawn.js');
+    const own = (await snapshotProcesses()).find(row => row.pid === process.pid);
+    expect(own).toMatchObject({ pgid: expect.any(Number), state: expect.stringMatching(/^[A-Za-z]/) });
+    expect(Number.isFinite(own.startedAt)).toBe(true);
+  });
+});

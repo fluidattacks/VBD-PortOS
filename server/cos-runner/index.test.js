@@ -1,0 +1,216 @@
+import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'fs';
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
+
+// index.js binds a socket server + `server.listen(PORT, HOST)` at module load,
+// so it can't be imported into a unit test. These are source-inspection tests
+// (the same convention as agentLifecycle.test.js) pinning the #2243 spawn fix:
+// the runner must resolve+wrap a bare npm CLI shim before spawning, or a
+// Windows `opencode`/`claude` .cmd shim fails with spawn ENOENT (errno -4058)
+// → empty output → startup-failure.
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const RUNNER_SRC = readFileSync(join(__dirname, 'index.js'), 'utf-8');
+
+describe('cos-runner spawn — Windows CLI shim resolve+wrap (#2243)', () => {
+  it('imports prepareCliSpawn from the shared bufferedSpawn helper', () => {
+    expect(RUNNER_SRC).toMatch(
+      /import\s*\{[^}]*\bprepareCliSpawn\b[^}]*\}\s*from\s*'\.\.\/lib\/bufferedSpawn\.js';/
+    );
+  });
+
+  it('resolves+wraps the agent CLI command before spawning it', () => {
+    // The agent spawn (the /spawn handler) must feed its command/args through
+    // prepareCliSpawn and spawn WHATEVER it returns — never the bare `command`.
+    // deliveredArgs is spawnArgs after prepareCliPrompt (antigravity --print
+    // value / grok Windows temp-file rewrite); every provider still resolves
+    // through prepareCliSpawn before spawning.
+    const call = RUNNER_SRC.match(
+      /const\s*\{\s*command:\s*spawnCommand,\s*args:\s*finalSpawnArgs\s*\}\s*=\s*prepareCliSpawn\(\s*command,\s*deliveredArgs,\s*childEnv\s*\)/
+    );
+    expect(call, 'agent spawn must call prepareCliSpawn(command, deliveredArgs, childEnv)').not.toBeNull();
+    // The resolved pair must be what spawn() actually receives.
+    expect(RUNNER_SRC).toMatch(/spawn\(\s*spawnCommand,\s*finalSpawnArgs,/);
+  });
+
+  it('resolves the command against the child env (childEnv) so a provider PATH override is honored', () => {
+    // childEnv (process.env + provider envVars, CLAUDECODE stripped, PWD pinned
+    // — composed by the shared buildCliChildEnv) is built BEFORE the resolve so
+    // PATH resolution sees the child's PATH, and is reused as the spawn env —
+    // matching the working server/services/runner.js path.
+    const childEnvIdx = RUNNER_SRC.indexOf('const childEnv = buildCliChildEnv(');
+    const prepareIdx = RUNNER_SRC.indexOf('prepareCliSpawn(command, deliveredArgs, childEnv)');
+    expect(childEnvIdx, 'childEnv must be defined').toBeGreaterThan(-1);
+    expect(prepareIdx, 'prepareCliSpawn must run against childEnv').toBeGreaterThan(-1);
+    expect(childEnvIdx, 'childEnv must be built before the resolve').toBeLessThan(prepareIdx);
+  });
+});
+
+describe('cos-runner spawn — per-provider prompt delivery (antigravity --print value)', () => {
+  it('imports prepareCliPrompt from the shared cliProviderArgs helper', () => {
+    expect(RUNNER_SRC).toMatch(
+      /import\s*\{[^}]*\bprepareCliPrompt\b[^}]*\}\s*from\s*'\.\.\/lib\/cliProviderArgs\.js';/
+    );
+  });
+
+  it('runs the built argv through prepareCliPrompt before resolving the spawn', () => {
+    // Antigravity (`agy`) takes the prompt as the --print VALUE and does NOT read
+    // stdin; without this the prompt never reaches the model. prepareCliPrompt
+    // rewrites the argv (and returns useStdin=false for agy) before the resolve.
+    // The trailing options object carries the run's `cwd`, which OpenChamber
+    // needs as the `--dir` its control plane cannot infer — pinned here so a
+    // refactor cannot drop it and leave that harness running in the wrong tree.
+    const prepareIdx = RUNNER_SRC.indexOf('prepareCliPrompt(command, spawnArgs, prompt, { cwd })');
+    const resolveIdx = RUNNER_SRC.indexOf('prepareCliSpawn(command, deliveredArgs, childEnv)');
+    expect(prepareIdx, 'must call prepareCliPrompt(command, spawnArgs, prompt, { cwd })').toBeGreaterThan(-1);
+    expect(resolveIdx, 'must resolve the delivered argv').toBeGreaterThan(-1);
+    expect(prepareIdx, 'prompt delivery runs before the spawn resolve').toBeLessThan(resolveIdx);
+  });
+
+  it('gates the stdin write on useStdin so an argv-delivered prompt is not also piped', () => {
+    // For antigravity (--print value) / grok-on-Windows (temp file) useStdin is
+    // false — writing the prompt to stdin too would be redundant/incorrect. The
+    // delivery helper writes its payload only when it is non-null, so passing
+    // null there is what "don't pipe it" looks like now (#5655).
+    expect(RUNNER_SRC).toMatch(/deliverChildStdin\(claudeProcess,\s*useStdin \? prompt : null,/);
+  });
+});
+
+describe('cos-runner termination', () => {
+  // Both halves of a kill now live in modules that can actually be imported:
+  // killProcessTree (bufferedSpawn.js) decides what "kill" means for the
+  // handle, and armForceKill (forceKill.js) owns the SIGTERM -> grace ->
+  // SIGKILL escalation. bufferedSpawn.test.js and forceKill.test.js exercise
+  // those for real; all this file pins is that index.js delegates to both
+  // rather than hand-rolling either.
+  it('kills only through the shared killProcessTree helper', () => {
+    // Matched as "killProcessTree is on the bufferedSpawn import line" rather than
+    // as the exact line text — pinning the whole specifier list made an unrelated
+    // helper import (guardChildStdin, #5655) fail a kill-path assertion.
+    expect(RUNNER_SRC).toMatch(/^import \{[^}]*\bkillProcessTree\b[^}]*\} from '\.\.\/lib\/bufferedSpawn\.js';$/m);
+    // A BARE `.kill()` is still fine — the sentinel watcher closes a finished
+    // TUI session that way, and a bare kill is the one form node-pty accepts
+    // on every platform. What must not reappear is a hand-rolled signal kill.
+    expect(RUNNER_SRC).not.toContain(".process.kill('SIG");
+  });
+
+  it('guards the child stdin pipe BEFORE writing the prompt to it', () => {
+    // A child that dies before reading stdin emits EPIPE, and an unlistened
+    // stream 'error' in this non-request context kills the runner process
+    // (#5655). Source-text because the route spawns a real child; the helper's
+    // behavior is covered in lib/bufferedSpawn.test.js.
+    const guardAt = RUNNER_SRC.indexOf('guardChildStdin(claudeProcess);');
+    const deliverAt = RUNNER_SRC.indexOf('deliverChildStdin(claudeProcess,');
+    expect(guardAt).toBeGreaterThan(-1);
+    expect(deliverAt).toBeGreaterThan(guardAt);
+  });
+
+  it('escalates through the shared armForceKill on every terminate path', () => {
+    expect(RUNNER_SRC).toContain("import { armForceKill as armForceKillShared } from './forceKill.js';");
+    // /terminate and /terminate-all, plus the post-finalize tui:kill relay.
+    expect(RUNNER_SRC.split('armForceKill(agentId, agent);')).toHaveLength(3);
+    expect(RUNNER_SRC).toContain('armForceKill(agentId, agent, { dropState: agent.paused !== true })');
+  });
+
+  it('binds TUI exit handling to the original process record', () => {
+    expect(RUNNER_SRC).toContain('tuiProcess.onExit(lifecycle.agentExit(agentId, agent, createTuiExitHandler({');
+    expect(RUNNER_SRC).toContain('agentId, taskId, sessionId, agent, activeAgents, io, emitToServer, withState,');
+  });
+});
+
+describe('cos-runner durable TUI ownership (#3202)', () => {
+  it('does not complete a TUI until sentinel read and recovery promotion both validate', () => {
+    const guard = RUNNER_SRC.indexOf('if (!sentinelValidated) {');
+    const completed = RUNNER_SRC.indexOf('current.completedBySentinel = true;');
+    const killed = RUNNER_SRC.indexOf('current.process.kill();');
+    expect(guard, 'sentinel failures must stay on the watch path').toBeGreaterThan(-1);
+    expect(completed, 'completion must be marked only after validation').toBeGreaterThan(guard);
+    expect(killed, 'the PTY must be killed only after validation').toBeGreaterThan(completed);
+    expect(RUNNER_SRC).toContain('current.doneWatcher = sentinelAccess.watch(handleSentinel);');
+  });
+
+  it('checks the TUI executable against its child PATH before opening a PTY', () => {
+    // node-pty otherwise turns a missing binary into exit 1 with no transcript,
+    // which loses the real configuration error to a generic startup failure.
+    expect(RUNNER_SRC).toMatch(
+      /import\s*\{[^}]*\bfindCommandOnPath\b[^}]*\}\s*from\s*'\.\.\/lib\/processEnv\.js';/
+    );
+    expect(RUNNER_SRC).toMatch(
+      /import\s*\{[^}]*\bcommandExists\b[^}]*\}\s*from\s*'\.\.\/lib\/commandExists\.js';/
+    );
+    const childEnvIdx = RUNNER_SRC.indexOf('const childEnv = buildCliChildEnv({ before: envVars, provider: providerAuth, cwd });');
+    const resolveIdx = RUNNER_SRC.indexOf('const executable = findCommandOnPath(command, { env: childEnv, cwd });');
+    const prepareProbeIdx = RUNNER_SRC.indexOf("const versionProbe = prepareCliSpawn(executable, ['--version'], childEnv);");
+    const probeIdx = RUNNER_SRC.indexOf('const runnable = await commandExists(versionProbe.command, versionProbe.args, {');
+    const spawnIdx = RUNNER_SRC.indexOf('pty.spawn(ptyCommand, ptyArgs');
+    expect(resolveIdx, 'runner must resolve the command against childEnv').toBeGreaterThan(childEnvIdx);
+    expect(prepareProbeIdx, 'runner must prepare a Windows-safe version probe').toBeGreaterThan(resolveIdx);
+    expect(probeIdx, 'runner must capability-check the prepared command').toBeGreaterThan(prepareProbeIdx);
+    expect(spawnIdx, 'runner must open the PTY after the executable probe').toBeGreaterThan(probeIdx);
+    expect(RUNNER_SRC).toContain('const TUI_CAPABILITY_PROBE_TIMEOUT_MS = 15 * 1000;');
+    expect(RUNNER_SRC).toMatch(/timeoutMs:\s*TUI_CAPABILITY_PROBE_TIMEOUT_MS/);
+    expect(RUNNER_SRC).toContain('Command executable unavailable: ${basename(command)} is not on the CoS Runner PATH');
+    expect(RUNNER_SRC).toContain('Command executable unavailable: ${basename(command)} did not pass the CoS Runner capability check');
+    expect(RUNNER_SRC).toContain('const { command: ptyCommand, args: ptyArgs } = prepareCliSpawn(executable, args, childEnv);');
+  });
+
+  it('tracks TUI liveness from onExit bookkeeping rather than a pid probe', () => {
+    // node-pty reports pid 0 for ConPTY on Windows, so getProcessStats(pid)
+    // reads every runner-owned TUI as invalid/dead. GET /agents must use the
+    // runner's own onExit flag, then tag the row so sweeps can tell a real
+    // processActive from that pid-0 artifact.
+    expect(RUNNER_SRC).toMatch(
+      /import\s*\{[^}]*\brunnerAgentLivenessFields\b[^}]*\}\s*from\s*'\.\.\/lib\/runnerAgentLiveness\.js';/
+    );
+    expect(RUNNER_SRC).toMatch(/exited:\s*false/);
+    expect(RUNNER_SRC).toMatch(/if\s*\(\s*agent\.exited\s*===\s*true\s*\)\s*continue;/);
+    expect(RUNNER_SRC).toMatch(/runnerAgentLivenessFields\(agent,\s*stats\)/);
+    expect(RUNNER_SRC).toMatch(/inspectAgentProcess\(agent\)/);
+  });
+
+  it('spawns the PTY through the shared Windows-safe CLI wrapper', () => {
+    expect(RUNNER_SRC).toMatch(/app\.post\('\/spawn-tui'/);
+    expect(RUNNER_SRC).toMatch(/prepareCliSpawn\(executable, args, childEnv\)/);
+    expect(RUNNER_SRC).toMatch(/pty\.spawn\(ptyCommand,\s*ptyArgs/);
+    expect(RUNNER_SRC).toMatch(/io\.emit\('tui:output'/);
+    expect(RUNNER_SRC).toMatch(/parseSentinelPayload\(validatedContents\)/);
+    expect(RUNNER_SRC).toMatch(/emitToServer\('agent:completed'/);
+  });
+});
+
+// The runner is the second headless spawner: the same providers land here when a
+// task is dispatched with `useRunner`, and its stdout/stderr handlers are a twin
+// of spawnDirectly's. `opencode run` colors its progress line, and those raw
+// escapes reached the agent card as `[stderr] [0m` noise — a working agent read
+// as a wedged one. The behavioral coverage lives in agentCliSpawning.test.js
+// against the real handlers; this pins that the runner twin was not left behind.
+describe('cos-runner output — ANSI decoloring parity with spawnDirectly', () => {
+  it('imports the shared streaming stripper rather than rolling its own regex', () => {
+    expect(RUNNER_SRC).toMatch(
+      /import\s*\{[^}]*\bcreateStreamingAnsiStripper\b[^}]*\}\s*from\s*'\.\.\/lib\/ansiStrip\.js';/
+    );
+  });
+
+  it('gives each agent its own stdout/stderr strippers, skipping NDJSON stdout', () => {
+    // Per agent, not per module: the stripper buffers an escape split across two
+    // chunks, so one shared instance would interleave two agents' tails.
+    expect(RUNNER_SRC).toMatch(
+      /stripStdoutAnsi:\s*isStreamJson\s*\?\s*\(text\)\s*=>\s*text\s*:\s*createStreamingAnsiStripper\(\)/
+    );
+    expect(RUNNER_SRC).toMatch(/stripStderrAnsi:\s*createStreamingAnsiStripper\(\)/);
+  });
+
+  it('decolors both streams before they reach the buffer, formatter, or socket', () => {
+    expect(RUNNER_SRC).toMatch(/agent\?\.stripStdoutAnsi\s*\?\s*agent\.stripStdoutAnsi\(data\.toString\(\)\)/);
+    expect(RUNNER_SRC).toMatch(/agent\?\.stripStderrAnsi\s*\?\s*agent\.stripStderrAnsi\(data\.toString\(\)\)/);
+    // The codex formatter must see the decolored text too — it matches prose that
+    // an SGR pair would otherwise split.
+    expect(RUNNER_SRC).toMatch(/codexStderrFormatter\.processChunk\(decolored\)/);
+    // And the `[stderr]` tag is built from the decolored chunk, never the raw one.
+    expect(RUNNER_SRC).toMatch(/const text = `\[stderr\] \$\{decolored\}`/);
+  });
+
+  it('drops a chunk that was only terminal control instead of emitting a blank line', () => {
+    expect(RUNNER_SRC).toMatch(/if \(!trimmedDecolored \|\| isKnownCliStderrNoise\(trimmedDecolored\)\) return;/);
+  });
+});

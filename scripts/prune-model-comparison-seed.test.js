@@ -1,0 +1,92 @@
+import { describe, it, expect } from 'vitest';
+import { readFile } from 'fs/promises';
+import { join } from 'path';
+import { inScopeModels, prunedSeed } from './prune-model-comparison-seed.js';
+import { BACKENDS, LOCAL_LLM_CATALOG, entryIdsForBackend } from '../server/lib/localLlmCatalog.js';
+import { catalogSlugForProviderModel, localCatalogBenchmarkModels } from '../server/lib/comparisonModelScope.js';
+
+const root = join(import.meta.dirname, '..');
+const readSeed = async () => JSON.parse(await readFile(join(root, 'data.reference/model-comparison.json'), 'utf8'));
+
+describe('model comparison seed scope', () => {
+  it('keeps official Grok 4.7 context-tier prices distinct', async () => {
+    const rows = (await readSeed()).observations.filter(row => row.model === 'grok-4.7' && row.benchmark.startsWith('Official'));
+    expect(rows.map(row => [row.inputPerMillion.value, row.outputPerMillion.value])).toEqual([[2, 6], [4, 12]]);
+    expect(new Set(rows.map(row => row.configuration)).size).toBe(2);
+    for (const row of rows) {
+      expect(row.inputPerMillion.source.url).toBe('https://docs.x.ai/developers/models/grok-4.7');
+      for (const metric of ['quality', 'costPerTask', 'reasoningPerMillion', 'responseSeconds', 'tokensPerSecond', 'quota']) expect(row[metric]).toBeNull();
+    }
+  });
+
+  it('ships public benchmark and price observations without PortOS run data', async () => {
+    const { observations } = await readSeed();
+    expect(observations.length).toBeGreaterThan(0);
+    const scored = observations.filter(row => row.quality);
+    const priced = observations.filter(row => row.inputPerMillion || row.outputPerMillion || row.reasoningPerMillion);
+    expect(scored.length).toBeGreaterThan(0);
+    expect(priced.length).toBeGreaterThan(0);
+    expect(observations.some(row => row.quality && (row.inputPerMillion || row.outputPerMillion))).toBe(true);
+
+    const metricFields = [
+      'quality', 'costPerTask', 'apiEquivalentCost', 'inputPerMillion', 'outputPerMillion',
+      'reasoningPerMillion', 'responseSeconds', 'tokensPerSecond', 'tokensPerRun',
+      'inputTokens', 'outputTokens', 'quota',
+    ];
+    for (const row of observations) {
+      expect(row.benchmark).not.toMatch(/^PortOS Task Bench/);
+      expect(row.id).not.toMatch(/^portos:/);
+      for (const field of metricFields) {
+        if (row[field]) expect(row[field].source.url).toMatch(/^https:\/\//);
+      }
+    }
+  });
+
+  it('ships only models a configured provider or a current frontier anchor can dispatch', async () => {
+    const [seed, scope] = await Promise.all([readSeed(), inScopeModels()]);
+    const outOfScope = [...new Set(seed.observations.filter(row => !row.quality && !['OpenRouter', 'OpenCode Zen'].includes(row.provider)).map(row => row.model))].filter(model => !scope.has(model));
+    expect(outOfScope).toEqual([]);
+  });
+
+  it('is already pruned — the checked-in seed equals the pruned seed', async () => {
+    const [seed, { pruned }] = await Promise.all([readSeed(), prunedSeed()]);
+    expect(seed.observations).toEqual(pruned.observations);
+  });
+
+  it('scopes local model identities without claiming that hosted prices apply locally', async () => {
+    const declared = localCatalogBenchmarkModels();
+    expect(declared.size).toBeGreaterThan(0);
+    for (const entry of LOCAL_LLM_CATALOG.filter(model => model.benchmarkModel)) {
+      for (const backend of BACKENDS) {
+        for (const id of entryIdsForBackend(entry, backend)) {
+          expect(catalogSlugForProviderModel(id)).toBe(entry.benchmarkModel);
+        }
+      }
+    }
+  });
+
+  it('ships Claude Sonnet 5.5 benchmark performance, pricing, and coding data', async () => {
+    const seed = await readSeed();
+    const rows = seed.observations.filter(row => row.model === 'claude-sonnet-5.5');
+    expect(rows.length).toBeGreaterThanOrEqual(10);
+
+    const aaRows = rows.filter(row => row.benchmark === 'Artificial Analysis Intelligence Index v4.3.2');
+    const efforts = new Set(aaRows.map(row => row.effort));
+    expect(efforts).toEqual(new Set(['low', 'medium', 'high', 'xhigh', 'max']));
+
+    const maxRow = aaRows.find(row => row.effort === 'max' && row.provider === 'Anthropic' && row.id.startsWith('aa-v4.3.2'));
+    expect(maxRow.quality.value).toBe(56);
+    expect(maxRow.costPerTask.value).toBe(7.6);
+    expect(maxRow.inputPerMillion.value).toBe(2);
+    expect(maxRow.outputPerMillion.value).toBe(10);
+    expect(maxRow.tokensPerSecond.value).toBe(141.9);
+
+    const codingRow = rows.find(row => row.benchmark === 'Terminal-Bench 4.0 (agentic coding, pass@1)');
+    expect(codingRow).toBeDefined();
+    expect(codingRow.quality.value).toBe(63.6);
+
+    const pricing = rows.filter(row => row.benchmark.startsWith('Official API pricing'));
+    expect(pricing.length).toBeGreaterThanOrEqual(2);
+  });
+
+});

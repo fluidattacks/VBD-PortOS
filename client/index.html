@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PortOS</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png" />
+    <link rel="icon" type="image/x-icon" href="/favicon.ico" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/manifest.json" />
+    <meta name="theme-color" content="#01051F" />
+    <!-- No webfont <link> here, deliberately. Inter and IBM Plex Mono are
+         SELF-HOSTED from /fonts/ and declared with @font-face in src/index.css
+         (same as GeistPixel for CyberCity). A PortOS install runs on a private
+         Tailscale network with no assumed route to the public internet, so a
+         font pulled from a public CDN simply never arrives and four theme
+         stacks silently fall back to system fonts. Same-origin fonts are served
+         by the install itself, so the intended typography renders with zero WAN
+         — and every boot drops a third-party request. See #3812. -->
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

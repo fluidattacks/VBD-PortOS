@@ -1,0 +1,331 @@
+vi.mock('../instanceIdentity.js', () => ({ ensureInstanceId: vi.fn(async () => 'example-owner'), getInstanceId: vi.fn(async () => 'example-owner') }));
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+// Mocks declared before importing the module under test.
+const mockReadJSONFile = vi.fn();
+const mockAtomicWrite = vi.fn();
+const mockEnsureDir = vi.fn();
+
+vi.mock('../../lib/fileUtils.js', () => ({
+tryReadFile: vi.fn().mockResolvedValue(null),
+  PATHS: { data: '/fake/data' },
+  readJSONFile: (...args) => mockReadJSONFile(...args),
+  atomicWrite: (...args) => mockAtomicWrite(...args),
+  ensureDir: (...args) => mockEnsureDir(...args),
+}));
+
+vi.mock('../mediaCollections.js', () => ({
+  createCollection: vi.fn(async () => ({ id: 'col-1' })),
+}));
+
+// local.js imports catalogDB for the #1808 catalog-seed path; mock it so this
+// dispatcher test doesn't pull in the real Postgres/instances/peer-sync chain
+// (none of these cases pass catalogIngredientIds, so the resolve is a no-op).
+vi.mock('../catalogDB.js', () => ({
+  resolveIngredientsByIds: vi.fn(async () => []),
+  linkIngredientsToCreativeDirector: vi.fn(async () => []),
+  cdRefRoleForType: (type) => type,
+}));
+
+// setTreatment fires first-pass scene-frame seeding (#1938) — mock it so this
+// dispatcher test doesn't pull the real mediaJobQueue/imageGen graph.
+vi.mock('./firstPassGen.js', () => ({
+  enqueueFirstPassSceneFrames: vi.fn(async () => ({ mode: 'local', enqueued: [], skipped: [] })),
+}));
+
+vi.mock('../catalogDB/ingredients.js', () => ({ getIngredient: vi.fn() }));
+import { getIngredient } from '../catalogDB/ingredients.js';
+
+const { setTreatment, setPlan, recordRun, updateRun, trimRuns, getProjectsByIds } = await import('./local.js');
+import * as firstPassGen from './firstPassGen.js';
+
+const VALID_TREATMENT = {
+  logline: 'A cat finds a hat.',
+  synopsis: 'Then puts it on.',
+  scenes: [
+    {
+      sceneId: 'scene-1',
+      order: 0,
+      intent: 'Cat enters frame',
+      prompt: 'A cat walks into view',
+      durationSeconds: 4,
+    },
+  ],
+};
+
+beforeEach(() => {
+  mockReadJSONFile.mockReset();
+  mockAtomicWrite.mockReset().mockResolvedValue(undefined);
+  mockEnsureDir.mockReset().mockResolvedValue(undefined);
+  firstPassGen.enqueueFirstPassSceneFrames.mockClear();
+});
+
+describe('setTreatment — first-pass scene frames (#1867/#1938)', () => {
+  it('rejects a treatment when sources changed after planning, then records the replanned fingerprint', async () => {
+    const { prepareVideoPlanningProject } = await import('./videoSources.js');
+    let project = { id: 'cd-video', workspace: 'video', status: 'draft', name: 'Example', targetDurationSeconds: 4, aspectRatio: '16:9', videoDraft: { sources: [{ kind: 'catalog', id: 'example-catalog' }] } };
+    mockReadJSONFile.mockImplementation(async () => [project]);
+    mockAtomicWrite.mockImplementation(async (path, data) => { if (path.endsWith('creative-director-projects.json')) project = data[0]; });
+    getIngredient.mockResolvedValue({ id: 'example-catalog', name: 'Example character', type: 'character', payload: { physicalDescription: 'A silver cloak' }, updatedAt: '2026-09-01T00:00:00Z' });
+    await prepareVideoPlanningProject(project);
+    const plannedRevision = project.videoPlanningContext.revision;
+    getIngredient.mockResolvedValue({ id: 'example-catalog', name: 'Example character', type: 'character', payload: { physicalDescription: 'A golden cloak' }, updatedAt: '2026-09-02T00:00:00Z' });
+    await expect(setTreatment(project.id, { ...VALID_TREATMENT, script: 'A traveler arrives.' })).rejects.toMatchObject({ code: 'VIDEO_SOURCE_CONTEXT_CHANGED' });
+    expect(project.treatment).toBeUndefined();
+    await prepareVideoPlanningProject(project);
+    expect(project.videoPlanningContext.revision).not.toBe(plannedRevision);
+    await expect(setTreatment(project.id, { ...VALID_TREATMENT, script: 'A traveler arrives.', sourceContextRevision: plannedRevision })).rejects.toMatchObject({ code: 'VIDEO_SOURCE_CONTEXT_CHANGED' });
+    const saved = await setTreatment(project.id, { ...VALID_TREATMENT, script: 'A traveler arrives.', sourceContextRevision: project.videoPlanningContext.revision });
+    expect(saved.treatment.artifact.sourceContextRevision).toBe(project.videoPlanningContext.revision);
+    expect(saved.treatment.artifact.references[0].sourceRevision).toBe(project.videoPlanningContext.references[0].sourceRevision);
+    expect(JSON.stringify(saved)).not.toContain('golden cloak');
+  });
+  it('blocks both Video artifact writers on missing sources, then saves after source repair', async () => {
+    const project = { id: 'cd-video', workspace: 'video', status: 'draft', name: 'Example', targetDurationSeconds: 120, aspectRatio: '16:9', videoDraft: { sources: [{ kind: 'catalog', id: 'example-catalog', revision: 'revision-1' }] } };
+    mockReadJSONFile.mockResolvedValue([project]);
+    getIngredient.mockResolvedValue(null);
+    const treatment = { ...VALID_TREATMENT, script: 'A cat finds a hat.', scenes: Array.from({ length: 12 }, (_, order) => ({ ...VALID_TREATMENT.scenes[0], sceneId: `scene-${order}`, order, durationSeconds: 10 })) };
+    const plan = { steps: [{ stepId: 'render', toolName: 'media_enqueueVideoJob', args: { params: { prompt: 'Example forest', durationSeconds: 10 } } }] };
+    await expect(setTreatment(project.id, treatment)).rejects.toMatchObject({ code: 'VIDEO_SOURCE_MISSING', status: 409 });
+    await expect(setPlan(project.id, plan)).rejects.toMatchObject({ code: 'VIDEO_SOURCE_MISSING', status: 409 });
+    getIngredient.mockRejectedValueOnce(new Error('Store unavailable'));
+    await expect(setTreatment(project.id, treatment)).rejects.toThrow('Store unavailable');
+    expect(mockAtomicWrite).not.toHaveBeenCalled();
+    getIngredient.mockResolvedValue({ id: 'example-catalog', updatedAt: 'newer-source-revision' });
+    const saved = await setTreatment(project.id, treatment);
+    expect(saved.treatment.artifact.references).toEqual([{ kind: 'catalog', id: 'example-catalog', referenceId: 'catalog:example-catalog', revision: 'revision-1', sourceRevision: expect.any(String) }]);
+    expect(saved.status).toBe('draft');
+    await expect(setPlan(project.id, plan)).resolves.toMatchObject({ status: 'draft' });
+    expect(firstPassGen.enqueueFirstPassSceneFrames).not.toHaveBeenCalled();
+  });
+
+  it('seeds first-pass scene frames when the project opted into generateFirstPass', async () => {
+    mockReadJSONFile.mockResolvedValue([{ id: 'cd-1', generateFirstPass: true, name: 'Test' }]);
+    const result = await setTreatment('cd-1', VALID_TREATMENT);
+    // Fires on the domain write itself (not the route) so every setTreatment
+    // caller honors the opt-in. Called with the freshly-persisted project.
+    expect(firstPassGen.enqueueFirstPassSceneFrames).toHaveBeenCalledWith(result);
+    expect(result.generateFirstPass).toBe(true);
+  });
+
+  it('does not seed first-pass scene frames when the project never opted in', async () => {
+    mockReadJSONFile.mockResolvedValue([{ id: 'cd-1', name: 'Test' }]);
+    await setTreatment('cd-1', VALID_TREATMENT);
+    expect(firstPassGen.enqueueFirstPassSceneFrames).not.toHaveBeenCalled();
+  });
+});
+
+describe('setTreatment — status preservation', () => {
+  it('preserves paused status when agent PATCHes treatment on a paused project', async () => {
+    mockReadJSONFile.mockResolvedValue([{ id: 'cd-1', status: 'paused', name: 'Test' }]);
+    const result = await setTreatment('cd-1', VALID_TREATMENT);
+    expect(result.status).toBe('paused');
+    const saved = mockAtomicWrite.mock.calls[0][1];
+    expect(saved[0].status).toBe('paused');
+  });
+
+  it('preserves failed status when agent PATCHes treatment on a failed project', async () => {
+    mockReadJSONFile.mockResolvedValue([{ id: 'cd-1', status: 'failed', name: 'Test' }]);
+    const result = await setTreatment('cd-1', VALID_TREATMENT);
+    expect(result.status).toBe('failed');
+    const saved = mockAtomicWrite.mock.calls[0][1];
+    expect(saved[0].status).toBe('failed');
+  });
+
+  it('flips planning → rendering when agent PATCHes treatment on a planning project', async () => {
+    mockReadJSONFile.mockResolvedValue([{ id: 'cd-1', status: 'planning', name: 'Test' }]);
+    const result = await setTreatment('cd-1', VALID_TREATMENT);
+    expect(result.status).toBe('rendering');
+    const saved = mockAtomicWrite.mock.calls[0][1];
+    expect(saved[0].status).toBe('rendering');
+  });
+
+  it('flips draft → rendering when agent PATCHes treatment on a draft project', async () => {
+    mockReadJSONFile.mockResolvedValue([{ id: 'cd-1', status: 'draft', name: 'Test' }]);
+    const result = await setTreatment('cd-1', VALID_TREATMENT);
+    expect(result.status).toBe('rendering');
+  });
+});
+
+describe('trimRuns — bound runs[] growth', () => {
+  it('passes through arrays under the cap unchanged', () => {
+    const runs = Array.from({ length: 50 }, (_, i) => ({ runId: `r-${i}`, status: 'completed' }));
+    expect(trimRuns(runs)).toBe(runs);
+  });
+
+  it('keeps the most recent terminal runs when over the cap', () => {
+    const runs = Array.from({ length: 250 }, (_, i) => ({ runId: `r-${i}`, status: 'completed' }));
+    const trimmed = trimRuns(runs);
+    expect(trimmed).toHaveLength(200);
+    expect(trimmed[0].runId).toBe('r-50');
+    expect(trimmed[199].runId).toBe('r-249');
+  });
+
+  it('preserves every in-flight run even when total exceeds the cap', () => {
+    const terminal = Array.from({ length: 300 }, (_, i) => ({ runId: `done-${i}`, status: 'completed' }));
+    const inflight = [
+      { runId: 'live-1', status: 'running', kind: 'evaluate', sceneId: 'scene-1' },
+      { runId: 'live-2', status: 'queued', kind: 'treatment' },
+    ];
+    const trimmed = trimRuns([...terminal, ...inflight]);
+    expect(trimmed).toHaveLength(200);
+    expect(trimmed.filter((r) => r.runId.startsWith('live-'))).toHaveLength(2);
+    expect(trimmed.filter((r) => r.status === 'completed')).toHaveLength(198);
+  });
+
+  it('preserves chronological insertion order across mixed terminal/in-flight entries', () => {
+    // Interleave terminal + in-flight so a partition-and-concat impl would
+    // shuffle them. The contract: kept entries appear in the same relative
+    // order as in the input — RunsTab sorts by startedAt for display, but
+    // completionHook + recovery iterate runs[] directly.
+    const runs = [];
+    for (let i = 0; i < 150; i += 1) {
+      runs.push({ runId: `t-a-${i}`, status: 'completed' });
+    }
+    runs.push({ runId: 'live-mid', status: 'running' });
+    for (let i = 0; i < 150; i += 1) {
+      runs.push({ runId: `t-b-${i}`, status: 'failed' });
+    }
+    runs.push({ runId: 'live-end', status: 'queued' });
+    const trimmed = trimRuns(runs);
+    expect(trimmed).toHaveLength(200);
+    const liveMidIdx = trimmed.findIndex((r) => r.runId === 'live-mid');
+    const liveEndIdx = trimmed.findIndex((r) => r.runId === 'live-end');
+    expect(liveMidIdx).toBeGreaterThanOrEqual(0);
+    expect(liveEndIdx).toBeGreaterThan(liveMidIdx);
+    // Every retained terminal entry must keep its relative order vs. its neighbors.
+    const ids = trimmed.map((r) => r.runId);
+    const sorted = [...ids].sort((a, b) => runs.findIndex((r) => r.runId === a) - runs.findIndex((r) => r.runId === b));
+    expect(ids).toEqual(sorted);
+  });
+
+  it('treats unknown non-terminal statuses as in-flight (orphan/wedge detection load-bearing)', () => {
+    const runs = [
+      { runId: 'mystery', status: 'evaluating' },
+      ...Array.from({ length: 300 }, (_, i) => ({ runId: `done-${i}`, status: 'failed' })),
+    ];
+    const trimmed = trimRuns(runs);
+    expect(trimmed.find((r) => r.runId === 'mystery')).toBeTruthy();
+  });
+
+  it('returns [] for non-array / nullish input (including truthy non-arrays like {})', () => {
+    expect(trimRuns(null)).toEqual([]);
+    expect(trimRuns(undefined)).toEqual([]);
+    expect(trimRuns({})).toEqual([]);
+    expect(trimRuns('runs')).toEqual([]);
+  });
+});
+
+describe('runs[] cap enforced at saveAll chokepoint', () => {
+  it('recordRun caps when an append pushes the array over the limit', async () => {
+    const existing = Array.from({ length: 200 }, (_, i) => ({ runId: `r-${i}`, status: 'completed', startedAt: new Date(2026, 0, 1, 0, i).toISOString() }));
+    mockReadJSONFile.mockResolvedValue([{ id: 'cd-1', status: 'rendering', name: 'Test', runs: existing }]);
+    await recordRun('cd-1', { agentId: 'agent-x', kind: 'evaluate', sceneId: 'scene-1', status: 'running' });
+    const saved = mockAtomicWrite.mock.calls[0][1];
+    expect(saved[0].runs).toHaveLength(200);
+    expect(saved[0].runs.find((r) => r.kind === 'evaluate' && r.sceneId === 'scene-1' && r.status === 'running')).toBeTruthy();
+  });
+
+  it('recordRun leaves the array alone when total is still under the limit', async () => {
+    const existing = Array.from({ length: 10 }, (_, i) => ({ runId: `r-${i}`, status: 'completed' }));
+    mockReadJSONFile.mockResolvedValue([{ id: 'cd-1', status: 'rendering', name: 'Test', runs: existing }]);
+    await recordRun('cd-1', { agentId: 'agent-x', kind: 'evaluate', status: 'running' });
+    const saved = mockAtomicWrite.mock.calls[0][1];
+    expect(saved[0].runs).toHaveLength(11);
+  });
+
+  it('updateRun returns the patched run even when saveAll trim shifts indices', async () => {
+    // Legacy project where trim will drop the patched run's index. The patched
+    // run survives trim (it's in-flight when patched, terminal after — and most-
+    // recent), but the *index* it lives at shifts because earlier terminal
+    // entries get dropped. completionHook treats a falsy return as "not found"
+    // and recordRuns a duplicate, so this must return the patched object.
+    const existing = [
+      ...Array.from({ length: 300 }, (_, i) => ({ runId: `old-${i}`, status: 'completed' })),
+      { runId: 'live-1', status: 'running', kind: 'evaluate', sceneId: 'scene-1' },
+    ];
+    mockReadJSONFile.mockResolvedValue([{ id: 'cd-1', status: 'rendering', name: 'Test', runs: existing }]);
+    const result = await updateRun('cd-1', 'live-1', { status: 'completed', completedAt: '2026-05-29T12:00:00.000Z' });
+    expect(result).toBeTruthy();
+    expect(result.runId).toBe('live-1');
+    expect(result.status).toBe('completed');
+  });
+
+  it('updateRun also shrinks a legacy over-cap array (not just recordRun)', async () => {
+    // Legacy bloated project — 500 terminal + 1 in-flight. The in-flight one
+    // is what updateRun is going to patch. Without saveAll-side trim, the
+    // 500-entry terminal history would persist unchanged.
+    const existing = [
+      ...Array.from({ length: 500 }, (_, i) => ({ runId: `legacy-${i}`, status: 'completed' })),
+      { runId: 'live-1', status: 'running', kind: 'evaluate', sceneId: 'scene-1' },
+    ];
+    mockReadJSONFile.mockResolvedValue([{ id: 'cd-1', status: 'rendering', name: 'Test', runs: existing }]);
+    await updateRun('cd-1', 'live-1', { status: 'completed', completedAt: '2026-05-29T12:00:00.000Z' });
+    const saved = mockAtomicWrite.mock.calls[0][1];
+    expect(saved[0].runs).toHaveLength(200);
+    const patched = saved[0].runs.find((r) => r.runId === 'live-1');
+    expect(patched).toBeTruthy();
+    expect(patched.status).toBe('completed');
+  });
+});
+
+// #4148 — batch-by-id read (file backend, through the dispatcher). The Creative
+// Commission detail page resolves only the projects its runs reference instead
+// of listing every project on the install.
+describe('getProjectsByIds (#4148)', () => {
+  const STORED = [
+    { id: 'cd-1', name: 'One' },
+    { id: 'cd-2', name: 'Two' },
+    { id: 'cd-3', name: 'Three', deleted: true },
+  ];
+
+  it('returns only the requested live projects, ignoring unknown ids', async () => {
+    mockReadJSONFile.mockResolvedValue(STORED);
+    const found = await getProjectsByIds(['cd-2', 'cd-nope', 'cd-1']);
+    expect(found.map((p) => p.id)).toEqual(['cd-1', 'cd-2']);
+  });
+
+  it('omits tombstoned projects unless includeDeleted is set', async () => {
+    mockReadJSONFile.mockResolvedValue(STORED);
+    expect(await getProjectsByIds(['cd-3'])).toEqual([]);
+    const withDeleted = await getProjectsByIds(['cd-3'], { includeDeleted: true });
+    expect(withDeleted.map((p) => p.id)).toEqual(['cd-3']);
+  });
+
+  it('short-circuits an empty/blank id list without reading the store', async () => {
+    mockReadJSONFile.mockResolvedValue(STORED);
+    expect(await getProjectsByIds([])).toEqual([]);
+    expect(await getProjectsByIds([null, undefined, ''])).toEqual([]);
+    expect(await getProjectsByIds()).toEqual([]);
+    expect(mockReadJSONFile).not.toHaveBeenCalled();
+  });
+});
+
+describe('project invalidation after persistence', () => {
+  it('publishes run completion only after the write and never on a failed write', async () => {
+    const { recordEvents } = await import('../sharing/recordEvents.js');
+    const notifications = [];
+    const listener = event => notifications.push(event);
+    const federated = vi.fn();
+    recordEvents.on('invalidated', listener);
+    recordEvents.on('updated', federated);
+    try {
+      mockReadJSONFile.mockResolvedValue([{ id: 'cd-example', runs: [{ runId: 'run-example', status: 'running' }] }]);
+      let releaseWrite;
+      mockAtomicWrite.mockImplementationOnce(() => new Promise(resolve => { releaseWrite = resolve; }));
+      const pending = updateRun('cd-example', 'run-example', { status: 'completed' });
+      await vi.waitFor(() => expect(releaseWrite).toBeTypeOf('function'));
+      expect(notifications).toEqual([]);
+      releaseWrite();
+      await pending;
+      expect(notifications).toEqual([{ recordKind: 'creativeDirectorProject', recordId: 'cd-example' }]);
+      expect(federated).not.toHaveBeenCalled();
+      mockAtomicWrite.mockRejectedValueOnce(new Error('write failed'));
+      await expect(recordRun('cd-example', { kind: 'evaluate', status: 'running' })).rejects.toThrow('write failed');
+      expect(notifications).toHaveLength(1);
+    } finally {
+      recordEvents.off('invalidated', listener);
+      recordEvents.off('updated', federated);
+    }
+  });
+});

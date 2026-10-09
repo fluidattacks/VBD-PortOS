@@ -1,0 +1,607 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import express from 'express';
+import { request } from '../lib/testHelper.js';
+import { errorMiddleware } from '../lib/errorHandler.js';
+
+vi.mock('../services/writersRoom/local.js', () => ({
+  listFolders: vi.fn(async () => [{ id: 'wr-folder-1', name: 'Drafts' }]),
+  createFolder: vi.fn(async (data) => ({ id: 'wr-folder-new', ...data })),
+  deleteFolder: vi.fn(async () => ({ ok: true })),
+  listWorksPage: vi.fn(),
+  listWorks: vi.fn(async () => [{ id: 'wr-work-1', title: 'A' }]),
+  createWork: vi.fn(async (data) => ({ id: 'wr-work-new', title: data.title, kind: data.kind || 'short-story' })),
+  getWorkWithBody: vi.fn(),
+  updateWork: vi.fn(async (id, patch) => ({ id, ...patch })),
+  deleteWork: vi.fn(async () => ({ ok: true })),
+  saveDraftBody: vi.fn(async (id, body) => ({ manifest: { id }, body })),
+  snapshotDraft: vi.fn(async (id) => ({ id, drafts: [{}, {}] })),
+  setActiveDraft: vi.fn(async (id, draftId) => ({ id, activeDraftVersionId: draftId })),
+  getDraftBody: vi.fn(async () => 'draft body text'),
+  listExercises: vi.fn(async () => []),
+  createExercise: vi.fn(async (data) => ({ id: 'wr-ex-new', ...data })),
+  finishExercise: vi.fn(async (id) => ({ id, status: 'finished' })),
+  discardExercise: vi.fn(async (id) => ({ id, status: 'discarded' })),
+  promoteExercise: vi.fn(async (id) => ({ exercise: { id, promotedAt: '2026-01-01T00:00:00.000Z' }, work: { id: 'wr-work-1' } })),
+  ensureWorkMediaCollection: vi.fn(async () => ({ id: 'col-1' })),
+}));
+
+vi.mock('../services/writersRoom/characters.js', () => ({
+  listCharacters: vi.fn(async () => [{ id: 'wr-char-1', name: 'Aria' }]),
+  createCharacter: vi.fn(async (workId, data) => ({ id: 'wr-char-new', name: data.name })),
+  updateCharacter: vi.fn(async (workId, charId, data) => ({ id: charId, ...data })),
+  deleteCharacter: vi.fn(async () => ({ ok: true })),
+}));
+
+vi.mock('../services/writersRoom/places.js', () => ({
+  listPlaces: vi.fn(async () => [{ id: 'wr-place-1', slugline: 'INT. KITCHEN — NIGHT' }]),
+  createPlace: vi.fn(async (workId, data) => ({ id: 'wr-place-new', ...data })),
+  updatePlace: vi.fn(async (workId, placeId, data) => ({ id: placeId, ...data })),
+  deletePlace: vi.fn(async () => ({ ok: true })),
+}));
+
+vi.mock('../services/writersRoom/objects.js', () => ({
+  listObjects: vi.fn(async () => [{ id: 'wr-object-1', name: 'The Locket' }]),
+  createObject: vi.fn(async (workId, data) => ({ id: 'wr-object-new', ...data })),
+  updateObject: vi.fn(async (workId, objectId, data) => ({ id: objectId, ...data })),
+  deleteObject: vi.fn(async () => ({ ok: true })),
+}));
+
+vi.mock('../services/writersRoom/evaluator.js', () => ({
+  runAnalysis: vi.fn(),
+  listAnalyses: vi.fn(async () => []),
+  getAnalysis: vi.fn(),
+  attachSceneImage: vi.fn(async () => ({})),
+}));
+
+vi.mock('../services/mediaCollections.js', () => ({
+  addItem: vi.fn(async () => ({ ok: true })),
+  ERR_DUPLICATE: 'ERR_DUPLICATE',
+}));
+
+vi.mock('../services/writersRoom/promoteToPipeline.js', () => ({
+  ERR_NO_DRAFT_BODY: 'WR_PROMOTE_NO_DRAFT_BODY',
+  promoteWorkToPipeline: vi.fn(),
+}));
+
+// Mock the catalog scan so the draft-save route stays pure (no Postgres pool).
+// Default: the work has no linked cast, so the scan finds nothing.
+vi.mock('../services/catalogExtraction.js', () => ({
+  scanProseForIngredientRefs: vi.fn(async () => []),
+}));
+
+// Mock the live-director service so the suggest route doesn't reach a provider.
+vi.mock('../services/writersRoom/liveDirector.js', () => ({
+  suggestContinuation: vi.fn(async () => ({
+    options: [{ kind: 'beat', label: 'Next', text: 'A move.', rationale: '' }],
+    usage: { date: '2026-06-03', count: 1 },
+    budget: 100,
+  })),
+  reserveRenderPreview: vi.fn(async () => ({
+    renderUsage: { date: '2026-06-03', count: 1 },
+    renderBudget: 20,
+  })),
+  suggestCdBridge: vi.fn(async () => ({
+    proposal: {
+      logline: 'A courier outruns the storm.',
+      synopsis: 'Cross the flooded city.',
+      styleSpec: 'Rain-slick neon.',
+      scenes: [
+        { intent: 'Deluge', prompt: 'Wide shot', durationSeconds: 6 },
+        { intent: 'Run', prompt: 'Tracking shot', durationSeconds: 4 },
+      ],
+    },
+    usage: { date: '2026-06-03', count: 1 },
+    budget: 100,
+  })),
+  sendToCreativeDirector: vi.fn(async () => ({ project: { id: 'cd-1' } })),
+}));
+
+import * as svc from '../services/writersRoom/local.js';
+import * as catalogExtraction from '../services/catalogExtraction.js';
+import * as charSvc from '../services/writersRoom/characters.js';
+import * as placesSvc from '../services/writersRoom/places.js';
+import * as objectsSvc from '../services/writersRoom/objects.js';
+import * as liveSvc from '../services/writersRoom/liveDirector.js';
+import writersRoomRoutes from './writersRoom.js';
+
+describe('writersRoom routes', () => {
+  let app;
+
+  beforeEach(() => {
+    app = express();
+    // Match the production parser limit so the schema's 5 MB ceiling, not the
+    // express body parser, is what produces the 400 in the body-too-large test.
+    app.use(express.json({ limit: '55mb' }));
+    app.use('/api/writers-room', writersRoomRoutes);
+    app.use(errorMiddleware);
+    vi.clearAllMocks();
+  });
+
+  describe('folders', () => {
+    it('GET /folders returns the list', async () => {
+      const r = await request(app).get('/api/writers-room/folders');
+      expect(r.status).toBe(200);
+      expect(r.body[0].id).toBe('wr-folder-1');
+    });
+
+    it('POST /folders rejects empty name', async () => {
+      const r = await request(app).post('/api/writers-room/folders').send({ name: '' });
+      expect(r.status).toBe(400);
+    });
+
+    it('POST /folders accepts valid payload', async () => {
+      const r = await request(app).post('/api/writers-room/folders').send({ name: 'Novels' });
+      expect(r.status).toBe(201);
+      expect(svc.createFolder).toHaveBeenCalledWith({ name: 'Novels' });
+    });
+
+    it('DELETE /folders/:id forwards to the service', async () => {
+      const r = await request(app).delete('/api/writers-room/folders/wr-folder-1');
+      expect(r.status).toBe(200);
+      expect(svc.deleteFolder).toHaveBeenCalledWith('wr-folder-1');
+    });
+  });
+
+  describe('works', () => {
+    it('GET /works returns the plain array by default', async () => {
+      const r = await request(app).get('/api/writers-room/works');
+      expect(r.status).toBe(200);
+      expect(r.body).toEqual([{ id: 'wr-work-1', title: 'A' }]);
+    });
+
+    it('GET /works returns a bounded envelope when pagination is requested', async () => {
+      svc.listWorksPage.mockResolvedValueOnce({ items: [{ id: 'wr-work-1' }, { id: 'wr-work-2' }], total: 5, limit: 2, offset: 1, nextCursor: 'cursor' });
+      const r = await request(app).get('/api/writers-room/works?limit=2&offset=1');
+      expect(r.status).toBe(200);
+      expect(r.body.items).toHaveLength(2);
+      expect(r.body.items[0].id).toBe('wr-work-1');
+      expect(r.body.total).toBe(5);
+      expect(r.body.limit).toBe(2);
+      expect(r.body.offset).toBe(1);
+    });
+
+    it('rejects oversized pages and forwards validated cursor queries', async () => {
+      expect((await request(app).get('/api/writers-room/works?limit=101')).status).toBe(400);
+      expect((await request(app).get('/api/writers-room/works?cursor=bad')).status).toBe(400);
+      svc.listWorksPage.mockResolvedValueOnce({ items: [], total: 0, nextCursor: null });
+      const cursor = '00000000-0000-4000-8000-000000000000.50';
+      expect((await request(app).get(`/api/writers-room/works?cursor=${cursor}`)).status).toBe(200);
+      expect(svc.listWorksPage).toHaveBeenLastCalledWith({ limit: 50, offset: 0, cursor });
+    });
+
+    it('POST /works rejects unknown kind', async () => {
+      const r = await request(app).post('/api/writers-room/works').send({ title: 'X', kind: 'manifesto' });
+      expect(r.status).toBe(400);
+    });
+
+    it('POST /works defaults kind to short-story', async () => {
+      const r = await request(app).post('/api/writers-room/works').send({ title: 'Untitled' });
+      expect(r.status).toBe(201);
+      expect(svc.createWork).toHaveBeenCalledWith({ title: 'Untitled', kind: 'short-story' });
+    });
+
+    it('GET /works/:id flattens manifest + activeDraftBody', async () => {
+      svc.getWorkWithBody.mockResolvedValue({
+        manifest: { id: 'wr-work-1', title: 'A' },
+        body: 'prose',
+      });
+      const r = await request(app).get('/api/writers-room/works/wr-work-1');
+      expect(r.status).toBe(200);
+      expect(r.body.title).toBe('A');
+      expect(r.body.activeDraftBody).toBe('prose');
+    });
+
+    it('PATCH /works/:id rejects unknown status', async () => {
+      const r = await request(app).patch('/api/writers-room/works/wr-work-1').send({ status: 'wat' });
+      expect(r.status).toBe(400);
+    });
+
+    it('PATCH /works/:id rejects extra fields (strict schema)', async () => {
+      const r = await request(app).patch('/api/writers-room/works/wr-work-1').send({ tags: ['a'] });
+      expect(r.status).toBe(400);
+    });
+
+    it('DELETE /works/:id forwards to the service', async () => {
+      const r = await request(app).delete('/api/writers-room/works/wr-work-1');
+      expect(r.status).toBe(200);
+      expect(svc.deleteWork).toHaveBeenCalledWith('wr-work-1');
+    });
+  });
+
+  describe('drafts', () => {
+    it('PUT /works/:id/draft rejects body over 5MB', async () => {
+      const big = 'x'.repeat(5_000_001);
+      const r = await request(app).put('/api/writers-room/works/wr-work-1/draft').send({ body: big });
+      expect(r.status).toBe(400);
+    });
+
+    it('PUT /works/:id/draft persists, echoes the body, and stamps scanned ingredient refs', async () => {
+      catalogExtraction.scanProseForIngredientRefs.mockResolvedValueOnce(['cat-chr-mira']);
+      const r = await request(app).put('/api/writers-room/works/wr-work-1/draft').send({ body: 'new prose' });
+      expect(r.status).toBe(200);
+      // The route scans the prose scoped to this work, then passes the derived
+      // ids through to the save path.
+      expect(catalogExtraction.scanProseForIngredientRefs).toHaveBeenCalledWith('new prose', { workId: 'wr-work-1' });
+      expect(svc.saveDraftBody).toHaveBeenCalledWith('wr-work-1', 'new prose', { referencedIngredientIds: ['cat-chr-mira'] });
+      expect(r.body.activeDraftBody).toBe('new prose');
+    });
+
+    it('PUT /works/:id/draft trusts a client-supplied referencedIngredientIds and skips the scan', async () => {
+      const r = await request(app)
+        .put('/api/writers-room/works/wr-work-1/draft')
+        .send({ body: 'new prose', referencedIngredientIds: ['cat-plc-harbor'] });
+      expect(r.status).toBe(200);
+      expect(catalogExtraction.scanProseForIngredientRefs).not.toHaveBeenCalled();
+      expect(svc.saveDraftBody).toHaveBeenCalledWith('wr-work-1', 'new prose', { referencedIngredientIds: ['cat-plc-harbor'] });
+    });
+
+    it('PUT /works/:id/draft survives a scan failure (best-effort, omits refs)', async () => {
+      catalogExtraction.scanProseForIngredientRefs.mockRejectedValueOnce(new Error('db down'));
+      const r = await request(app).put('/api/writers-room/works/wr-work-1/draft').send({ body: 'new prose' });
+      expect(r.status).toBe(200);
+      // Scan failure → undefined refs → save path preserves the prior snapshot.
+      expect(svc.saveDraftBody).toHaveBeenCalledWith('wr-work-1', 'new prose', { referencedIngredientIds: undefined });
+    });
+
+    it('POST /works/:id/versions accepts an optional label', async () => {
+      const r = await request(app).post('/api/writers-room/works/wr-work-1/versions').send({ label: 'Pre-revision' });
+      expect(r.status).toBe(201);
+      expect(svc.snapshotDraft).toHaveBeenCalledWith('wr-work-1', { label: 'Pre-revision' });
+    });
+  });
+
+  describe('exercises', () => {
+    it('POST /exercises clamps duration via schema (rejects 30 seconds)', async () => {
+      const r = await request(app).post('/api/writers-room/exercises').send({ durationSeconds: 30 });
+      expect(r.status).toBe(400);
+    });
+
+    it('POST /exercises accepts default duration', async () => {
+      const r = await request(app).post('/api/writers-room/exercises').send({});
+      expect(r.status).toBe(201);
+      expect(svc.createExercise).toHaveBeenCalled();
+    });
+
+    it('POST /exercises/:id/finish forwards endingWords', async () => {
+      const r = await request(app).post('/api/writers-room/exercises/wr-ex-1/finish').send({ endingWords: 100 });
+      expect(r.status).toBe(200);
+      expect(svc.finishExercise).toHaveBeenCalledWith('wr-ex-1', { endingWords: 100 });
+    });
+
+    it('POST /exercises/:id/discard hits the discard handler', async () => {
+      const r = await request(app).post('/api/writers-room/exercises/wr-ex-1/discard');
+      expect(r.status).toBe(200);
+      expect(svc.discardExercise).toHaveBeenCalledWith('wr-ex-1');
+    });
+
+    it('POST /exercises/:id/promote hits the promotion handler', async () => {
+      const r = await request(app).post('/api/writers-room/exercises/wr-ex-1/promote');
+      expect(r.status).toBe(200);
+      expect(svc.promoteExercise).toHaveBeenCalledWith('wr-ex-1');
+    });
+  });
+
+  describe('characters', () => {
+    it('GET /works/:id/characters returns the bible', async () => {
+      const r = await request(app).get('/api/writers-room/works/wr-work-1/characters');
+      expect(r.status).toBe(200);
+      expect(r.body[0].id).toBe('wr-char-1');
+      expect(charSvc.listCharacters).toHaveBeenCalledWith('wr-work-1');
+    });
+
+    it('POST /works/:id/characters rejects empty name (schema validation)', async () => {
+      const r = await request(app).post('/api/writers-room/works/wr-work-1/characters').send({ name: '' });
+      expect(r.status).toBe(400);
+      expect(charSvc.createCharacter).not.toHaveBeenCalled();
+    });
+
+    it('POST /works/:id/characters rejects extra/unknown fields (strict schema)', async () => {
+      const r = await request(app)
+        .post('/api/writers-room/works/wr-work-1/characters')
+        .send({ name: 'Mila', wat: 'not allowed' });
+      expect(r.status).toBe(400);
+    });
+
+    it('POST /works/:id/characters accepts a valid payload', async () => {
+      const r = await request(app)
+        .post('/api/writers-room/works/wr-work-1/characters')
+        .send({ name: 'Mila', physicalDescription: 'tall, copper hair' });
+      expect(r.status).toBe(201);
+      expect(charSvc.createCharacter).toHaveBeenCalledWith('wr-work-1', {
+        name: 'Mila',
+        physicalDescription: 'tall, copper hair',
+      });
+    });
+
+    it('PATCH /works/:id/characters/:characterId forwards a partial update', async () => {
+      const r = await request(app)
+        .patch('/api/writers-room/works/wr-work-1/characters/wr-char-1')
+        .send({ role: 'protagonist' });
+      expect(r.status).toBe(200);
+      expect(charSvc.updateCharacter).toHaveBeenCalledWith('wr-work-1', 'wr-char-1', { role: 'protagonist' });
+    });
+
+    it('PATCH /works/:id/characters/:characterId rejects empty name', async () => {
+      const r = await request(app)
+        .patch('/api/writers-room/works/wr-work-1/characters/wr-char-1')
+        .send({ name: '   ' });
+      expect(r.status).toBe(400);
+    });
+
+    it('DELETE /works/:id/characters/:characterId forwards to the service', async () => {
+      const r = await request(app).delete('/api/writers-room/works/wr-work-1/characters/wr-char-1');
+      expect(r.status).toBe(200);
+      expect(charSvc.deleteCharacter).toHaveBeenCalledWith('wr-work-1', 'wr-char-1');
+    });
+  });
+
+  describe('places', () => {
+    it('GET /works/:id/places returns the bible', async () => {
+      const r = await request(app).get('/api/writers-room/works/wr-work-1/places');
+      expect(r.status).toBe(200);
+      expect(r.body[0].id).toBe('wr-place-1');
+      expect(placesSvc.listPlaces).toHaveBeenCalledWith('wr-work-1');
+    });
+
+    it('POST /works/:id/places rejects payload missing both slugline and name', async () => {
+      const r = await request(app).post('/api/writers-room/works/wr-work-1/places').send({});
+      expect(r.status).toBe(400);
+      expect(placesSvc.createPlace).not.toHaveBeenCalled();
+    });
+
+    it('POST /works/:id/places accepts slugline-only payload', async () => {
+      const r = await request(app)
+        .post('/api/writers-room/works/wr-work-1/places')
+        .send({ slugline: 'INT. KITCHEN — NIGHT', description: 'cozy' });
+      expect(r.status).toBe(201);
+      expect(placesSvc.createPlace).toHaveBeenCalledWith('wr-work-1', {
+        slugline: 'INT. KITCHEN — NIGHT',
+        description: 'cozy',
+      });
+    });
+
+    it('POST /works/:id/places rejects unknown extra fields', async () => {
+      const r = await request(app)
+        .post('/api/writers-room/works/wr-work-1/places')
+        .send({ slugline: 'INT. ATTIC — DUSK', tags: ['a'] });
+      expect(r.status).toBe(400);
+    });
+
+    it('PATCH /works/:id/places/:placeId forwards a partial update', async () => {
+      const r = await request(app)
+        .patch('/api/writers-room/works/wr-work-1/places/wr-place-1')
+        .send({ palette: 'amber and ochre' });
+      expect(r.status).toBe(200);
+      expect(placesSvc.updatePlace).toHaveBeenCalledWith('wr-work-1', 'wr-place-1', { palette: 'amber and ochre' });
+    });
+
+    it('DELETE /works/:id/places/:placeId forwards to the service', async () => {
+      const r = await request(app).delete('/api/writers-room/works/wr-work-1/places/wr-place-1');
+      expect(r.status).toBe(200);
+      expect(placesSvc.deletePlace).toHaveBeenCalledWith('wr-work-1', 'wr-place-1');
+    });
+  });
+
+  describe('objects', () => {
+    it('GET /works/:id/objects returns the bible', async () => {
+      const r = await request(app).get('/api/writers-room/works/wr-work-1/objects');
+      expect(r.status).toBe(200);
+      expect(r.body[0].id).toBe('wr-object-1');
+      expect(objectsSvc.listObjects).toHaveBeenCalledWith('wr-work-1');
+    });
+
+    it('POST /works/:id/objects rejects empty name (schema validation)', async () => {
+      const r = await request(app).post('/api/writers-room/works/wr-work-1/objects').send({ name: '' });
+      expect(r.status).toBe(400);
+      expect(objectsSvc.createObject).not.toHaveBeenCalled();
+    });
+
+    it('POST /works/:id/objects rejects extra/unknown fields (strict schema)', async () => {
+      const r = await request(app)
+        .post('/api/writers-room/works/wr-work-1/objects')
+        .send({ name: 'The Locket', wat: 'not allowed' });
+      expect(r.status).toBe(400);
+    });
+
+    it('POST /works/:id/objects accepts a valid payload', async () => {
+      const r = await request(app)
+        .post('/api/writers-room/works/wr-work-1/objects')
+        .send({ name: 'The Locket', significance: 'A family heirloom' });
+      expect(r.status).toBe(201);
+      expect(objectsSvc.createObject).toHaveBeenCalledWith('wr-work-1', {
+        name: 'The Locket',
+        significance: 'A family heirloom',
+      });
+    });
+
+    it('PATCH /works/:id/objects/:objectId forwards a partial update', async () => {
+      const r = await request(app)
+        .patch('/api/writers-room/works/wr-work-1/objects/wr-object-1')
+        .send({ description: 'Tarnished silver, engraved initials' });
+      expect(r.status).toBe(200);
+      expect(objectsSvc.updateObject).toHaveBeenCalledWith('wr-work-1', 'wr-object-1', {
+        description: 'Tarnished silver, engraved initials',
+      });
+    });
+
+    it('PATCH /works/:id/objects/:objectId rejects empty name', async () => {
+      const r = await request(app)
+        .patch('/api/writers-room/works/wr-work-1/objects/wr-object-1')
+        .send({ name: '   ' });
+      expect(r.status).toBe(400);
+    });
+
+    it('DELETE /works/:id/objects/:objectId forwards to the service', async () => {
+      const r = await request(app).delete('/api/writers-room/works/wr-work-1/objects/wr-object-1');
+      expect(r.status).toBe(200);
+      expect(objectsSvc.deleteObject).toHaveBeenCalledWith('wr-work-1', 'wr-object-1');
+    });
+  });
+
+  describe('promote-to-pipeline', () => {
+    it('POST /works/:id/promote-to-pipeline returns 201 with series + issue on fresh promote', async () => {
+      const promoter = await import('../services/writersRoom/promoteToPipeline.js');
+      promoter.promoteWorkToPipeline.mockResolvedValue({
+        series: { id: 'ser-1', name: 'A', writersRoomWorkId: 'wr-work-1' },
+        issue: { id: 'iss-1', seriesId: 'ser-1', title: 'A' },
+        reused: false,
+      });
+
+      const r = await request(app)
+        .post('/api/writers-room/works/wr-work-1/promote-to-pipeline')
+        .send({});
+      expect(r.status).toBe(201);
+      expect(r.body.series.id).toBe('ser-1');
+      expect(r.body.issue.id).toBe('iss-1');
+      expect(r.body.reused).toBe(false);
+      expect(promoter.promoteWorkToPipeline).toHaveBeenCalledWith('wr-work-1', {});
+    });
+
+    it('POST /works/:id/promote-to-pipeline returns 200 + reused=true when the link already exists', async () => {
+      const promoter = await import('../services/writersRoom/promoteToPipeline.js');
+      promoter.promoteWorkToPipeline.mockResolvedValue({
+        series: { id: 'ser-1' }, issue: { id: 'iss-1' }, reused: true,
+      });
+
+      const r = await request(app)
+        .post('/api/writers-room/works/wr-work-1/promote-to-pipeline')
+        .send({});
+      expect(r.status).toBe(200);
+      expect(r.body.reused).toBe(true);
+    });
+
+    it('POST /works/:id/promote-to-pipeline forwards force flag through', async () => {
+      const promoter = await import('../services/writersRoom/promoteToPipeline.js');
+      promoter.promoteWorkToPipeline.mockResolvedValue({
+        series: { id: 'ser-2' }, issue: { id: 'iss-2' }, reused: false,
+      });
+
+      await request(app)
+        .post('/api/writers-room/works/wr-work-1/promote-to-pipeline')
+        .send({ force: true });
+      expect(promoter.promoteWorkToPipeline).toHaveBeenCalledWith('wr-work-1', { force: true });
+    });
+
+    it('POST /works/:id/promote-to-pipeline surfaces empty-draft as 400', async () => {
+      const promoter = await import('../services/writersRoom/promoteToPipeline.js');
+      promoter.promoteWorkToPipeline.mockRejectedValue(
+        Object.assign(new Error('Cannot promote — the active draft has no prose. Write some text first.'), {
+          code: 'WR_PROMOTE_NO_DRAFT_BODY',
+        }),
+      );
+
+      const r = await request(app)
+        .post('/api/writers-room/works/wr-work-1/promote-to-pipeline')
+        .send({});
+      expect(r.status).toBe(400);
+      expect(r.body.error || r.body.message).toMatch(/no prose/i);
+    });
+  });
+
+  describe('live mode (Phase 5)', () => {
+    it('PATCH /works/:id accepts a partial liveMode patch', async () => {
+      const r = await request(app)
+        .patch('/api/writers-room/works/wr-work-1')
+        .send({ liveMode: { enabled: true, debounceMs: 3000 } });
+      expect(r.status).toBe(200);
+      expect(svc.updateWork).toHaveBeenCalledWith('wr-work-1', { liveMode: { enabled: true, debounceMs: 3000 } });
+    });
+
+    it('PATCH /works/:id rejects an out-of-range debounceMs', async () => {
+      const r = await request(app)
+        .patch('/api/writers-room/works/wr-work-1')
+        .send({ liveMode: { debounceMs: 10 } });
+      expect(r.status).toBe(400);
+    });
+
+    it('POST /works/:id/live-suggest forwards the cursor context and returns options', async () => {
+      const r = await request(app)
+        .post('/api/writers-room/works/wr-work-1/live-suggest')
+        .send({ before: 'The door opened.', after: '', selection: '' });
+      expect(r.status).toBe(200);
+      expect(r.body.options[0].text).toBe('A move.');
+      expect(liveSvc.suggestContinuation).toHaveBeenCalledWith('wr-work-1', {
+        before: 'The door opened.', after: '', selection: '',
+      });
+    });
+
+    it('POST /works/:id/live-suggest rejects an over-long before window', async () => {
+      const r = await request(app)
+        .post('/api/writers-room/works/wr-work-1/live-suggest')
+        .send({ before: 'x'.repeat(12_001) });
+      expect(r.status).toBe(400);
+      expect(liveSvc.suggestContinuation).not.toHaveBeenCalled();
+    });
+
+    it('PATCH /works/:id accepts a dailyRenderBudget knob', async () => {
+      const r = await request(app)
+        .patch('/api/writers-room/works/wr-work-1')
+        .send({ liveMode: { dailyRenderBudget: 5 } });
+      expect(r.status).toBe(200);
+      expect(svc.updateWork).toHaveBeenCalledWith('wr-work-1', { liveMode: { dailyRenderBudget: 5 } });
+    });
+
+    it('POST /works/:id/live-render-preview reserves a render slot', async () => {
+      const r = await request(app)
+        .post('/api/writers-room/works/wr-work-1/live-render-preview')
+        .send({});
+      expect(r.status).toBe(200);
+      expect(r.body.renderUsage.count).toBe(1);
+      expect(r.body.renderBudget).toBe(20);
+      expect(liveSvc.reserveRenderPreview).toHaveBeenCalledWith('wr-work-1');
+    });
+
+    it('POST /works/:id/live-render-preview rejects a non-empty body', async () => {
+      const r = await request(app)
+        .post('/api/writers-room/works/wr-work-1/live-render-preview')
+        .send({ renderUsage: { count: 9999 } });
+      expect(r.status).toBe(400);
+      expect(liveSvc.reserveRenderPreview).not.toHaveBeenCalled();
+    });
+
+    it('POST /works/:id/cd-bridge/suggest forwards the cursor context and returns a proposal', async () => {
+      const r = await request(app)
+        .post('/api/writers-room/works/wr-work-1/cd-bridge/suggest')
+        .send({ before: 'The levee groaned.', after: '', selection: '' });
+      expect(r.status).toBe(200);
+      expect(r.body.proposal.scenes).toHaveLength(2);
+      expect(liveSvc.suggestCdBridge).toHaveBeenCalledWith('wr-work-1', {
+        before: 'The levee groaned.', after: '', selection: '',
+      });
+    });
+
+    it('POST /works/:id/cd-bridge/suggest rejects an over-long before window', async () => {
+      const r = await request(app)
+        .post('/api/writers-room/works/wr-work-1/cd-bridge/suggest')
+        .send({ before: 'x'.repeat(12_001) });
+      expect(r.status).toBe(400);
+      expect(liveSvc.suggestCdBridge).not.toHaveBeenCalled();
+    });
+
+    it('POST /works/:id/cd-bridge/send creates a CD project from the proposal', async () => {
+      const proposal = {
+        logline: 'A courier outruns the storm.',
+        synopsis: 'Cross the flooded city.',
+        styleSpec: 'Rain-slick neon.',
+        scenes: [
+          { intent: 'Deluge', prompt: 'Wide shot', durationSeconds: 6 },
+          { intent: 'Run', prompt: 'Tracking shot', durationSeconds: 4 },
+        ],
+      };
+      const r = await request(app)
+        .post('/api/writers-room/works/wr-work-1/cd-bridge/send')
+        .send({ proposal });
+      expect(r.status).toBe(201);
+      expect(r.body.project.id).toBe('cd-1');
+      expect(liveSvc.sendToCreativeDirector).toHaveBeenCalledWith('wr-work-1', { proposal });
+    });
+
+    it('POST /works/:id/cd-bridge/send rejects a proposal with an empty logline', async () => {
+      const r = await request(app)
+        .post('/api/writers-room/works/wr-work-1/cd-bridge/send')
+        .send({ proposal: { logline: '', synopsis: 's', scenes: [{ intent: 'i', prompt: 'p', durationSeconds: 5 }] } });
+      expect(r.status).toBe(400);
+      expect(liveSvc.sendToCreativeDirector).not.toHaveBeenCalled();
+    });
+  });
+});

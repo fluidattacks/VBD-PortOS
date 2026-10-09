@@ -1,0 +1,231 @@
+import { IMAGE_GEN_MODE } from '../../lib/imageGenBackends';
+import { normalizeVideoTiling } from '../../lib/videoTilingOptions';
+
+// Friendly display name for a LoRA basename. The on-disk filenames look like
+// `lora-realstagram-v7.safetensors` — strip the `lora-` prefix, the version
+// suffix (`-v123`), and the extension, then re-spaceify dashes. Idempotent
+// for legacy filenames that don't follow the convention.
+export function loraDisplayName(filename) {
+  if (typeof filename !== 'string' || !filename) return '';
+  return filename
+    .replace(/^lora-/, '')
+    .replace(/\.safetensors$/i, '')
+    .replace(/-v\d+$/, '')
+    .replace(/[-_]+/g, ' ')
+    .trim();
+}
+
+// Normalizes raw image-gallery / video-history records into a single shape
+// consumed by <MediaCard>. Lets the same card render in any history grid.
+export function normalizeImage(i) {
+  const loraNames = (pickLoraFilenames(i) || []).filter(Boolean);
+  const originalUrl = i.path || `/data/images/${i.filename}`;
+  const thumbnailUrl = /^\/data\/images\/[^/]+\.png(?:\?.*)?$/i.test(originalUrl)
+    ? `/data/image-thumbnails/${originalUrl.split('/').pop().replace(/\.png(?=\?|$)/i, '.webp')}`
+    : originalUrl;
+  // modelId display falls back through several sidecar shapes:
+  //   1. modelId — local-runner sidecars (mflux/flux2/z-image/ernie)
+  //   2. model   — codex sidecars (older path), and future Gemini etc.
+  //   3. mode    — pre-model-field codex sidecars saved before the default
+  //                was added; surface the provider tag so the card still
+  //                shows where the image came from.
+  const modelId = i.modelId || i.model || (i.mode && i.mode !== IMAGE_GEN_MODE.LOCAL ? i.mode : null);
+  return {
+    kind: 'image',
+    key: `image:${i.filename}`,
+    filename: i.filename,
+    previewUrl: originalUrl,
+    thumbnailUrl,
+    downloadUrl: originalUrl,
+    prompt: i.prompt || i.metadata?.prompt || '(no prompt)',
+    negativePrompt: i.negativePrompt || i.negative_prompt || null,
+    modelId,
+    width: i.width,
+    height: i.height,
+    steps: i.steps,
+    guidance: i.guidance,
+    quantize: i.quantize,
+    seed: i.seed,
+    // Codex (gpt-image-2) doesn't expose a seed — `codexSessionId` is the
+    // run-identifier from the codex CLI banner, surfaced in the lightbox so
+    // each codex image has a unique trace even though it isn't reproducible.
+    codexSessionId: i.codexSessionId,
+    mode: i.mode,
+    loraNames,
+    // Universe Builder tags — stamped onto sidecars by the completion hook
+    // (server/services/universeBuilderCollectionHook.js) for renders driven
+    // by a canon entry, category variation, or composite sheet. Powers
+    // entity-name search in MediaHistory and the lightbox detail panel.
+    universeId: i.universeId || null,
+    universeName: i.universeName || null,
+    universeRunId: i.universeRunId || null,
+    entryKind: i.entryKind || null,        // 'canon' | 'variation' | 'sheet'
+    entryCategory: i.entryCategory || null,
+    entryId: i.entryId || null,
+    entryName: i.entryName || null,
+    entryLabel: i.entryLabel || null,
+    createdAt: i.createdAt,
+    // How long the render itself took, in ms — stamped server-side by
+    // lib/renderTiming.js from the moment the media-job queue ingested the job,
+    // so it excludes queue wait. Absent on records from a path that never
+    // observed a start instant (uploads, downloads, extracted frames, older
+    // renders), which the cards render as "no render time" rather than 0.
+    // `Number.isFinite`, not `typeof === 'number'` — the latter admits NaN, and
+    // `formatDurationMs(NaN)` renders the literal string "NaNd NaNh".
+    renderMs: Number.isFinite(i.renderMs) ? i.renderMs : null,
+    hidden: !!i.hidden,
+    extractedFromVideoId: i.extractedFromVideoId || null,
+    extractedFromVideoFilename: i.extractedFromVideoFilename || null,
+    // Cleaning lineage — stamped by /api/image-gen/:filename/clean (manual,
+    // `cleanedFrom` points at the source) or by the auto-clean post-generation
+    // hook (`autoCleaned: true`, in-place replace). Surfaced in the lightbox
+    // so the user can tell at a glance which version they're looking at.
+    cleanedFrom: i.cleanedFrom || null,
+    cleanLevel: i.cleanLevel || null,
+    autoCleaned: i.autoCleaned === true,
+    c2paStripped: typeof i.c2paStripped === 'boolean' ? i.c2paStripped : null,
+    // SynthID-defeat regen lineage (issue #912) — stamped by
+    // /api/image-gen/:filename/regenerate. `regenerated` is the discriminator
+    // computeImageVariantGroup uses to label a `cleanedFrom` sibling as
+    // "Regenerated" rather than "Cleaned", so it MUST survive normalization.
+    regenerated: i.regenerated === true,
+    regenStrength: typeof i.regenStrength === 'number' ? i.regenStrength : null,
+    regenSteps: typeof i.regenSteps === 'number' ? i.regenSteps : null,
+    regenModelId: i.regenModelId || null,
+    // 'flux' (GPU round-trip) | 'light-spatial' (CPU pass). Drives the "(light)"
+    // lineage label — must survive normalization or the label never renders.
+    regenMethod: i.regenMethod || null,
+    // Realized fidelity stamped by the server (% the pixels actually changed +
+    // PSNR); surfaced in the lightbox lineage row, so it must be lifted here too.
+    regenPixelDeltaPct: typeof i.regenPixelDeltaPct === 'number' ? i.regenPixelDeltaPct : null,
+    regenPsnr: typeof i.regenPsnr === 'number' ? i.regenPsnr : null,
+    // Visible Gemini/Nano-Banana corner-watermark removal — stamped by
+    // /api/image-gen/:filename/remove-watermark. The discriminator
+    // computeImageVariantGroup + describeCleanedLineage use to label a
+    // `cleanedFrom` sibling "Watermark removed" rather than "Cleaned", so it
+    // MUST survive normalization (same contract as `regenerated` above).
+    watermarkRemoved: i.watermarkRemoved === true,
+    provenance: i.provenance || null,
+    // A compact gallery row (#8292) holds only a prompt preview; see
+    // mediaDetail.js for the hydration every prompt consumer goes through.
+    compact: i.compact === true,
+    raw: i,
+  };
+}
+
+// Gallery/history rows arrive as { kind, data } from the mixed-media endpoints.
+// Three callers were each re-deriving this ternary; the row shape belongs here,
+// beside the two normalizers it dispatches between.
+export const normalizeMediaRow = (row) => (row.kind === 'image' ? normalizeImage(row.data) : normalizeVideo(row.data));
+
+export function normalizeVideo(v) {
+  const loraNames = (pickLoraFilenames(v) || []).filter(Boolean);
+  return {
+    kind: 'video',
+    key: `video:${v.id}`,
+    posterSec: v.posterSec ?? null,
+    id: v.id,
+    filename: v.filename,
+    previewUrl: v.thumbnail ? `/data/video-thumbnails/${v.thumbnail}` : null,
+    downloadUrl: `/data/videos/${v.filename}`,
+    prompt: v.prompt || '(no prompt)',
+    negativePrompt: v.negativePrompt || v.negative_prompt || null,
+    modelId: v.modelId,
+    width: v.width,
+    height: v.height,
+    numFrames: v.numFrames,
+    fps: v.fps,
+    mode: v.mode,
+    stitchedFrom: v.stitchedFrom,
+    upscaledFrom: v.upscaledFrom,
+    loraNames,
+    createdAt: v.createdAt,
+    // Same contract as normalizeImage's renderMs above.
+    renderMs: Number.isFinite(v.renderMs) ? v.renderMs : null,
+    hidden: !!v.hidden,
+    provenance: v.provenance || null,
+    compact: v.compact === true,
+    raw: v,
+  };
+}
+
+// Resolve `loraFilenames` from a raw sidecar with four fallbacks:
+//   1. raw.loraFilenames    — new gen records, already basenames
+//   2. raw.lora_filenames   — same shape, snake_case writer
+//   3. raw.loraPaths        — legacy records pre-refactor, absolute paths
+//   4. raw.lora_paths       — same legacy shape, snake_case
+// Legacy paths are reduced to basenames so the requeued payload matches the
+// new `loraFilenames` contract on the server.
+function pickLoraFilenames(raw) {
+  if (Array.isArray(raw.loraFilenames)) return raw.loraFilenames;
+  if (Array.isArray(raw.lora_filenames)) return raw.lora_filenames;
+  const paths = Array.isArray(raw.loraPaths) ? raw.loraPaths
+    : Array.isArray(raw.lora_paths) ? raw.lora_paths
+    : null;
+  if (!paths) return undefined;
+  return paths
+    .map((p) => (typeof p === 'string' ? p.split(/[\\/]/).pop() : ''))
+    .filter(Boolean);
+}
+
+// Sidecar field knowledge co-located with the normalize functions. Sidecars
+// were written with both snake_case (Python writer) and camelCase (Node
+// writer) over the project's history; the fallback chains keep older renders
+// queueable from <PromptRefineModal> without forcing a one-shot migration.
+//
+// Returns the subset of fields the queue-render API accepts for the given
+// kind. The `mode` here is the *original* render mode (defaulted when
+// missing); callers may override it (e.g. PromptRefineModal forces
+// `mode: 'text'` for video requeues so a missing source-image doesn't drop
+// the render).
+export function getRenderConfigForItem(item) {
+  if (!item) return {};
+  const raw = item.raw || {};
+  if (item.kind === 'image') {
+    return {
+      mode: item.mode || IMAGE_GEN_MODE.LOCAL,
+      modelId: item.modelId,
+      width: item.width,
+      height: item.height,
+      steps: item.steps,
+      guidance: item.guidance,
+      cfgScale: raw.cfgScale ?? raw.cfg_scale,
+      seed: item.seed,
+      quantize: item.quantize,
+      loraFilenames: pickLoraFilenames(raw),
+      loraScales: raw.loraScales ?? raw.lora_scales,
+    };
+  }
+  if (item.kind === 'video') {
+    return {
+      mode: item.mode || 'text',
+      modelId: item.modelId,
+      width: item.width,
+      height: item.height,
+      numFrames: item.numFrames,
+      fps: item.fps,
+      steps: raw.steps,
+      // Nullish coalescing — a deliberate `0` guidanceScale is valid for some
+      // video models and must survive the round-trip back into the queued payload.
+      guidanceScale: raw.guidanceScale ?? raw.guidance_scale ?? raw.guidance,
+      seed: raw.seed,
+      tiling: normalizeVideoTiling(raw.tiling),
+      disableAudio: raw.disableAudio ?? raw.disable_audio,
+      textEncoderId: raw.textEncoderId,
+      // The named sampler schedule (#4875), when the record was rendered with
+      // one. Without it a requeue would carry the profile's steps/CFG but none
+      // of its levers (stage-2 budget, TeaCache) — a slower, different render
+      // presented as a re-run of the same one. Absent on a Quality record, so
+      // the payload stays byte-identical to a pre-feature requeue.
+      speedProfileId: raw.speedProfileId,
+      // The decode the record was rendered with (#5423), for the same reason:
+      // a requeue that dropped it would silently re-render at full fidelity and
+      // full cost. Absent on a full-decode record, so the payload stays
+      // byte-identical to a pre-feature requeue.
+      draftDecode: raw.draftDecode,
+      loraFilenames: pickLoraFilenames(raw),
+      loraScales: raw.loraScales ?? raw.lora_scales,
+    };
+  }
+  return {};
+}

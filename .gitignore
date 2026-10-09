@@ -1,0 +1,117 @@
+# Dependencies
+# NO trailing slash: a CoS agent worktree receives its dependencies as a
+# SYMLINK to the primary checkout's tree (root AGENTS.md → Architecture), and
+# git treats a symlink as a file, so `node_modules/` does not match one. The
+# root and `autofixer/` links therefore showed as untracked in every agent
+# worktree, and `npm run pregate` — which AGENTS.md requires before every push
+# — aborted on them: the hidden-content scan cannot diff an untracked
+# directory ("Could not access 'autofixer/node_modules/null'"). The explicit
+# `/client/node_modules` and `/server/node_modules` entries were slash-less for
+# this reason; unanchored, this one line covers every depth instead.
+node_modules
+
+# Build output
+dist/
+build/
+/client/.dist-stage-*/
+
+# Runtime data (app registry, history, runs, migration state). Override the
+# directory-level `data/` rule from the global ~/.gitignore so git descends
+# into data/ and evaluates the negation below; then re-exclude everything
+# inside except the .gitkeep that pins the empty directory. Seed/template
+# content lives in data.reference/ and is copied in by scripts/setup-data.js;
+# migration scripts live in scripts/migrations/.
+!data/
+data/*
+!data/.gitkeep
+
+# Scratch dir the provider-status suite writes under server/ while it runs —
+# transient, but long-lived enough for a concurrent `git add -A` to catch it.
+server/test-data-status/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Screenshots
+*.png
+!client/public/portos-logo.png
+!client/public/sky/*.png
+!docs/media/portos-logo.png
+!data.reference/templates/*.png
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# PM2
+.pm2/
+
+# Playwright
+.playwright-mcp
+
+# Claude worktrees + session workflow scripts
+.claude/workflows/
+.claude/worktrees/
+.worktrees/
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+
+# Agent completion sentinels (consumed and cleaned up by the orchestrator)
+/.agent-done
+/.agent-done-*
+
+# Public-review input bundle PortOS materializes into a reviewer's worktree
+# (see server/lib/agentScratchPaths.js) — pipeline state, never work product
+/PORTOS_PUBLIC_REVIEW_INPUT.json
+/.portos-public-review/
+
+# BTW messages (ephemeral agent context, cleaned up after ingestion)
+BTW.md
+
+# Browser service node_modules (code is committed)
+browser/node_modules/
+
+# Browser service runtime data (CDP profiles, cache, downloads)
+browser/data/
+
+# Sub-package lock files. Root package.json does NOT declare these as
+# workspaces (npm workspaces were reverted in b743222be — exFAT has no
+# symlink support); `npm run setup` runs `npm install --prefix <pkg>` for
+# each. client/ and server/ lockfiles ARE committed and CI installs them
+# with `npm ci`: without them Dependabot only sees the ~45 deps declared in
+# their package.json files and is blind to ~560 transitive packages, and
+# every install/peer resolves a different tree. Only browser/ stays ignored
+# (its node_modules is committed instead).
+browser/package-lock.json
+__pycache__/
+
+# Temporary reference/scrape files created while building Freydis LoRA datasets
+tmp/freydis*
+tmp/portos-index.js
+tmp/LoraDatasetDetail.js
+
+# Runtime cache (e.g. projects.json) — regenerated, never committed
+cache/
+
+# Local GGUF weights downloaded by the speculative-decoding launcher — many GB,
+# re-downloadable from Hugging Face
+/models/
+
+.antigravitycli
+.superpowers/
+
+
+tmp

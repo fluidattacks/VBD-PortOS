@@ -1,0 +1,324 @@
+import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
+import { useSseProgress } from './useSseProgress.js';
+import { isIcLoraMode } from '../lib/videoGenParams.js';
+import toast from '../components/ui/Toast';
+import {
+  getImageModelStatuses, getVideoModelStatuses,
+  verifyImageModels, verifyVideoModels, repairImageModel, repairVideoModel,
+  repairTextEncoder, repairTextEncoderOption, repairIcLora,
+} from '../services/apiImageVideo.js';
+
+// Sentinel `modelId` used to drive a text-encoder download instead of a model
+// download. The video form passes this to `start()`; the URL builder below
+// rewrites to the dedicated /text-encoder/download endpoint. Exported so
+// callers and the hook agree on the magic string.
+export const TEXT_ENCODER_DOWNLOAD_ID = '__text_encoder__';
+
+// Namespace for a substitutable prompt-conditioner download id (#4081). The
+// video form passes `textEncoderDownloadId(option.id)` to start()/repair(); the
+// prefix keeps those ids from ever colliding with a registry model id.
+export const TEXT_ENCODER_OPTION_PREFIX = '__text_encoder_option__:';
+export const textEncoderDownloadId = (id) => `${TEXT_ENCODER_OPTION_PREFIX}${id}`;
+// The registry id inside a namespaced download id, or `null` when this isn't
+// one. One place decides both questions, so the URL builder, the repair
+// dispatch and the status lookup can't disagree about what counts as a
+// conditioner id or where the bare id starts.
+const textEncoderOptionIdOf = (downloadId) => (
+  String(downloadId).startsWith(TEXT_ENCODER_OPTION_PREFIX)
+    ? String(downloadId).slice(TEXT_ENCODER_OPTION_PREFIX.length)
+    : null
+);
+
+// IC-LoRA remix weights (issue #3100) are downloadable but aren't registry
+// models, so — like the text encoder — they route to a dedicated endpoint.
+// Callers pass the remix mode itself ('ic-control') as the download id, and
+// membership in the mode registry (NOT a raw `ic-` string prefix) is what
+// identifies one — so an id can never be misrouted by coincidence of naming.
+export const buildDownloadUrl = (kind, modelId, force = false) => {
+  if (!modelId) return null;
+  // A repair-initiated re-download appends `?force=1` so the server re-fetches
+  // even when the repo still looks cached — repairModelCache() deleted the bad
+  // file(s), but a multi-shard repo's surviving shards otherwise mask the gap
+  // and the deleted shard would never be pulled back.
+  const params = new URLSearchParams();
+  if (force) params.set('force', '1');
+  const q = params.size > 0 ? `?${params.toString()}` : '';
+  if (kind === 'video' && modelId === TEXT_ENCODER_DOWNLOAD_ID) {
+    return `/api/video-gen/text-encoder/download${q}`;
+  }
+  if (kind === 'video' && isIcLoraMode(modelId)) {
+    return `/api/video-gen/ic-loras/${encodeURIComponent(modelId)}/download${q}`;
+  }
+  // Substitutable prompt conditioners (#4081) are downloadable but aren't
+  // registry models either. Identified by the namespace the caller wraps the
+  // registry id in, rather than by the bare id — otherwise a future model whose
+  // id happened to match one would be misrouted.
+  const encoderOptionId = kind === 'video' ? textEncoderOptionIdOf(modelId) : null;
+  if (encoderOptionId) {
+    return `/api/video-gen/text-encoders/${encodeURIComponent(encoderOptionId)}/download${q}`;
+  }
+  return `/api/${kind}-gen/models/${encodeURIComponent(modelId)}/download${q}`;
+};
+
+// Model download-status hook. Drives the inline "Available · 7.8 GB" /
+// "Download (~8 GB)" badge next to the image/video gen model picker.
+//
+// `kind` selects the endpoint family ('image' | 'video'). `start(modelId)`
+// opens an EventSource against the download endpoint. When the stream
+// emits a terminal frame we automatically refetch /models/status so the
+// badge flips to "Available" without the caller wiring that up.
+//
+// `startWhenIdle(modelId)` is the same pull expressed as an intent rather than
+// a command — for a picker where choosing an option IS the request for its
+// weights. It waits for the cache verdict, skips an already-resident repo, and
+// queues behind whatever owns the lane; `queuedModelId` is what a badge renders
+// while it waits.
+export function useModelDownloadStatus({ kind = 'image' } = {}) {
+  const [statuses, setStatuses] = useState(null);
+  const [extra, setExtra] = useState({}); // video: { textEncoder: {...} }
+  const [loading, setLoading] = useState(false);
+  const [statusError, setStatusError] = useState(null);
+  const [activeModelId, setActiveModelId] = useState(null);
+  const activeModelIdRef = useRef(null);
+  const [lastError, setLastError] = useState(null);
+  // True only for a repair-initiated re-download — appends `?force=1` so the
+  // server re-fetches a repo whose surviving shards still read as cached.
+  const [forceDownload, setForceDownload] = useState(false);
+
+  const fetchStatuses = useCallback(async () => {
+    setLoading(true);
+    // Best-effort: a failure resolves to an empty status list. Local forms
+    // stay gated because an unknown cache state must not trigger a hidden
+    // render-time download; retrying the status request remains safe.
+    const body = await (kind === 'video' ? getVideoModelStatuses() : getImageModelStatuses())
+      .catch(() => null);
+    if (body == null) {
+      setStatusError('PortOS could not check the local model cache. Retry before generating.');
+      setStatuses([]);
+      setExtra({});
+    } else if (kind === 'video') {
+      setStatusError(null);
+      setStatuses(Array.isArray(body?.models) ? body.models : []);
+      setExtra({
+        textEncoder: body?.textEncoder || null,
+        textEncoderOptions: Array.isArray(body?.textEncoderOptions) ? body.textEncoderOptions : [],
+        icLoras: Array.isArray(body?.icLoras) ? body.icLoras : [],
+      });
+    } else {
+      setStatusError(null);
+      setStatuses(Array.isArray(body) ? body : []);
+      setExtra({});
+    }
+    setLoading(false);
+  }, [kind]);
+
+  useEffect(() => { fetchStatuses(); }, [fetchStatuses]);
+
+  // EventSource for the active download. `null` URL = idle (useSseProgress's
+  // `enabled: false` cleanup tears the connection down on cancel).
+  const downloadUrl = buildDownloadUrl(kind, activeModelId, forceDownload);
+  const sse = useSseProgress(downloadUrl, { enabled: !!downloadUrl });
+
+  // Refetch on natural stream close. useSseProgress flips `closed:true` once
+  // per subscription and resets to false when the URL changes; that single
+  // transition is the safe signal — no extra `wasClosed` ref needed.
+  // A terminal error frame (gated repo, missing HF token, broken venv) is
+  // routed to a toast here because the active-badge state vanishes the moment
+  // we clear `activeModelId`; without this, the UI silently snaps back to the
+  // Download button and the actionable server message is lost.
+  useEffect(() => {
+    if (sse.closed) {
+      if (sse.latest?.type === 'error' && sse.latest?.message) {
+        setLastError({
+          modelId: activeModelIdRef.current,
+          message: sse.latest.message,
+          kind: sse.latest.kind || 'download_failed',
+          repo: sse.latest.repo || null,
+        });
+        toast.error(sse.latest.message);
+      } else {
+        setLastError(null);
+      }
+      fetchStatuses();
+      setActiveModelId(null);
+      activeModelIdRef.current = null;
+      setForceDownload(false);
+    }
+  }, [sse.closed, sse.latest, fetchStatuses]);
+
+  const start = useCallback((modelId, { force = false } = {}) => {
+    setLastError(null);
+    setForceDownload(force);
+    activeModelIdRef.current = modelId;
+    setActiveModelId(modelId);
+  }, []);
+
+  // Force a deep integrity re-scan (per-file sha256). Returns the server's
+  // result and refreshes the status list so the structural badge stays current.
+  // `verifying` flips while in flight so the caller can disable the button.
+  const [verifying, setVerifying] = useState(false);
+  const verify = useCallback(async ({ modelId, deep = true } = {}) => {
+    setVerifying(true);
+    const fn = kind === 'video' ? verifyVideoModels : verifyImageModels;
+    const result = await fn({ modelId, deep }).catch((err) => {
+      toast.error(err?.message || 'Integrity scan failed');
+      return null;
+    });
+    await fetchStatuses();
+    setVerifying(false);
+    return result;
+  }, [kind, fetchStatuses]);
+
+  // Repair = delete the flagged corrupt files, then re-download them through
+  // the same SSE path the Download button uses (progress + auto status-refresh
+  // on completion come for free). `repairing` gates the button while the
+  // deletion request is in flight.
+  const [repairing, setRepairing] = useState(false);
+  const repair = useCallback(async (modelId, { deep = false } = {}) => {
+    if (!modelId) return;
+    setRepairing(true);
+    // The shared text encoder isn't a model id, so its repair hits the scalar
+    // /text-encoder/repair endpoint; the sentinel `start()` below already maps
+    // to the dedicated /text-encoder/download SSE for the clean re-fetch.
+    const run = () => {
+      if (kind === 'video') {
+        if (modelId === TEXT_ENCODER_DOWNLOAD_ID) return repairTextEncoder({ deep });
+        if (isIcLoraMode(modelId)) return repairIcLora(modelId, { deep });
+        const encoderOptionId = textEncoderOptionIdOf(modelId);
+        if (encoderOptionId) return repairTextEncoderOption(encoderOptionId, { deep });
+      }
+      return (kind === 'video' ? repairVideoModel : repairImageModel)(modelId, { deep });
+    };
+    const result = await run().catch((err) => {
+      toast.error(err?.message || 'Repair failed');
+      return null;
+    });
+    setRepairing(false);
+    // Force the re-download: repair deleted the bad file(s), but a multi-shard
+    // repo's surviving shards keep it reading as cached, so a non-forced pull
+    // would skip the deleted shard.
+    if (result) start(modelId, { force: true });
+    return result;
+  }, [kind, start]);
+
+  // Manual cancel: refetch directly because `sse.close()` followed by
+  // setActiveModelId(null) clears the URL, which causes useSseProgress to
+  // reset `closed → false` before the close-effect can observe `true`.
+  // Without this direct refetch the badge would stay stuck on its pre-cancel
+  // state until the next page mount.
+  const cancel = useCallback(() => {
+    sse.close();
+    setActiveModelId(null);
+    activeModelIdRef.current = null;
+    setForceDownload(false);
+    fetchStatuses();
+  }, [sse, fetchStatuses]);
+
+  // Memoize the active model's enriched status so a new SSE frame doesn't
+  // hand a fresh object to every non-active model's badge (only the active
+  // one re-renders). For inactive models we return the raw entry, which is
+  // referentially stable across frames.
+  // Look an id up across every download-able collection. IC-LoRA weights
+  // (issue #3100) arrive under `extra.icLoras` rather than `statuses` — they're
+  // not registry models — but they share the `{ id, repo, cached, sizeBytes,
+  // integrity }` badge shape, so one resolver keeps every caller uniform.
+  const findEntry = useCallback((modelId) => {
+    const list = Array.isArray(statuses) ? statuses : [];
+    const found = list.find((s) => s.id === modelId);
+    if (found) return found;
+    const icList = Array.isArray(extra.icLoras) ? extra.icLoras : [];
+    const ic = icList.find((s) => s.id === modelId);
+    if (ic) return ic;
+    // Conditioner entries are keyed by their BARE registry id in the status
+    // payload, so unwrap the download namespace before matching.
+    const encoderOptionId = textEncoderOptionIdOf(modelId);
+    if (encoderOptionId) {
+      const encoders = Array.isArray(extra.textEncoderOptions) ? extra.textEncoderOptions : [];
+      return encoders.find((s) => s.id === encoderOptionId) || null;
+    }
+    return null;
+  }, [statuses, extra.icLoras, extra.textEncoderOptions]);
+
+  const activeStatus = useMemo(() => {
+    if (!activeModelId) return null;
+    const entry = findEntry(activeModelId);
+    if (!entry) return null;
+    return { ...entry, downloading: true, progress: sse.latest };
+  }, [activeModelId, findEntry, sse.latest]);
+
+  const getStatus = useCallback((modelId) => {
+    if (modelId === activeModelId) return activeStatus;
+    return findEntry(modelId);
+  }, [findEntry, activeModelId, activeStatus]);
+
+  // "Download this unless it's already here" — the shape a picker needs when
+  // choosing an option IS the request to fetch its weights, with no separate
+  // Download click. Lives here rather than in the caller because both things it
+  // has to wait on are this hook's: the cache verdict (`statuses` may still be
+  // loading, and starting on an unknown verdict would re-pull a resident
+  // multi-GB repo) and the single EventSource lane (`start` would otherwise
+  // hijack a download already in flight).
+  //
+  // Passing a falsy id clears a queued intent, so a caller whose selection moved
+  // on — to an option with no download of its own, or to another id, which
+  // replaces the queue — doesn't strand a pull nobody is waiting for any more.
+  const [queuedModelId, setQueuedModelId] = useState(null);
+  const startWhenIdle = useCallback((modelId) => { setQueuedModelId(modelId || null); }, []);
+  useEffect(() => {
+    if (!queuedModelId || loading || activeModelId) return;
+    const entry = findEntry(queuedModelId);
+    // Cleared either way: with the verdict in, the question is answered. A
+    // missing entry means the id is in no downloadable collection, so there is
+    // nothing to start and nothing to keep waiting for.
+    setQueuedModelId(null);
+    if (entry?.cached === false) start(queuedModelId);
+  }, [queuedModelId, loading, activeModelId, findEntry, start]);
+
+  return {
+    statuses,
+    extra,
+    loading,
+    statusError,
+    refresh: fetchStatuses,
+    start,
+    startWhenIdle,
+    queuedModelId,
+    cancel,
+    verify,
+    verifying,
+    repair,
+    repairing,
+    getStatus,
+    activeModelId,
+    progress: sse.latest,
+    lastError,
+    downloading: !!activeModelId,
+  };
+}
+
+// Preserve the cache-status contract: null is unknown; an explicit cached:false
+// requires a download. Older payloads that omit cached retain their behavior.
+const weightsNotReady = (status, loading) => loading || status === null || status?.cached === false;
+
+// One dismissal slot per asset role, with the selected download + bad-file names
+// in its key. Switching selections or discovering different damage re-shows the
+// warning. Integrity remains visible independently of readiness applicability,
+// so a damaged shared cache can still be repaired from this surface.
+export function useDownloadableAssets(descriptors, { loading = false, downloading = false, enabled = true } = {}) {
+  const [dismissedKeys, setDismissedKeys] = useState({});
+  return descriptors.map((asset) => {
+    const integrity = asset.status && !asset.status.downloading ? asset.status.integrity : null;
+    const integrityBad = integrity?.status === 'bad';
+    const badFiles = integrity?.badFiles || [];
+    const integrityKey = integrityBad ? `${asset.keyPrefix}:${badFiles.map(file => file.name).join(',')}` : null;
+    return {
+      ...asset,
+      blocked: enabled && asset.applies && (asset.extraBlocked || weightsNotReady(asset.status, loading)),
+      missingWeights: weightsNotReady(asset.status, false),
+      integrityBadCount: integrityBad ? badFiles.length : 0,
+      integrityKey,
+      showBanner: integrityBad && dismissedKeys[asset.key] !== integrityKey && !downloading,
+      dismiss: () => setDismissedKeys(previous => ({ ...previous, [asset.key]: integrityKey })),
+    };
+  });
+}

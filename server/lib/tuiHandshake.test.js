@@ -1,0 +1,2220 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import {
+  READY_POLL_INTERVAL_MS,
+  READY_IDLE_THRESHOLD_MS,
+  PASTE_DEADLINE_MS,
+  PASTE_MARKER_POLL_MS,
+  PASTE_MARKER_PATTERN,
+  detectPasteMarker,
+  countPasteMarkers,
+  createGenerationActivityTracker,
+  createSelfClearingSignalGate,
+  createOomNudgeGate,
+  OOM_NUDGE_SETTLE_MS,
+  OOM_NUDGE_ARM_WINDOW_MS,
+  OOM_NUDGE_COOLDOWN_MS,
+  OOM_NUDGE_MAX_ATTEMPTS,
+  createTruncationNudgeGate,
+  TRUNCATION_NUDGE_MAX_ATTEMPTS,
+  createStallNudgeGate,
+  STALL_NUDGE_MAX_TOTAL,
+  STALL_NUDGE_IDLE_MS,
+  STALL_NUDGE_RECOVERY_MS,
+  STALL_NUDGE_MAX_ATTEMPTS,
+  STALL_NUDGE_TEXT,
+  SELF_CLEARING_RESUBMIT_INTERVAL_MS,
+  SELF_CLEARING_RESUBMIT_ECHO_MS,
+  MCP_BOOT_PASTE_DEADLINE_MS,
+  isPasteCommitted,
+  isPasteConfirmed,
+  MCP_BOOT_PASTE_RETRY_DELAY_MS,
+  isMcpBootSignal,
+  createMcpBootTracker,
+  PASTE_TO_ENTER_MIN_DELAY_MS,
+  PASTE_TO_ENTER_FALLBACK_MS,
+  SUBMIT_ENTER_ATTEMPTS,
+  SUBMIT_ENTER_SPACING_MS,
+  DEFAULT_TUI_PROMPT_DELAY_MS,
+  RAW_BUFFER_CAP,
+  RAW_BUFFER_HEADROOM,
+  OUTPUT_BUFFER_CAP,
+  OUTPUT_BUFFER_HEADROOM,
+  inferTuiCommand,
+  applyCommandDefaults,
+  buildTuiInvocation,
+  detectMissingTuiBinary,
+  scheduleSubmitEnters,
+  PASTE_VERIFY_POLL_MS,
+  PASTE_VERIFY_WINDOW_MS,
+  PASTE_RETRY_MAX_ATTEMPTS,
+  PASTE_RETRY_BASE_DELAY_MS,
+  extractVerifiablePromptPrefix,
+  verifyPasteRendered,
+  isCollapsedPasteChip,
+  createInputReadyTracker,
+  createStartupDialogAnswers,
+  answerStartupDialogs,
+  SUBMIT_KEY,
+  AGY_INPUT_READY_PATTERN,
+  createRetryStallGate,
+  RETRY_STALL_MS,
+  RETRY_STALL_MIN_ADVANCES,
+  detectToolPermissionPrompt,
+  createToolPermissionGate,
+  TOOL_PERMISSION_REPAINT_COOLDOWN_MS,
+  TOOL_PERMISSION_DECLINE_MAX,
+  TOOL_PERMISSION_NUDGE_TEXT,
+  CODEX_COMPOSER_READY_PATTERN,
+} from './tuiHandshake.js';
+import { detectImmediateFallbackSignal } from './aiToolkit/errorDetection.js';
+import { CODEX_CONFIGURED_DEFAULT } from './providerModels.js';
+import { readFileSync } from 'fs';
+import { dirname, resolve } from 'path';
+import { fileURLToPath } from 'url';
+
+// The exported constants are load-bearing for both production callers
+// (`tuiPromptRunner.js`, `agentTuiSpawning.js`). Pin every value so an
+// inadvertent edit on one timing knob trips a test instead of silently
+// drifting the paste handshake.
+describe('tuiHandshake — paste timing constants', () => {
+  it('pins ready-poll constants', () => {
+    expect(READY_POLL_INTERVAL_MS).toBe(300);
+    expect(READY_IDLE_THRESHOLD_MS).toBe(1200);
+    expect(PASTE_DEADLINE_MS).toBe(10000);
+    // The idle threshold must remain larger than the poll interval —
+    // otherwise the first idle window is observed before the banner
+    // has finished its second paint.
+    expect(READY_IDLE_THRESHOLD_MS).toBeGreaterThan(READY_POLL_INTERVAL_MS);
+    // The deadline must outrun the idle threshold by enough headroom to
+    // catch a slow spawn + initial paint.
+    expect(PASTE_DEADLINE_MS).toBeGreaterThan(READY_IDLE_THRESHOLD_MS);
+  });
+
+  it('pins paste-marker constants', () => {
+    expect(PASTE_MARKER_POLL_MS).toBe(150);
+    expect(PASTE_TO_ENTER_MIN_DELAY_MS).toBe(200);
+    expect(PASTE_TO_ENTER_FALLBACK_MS).toBe(3500);
+    // Fallback only fires when no marker appears; it must be longer than
+    // the min delay or the min delay never gates anything.
+    expect(PASTE_TO_ENTER_FALLBACK_MS).toBeGreaterThan(PASTE_TO_ENTER_MIN_DELAY_MS);
+  });
+
+  it('PASTE_MARKER_PATTERN matches Claude Code paste markers', () => {
+    expect(PASTE_MARKER_PATTERN.test('[Pasted text #1 +3 lines]')).toBe(true);
+    expect(PASTE_MARKER_PATTERN.test('[Pasted text #42 +120 lines]')).toBe(true);
+    // Embedded inside a banner of escape-stripped output.
+    expect(PASTE_MARKER_PATTERN.test('banner stuff [Pasted text #7 +1 lines] trailer')).toBe(true);
+  });
+
+  it('PASTE_MARKER_PATTERN matches Codex paste-commit chips', () => {
+    expect(PASTE_MARKER_PATTERN.test('[Pasted Content 2431 chars]')).toBe(true);
+    expect(PASTE_MARKER_PATTERN.test('[PastedContent2431chars]')).toBe(true);
+  });
+
+  it('PASTE_MARKER_PATTERN matches OpenCode paste-commit chips', () => {
+    expect(PASTE_MARKER_PATTERN.test('[Pasted ~46 lines]')).toBe(true);
+    expect(PASTE_MARKER_PATTERN.test('[Pasted~46lines]')).toBe(true);
+    expect(PASTE_MARKER_PATTERN.test('[Pasted ~1 line]')).toBe(true);
+    expect(PASTE_MARKER_PATTERN.test('[Pasted ~46 chars]')).toBe(false);
+  });
+
+  it('PASTE_MARKER_PATTERN matches Pi paste-commit chips', () => {
+    // Pi spells the chip `[paste #N +M lines]` — lowercase and WITHOUT the
+    // trailing `d` every other TUI uses, and with no `text` token. Real
+    // incident (2026-09-17): a pi-TUI CoS agent pasted its prompt 3 times and
+    // died `paste-not-rendered` with `[paste #1 +371 lines][paste #2 +371
+    // lines][paste #3 +371 lines]` visible in the composer and Enter never
+    // sent. Pi collapses the paste and HIDES the body, so the marker is the
+    // ONLY confirmation signal available — without it the text fallback in
+    // verifyPasteRendered can never succeed either.
+    expect(PASTE_MARKER_PATTERN.test('[paste #1 +371 lines]')).toBe(true);
+    expect(PASTE_MARKER_PATTERN.test('[paste #3 +1 line]')).toBe(true);
+    // Space-collapsed form left behind by the ANSI stripper.
+    expect(PASTE_MARKER_PATTERN.test('[paste#1+371lines]')).toBe(true);
+    // Each re-paste adds its own chip, so the count is what distinguishes the
+    // TUI's own commit from a marker echoed out of the prompt.
+    expect(countPasteMarkers('[paste #1 +371 lines][paste #2 +371 lines]')).toBe(2);
+  });
+
+  it('a pi paste confirms on the marker alone, with the body hidden', () => {
+    // The whole point of the marker path: pi's chip REPLACES the prompt text in
+    // the buffer, so a prefix that is genuinely absent must still confirm.
+    const prompt = 'x'.repeat(40) + ' ship up to 6 independent issues in parallel';
+    const verifiablePrefix = extractVerifiablePromptPrefix(prompt);
+    expect(verifiablePrefix).toBeTruthy();
+    const buffer = '[Skills] find-skills, hyperframes\n[paste #1 +371 lines]';
+    expect(verifyPasteRendered(buffer, verifiablePrefix)).toBe(false);
+    expect(isPasteConfirmed(buffer, { verifiablePrefix, promptMarkerCount: 0 })).toBe(true);
+  });
+
+  it('PASTE_MARKER_PATTERN matches the SPACE-COLLAPSED form left after ANSI strip', () => {
+    // The raw PTY stream renders the marker with absolute-column cursor moves
+    // between tokens (`[Pasted\x1b[11Gtext\x1b[16G#1…`), so once ANSI is stripped
+    // the spaces vanish and glyphs collapse adjacent. This is the exact shape
+    // observed in real transcripts and the root cause of #1229 — a space-
+    // requiring regex never matched it. (See the integration assertion below
+    // that strips the real escape sequence and matches the result.)
+    expect(PASTE_MARKER_PATTERN.test('[Pastedtext#1+35lines]')).toBe(true);
+    expect(PASTE_MARKER_PATTERN.test('[Pastedtext#42+120lines]')).toBe(true);
+  });
+
+  it('PASTE_MARKER_PATTERN matches the real cursor-positioned marker once ANSI-stripped', () => {
+    // Verbatim byte shape from data/cos/agents/.../raw.txt, stripped the same
+    // way the streaming ANSI stripper does (drop CSI sequences).
+    const rawMarker = '[Pasted\x1b[11Gtext\x1b[16G#1\x1b[19G+35\x1b[23Glines]';
+    const stripped = rawMarker.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '');
+    expect(stripped).toBe('[Pastedtext#1+35lines]');
+    // The raw form must NOT match (regression guard: this is why the fast path
+    // was dead) but the stripped form MUST.
+    expect(detectPasteMarker(rawMarker)).toBe(false);
+    expect(detectPasteMarker(stripped)).toBe(true);
+  });
+
+  it('PASTE_MARKER_PATTERN does NOT match similar-looking but distinct text', () => {
+    expect(PASTE_MARKER_PATTERN.test('[Pasted text]')).toBe(false);
+    expect(PASTE_MARKER_PATTERN.test('[Pasted #1]')).toBe(false);
+    // Pi's `#N` branch requires the `+M lines` tail, so a bare chip stays out.
+    expect(PASTE_MARKER_PATTERN.test('[paste #1]')).toBe(false);
+    expect(PASTE_MARKER_PATTERN.test('[paste #1 +371 chars]')).toBe(false);
+    expect(PASTE_MARKER_PATTERN.test('Pasted text #1')).toBe(false);
+    expect(PASTE_MARKER_PATTERN.test('')).toBe(false);
+  });
+
+  it('detectPasteMarker guards non-string input', () => {
+    expect(detectPasteMarker(null)).toBe(false);
+    expect(detectPasteMarker(undefined)).toBe(false);
+    expect(detectPasteMarker(123)).toBe(false);
+    expect(detectPasteMarker('[Pasted text #1 +3 lines]')).toBe(true);
+  });
+
+  it('countPasteMarkers counts markers (so an echoed-prompt marker can be subtracted)', () => {
+    expect(countPasteMarkers('')).toBe(0);
+    expect(countPasteMarkers(null)).toBe(0);
+    expect(countPasteMarkers('no marker here')).toBe(0);
+    expect(countPasteMarkers('[Pasted text #1 +3 lines]')).toBe(1);
+    // Collapsed (stripped) + spaced forms both count.
+    expect(countPasteMarkers('[Pastedtext#1+35lines] then [Pasted text #2 +1 lines]')).toBe(2);
+  });
+
+  it('countPasteMarkers underpins the echoed-marker gate (count must EXCEED the prompt count)', () => {
+    // A transcript-analysis prompt that itself contains a paste marker. The fast
+    // path must wait for the TUI's OWN (N+1)th marker, not fire on the echo
+    // (issue #1229 round-5 review).
+    const prompt = 'analyze this transcript: "[Pasted text #1 +35 lines]" and report';
+    const promptMarkers = countPasteMarkers(prompt); // 1
+    expect(promptMarkers).toBe(1);
+    // Echo of the prompt alone — count does NOT exceed the prompt's own count.
+    expect(countPasteMarkers(prompt) > promptMarkers).toBe(false);
+    // Once the TUI appends its real commit marker, the count exceeds it → fire.
+    expect(countPasteMarkers(`${prompt} [Pastedtext#2+40lines]`) > promptMarkers).toBe(true);
+    // A NORMAL prompt (0 markers) keeps the original presence behavior.
+    expect(countPasteMarkers('[Pastedtext#1+35lines]') > countPasteMarkers('do the thing')).toBe(true);
+  });
+
+  it('the gate must count a STRIPPED prompt — a raw cursor-positioned marker echoes back stripped', () => {
+    // Round-6 review: a pasted RAW transcript can carry the cursor-positioned form.
+    // Unstripped it counts as 0 (escapes break the match), but it echoes back as
+    // the stripped form (count 1) — so counting the RAW prompt would undercount and
+    // fire the fast path early. The prompt must be stripped the same way the
+    // post-paste buffer is. (stripAnsi behavior is covered in ansiStrip.test.js;
+    // here we pin the count asymmetry the consumers must avoid.)
+    const rawMarkerPrompt = 'analyze: [Pasted\x1b[11Gtext\x1b[16G#1\x1b[19G+35\x1b[23Glines]';
+    const strippedPrompt = rawMarkerPrompt.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '');
+    expect(countPasteMarkers(rawMarkerPrompt)).toBe(0);      // raw → undercount (the bug)
+    expect(countPasteMarkers(strippedPrompt)).toBe(1);       // stripped → correct count
+    // What the echo produces in the (stripped) post-paste buffer:
+    const echoInStrippedBuffer = countPasteMarkers('[Pastedtext#1+35lines]'); // 1
+    // Gating on the RAW count fires early (1 > 0); gating on the STRIPPED count does not (1 > 1 == false).
+    expect(echoInStrippedBuffer > countPasteMarkers(rawMarkerPrompt)).toBe(true);
+    expect(echoInStrippedBuffer > countPasteMarkers(strippedPrompt)).toBe(false);
+  });
+
+
+  // Verdict for agy's self-clearing eligibility banner: did the provider come
+  // back? The chrome below is lifted from real transcripts — healthy agy runs
+  // (2026-08-05) carry `esc to cancel`/`Generating…`; the five runs killed on the
+  // banner (2026-08-07 → 08-11) carry neither.
+  it('createGenerationActivityTracker latches on agy in-flight chrome', () => {
+    const tracker = createGenerationActivityTracker();
+    tracker.observe('> ? for shortcuts');
+    expect(tracker.active).toBe(false);
+    tracker.observe('Generating...');
+    expect(tracker.active).toBe(true);
+  });
+
+  // `esc to cancel` is agy's in-flight footer AND its slash-command-palette
+  // footer, down to the trailing status line — so it proves nothing. Verbatim
+  // from agent-03904eb1, which was parked on the eligibility banner when a
+  // `/usage` scrape opened the palette in its session: reading this as recovery
+  // disarmed the retry and the fail-over, and the run idle-reaped into a bogus
+  // `idle-no-changes`.
+  it('createGenerationActivityTracker ignores the ambiguous esc-to-cancel footer', () => {
+    const tracker = createGenerationActivityTracker();
+    tracker.observe('  ↑/↓ Navigate · enter Select · tab Complete\nesc to cancelGemini 3.6 Flash · medium');
+    expect(tracker.active).toBe(false);
+  });
+
+  it('createGenerationActivityTracker also admits the Claude/Codex elapsed counter', () => {
+    const tracker = createGenerationActivityTracker();
+    tracker.observe('(12s · esc to interrupt)');
+    expect(tracker.active).toBe(true);
+  });
+
+  it('createGenerationActivityTracker stays inactive on the stuck agy banner screen', () => {
+    const tracker = createGenerationActivityTracker();
+    // Verbatim from agent-09824620's raw.txt, ANSI-stripped.
+    tracker.observe('[Pasted text #1 +43 lines]');
+    tracker.observe('Verifying your account...');
+    tracker.observe("We're finishing verifying your account eligibility.");
+    tracker.observe('This usually takes a moment. Please try again shortly.');
+    tracker.observe('> ? for shortcutsGemini 3.6 Flash   high');
+    expect(tracker.active).toBe(false);
+  });
+
+  it('createGenerationActivityTracker stays latched once active', () => {
+    const tracker = createGenerationActivityTracker();
+    tracker.observe('Generating...');
+    tracker.observe('> ? for shortcuts');
+    expect(tracker.active).toBe(true);
+  });
+
+  it('createGenerationActivityTracker ignores non-string input', () => {
+    const tracker = createGenerationActivityTracker();
+    tracker.observe(undefined);
+    tracker.observe(null);
+    expect(tracker.active).toBe(false);
+  });
+
+  // The sibling trackers each had to learn this after review found the miss.
+  it('createGenerationActivityTracker matches chrome split across PTY chunks', () => {
+    const tracker = createGenerationActivityTracker();
+    tracker.observe('Generat');
+    expect(tracker.active).toBe(false);
+    tracker.observe('ing…');
+    expect(tracker.active).toBe(true);
+  });
+
+  // A real TUI repaint is hundreds of bytes and the chrome lands wherever the
+  // frame puts it. Trimming to the carry cap BEFORE matching (rather than after)
+  // discards everything but the last 64 chars, so the tracker misses a provider
+  // that HAD recovered and the run gets failed over for nothing.
+  it('createGenerationActivityTracker matches chrome early in a large chunk', () => {
+    const tracker = createGenerationActivityTracker();
+    tracker.observe(`Generating...${'x'.repeat(500)}`);
+    expect(tracker.active).toBe(true);
+  });
+
+  it('createGenerationActivityTracker matches chrome mid-way through a large chunk', () => {
+    const tracker = createGenerationActivityTracker();
+    tracker.observe(`${'a'.repeat(300)}Generating…${'b'.repeat(300)}`);
+    expect(tracker.active).toBe(true);
+  });
+
+  describe('createSelfClearingSignalGate', () => {
+    const BANNER = { message: 'eligibility', graceMs: 60000 };
+
+    it('arms once and reports the deadline only after it passes', () => {
+      const gate = createSelfClearingSignalGate();
+      expect(gate.arm(BANNER, 1000)).toBe(true);
+      expect(gate.armed).toBe(true);
+      expect(gate.takeExpired(60000)).toBeNull();
+      expect(gate.takeExpired(61000)).toBe(BANNER);
+      expect(gate.armed).toBe(false);
+    });
+
+    it('refuses to re-arm while open, so a repainting banner cannot restart the clock', () => {
+      const gate = createSelfClearingSignalGate();
+      gate.arm(BANNER, 1000);
+      expect(gate.arm(BANNER, 50000)).toBe(false);
+      // Deadline still measured from the FIRST sighting, not the latest repaint.
+      expect(gate.takeExpired(61001)).toBe(BANNER);
+    });
+
+    it('ignores a signal with no grace window', () => {
+      const gate = createSelfClearingSignalGate();
+      expect(gate.arm({ message: 'usage limit', graceMs: 0 }, 1000)).toBe(false);
+      expect(gate.armed).toBe(false);
+    });
+
+    it('closes on the first sign of generation instead of holding to the deadline', () => {
+      const gate = createSelfClearingSignalGate();
+      gate.arm(BANNER, 1000);
+      expect(gate.observe('Generating...', 2000)).toBe(true);
+      expect(gate.armed).toBe(false);
+      // Nothing left to fail over with — the run continues.
+      expect(gate.takeExpired(61000)).toBeNull();
+    });
+
+    // The caller's detector buffers ~512 chars, so the banner keeps matching well
+    // after recovery. Re-arming on one of those stale matches would fail the run
+    // over 60s later — the exact bug the grace window exists to prevent.
+    it('does not re-arm on a stale banner match after the provider recovered', () => {
+      const gate = createSelfClearingSignalGate();
+      gate.arm(BANNER, 1000);
+      gate.observe('Generating...', 2000);
+      expect(gate.recovered).toBe(true);
+      expect(gate.arm(BANNER, 2000)).toBe(false);
+      expect(gate.takeExpired(120000)).toBeNull();
+    });
+
+    // Replays agent-03904eb1 (2026-08-12), the run that made this whole file's
+    // fail-over unreachable: parked on the eligibility banner, a `/usage` scrape
+    // opened agy's slash-command palette in its session, and the palette's
+    // `esc to cancel` footer read as recovery. The gate latched, which disarms
+    // BOTH the re-submission and the fail-over, so the run sat silent until the
+    // idle reaper finalized it as a bogus `idle-no-changes` — the "agy hangs on
+    // Verifying your account" report. Palette chrome must leave the window open.
+    it('does not accept slash-command-palette chrome as recovery', () => {
+      const gate = createSelfClearingSignalGate();
+      gate.arm(BANNER, 1000);
+      // Verbatim shapes from that transcript, ANSI-stripped.
+      expect(gate.observe('/\n> /add-dir             Add a directory to the workspace', 2000)).toBe(false);
+      expect(gate.observe('  ↑/↓ Navigate · enter Select · tab Complete\nesc to cancelu', 3000)).toBe(false);
+      expect(gate.observe('esc to cancelGemini 3.6 Flash · medium', 4000)).toBe(false);
+      expect(gate.armed).toBe(true);
+      expect(gate.takeExpired(61001)).toBe(BANNER);
+    });
+
+    it('does not treat pre-arm output as evidence of recovery', () => {
+      const gate = createSelfClearingSignalGate();
+      expect(gate.observe('Generating...', 500)).toBe(false);
+      gate.arm(BANNER, 1000);
+      // Only the banner screen repaints from here — still stuck.
+      gate.observe('> ? for shortcuts', 2000);
+      expect(gate.takeExpired(61001)).toBe(BANNER);
+    });
+
+    // A consumer whose own one-shot setTimeout fired for exactly this window
+    // omits the clock. A deadline re-check that came up a millisecond short
+    // (ms-resolution clock vs. timer rounding) would strand the gate armed with
+    // nothing left to retry it — idle-completion suppressed and no fail-over.
+    it('force-expires when called with no clock, even a hair before the deadline', () => {
+      const gate = createSelfClearingSignalGate();
+      gate.arm(BANNER, 1000);
+      expect(gate.takeExpired(60999)).toBeNull(); // polling form: still waiting
+      expect(gate.takeExpired()).toBe(BANNER);    // timer form: fires regardless
+      expect(gate.armed).toBe(false);
+    });
+
+    it('force-expiry still returns null once the provider recovered', () => {
+      const gate = createSelfClearingSignalGate();
+      gate.arm(BANNER, 1000);
+      gate.observe('Generating...', 2000);
+      expect(gate.takeExpired()).toBeNull();
+    });
+
+    it('honors a per-signal grace window rather than one global constant', () => {
+      const gate = createSelfClearingSignalGate();
+      gate.arm({ message: 'slow warmup', graceMs: 5000 }, 0);
+      expect(gate.takeExpired(4999)).toBeNull();
+      expect(gate.takeExpired(5000)).toMatchObject({ graceMs: 5000 });
+    });
+
+    // The window has to be ACTIVE: agy's banner is the REJECTION of the
+    // submission (composer emptied, session back at its idle footer), so nothing
+    // is in flight and no amount of waiting produces generation chrome. Without a
+    // re-submission the window's only reachable outcome is expiry.
+    describe('re-submission cadence', () => {
+      const I = SELF_CLEARING_RESUBMIT_INTERVAL_MS;
+
+      it('asks for a re-submission once per interval, numbering the attempts', () => {
+        const gate = createSelfClearingSignalGate();
+        gate.arm(BANNER, 0);
+        // Not immediately: the banner paints a second after the submit-Enter, and
+        // re-pasting into a TUI still settling concatenates two prompts.
+        expect(gate.takeResubmit(0)).toBe(0);
+        expect(gate.takeResubmit(I - 1)).toBe(0);
+        expect(gate.takeResubmit(I)).toBe(1);
+        expect(gate.takeResubmit(I)).toBe(0);
+        expect(gate.takeResubmit(2 * I)).toBe(2);
+      });
+
+      it('never asks before the window opens or after the provider recovered', () => {
+        const gate = createSelfClearingSignalGate();
+        expect(gate.takeResubmit(I)).toBe(0);
+        gate.arm(BANNER, 0);
+        gate.observe('Generating...', I);
+        expect(gate.takeResubmit(2 * I)).toBe(0);
+      });
+
+      // A retry landing after takeExpired would paste into a session the
+      // fail-over is already tearing down.
+      it('stops asking at the deadline', () => {
+        const gate = createSelfClearingSignalGate();
+        gate.arm(BANNER, 0);
+        expect(gate.takeResubmit(BANNER.graceMs - 1)).toBe(1);
+        expect(gate.takeResubmit(BANNER.graceMs)).toBe(0);
+      });
+
+      it('numbers attempts per window, not per gate', () => {
+        const gate = createSelfClearingSignalGate();
+        gate.arm(BANNER, 0);
+        expect(gate.takeResubmit(I)).toBe(1);
+        gate.takeExpired(BANNER.graceMs);
+        gate.arm(BANNER, BANNER.graceMs);
+        expect(gate.takeResubmit(BANNER.graceMs + I)).toBe(1);
+      });
+
+      // The tracker matches a single chunk, which is only safe while the stream
+      // can't contain the prompt. Re-pasting puts it back, so a task whose text
+      // quotes in-flight chrome (a task about THIS failure mode does) would latch
+      // a bogus recovery — worse than expiring, because a recovered gate neither
+      // retries nor fails over and the run idle-reaps into a false success.
+      it('discounts the echo of the prompt it just re-pasted', () => {
+        const gate = createSelfClearingSignalGate();
+        gate.arm(BANNER, 0);
+        gate.takeResubmit(I);
+        expect(gate.observe('Investigate why the TUI shows `Generating…` forever', I + 10)).toBe(false);
+        expect(gate.armed).toBe(true);
+        // Real chrome repaints continuously, so the next chunk past the echo
+        // window still latches.
+        expect(gate.observe('Generating…', I + SELF_CLEARING_RESUBMIT_ECHO_MS)).toBe(true);
+      });
+
+      it('only discounts the echo window, not everything after a re-submission', () => {
+        const gate = createSelfClearingSignalGate();
+        gate.arm(BANNER, 0);
+        gate.takeResubmit(I);
+        expect(gate.observe('Generating...', I + SELF_CLEARING_RESUBMIT_ECHO_MS + 1)).toBe(true);
+      });
+
+      // Nothing has been re-pasted before the first attempt, so nothing in the
+      // stream is our echo and a recovery counts immediately.
+      it('does not suppress anything before the first re-submission', () => {
+        const gate = createSelfClearingSignalGate();
+        gate.arm(BANNER, 0);
+        expect(gate.observe('Generating...', 10)).toBe(true);
+      });
+
+      // Cross-file invariant between the signal that sets the window and the gate
+      // that spends it. The grace window must allow several retries before the
+      // provider is classified as requiring fallback.
+      it("sizes agy's eligibility window for several retries", () => {
+        const signal = detectImmediateFallbackSignal(
+          "We're finishing verifying your account eligibility. This usually takes a moment. Please try again shortly."
+        );
+        expect(signal.graceMs).toBeGreaterThanOrEqual(3 * SELF_CLEARING_RESUBMIT_INTERVAL_MS);
+        expect(signal.graceMs).toBeGreaterThan(0);
+      });
+    });
+  });
+
+  it('pins provider-default constants', () => {
+    expect(DEFAULT_TUI_PROMPT_DELAY_MS).toBe(2500);
+  });
+
+  it('pins buffer caps with headroom > cap (defensive growth allowance)', () => {
+    expect(RAW_BUFFER_CAP).toBe(512 * 1024);
+    expect(RAW_BUFFER_HEADROOM).toBe(640 * 1024);
+    // OUTPUT cap was bumped 1MB → 8MB so realistic full-context LLM responses
+    // (~600KB UTF-8 from a 200K-token window + screen chrome) fit cleanly
+    // when the file-write path falls back to the buffer scrape. A regression
+    // back to ~1MB would silently mid-token-truncate large fallback responses.
+    expect(OUTPUT_BUFFER_CAP).toBe(8 * 1024 * 1024);
+    expect(OUTPUT_BUFFER_HEADROOM).toBe(10 * 1024 * 1024);
+    // Headroom must exceed cap so the slice-tail-after-overflow logic in
+    // the callers actually keeps recent bytes instead of dropping them.
+    expect(RAW_BUFFER_HEADROOM).toBeGreaterThan(RAW_BUFFER_CAP);
+    expect(OUTPUT_BUFFER_HEADROOM).toBeGreaterThan(OUTPUT_BUFFER_CAP);
+  });
+});
+
+describe('tuiHandshake — codex MCP-boot paste patience (agent-c5a26b40)', () => {
+  it('deadline covers a node_repl startup_timeout_sec=120 plus margin', () => {
+    // Long enough for the documented 120s node_repl startup + an npx cold
+    // download, with a bounded retry window for a genuinely hung boot.
+    expect(MCP_BOOT_PASTE_DEADLINE_MS).toBe(150000);
+    expect(MCP_BOOT_PASTE_DEADLINE_MS).toBeGreaterThan(120000);
+    expect(MCP_BOOT_PASTE_RETRY_DELAY_MS).toBe(5000);
+  });
+
+  it('isMcpBootSignal matches codex MCP boot banners (case-insensitive)', () => {
+    expect(isMcpBootSignal('Booting MCP server: codex_apps(0s • esc to interrupt)')).toBe(true);
+    expect(isMcpBootSignal('Starting MCP servers (0/3): codex_apps, node_repl, playwright')).toBe(true);
+    expect(isMcpBootSignal('STARTING MCP SERVERS (3/3)')).toBe(true);
+  });
+
+  it('isMcpBootSignal ignores ordinary output that merely mentions MCP', () => {
+    // Conservative anchoring: a prompt/output that talks ABOUT mcp servers must
+    // not latch the extended budget (a false positive only slows a failure, but
+    // keep it tight anyway — mirrors the merge-queue/review-loop discipline).
+    expect(isMcpBootSignal('Configure the mcp server in server/services/voice/tools.js')).toBe(false);
+    expect(isMcpBootSignal('the playwright MCP server is slow')).toBe(false);
+    expect(isMcpBootSignal('')).toBe(false);
+    expect(isMcpBootSignal(null)).toBe(false);
+    expect(isMcpBootSignal(undefined)).toBe(false);
+  });
+
+  it('createMcpBootTracker latches on first banner and stays active through the silent boot', () => {
+    const tracker = createMcpBootTracker();
+    expect(tracker.active).toBe(false);
+    // Ordinary startup banner chrome — not a boot signal.
+    tracker.observe('>_ OpenAI Codex (v0.144.1)  permissions: YOLO mode');
+    expect(tracker.active).toBe(false);
+    // MCP boot begins — latches.
+    expect(tracker.observe('Starting MCP servers (0/3): codex_apps, node_repl, playwright')).toBe(true);
+    expect(tracker.active).toBe(true);
+    // Codex updates the line via cursor-positioned partial redraws that do NOT
+    // reprint the full phrase, and the boot subprocess can go silent (npx
+    // download) — neither must un-latch the extended patience.
+    tracker.observe('servers (3/4');
+    tracker.observe('');
+    expect(tracker.active).toBe(true);
+  });
+
+  it('createMcpBootTracker latches on a banner split across two chunks', () => {
+    const tracker = createMcpBootTracker();
+    tracker.observe('• You have 3 usage limit resets available. Booting MCP');
+    expect(tracker.active).toBe(false);
+    expect(tracker.observe(' server: codex_apps(0s • esc to interrupt)')).toBe(true);
+    expect(tracker.active).toBe(true);
+  });
+});
+
+describe('tuiHandshake.inferTuiCommand', () => {
+  // Catch-all default also returns claude; the claude rows just confirm
+  // an explicit match isn't accidentally tagged codex/antigravity/gemini.
+  it.each([
+    ['', 'claude'],
+    [null, 'claude'],
+    [undefined, 'claude'],
+    ['mystery-provider', 'claude'],
+    ['codex', 'codex'],
+    ['openai-codex', 'codex'],
+    ['codex-cloud', 'codex'],
+    ['antigravity', 'agy'],
+    ['google-antigravity-2', 'agy'],
+    ['gemini', 'gemini'],
+    ['google-gemini-2', 'gemini'],
+    ['claude', 'claude'],
+    ['anthropic-claude-code', 'claude'],
+    ['kimi-tui', 'kimi'],
+    ['moonshot-kimi-2', 'kimi'],
+    // grok / opencode were missing, so a blank-command provider under either id
+    // silently resolved to `claude` — which also told it (via
+    // resolveSlashdoStyle's spawner posture) to type `/do:pr` commands its real
+    // binary doesn't have.
+    ['grok-tui', 'grok'],
+    ['xai-grok-2', 'grok'],
+    ['opencode-tui', 'opencode'],
+    ['opencode-ollama-tui', 'opencode'],
+    // `cursor` must map to the AGENT binary, not the `cursor` GUI launcher, and
+    // must not fall through to the blank-command `claude` default.
+    ['cursor-tui', 'cursor-agent'],
+    ['cursor-cli', 'cursor-agent'],
+  ])('inferTuiCommand(%p) → %p', (id, expected) => {
+    expect(inferTuiCommand(id)).toBe(expected);
+  });
+});
+
+describe('tuiHandshake.applyCommandDefaults', () => {
+  it('injects the bypass flag and disables the startup update check for codex when not already present', () => {
+    expect(applyCommandDefaults('codex', ['exec', '-'])).toEqual([
+      '--dangerously-bypass-approvals-and-sandbox', '-c', 'check_for_update_on_startup=false', 'exec', '-',
+    ]);
+  });
+
+  it('skips the bypass flag but still disables the update check when --ask-for-approval is already present', () => {
+    const args = ['--ask-for-approval', 'auto-edit', 'exec', '-'];
+    expect(applyCommandDefaults('codex', args)).toEqual([
+      '-c', 'check_for_update_on_startup=false', '--ask-for-approval', 'auto-edit', 'exec', '-',
+    ]);
+  });
+
+  it('skips the bypass flag but still disables the update check when --sandbox is already present', () => {
+    const args = ['--sandbox', 'workspace-write', 'exec', '-'];
+    expect(applyCommandDefaults('codex', args)).toEqual([
+      '-c', 'check_for_update_on_startup=false', '--sandbox', 'workspace-write', 'exec', '-',
+    ]);
+  });
+
+  it('does not duplicate the bypass flag when codex args already pin it', () => {
+    const args = ['--dangerously-bypass-approvals-and-sandbox', 'exec', '-'];
+    expect(applyCommandDefaults('codex', args)).toEqual([
+      '-c', 'check_for_update_on_startup=false', '--dangerously-bypass-approvals-and-sandbox', 'exec', '-',
+    ]);
+  });
+
+  it('does not duplicate the update-check config when codex args already pin it', () => {
+    const args = ['-c', 'check_for_update_on_startup=true', 'exec', '-'];
+    expect(applyCommandDefaults('codex', args)).toEqual([
+      '--dangerously-bypass-approvals-and-sandbox', '-c', 'check_for_update_on_startup=true', 'exec', '-',
+    ]);
+  });
+
+  it('returns the same codex arg list untouched when both policy and update-check are already pinned', () => {
+    const args = ['--dangerously-bypass-approvals-and-sandbox', '-c', 'check_for_update_on_startup=false', 'exec', '-'];
+    expect(applyCommandDefaults('codex', args)).toBe(args);
+  });
+
+  it('passes non-codex commands through unchanged', () => {
+    const args = ['-p', '-'];
+    expect(applyCommandDefaults('claude', args)).toBe(args);
+    expect(applyCommandDefaults('gemini', args)).toBe(args);
+    expect(applyCommandDefaults('something-else', args)).toBe(args);
+  });
+
+  it('adds Antigravity permission bypass and strips legacy Gemini flags', () => {
+    expect(applyCommandDefaults('agy', ['--yolo', '-m', 'gemini-2.5-pro'])).toEqual([
+      '--dangerously-skip-permissions',
+    ]);
+  });
+
+  // agy accepts the long `--model` now, so a baked pin survives (and suppresses
+  // the per-run model injection in buildTuiInvocation).
+  it('preserves a long-form --model pin for Antigravity', () => {
+    expect(applyCommandDefaults('agy', ['--model', 'gemini-3.1-pro-high'])).toEqual([
+      '--model', 'gemini-3.1-pro-high', '--dangerously-skip-permissions',
+    ]);
+  });
+
+  it('preserves the original arg list when injecting (caller can still mutate before spawn)', () => {
+    const args = ['exec', '-'];
+    const result = applyCommandDefaults('codex', args);
+    // The injection produces a new array; original is untouched.
+    expect(result).not.toBe(args);
+    expect(args).toEqual(['exec', '-']);
+  });
+
+  it('adds Grok TUI permission bypass and is idempotent when already pinned', () => {
+    expect(applyCommandDefaults('grok', [])).toEqual(['--permission-mode', 'bypassPermissions']);
+    const pinned = ['--permission-mode', 'auto'];
+    expect(applyCommandDefaults('grok', pinned)).toEqual(['--permission-mode', 'auto']);
+  });
+
+  it('adds the Kimi TUI --yolo auto-approve and is idempotent when an approval posture is already pinned', () => {
+    expect(applyCommandDefaults('kimi', [])).toEqual(['--yolo']);
+    // Seeded default already carries --yolo — no duplicate.
+    expect(applyCommandDefaults('kimi', ['--yolo'])).toEqual(['--yolo']);
+    // A user-pinned short posture is respected.
+    expect(applyCommandDefaults('kimi', ['-y'])).toEqual(['-y']);
+  });
+
+  // The bare-argv case is asserted by the catalog-derived parity guard below
+  // (BUILDER_POSTURE_EXEMPTIONS); these two cover what it does not. Why the
+  // pin exists at all: ensureOpencodeAgent in providerVendors.js (#7405).
+  it('respects an OpenCode agent the operator already pinned, in either flag form', () => {
+    expect(applyCommandDefaults('opencode', ['--agent', 'plan'])).toEqual(['--agent', 'plan']);
+    expect(applyCommandDefaults('opencode', ['--agent=plan'])).toEqual(['--agent=plan']);
+  });
+
+  it('pins the OpenCode agent for a path-configured binary too', () => {
+    expect(applyCommandDefaults('/opt/homebrew/bin/opencode', ['-m', 'mtplx/example-model']))
+      .toEqual(['-m', 'mtplx/example-model', '--agent', 'build']);
+  });
+});
+
+describe('tuiHandshake.buildTuiInvocation', () => {
+  // buildTuiInvocation reads process.env for the Bedrock signal; isolate from host/CI.
+  let savedBedrock;
+  beforeEach(() => {
+    savedBedrock = process.env.CLAUDE_CODE_USE_BEDROCK;
+    delete process.env.CLAUDE_CODE_USE_BEDROCK;
+  });
+  afterEach(() => {
+    if (savedBedrock === undefined) delete process.env.CLAUDE_CODE_USE_BEDROCK;
+    else process.env.CLAUDE_CODE_USE_BEDROCK = savedBedrock;
+  });
+
+  it('uses provider.command when present and skips codex defaults for non-codex-basename command names', () => {
+    const provider = { id: 'codex', command: 'my-codex-wrapper', args: ['exec', '-'] };
+    const out = buildTuiInvocation(provider, null);
+    expect(out.command).toBe('my-codex-wrapper');
+    // `applyCommandDefaults` matches codex by basename. `my-codex-wrapper`'s
+    // basename is not `codex`, so it escapes the auto-inject — a caller-
+    // controlled wrapper owns its argv entirely.
+    expect(out.args).toEqual(['exec', '-']);
+  });
+
+  it('injects codex defaults for an absolute codex binary path (basename-aware match)', () => {
+    // A provider commonly pins the absolute path `which codex` returns; a strict
+    // `=== 'codex'` would skip the defaults and leave the TUI to wedge on the
+    // update modal. Basename `codex` still matches.
+    const provider = { id: 'codex-tui', command: '/opt/homebrew/bin/codex', args: [] };
+    const out = buildTuiInvocation(provider, null);
+    expect(out.command).toBe('/opt/homebrew/bin/codex');
+    expect(out.args).toEqual(['--dangerously-bypass-approvals-and-sandbox', '-c', 'check_for_update_on_startup=false']);
+  });
+
+  it('infers command from id when provider.command is missing', () => {
+    const provider = { id: 'codex' };
+    const out = buildTuiInvocation(provider, null);
+    expect(out.command).toBe('codex');
+    expect(out.args).toEqual(['--dangerously-bypass-approvals-and-sandbox', '-c', 'check_for_update_on_startup=false']);
+  });
+
+  it('builds the Kimi TUI with --yolo and no --model for the configured-default sentinel', () => {
+    const provider = { id: 'kimi-tui', command: 'kimi', args: ['--yolo'] };
+    const out = buildTuiInvocation(provider, 'kimi-configured-default');
+    expect(out.command).toBe('kimi');
+    // --yolo is already seeded; sentinel resolves to null so no --model is appended.
+    expect(out.args).toEqual(['--yolo']);
+    expect(out.args).not.toContain('--model');
+  });
+
+  it('appends --model for a concrete kimi model id', () => {
+    const provider = { id: 'kimi-tui', command: 'kimi', args: ['--yolo'] };
+    const out = buildTuiInvocation(provider, 'kimi-k2');
+    expect(out.args).toEqual(['--yolo', '--model', 'kimi-k2']);
+  });
+
+  it('builds the Cursor TUI with --force and appends the model', () => {
+    const provider = { id: 'cursor-tui', command: 'cursor-agent', args: ['--force'] };
+    const out = buildTuiInvocation(provider, 'auto');
+    expect(out.command).toBe('cursor-agent');
+    expect(out.args).toEqual(['--force', '--model', 'auto']);
+  });
+
+  it('canonicalizes a dotted Claude model id for the TUI spawn (regression: claude-fable-5.1)', () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const provider = { id: 'claude-code-tui', command: 'claude', args: ['--dangerously-skip-permissions'] };
+    const out = buildTuiInvocation(provider, 'claude-fable-5.1');
+    expect(out.args).toEqual(['--dangerously-skip-permissions', '--model', 'claude-fable-5-1']);
+    spy.mockRestore();
+  });
+
+  it('injects --force when a cursor provider’s saved args dropped it', () => {
+    const out = buildTuiInvocation({ id: 'cursor-tui', command: 'cursor-agent', args: [] }, null);
+    expect(out.args).toEqual(['--force']);
+  });
+
+  it('emits no --effort for cursor — the tier is a parameter of the model id', () => {
+    const provider = { id: 'cursor-tui', command: 'cursor-agent', args: ['--force'], effort: 'high' };
+    const out = buildTuiInvocation(provider, 'claude-opus-5-thinking-high');
+    expect(out.args).not.toContain('--effort');
+    // …and it is not dropped either: cursor's own variant syntax carries it.
+    expect(out.args).toEqual(['--force', '--model', 'claude-opus-5-thinking-high[effort=high]']);
+  });
+
+  it('extends an existing cursor model variant rather than opening a second bracket', () => {
+    const provider = { id: 'cursor-tui', command: 'cursor-agent', args: ['--force'], effort: 'max' };
+    const out = buildTuiInvocation(provider, 'claude-opus-4-7[thinking=true]');
+    expect(out.args).toEqual(['--force', '--model', 'claude-opus-4-7[thinking=true,effort=max]']);
+  });
+
+  it('leaves a cursor model that already names its own effort alone', () => {
+    const provider = { id: 'cursor-tui', command: 'cursor-agent', args: ['--force'], effort: 'low' };
+    const out = buildTuiInvocation(provider, 'gpt-5[effort=max]');
+    expect(out.args).toEqual(['--force', '--model', 'gpt-5[effort=max]']);
+  });
+
+  it('does not Bedrock-map a cursor model id that merely contains "claude"', () => {
+    const prev = process.env.CLAUDE_CODE_USE_BEDROCK;
+    process.env.CLAUDE_CODE_USE_BEDROCK = '1';
+    try {
+      const provider = { id: 'cursor-tui', command: 'cursor-agent', args: ['--force'] };
+      const out = buildTuiInvocation(provider, 'claude-opus-5-thinking-high');
+      expect(out.args).toEqual(['--force', '--model', 'claude-opus-5-thinking-high']);
+      expect(out.args.join(' ')).not.toContain('anthropic.');
+    } finally {
+      if (prev === undefined) delete process.env.CLAUDE_CODE_USE_BEDROCK;
+      else process.env.CLAUDE_CODE_USE_BEDROCK = prev;
+    }
+  });
+
+  it('appends --model when caller passes a model and provider.args has no model flag', () => {
+    const provider = { id: 'claude', args: ['-p', '-'] };
+    const out = buildTuiInvocation(provider, 'claude-opus-4-7');
+    expect(out.command).toBe('claude');
+    expect(out.args).toEqual(['-p', '-', '--model', 'claude-opus-4-7']);
+  });
+
+  it.each([
+    { form: '--model X', bakedArgs: ['--model', 'baked-in'] },
+    { form: '--model=X', bakedArgs: ['--model=baked-in'] },
+    { form: '-m X', bakedArgs: ['-m', 'baked-in'] },
+    { form: '-m=X', bakedArgs: ['-m=baked-in'] },
+  ])('does NOT append --model when provider.args pins one ($form form)', ({ bakedArgs }) => {
+    const provider = { id: 'claude', args: ['-p', '-', ...bakedArgs] };
+    const out = buildTuiInvocation(provider, 'caller-model');
+    expect(out.args).toEqual(['-p', '-', ...bakedArgs]);
+  });
+
+  it('skips --model injection when caller passes the codex sentinel (configured default)', () => {
+    // resolveCliModel(CODEX_CONFIGURED_DEFAULT) returns null → no flag.
+    const provider = { id: 'codex', args: ['exec', '-'] };
+    const out = buildTuiInvocation(provider, CODEX_CONFIGURED_DEFAULT);
+    expect(out.args).toEqual(['--dangerously-bypass-approvals-and-sandbox', '-c', 'check_for_update_on_startup=false', 'exec', '-']);
+  });
+
+  it('passes a selected Codex model tier to the interactive CLI', () => {
+    const provider = { id: 'codex-tui', command: 'codex', args: [] };
+    const out = buildTuiInvocation(provider, 'gpt-5.6-sol');
+    expect(out.args).toEqual(['--dangerously-bypass-approvals-and-sandbox', '-c', 'check_for_update_on_startup=false', '--model', 'gpt-5.6-sol']);
+  });
+
+  it('skips --model injection when model is null/undefined/empty', () => {
+    const provider = { id: 'claude', args: ['-p', '-'] };
+    expect(buildTuiInvocation(provider, null).args).toEqual(['-p', '-']);
+    expect(buildTuiInvocation(provider, undefined).args).toEqual(['-p', '-']);
+    expect(buildTuiInvocation(provider, '').args).toEqual(['-p', '-']);
+  });
+
+  it('injects Grok TUI permission bypass and omits --model for the configured-default sentinel', () => {
+    const provider = { id: 'grok-tui', command: 'grok', args: [] };
+    const out = buildTuiInvocation(provider, 'grok-configured-default');
+    expect(out.command).toBe('grok');
+    expect(out.args).toEqual(['--permission-mode', 'bypassPermissions']);
+    expect(out.args).not.toContain('--model');
+  });
+
+  it('appends --model for Grok TUI when a concrete model is requested', () => {
+    const provider = { id: 'grok-tui', command: 'grok', args: [] };
+    const out = buildTuiInvocation(provider, 'grok-code-fast-1');
+    expect(out.args).toEqual(['--permission-mode', 'bypassPermissions', '--model', 'grok-code-fast-1']);
+  });
+
+  it('namespaces the Ollama model under ollama/ for an OpenCode TUI', () => {
+    const provider = { id: 'opencode-ollama-tui', command: 'opencode', args: [], ollamaBacked: true };
+    const out = buildTuiInvocation(provider, 'qwen2.5:7b');
+    expect(out.command).toBe('opencode');
+    // `--agent build` is the TUI arm's role pin (#7405) — see applyCommandDefaults.
+    expect(out.args).toEqual(['--agent', 'build', '--model', 'ollama/qwen2.5:7b']);
+  });
+
+  it('handles a provider with no args (treats as empty array)', () => {
+    const out = buildTuiInvocation({ id: 'claude' }, 'opus-x');
+    expect(out.command).toBe('claude');
+    expect(out.args).toEqual(['--model', 'opus-x']);
+  });
+
+  it('does not append --model for the Antigravity configured-default sentinel', () => {
+    const out = buildTuiInvocation({ id: 'antigravity-tui', command: 'agy', args: [] }, 'antigravity-configured-default');
+    expect(out.command).toBe('agy');
+    expect(out.args).toEqual(['--dangerously-skip-permissions']);
+  });
+
+  it('appends --model for Antigravity TUI when a real model is selected', () => {
+    const out = buildTuiInvocation({ id: 'antigravity-tui', command: 'agy', args: [] }, 'gemini-3.1-pro-high');
+    expect(out.command).toBe('agy');
+    // A legacy effort-suffixed id splits into base + `--effort` — the same
+    // invocation agy resolves `gemini-3.1-pro-high` to.
+    expect(out.args).toEqual(['--dangerously-skip-permissions', '--model', 'gemini-3.1-pro', '--effort', 'high']);
+  });
+
+  it('pairs a base Antigravity model with provider.effort', () => {
+    const out = buildTuiInvocation(
+      { id: 'antigravity-tui', command: 'agy', args: [], effort: 'medium' },
+      'gemini-3.6-flash',
+    );
+    expect(out.args).toEqual(['--dangerously-skip-permissions', '--model', 'gemini-3.6-flash', '--effort', 'medium']);
+  });
+
+  it('clamps provider.effort to a tier the selected Antigravity model actually has', () => {
+    // agy rejects `--model gemini-3.1-pro --effort medium` outright, so the
+    // catalog narrows the ladder to the tiers that base really offers.
+    const out = buildTuiInvocation(
+      {
+        id: 'antigravity-tui',
+        command: 'agy',
+        args: [],
+        effort: 'medium',
+        models: ['gemini-3.1-pro-low', 'gemini-3.1-pro-high'],
+      },
+      'gemini-3.1-pro',
+    );
+    expect(out.args).toEqual(['--dangerously-skip-permissions', '--model', 'gemini-3.1-pro', '--effort', 'low']);
+  });
+
+  it('emits no --effort for an Antigravity model the catalog gives no tiers', () => {
+    const out = buildTuiInvocation(
+      {
+        id: 'antigravity-tui',
+        command: 'agy',
+        args: [],
+        effort: 'high',
+        models: ['gemini-3.6-flash-high', 'claude-sonnet-4-6'],
+      },
+      'claude-sonnet-4-6',
+    );
+    expect(out.args).toEqual(['--dangerously-skip-permissions', '--model', 'claude-sonnet-4-6']);
+  });
+
+  it('appends --effort for a claude TUI provider carrying provider.effort', () => {
+    const out = buildTuiInvocation(
+      { id: 'claude-code-tui', command: 'claude', args: [], effort: 'max' },
+      'claude-opus-5',
+    );
+    expect(out.args).toEqual(['--model', 'claude-opus-5', '--effort', 'max']);
+  });
+
+  it('emits no --effort for a TUI provider with no effort control', () => {
+    const out = buildTuiInvocation(
+      { id: 'opencode-tui', command: 'opencode', args: [], effort: 'high' },
+      'qwen3',
+    );
+    expect(out.args).toEqual(['--agent', 'build', '--model', 'qwen3']);
+  });
+
+  // agy serves its `claude-*` ids through Google's own gateway, so a Bedrock box
+  // must NOT rewrite them to `global.anthropic.*` (agy can't resolve that).
+  it('does not Bedrock-map an Antigravity claude-* model id', () => {
+    const prev = process.env.CLAUDE_CODE_USE_BEDROCK;
+    process.env.CLAUDE_CODE_USE_BEDROCK = '1';
+    try {
+      const out = buildTuiInvocation({ id: 'antigravity-tui', command: 'agy', args: [] }, 'claude-sonnet-4-6');
+      expect(out.args).toEqual(['--dangerously-skip-permissions', '--model', 'claude-sonnet-4-6']);
+    } finally {
+      if (prev === undefined) delete process.env.CLAUDE_CODE_USE_BEDROCK;
+      else process.env.CLAUDE_CODE_USE_BEDROCK = prev;
+    }
+  });
+
+  it('handles a missing provider with no id (falls back to claude)', () => {
+    const out = buildTuiInvocation(undefined, 'opus-x');
+    expect(out.command).toBe('claude');
+    expect(out.args).toEqual(['--model', 'opus-x']);
+  });
+
+  it('maps a bare Claude model to its Bedrock form when CLAUDE_CODE_USE_BEDROCK is set (claude-code-tui runner)', () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const provider = { id: 'claude-code-tui', args: ['-p', '-'], envVars: { CLAUDE_CODE_USE_BEDROCK: '1' } };
+    const out = buildTuiInvocation(provider, 'claude-opus-4-8');
+    expect(out.args).toEqual(['-p', '-', '--model', 'global.anthropic.claude-opus-4-8']);
+    spy.mockRestore();
+  });
+});
+
+describe('tuiHandshake.detectMissingTuiBinary', () => {
+  it('detects bash-style not-found for the spawned command', () => {
+    expect(detectMissingTuiBinary('bash: codex: command not found', 'codex')).toBe(true);
+    expect(detectMissingTuiBinary('zsh: command not found: claude', 'claude')).toBe(true);
+  });
+
+  it('is case-insensitive on both sides', () => {
+    expect(detectMissingTuiBinary('Codex: COMMAND NOT FOUND', 'codex')).toBe(true);
+    expect(detectMissingTuiBinary('command not found CODEX', 'CoDeX')).toBe(true);
+  });
+
+  it('rejects unrelated errors that mention the command but not "command not found"', () => {
+    expect(detectMissingTuiBinary('codex: permission denied', 'codex')).toBe(false);
+    expect(detectMissingTuiBinary('codex panicked at line 42', 'codex')).toBe(false);
+  });
+
+  it('rejects "command not found" for a different command', () => {
+    expect(detectMissingTuiBinary('bash: gemini: command not found', 'codex')).toBe(false);
+  });
+
+  it('rejects empty / whitespace strings', () => {
+    expect(detectMissingTuiBinary('', 'codex')).toBe(false);
+    expect(detectMissingTuiBinary('   ', 'codex')).toBe(false);
+  });
+});
+
+describe('tuiHandshake.scheduleSubmitEnters', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('writes SUBMIT_ENTER_ATTEMPTS times: once immediately, the rest spaced apart', () => {
+    const write = vi.fn();
+    const timer = scheduleSubmitEnters(write, () => false);
+
+    // First Enter fires synchronously; the rest come from the interval.
+    expect(write).toHaveBeenCalledTimes(1);
+    expect(timer).not.toBeNull();
+
+    vi.advanceTimersByTime(SUBMIT_ENTER_SPACING_MS * (SUBMIT_ENTER_ATTEMPTS + 2));
+    expect(write).toHaveBeenCalledTimes(SUBMIT_ENTER_ATTEMPTS);
+  });
+
+  it('sends nothing and returns null when already finalized', () => {
+    const write = vi.fn();
+    const timer = scheduleSubmitEnters(write, () => true);
+    expect(write).not.toHaveBeenCalled();
+    expect(timer).toBeNull();
+  });
+
+  it('stops re-sending once finalized mid-flight (no write into a torn-down session)', () => {
+    const write = vi.fn();
+    let finalized = false;
+    scheduleSubmitEnters(write, () => finalized);
+    expect(write).toHaveBeenCalledTimes(1);
+
+    finalized = true;
+    vi.advanceTimersByTime(SUBMIT_ENTER_SPACING_MS * (SUBMIT_ENTER_ATTEMPTS + 2));
+    // The immediate write already happened; no interval-driven writes follow.
+    expect(write).toHaveBeenCalledTimes(1);
+  });
+});
+
+// Paste verification helpers (issue #2192)
+describe('tuiHandshake — paste verification constants', () => {
+  it('pins paste verification constants', () => {
+    expect(PASTE_VERIFY_POLL_MS).toBe(200);
+    expect(PASTE_VERIFY_WINDOW_MS).toBe(2000);
+    expect(PASTE_RETRY_MAX_ATTEMPTS).toBe(3);
+    expect(PASTE_RETRY_BASE_DELAY_MS).toBe(800);
+    // Verification window should be shorter than the overall paste deadline
+    expect(PASTE_VERIFY_WINDOW_MS).toBeLessThan(PASTE_DEADLINE_MS);
+  });
+});
+
+describe('tuiHandshake.extractVerifiablePromptPrefix', () => {
+  it('extracts a prefix from a normal prompt', () => {
+    const prompt = 'Please implement the feature described in issue #123. The feature should...';
+    const prefix = extractVerifiablePromptPrefix(prompt);
+    expect(prefix).toBeTruthy();
+    expect(prefix.length).toBeGreaterThanOrEqual(15);
+    expect(prefix.length).toBeLessThanOrEqual(40);
+    // The prefix should be from the prompt, not the very beginning (skips common prefixes)
+    expect(prompt.includes(prefix)).toBe(true);
+    expect(prompt.startsWith(prefix)).toBe(false);
+  });
+
+  it('returns the whole prompt for very short prompts', () => {
+    const prompt = 'Fix the bug';
+    const prefix = extractVerifiablePromptPrefix(prompt);
+    expect(prefix).toBe('Fix the bug');
+  });
+
+  it('returns null for prompts too short to verify', () => {
+    expect(extractVerifiablePromptPrefix('Hi')).toBeNull();
+    expect(extractVerifiablePromptPrefix('')).toBeNull();
+    expect(extractVerifiablePromptPrefix(null)).toBeNull();
+    expect(extractVerifiablePromptPrefix(undefined)).toBeNull();
+  });
+
+  it('collapses whitespace in the prefix', () => {
+    const prompt = 'Please  implement\n\nthe   feature';
+    const prefix = extractVerifiablePromptPrefix(prompt);
+    expect(prefix).not.toMatch(/\s{2,}/);
+    expect(prefix).not.toContain('\n');
+  });
+
+  it('handles prompts with leading boilerplate', () => {
+    const prompt = 'You are a helpful assistant. Please implement the truncateMiddle function.';
+    const prefix = extractVerifiablePromptPrefix(prompt);
+    // Should skip the first few characters to avoid matching common prefixes
+    expect(prefix.startsWith('You are')).toBe(false);
+    expect(prompt.replace(/\s+/g, ' ').includes(prefix)).toBe(true);
+  });
+});
+
+describe('createInputReadyTracker', () => {
+  const PASTE_OFF = '\x1b[?2004l';
+  const PASTE_ON = '\x1b[?2004h';
+
+  it('is ready once paste mode is re-enabled after the launch command ran', () => {
+    const tracker = createInputReadyTracker();
+    tracker.observe(PASTE_ON, ''); // the launch shell's own paste mode — not ready
+    expect(tracker.ready).toBe(false);
+    tracker.observe(PASTE_OFF, ''); // shell turned it off to run the command
+    expect(tracker.ready).toBe(false);
+    tracker.observe(PASTE_ON, '');
+    expect(tracker.ready).toBe(true);
+  });
+
+  it('latches needsTrust on every vendor trust-gate wording', () => {
+    const claude = createInputReadyTracker();
+    claude.observe('', 'Is this a project you trust?\n❯ 1. Yes, I trust this folder\n2. No, exit\n');
+    expect(claude.needsTrust).toBe(true);
+    expect(claude.trustChoiceReady).toBe(true);
+    expect(claude.trustSelectionKey).toBe('');
+
+    const agy = createInputReadyTracker();
+    agy.observe('', 'Do you trust the contents of this project?\n> Yes, I trust this folder\n');
+    expect(agy.needsTrust).toBe(true);
+    expect(agy.trustChoiceReady).toBe(true);
+
+    // Codex says "directory", and its options are "Yes, continue / No, quit" —
+    // neither of the two older alternatives appears anywhere in the dialog, so it
+    // went unmatched and the run pasted its task into the menu (agent-671af38f).
+    const codex = createInputReadyTracker();
+    codex.observe('', 'You are in /tmp/portos-cd-cwd/agent-abc\nDo you trust the contents of this directory?'
+      + ' Working with untrusted contents comes with higher risk of prompt injection.\n'
+      + '› 1. Yes, continue\n2. No, quit\nPress enter to continue\n');
+    expect(codex.needsTrust).toBe(true);
+    expect(codex.trustChoiceReady).toBe(true);
+    expect(codex.trustSelectionKey).toBe('');
+  });
+
+  it('waits for Cursor workspace trust to paint across chunks and uses its accelerator', () => {
+    const tracker = createInputReadyTracker();
+    tracker.observe(PASTE_OFF, 'Do you trust the contents of this directory?\n/workspace/example\n');
+    tracker.observe(PASTE_ON, '▶ [a] Trust this work');
+    expect(tracker.needsTrust).toBe(true);
+    expect(tracker.trustChoiceReady).toBe(false);
+    expect(tracker.ready).toBe(false);
+    tracker.observe('', 'space\n[q] Quit\nUse arrow keys to navigate, Enter to select, or press the key shown');
+    expect(tracker.trustChoiceReady).toBe(true);
+    expect(tracker.trustSelectionKey).toBe('a');
+    expect(tracker.ready).toBe(false);
+    tracker.ackTrustChoice();
+    tracker.observe(PASTE_ON, '');
+    expect(tracker.ready).toBe(true);
+  });
+
+  it('detects when Claude highlights the decline choice before trust acceptance', () => {
+    const tracker = createInputReadyTracker({ launchShape: 'direct' });
+    tracker.observe('', 'Quick safety check: Is this a project you created or one you trust?\n'
+      + '❯ No, exit\n'
+      + '  Yes, I trust this folder\n'
+      + 'Enter to confirm · Esc to cancel\n');
+
+    expect(tracker.needsTrust).toBe(true);
+    expect(tracker.trustChoiceReady).toBe(true);
+    expect(tracker.trustSelectionKey).toBe('\x1b[B');
+  });
+
+  it('uses option ordering when trust-choice highlight chrome is absent', () => {
+    const declineFirst = createInputReadyTracker();
+    declineFirst.observe('', 'Is this a project you trust?\nNo, exit\nYes, I trust this folder\n');
+    expect(declineFirst.trustChoiceReady).toBe(true);
+    expect(declineFirst.trustSelectionKey).toBe('\x1b[B');
+
+    const acceptFirst = createInputReadyTracker();
+    acceptFirst.observe('', 'Is this a project you trust?\nYes, I trust this folder\nNo, exit\n');
+    expect(acceptFirst.trustChoiceReady).toBe(true);
+    expect(acceptFirst.trustSelectionKey).toBe('');
+  });
+
+  it('moves upward when the highlighted decline choice follows the accept choice', () => {
+    const tracker = createInputReadyTracker();
+    tracker.observe('', 'Is this a project you trust?\nYes, I trust this folder\n❯ No, exit\n');
+    expect(tracker.trustSelectionKey).toBe('\x1b[A');
+  });
+
+  it('suppresses readiness until the trust choice is identified and acknowledged', () => {
+    const tracker = createInputReadyTracker({ launchShape: 'direct' });
+    tracker.observe(PASTE_ON, 'Is this a project you trust?');
+    expect(tracker.needsTrust).toBe(true);
+    expect(tracker.trustChoiceReady).toBe(false);
+    expect(tracker.ready).toBe(false);
+
+    tracker.observe('', 'Yes, I trust this folder\nNo, exit\n');
+    tracker.ackTrustChoice();
+    expect(tracker.ready).toBe(true);
+  });
+
+  // Claude Code v2.1.233's auto-mode offer. Unlike the trust gate it paints with
+  // bracketed paste ALREADY ON, so `ready` was true and the prompt went into a
+  // modal that ignored it — four agents died `paste-not-rendered` on 2026-08-14.
+  describe('claude auto-mode default offer', () => {
+    // Verbatim wording from agent-f71b794e's transcript.
+    const OFFER = 'Make auto mode your default permission mode?\n'
+      + '   ❯ 1. Yes, set auto mode as my default permission mode\n'
+      + '     2. No, keep don\'t ask\n';
+
+    const readyTracker = () => {
+      const tracker = createInputReadyTracker();
+      tracker.observe(`${PASTE_OFF}${PASTE_ON}`, '');
+      return tracker;
+    };
+
+    it('suppresses ready while the offer is up, even with paste mode on', () => {
+      const tracker = readyTracker();
+      expect(tracker.ready).toBe(true); // composer live...
+
+      tracker.observe('', OFFER);
+      expect(tracker.needsAutoModeChoice).toBe(true);
+      expect(tracker.ready).toBe(false); // ...but the modal owns input now
+    });
+
+    it('re-arms ready once the spawner acks the dismissal', () => {
+      const tracker = readyTracker();
+      tracker.observe('', OFFER);
+      tracker.ackAutoModeChoice();
+      expect(tracker.needsAutoModeChoice).toBe(false);
+      expect(tracker.ready).toBe(true);
+    });
+
+    // The rolling tail keeps the modal text for 4000 chars after the dialog is
+    // gone. Without a terminal ack that stale text re-arms the flag on the next
+    // chunk — re-answering forever and pinning `ready` false to the 45s deadline.
+    it('does not re-arm from the stale tail after being answered', () => {
+      const tracker = readyTracker();
+      tracker.observe('', OFFER);
+      tracker.ackAutoModeChoice();
+
+      tracker.observe('', 'bypass permissions on'); // tail still holds the offer
+      expect(tracker.needsAutoModeChoice).toBe(false);
+      expect(tracker.ready).toBe(true);
+    });
+
+    it('leaves the tracker alone when no offer appears', () => {
+      const tracker = readyTracker();
+      tracker.observe('', 'Try "fix lint errors"');
+      expect(tracker.needsAutoModeChoice).toBe(false);
+      expect(tracker.ready).toBe(true);
+    });
+  });
+
+  describe('Claude external-imports offer', () => {
+    const OFFER = "This project's CLAUDE" + ".md imports files outside the current working directory.\n"
+      + 'Never allow this for third-party repositories.\n'
+      + 'External imports:\n'
+      + '  /workspace-parent/AGENTS.md\n'
+      + '1. Yes, allow external imports\n'
+      + '2. No, disable external imports\n';
+
+    it('suppresses ready and does not re-arm after external imports are disabled', () => {
+      const tracker = createInputReadyTracker();
+      tracker.observe(`${PASTE_OFF}${PASTE_ON}`, OFFER);
+      expect(tracker.needsExternalImportsChoice).toBe(true);
+      expect(tracker.ready).toBe(false);
+
+      tracker.ackExternalImportsChoice();
+      expect(tracker.needsExternalImportsChoice).toBe(false);
+      expect(tracker.ready).toBe(true);
+
+      tracker.observe('', 'Claude ready'); // rolling tail still contains the offer
+      expect(tracker.needsExternalImportsChoice).toBe(false);
+      expect(tracker.ready).toBe(true);
+    });
+  });
+
+  describe('Codex hook-review offer', () => {
+    const OFFER = 'Hooks need review\n'
+      + '1 hook is new or changed.\n'
+      + '1. Review hooks\n'
+      + '2. Trust all and continue\n'
+      + "3. Continue without trusting (hooks won't run)\n";
+
+    it('latches the selector and does not re-arm after the safe dismissal', () => {
+      const tracker = createInputReadyTracker();
+      tracker.observe(`${PASTE_OFF}${PASTE_ON}`, OFFER);
+      expect(tracker.needsHookReview).toBe(true);
+      expect(tracker.ready).toBe(false);
+
+      tracker.ackHookReview();
+      expect(tracker.needsHookReview).toBe(false);
+      expect(tracker.ready).toBe(true);
+
+      tracker.observe('', 'Codex ready'); // rolling tail still contains the offer
+      expect(tracker.needsHookReview).toBe(false);
+      expect(tracker.ready).toBe(true);
+    });
+  });
+
+  it('matches a marker split across two PTY chunks (rolling tail)', () => {
+    const tracker = createInputReadyTracker();
+    tracker.observe('', '> Yes, I trust th');
+    expect(tracker.needsTrust).toBe(false);
+    tracker.observe('', 'is folder');
+    expect(tracker.needsTrust).toBe(true);
+  });
+
+  // agy enables bracketed paste on ALT-SCREEN ENTRY — before its composer, and
+  // before its folder-trust gate paints — so paste mode alone raced the trust
+  // menu and the prompt was pasted into it (`paste-not-rendered`).
+  it('readyTextPattern: paste mode alone is not ready until the composer marker is seen', () => {
+    const tracker = createInputReadyTracker({ readyTextPattern: AGY_INPUT_READY_PATTERN });
+    tracker.observe(`${PASTE_OFF}${PASTE_ON}`, 'Welcome to the Antigravity CLI.\n Signing in...\n');
+    expect(tracker.ready).toBe(false);
+
+    tracker.observe('', 'Do you trust the contents of this project?\n> Yes, I trust this folder\n');
+    expect(tracker.needsTrust).toBe(true);
+    expect(tracker.ready).toBe(false); // still not ready while the trust menu is up
+    tracker.ackTrustChoice();
+
+    tracker.observe('', '>\n? for shortcutsGemini 3.6 Flash · medium');
+    expect(tracker.ready).toBe(true);
+  });
+
+  it('readyTextPattern: the composer marker alone is not ready without paste mode', () => {
+    const tracker = createInputReadyTracker({ readyTextPattern: AGY_INPUT_READY_PATTERN });
+    tracker.observe('', '? for shortcuts');
+    expect(tracker.ready).toBe(false);
+  });
+
+  // The durable runner pty.spawns the TUI directly — no launch shell, so the
+  // shell's paste-mode OFF never appears in the stream. The TUI's own first ON
+  // is the ready signal (regression: every runner-tui claude agent died
+  // `tui-not-ready` at the deadline with a live input box on screen).
+  it('directLaunch: ready on the TUI\'s own first paste-mode ON, with no shell OFF ever seen', () => {
+    const tracker = createInputReadyTracker({ launchShape: 'direct' });
+    expect(tracker.ready).toBe(false); // banner painting, paste mode not yet on
+    tracker.observe(PASTE_ON, '');
+    expect(tracker.ready).toBe(true);
+  });
+
+  it('directLaunch: carries a split bracketed-paste toggle across PTY chunks', () => {
+    const tracker = createInputReadyTracker({ launchShape: 'direct' });
+    tracker.observe('\x1b[?2004', '');
+    expect(tracker.ready).toBe(false);
+    tracker.observe('h', '');
+    expect(tracker.ready).toBe(true);
+  });
+
+  it('directLaunch + readyTextPattern: still waits for the composer marker', () => {
+    const tracker = createInputReadyTracker({ readyTextPattern: AGY_INPUT_READY_PATTERN, launchShape: 'direct' });
+    tracker.observe(PASTE_ON, 'Signing in...');
+    expect(tracker.ready).toBe(false);
+    tracker.observe('', '? for shortcuts');
+    expect(tracker.ready).toBe(true);
+  });
+});
+
+describe('tuiHandshake.verifyPasteRendered', () => {
+  it('returns true when prefix is found in buffer', () => {
+    const prefix = 'implement the truncateMiddle function';
+    const buffer = 'Some TUI chrome... implement the truncateMiddle function ...more text';
+    expect(verifyPasteRendered(buffer, prefix)).toBe(true);
+  });
+
+  it('returns false when prefix is not found in buffer', () => {
+    const prefix = 'implement the truncateMiddle function';
+    const buffer = 'Some TUI chrome without the prompt text';
+    expect(verifyPasteRendered(buffer, prefix)).toBe(false);
+  });
+
+  it('handles whitespace normalization', () => {
+    const prefix = 'implement the function';
+    const buffer = 'implement   the\n  function';
+    expect(verifyPasteRendered(buffer, prefix)).toBe(true);
+  });
+
+  it('returns true for null/empty prefix (no verification possible)', () => {
+    expect(verifyPasteRendered('any buffer', null)).toBe(true);
+    expect(verifyPasteRendered('any buffer', '')).toBe(true);
+    expect(verifyPasteRendered('any buffer', undefined)).toBe(true);
+  });
+
+  it('returns false for non-string buffer', () => {
+    expect(verifyPasteRendered(null, 'prefix')).toBe(false);
+    expect(verifyPasteRendered(undefined, 'prefix')).toBe(false);
+    expect(verifyPasteRendered(123, 'prefix')).toBe(false);
+  });
+
+  it('handles real-world OpenCode scenario (issue #2192)', () => {
+    // Simulates the case where OpenCode was still initializing
+    const prompt = 'Run /do:next --issues --swarm using the truncateMiddle helper';
+    const prefix = extractVerifiablePromptPrefix(prompt);
+
+    // Empty buffer = paste was swallowed
+    expect(verifyPasteRendered('', prefix)).toBe(false);
+
+    // Only TUI chrome = paste was swallowed
+    expect(verifyPasteRendered('Ask anything... (ESC to exit)', prefix)).toBe(false);
+
+    // Prompt text visible (with the full prompt echoed) = paste succeeded
+    // The buffer would contain the actual prompt text after a successful paste
+    expect(verifyPasteRendered(`Ask anything... ${prompt}`, prefix)).toBe(true);
+
+    // Also verify partial echo (just the middle portion where the prefix is from)
+    expect(verifyPasteRendered(`Ask anything... o:next --issues --swarm using the trunca...`, prefix)).toBe(true);
+  });
+
+  // Every claude-code-tui CoS agent started failing immediately after #2192
+  // shipped, all with identical "paste-not-rendered" after 3 retries — 100%
+  // reproduction across real agent runs (agent-65e4d17f, agent-1f0bda99,
+  // agent-ec5a000c, agent-7dda893e, agent-9916b7be, agent-f5c8ca2a,
+  // agent-d0fa3cdc, 2026-07-05). Root cause: Claude Code redraws/reflows a
+  // pasted multi-word line using cursor-positioning escapes instead of literal
+  // space bytes between words — the exact "inter-glyph cursor moves" quirk
+  // already documented above (BRACKETED_PASTE_MODE_PATTERN comment) as the
+  // reason createInputReadyTracker deliberately avoids literal footer-text
+  // matching. #2192's verifyPasteRendered was never carved out for Claude (the
+  // changelog claimed "Claude TUIs ... are unaffected" but sendPrompt/
+  // attemptPaste is shared across all providers), so it inherited the same
+  // trap: normalizing to a SINGLE space still requires a space to exist, and a
+  // reflowed line has none. Captured verbatim (post-production-ansiStrip) from
+  // agent-147ad88f's raw.txt.
+  it('finds a pasted prompt whose words got glued together by Claude Code reflow (real incident)', () => {
+    const prompt = 'On the tasks page when we render pending/active/blocked task cards, I want to truncate the prompt and only show the first couple of lines with an expand button\n\nBegin working on the task now.';
+    const prefix = extractVerifiablePromptPrefix(prompt);
+    const renderedBuffer = '⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents Opus 4.8 (1M context) │ agent-147ad88f [Pastedtext#1+3lines] paste again to expand ctrl+g to edit in Vim ──────── ❯ Onthetaskspagewhenwerenderpending/active/blockedtaskcards,Iwant totruncatethepromptandonlyshowthefirstcoupleoflineswithan expandbutton Begin working on the task now.';
+    expect(verifyPasteRendered(renderedBuffer, prefix)).toBe(true);
+  });
+});
+
+describe('tuiHandshake.isPasteConfirmed', () => {
+  const PROMPT = 'On the tasks page when we render pending/active/blocked task cards, I want to truncate the prompt and only show the first couple of lines with an expand button\n\nBegin working on the task now.';
+  const prefix = extractVerifiablePromptPrefix(PROMPT);
+
+  // THE core regression: Claude Code collapses a multi-line paste into a
+  // `[Pasted text #1 +3 lines]` chip and HIDES the body text. Verbatim
+  // (ANSI-stripped) from agent-656efa6e's failed run, 2026-07-05 — the body text
+  // ("On the tasks page…") is genuinely absent, only the marker + the trailing
+  // "Begin working…" line survive. The old text-only gate false-failed here and
+  // killed every claude-code-tui CoS agent after 3 retries. The marker is
+  // authoritative proof the paste landed, so this MUST confirm.
+  it('confirms a multi-line paste that Claude collapsed to a chip (body text hidden) — real incident', () => {
+    const collapsedBuffer = 'Opus 4.8 │ agent-656efa6e [Pastedtext#1+3lines] paste again to expand ──────── ❯ [Pastedtext#1+3lines] ──────── Begin working on the task now. ⏵⏵ bypass permissions on (shift+tab to cycle)';
+    // The body prefix really is NOT in the buffer — verifyPasteRendered alone fails…
+    expect(verifyPasteRendered(collapsedBuffer, prefix)).toBe(false);
+    // …but the marker proves delivery, so isPasteConfirmed confirms it.
+    expect(isPasteConfirmed(collapsedBuffer, { verifiablePrefix: prefix, promptMarkerCount: 0 })).toBe(true);
+  });
+
+  it('confirms when the prompt text DID render inline (markerless small paste)', () => {
+    const inlineBuffer = '❯ Onthetaskspagewhenwerenderpending/active/blockedtaskcards Begin working on the task now.';
+    expect(isPasteConfirmed(inlineBuffer, { verifiablePrefix: prefix, promptMarkerCount: 0 })).toBe(true);
+  });
+
+  it('confirms an OpenCode line-count chip even when the prompt body is hidden', () => {
+    const opencodeBuffer = 'Build · hf.co/example/model Ollama [Pasted ~46 lines]';
+    expect(verifyPasteRendered(opencodeBuffer, prefix)).toBe(false);
+    expect(isPasteConfirmed(opencodeBuffer, { verifiablePrefix: prefix, promptMarkerCount: 0 })).toBe(true);
+  });
+
+  it('does NOT confirm when neither the marker nor the text appears (paste swallowed by a not-ready TUI)', () => {
+    const swallowedBuffer = '❯ Try "how does PipelineEditorialChecks.jsx work?" ⏵⏵ bypass permissions on (shift+tab to cycle)';
+    expect(isPasteConfirmed(swallowedBuffer, { verifiablePrefix: prefix, promptMarkerCount: 0 })).toBe(false);
+  });
+
+  it('ignores paste markers echoed from the prompt itself (count must EXCEED promptMarkerCount)', () => {
+    // A transcript-analysis prompt that itself contains a `[Pasted text #1]` chip:
+    // the echoed marker must not be mistaken for the TUI's own commit marker.
+    const echoOnlyBuffer = '❯ [Pastedtext#1+2lines] analyze this transcript';
+    expect(isPasteConfirmed(echoOnlyBuffer, { verifiablePrefix: prefix, promptMarkerCount: 1 })).toBe(false);
+    // One MORE marker than the prompt carried → the TUI's genuine commit → confirmed.
+    const echoPlusCommit = '❯ [Pastedtext#1+2lines] analyze this transcript [Pastedtext#2+2lines]';
+    expect(isPasteConfirmed(echoPlusCommit, { verifiablePrefix: prefix, promptMarkerCount: 1 })).toBe(true);
+  });
+
+  // Issue #2228: a MULTI-LINE prompt that itself embeds a `[Pasted text #N]`
+  // literal (a TUI-transcript-analysis task — the promptMarkerCount defense was
+  // added for exactly this domain). Claude Code collapses the whole multi-line
+  // paste into its OWN single chip and hides the body — including the prompt's
+  // embedded marker. So the buffer carries only Claude's 1 chip while
+  // promptMarkerCount is also 1: `count (1) > promptMarkerCount (1)` is false,
+  // AND the hidden body defeats the verifyPasteRendered text fallback. Before the
+  // fix this false-negatived and the agent died `paste-not-rendered` despite the
+  // paste landing. The collapsed-chip chrome ("paste again to expand") proves the
+  // visible marker is the TUI's own commit, so this MUST confirm.
+  it('confirms a collapsed multi-line paste even when the prompt embeds a marker literal (#2228)', () => {
+    // Prompt is multi-line AND embeds a `[Pasted text #1]` literal → promptMarkerCount = 1.
+    const selfMarkerPrompt = 'Analyze this TUI transcript where the agent hit a paste bug:\n\n[Pasted text #1 +40 lines]\n\nExplain why the paste false-negatived.';
+    const selfMarkerPrefix = extractVerifiablePromptPrefix(selfMarkerPrompt);
+    const promptMarkerCount = 1;
+    // Claude collapsed the whole thing to ITS OWN chip and hid the body — only the
+    // marker + collapse affordance survive; the prompt body is genuinely gone.
+    const collapsedBuffer = 'Opus 4.8 │ agent-2228abcd ❯ [Pastedtext#1+42lines] paste again to expand ──────── ⏵⏵ bypass permissions on (shift+tab to cycle)';
+    // The count-only comparison false-negatives (1 is not > 1)…
+    expect(countPasteMarkers(collapsedBuffer) > promptMarkerCount).toBe(false);
+    // …and the hidden body defeats the text fallback too…
+    expect(verifyPasteRendered(collapsedBuffer, selfMarkerPrefix)).toBe(false);
+    // …but the collapsed-chip shape proves the paste landed, so this MUST confirm.
+    expect(isPasteConfirmed(collapsedBuffer, { verifiablePrefix: selfMarkerPrefix, promptMarkerCount })).toBe(true);
+  });
+
+  it('does NOT re-introduce the echoed-marker false-positive: inline (uncollapsed) echo without collapse chrome still rejects (#2228)', () => {
+    // The prompt's `[Pasted text #1]` echoed INLINE (uncollapsed) with no
+    // "paste again to expand" chrome — the paste has NOT committed. The
+    // collapsed-chip rescue must not fire here; the subtraction must still reject.
+    const inlineEchoBuffer = '❯ [Pastedtext#1+40lines] analyze this TUI transcript where the agent hit a paste bug';
+    expect(isCollapsedPasteChip(inlineEchoBuffer)).toBe(false);
+    expect(isPasteConfirmed(inlineEchoBuffer, { verifiablePrefix: prefix, promptMarkerCount: 1 })).toBe(false);
+  });
+
+  it('confirms when there is nothing to verify against (no verifiable prefix)', () => {
+    expect(isPasteConfirmed('anything at all', { verifiablePrefix: null, promptMarkerCount: 0 })).toBe(true);
+    expect(isPasteConfirmed('anything at all', {})).toBe(true);
+  });
+});
+
+describe('tuiHandshake.isCollapsedPasteChip', () => {
+  it('is true only when a marker AND the "paste again to expand" affordance are both present', () => {
+    expect(isCollapsedPasteChip('[Pastedtext#1+3lines] paste again to expand')).toBe(true);
+    // Marker but no collapse affordance → not a collapsed chip.
+    expect(isCollapsedPasteChip('[Pastedtext#1+3lines] analyze this transcript')).toBe(false);
+    // Collapse affordance but no marker → nothing committed.
+    expect(isCollapsedPasteChip('paste again to expand')).toBe(false);
+  });
+
+  it('tolerates the inter-glyph whitespace Claude renders (ANSI-stripped)', () => {
+    expect(isCollapsedPasteChip('[Pastedtext#2+9lines] pasteagaintoexpand')).toBe(true);
+  });
+
+  it('returns false for non-string / empty input', () => {
+    expect(isCollapsedPasteChip(null)).toBe(false);
+    expect(isCollapsedPasteChip(undefined)).toBe(false);
+    expect(isCollapsedPasteChip('')).toBe(false);
+    expect(isCollapsedPasteChip(123)).toBe(false);
+  });
+});
+
+// ─── Discovery: shipped-catalog parity for the TUI dispatch points ─────────
+//
+// Adding a coding-agent vendor means touching a spread of per-vendor `if`
+// branches, and the failure mode is SILENT: the vendor ships in the seed
+// catalog, its provider shows up in the UI and spawns, but a dispatch point
+// nobody remembered doesn't know it — so it launches with the wrong binary or
+// without its unattended-run posture and stalls on a prompt with nobody to
+// answer. (Not theoretical: `resolveInjectedTuiModel` exists because the two
+// model-injection sites had already drifted that way — issue #3618.)
+//
+// These tests DERIVE their expectations by walking `data.reference/providers.json`
+// rather than hand-transcribing a vendor list, so a newly-seeded vendor that a
+// builder doesn't know about FAILS here instead of diverging in production.
+// Same shape as `server/cos-runner/allowedCommands.test.js` (catalog-derived
+// parity) and `server/lib/cliChildEnv.test.js` (discovery of a hand-rolled
+// call site). Sibling coverage for the model-injection point lives in
+// `providerModels.test.js#resolveInjectedTuiModel`.
+describe('tuiHandshake — parity with the shipped provider catalog', () => {
+  const SEED_PATH = resolve(dirname(fileURLToPath(import.meta.url)), '../../data.reference/providers.json');
+  const seedProviders = Object.entries(
+    JSON.parse(readFileSync(SEED_PATH, 'utf8')).providers || {}
+  ).map(([id, p]) => ({ ...p, id }));
+  // EVERY seeded TUI provider is walked, including one that declares no
+  // `command` — that shape is exactly what `inferTuiCommand` exists to resolve,
+  // so filtering it out would let a new vendor skip every check below.
+  const tuiProviders = seedProviders.filter((p) => p.type === 'tui');
+  // The binary a provider actually launches: its own `command`, or whatever the
+  // blank-command fallback resolves its id to (what the spawners do).
+  const launchCommand = (p) => p.command || inferTuiCommand(p.id);
+  const tuiCommands = [...new Set(tuiProviders.map(launchCommand))];
+  // Providers that name their own binary, and so can be compared against the
+  // fallback. Scoped to the process-spawning types: `inferTuiCommand` is also
+  // what `resolveSlashdoStyle` asks "which command will actually be spawned?",
+  // which it does for CLI providers too — so they are deliberately in scope,
+  // while a future non-process type that happens to carry a `command` is not.
+  const PROCESS_TYPES = new Set(['tui', 'cli']);
+  const withDeclaredCommand = seedProviders.filter((p) => PROCESS_TYPES.has(p.type) && Boolean(p.command));
+
+  // Commands whose unattended-run POSTURE does not come from
+  // `applyCommandDefaults`, and where it comes from instead. Both are asserted
+  // below, so an exemption can't rot into "we just forgot this vendor":
+  //   - the builder must inject exactly what the entry declares (`builderInjects`,
+  //     default nothing — an arm may still inject something that is not a
+  //     posture, which is why this is a declaration rather than "injects nothing"), and
+  //   - the recorded alternate channel must still carry the posture in the seed.
+  // A vendor absent from BOTH this map and `applyCommandDefaults` fails.
+  //
+  // `channel: null` is the escape hatch for a binary that genuinely needs no
+  // unattended posture at all — it must carry a `reason`, so the next vendor
+  // resolves this by making a documented call rather than inventing a marker
+  // string to satisfy the assertion.
+  const BUILDER_POSTURE_EXEMPTIONS = new Map([
+    // claude's `--dangerously-skip-permissions` rides in the seed `args`.
+    ['claude', { channel: 'args', marker: '--dangerously-skip-permissions' }],
+    // opencode has no argv approval/trust gate; its permission posture is
+    // configured through OPENCODE_CONFIG_CONTENT (see cliChildEnv.js). Its arm
+    // injects a ROLE, not a posture — see ensureOpencodeAgent (#7405).
+    ['opencode', { channel: 'envVars', marker: '"permission":"allow"', builderInjects: ['--agent', 'build'] }],
+  ]);
+
+  it('parses the shipped catalog (guards against a silently empty walk)', () => {
+    expect(seedProviders.length).toBeGreaterThan(0);
+    expect(tuiProviders.length).toBeGreaterThan(0);
+    expect(withDeclaredCommand.length).toBeGreaterThan(0);
+    // More than one distinct binary, or the per-command loops below prove nothing.
+    expect(tuiCommands.length).toBeGreaterThan(1);
+  });
+
+  // `inferTuiCommand` is the blank-`provider.command` fallback for BOTH spawners
+  // and the binary `resolveSlashdoStyle` asks about before deciding whether a
+  // session can type `/do:pr`. A vendor missing from its map silently resolves
+  // to `claude` — the wrong binary, told to run slash commands it doesn't have.
+  //
+  // Only providers that DECLARE a command can be checked here (there is nothing
+  // to compare against otherwise); every seeded id happens to name its vendor,
+  // which is the property this pins. A new provider that legitimately can't
+  // satisfy it should be renamed to name its vendor, not exempted — the
+  // fallback has no other signal to work from.
+  it.each(withDeclaredCommand.map((p) => [p.id, p.command]))(
+    'inferTuiCommand("%s") resolves to the catalog command "%s"',
+    (id, command) => {
+      expect(inferTuiCommand(id)).toBe(command);
+    }
+  );
+
+  // `applyCommandDefaults` is the TUI approval/trust-argv dispatch. A vendor
+  // with no arm falls through `return args` unchanged and launches interactive,
+  // then stalls on its first tool-approval prompt with nobody at the keyboard.
+  describe.each(tuiCommands)('applyCommandDefaults("%s")', (command) => {
+    const exemption = BUILDER_POSTURE_EXEMPTIONS.get(command);
+
+    if (exemption) {
+      it('injects only what its exemption declares (its posture comes from another channel)', () => {
+        expect(applyCommandDefaults(command, [])).toEqual(exemption.builderInjects || []);
+      });
+
+      if (exemption.channel) {
+        it(`still gets its unattended posture from the seed ${exemption.channel}`, () => {
+          for (const provider of tuiProviders.filter((p) => launchCommand(p) === command)) {
+            const args = provider.args || [];
+            const declared = exemption.channel === 'args'
+              // Exact argv membership, not a substring of the joined argv — a
+              // marker that is a prefix of some longer flag would match anything.
+              ? args.includes(exemption.marker)
+              // The env VALUES verbatim — not JSON.stringify of the map, which
+              // would re-escape the quotes inside OPENCODE_CONFIG_CONTENT's own
+              // embedded JSON and never match the marker.
+              : Object.values(provider.envVars || {}).join(' ').includes(exemption.marker);
+            expect(declared, `${provider.id} must declare ${exemption.marker} in its ${exemption.channel}`)
+              .toBe(true);
+          }
+        });
+      } else {
+        it('is recorded as needing no unattended posture at all', () => {
+          expect(exemption.reason, `${command}'s channel-less exemption must carry a reason`)
+            .toBeTruthy();
+        });
+      }
+    } else {
+      it('has a dispatch arm that injects an unattended-run posture', () => {
+        expect(
+          applyCommandDefaults(command, []),
+          `No applyCommandDefaults arm for "${command}". Add one (see ensureCursorTuiArgs), `
+          + 'or record why its posture arrives another way in BUILDER_POSTURE_EXEMPTIONS.'
+        ).not.toEqual([]);
+      });
+    }
+  });
+
+  // Each spawn path calls applyCommandDefaults on argv that may ALREADY carry
+  // the seed's posture flags, so a non-idempotent arm double-appends — codex
+  // errors outright on a repeated approval flag, and every other vendor grows a
+  // duplicated argv that's a coin flip on which wins.
+  it.each(tuiProviders.map((p) => [p.id, launchCommand(p), p.args || []]))(
+    'applyCommandDefaults is idempotent over the seed args of "%s" (%s)',
+    (_id, command, args) => {
+      const once = applyCommandDefaults(command, [...args]);
+      expect(applyCommandDefaults(command, [...once])).toEqual(once);
+    }
+  );
+
+  // End-to-end over the two dispatch points at once: a provider whose `command`
+  // is blank (older stored configs, and the shape `buildTuiSpawnConfig` handles)
+  // must land on exactly the same invocation as the fully-specified one.
+  it.each(tuiProviders.map((p) => [p.id, p]))(
+    'buildTuiInvocation("%s") is identical with and without an explicit command',
+    (_id, provider) => {
+      // Right-hand side is pinned to the RESOLVED binary rather than `provider`
+      // as-seeded: a provider that already ships a blank command would
+      // otherwise compare blank against blank and pass vacuously.
+      expect(buildTuiInvocation({ ...provider, command: '' }))
+        .toEqual(buildTuiInvocation({ ...provider, command: launchCommand(provider) }));
+    }
+  );
+});
+
+describe('createRetryStallGate', () => {
+  const MIN = 60 * 1000;
+  const banner = (attempt, secs = 0) => `API error · Retrying in ${secs}s · attempt ${attempt}/10`;
+
+  it('fails over a request the provider keeps failing across the stall window (agent-e057cca7)', () => {
+    // Stage 3's ~100K-token prefill was cancelled by the harness every ~6
+    // minutes and re-sent verbatim: attempt 1 at t, 2 at t+6m, 3 at t+12m …
+    const gate = createRetryStallGate();
+    gate.observe(banner(1, 1), 0);
+    gate.observe(banner(1, 0), 1000);
+    expect(gate.takeStall()).toBeNull();
+    gate.observe(banner(2), 6 * MIN);
+    expect(gate.takeStall()).toBeNull();
+    gate.observe(banner(3), 12 * MIN);
+
+    const verdict = gate.takeStall();
+    expect(verdict).toMatchObject({ category: 'timeout', requiresFallback: true, actionable: false });
+    expect(verdict.message).toContain('retried it 3 times over 12 minutes');
+    // Handed back once: the consumer fails over exactly once.
+    expect(gate.takeStall()).toBeNull();
+  });
+
+  it('is decided at a sighting, never by the clock: a fast ladder that then succeeded is not a stall', () => {
+    // A transient cloud fault: ten attempts in two minutes, the last one
+    // answered, and the run did an hour of useful work afterwards.
+    const gate = createRetryStallGate();
+    for (let attempt = 1; attempt <= 10; attempt += 1) gate.observe(banner(attempt), attempt * 12 * 1000);
+    gate.observe('⏺ Read(server/index.js)\n', 5 * MIN);
+    gate.observe('⏺ Edit(server/index.js)\n', 60 * MIN);
+    expect(gate.takeStall()).toBeNull();
+  });
+
+  it('needs the banner to advance RETRY_STALL_MIN_ADVANCES times inside one episode', () => {
+    const gate = createRetryStallGate();
+    // A single failing attempt repainted for a long time — the countdown
+    // ticking and a stale screen — is one sighting, not a ladder.
+    gate.observe(banner(1, 2), 0);
+    gate.observe(banner(1, 1), RETRY_STALL_MS);
+    gate.observe(banner(1, 0), RETRY_STALL_MS + 5000);
+    expect(gate.takeStall()).toBeNull();
+    gate.observe(banner(1 + RETRY_STALL_MIN_ADVANCES - 1), RETRY_STALL_MS + 6 * MIN);
+    expect(gate.takeStall()).toBeNull();
+    gate.observe(banner(1 + RETRY_STALL_MIN_ADVANCES), RETRY_STALL_MS + 12 * MIN);
+    expect(gate.takeStall()).not.toBeNull();
+  });
+
+  it('starts a new episode when the counter restarts or the last banner is stale', () => {
+    const gate = createRetryStallGate();
+    // Episode A: two attempts, then the request answered.
+    gate.observe(banner(1), 0);
+    gate.observe(banner(2), 6 * MIN);
+    // Episode B, a later request: its counter restarts at 1 …
+    gate.observe(banner(1), 30 * MIN);
+    gate.observe(banner(2), 36 * MIN);
+    expect(gate.takeStall()).toBeNull();
+    gate.observe(banner(3), 42 * MIN);
+    const verdict = gate.takeStall();
+    // … and is judged on its own attempts, not A's.
+    expect(verdict.message).toContain('retried it 3 times over 12 minutes');
+
+    // A banner more than the stall window after the previous one is a fresh
+    // episode even when its counter happens to be higher.
+    const stale = createRetryStallGate();
+    stale.observe(banner(1), 0);
+    stale.observe(banner(4), RETRY_STALL_MS + 1000);
+    stale.observe(banner(5), RETRY_STALL_MS + 2000);
+    expect(stale.takeStall()).toBeNull();
+  });
+
+  it('matches a banner split across PTY chunks, and never re-sights it from the carry-over', () => {
+    const gate = createRetryStallGate();
+    gate.observe('API error · Retrying in 0s · att', 0);
+    gate.observe('empt 1/10\n', 10);
+    // Chunks that follow carry no banner of their own; the carry-over was
+    // consumed through the match, so these must not read as new sightings that
+    // would keep an episode alive.
+    gate.observe('\n', 6 * MIN);
+    gate.observe('─────\n', 12 * MIN);
+    gate.observe(banner(2), 20 * MIN);
+    // If the carry-over had re-sighted attempt 1 at 6m/12m, attempt 2 at 20m
+    // would still be inside the episode; being > RETRY_STALL_MS after the only
+    // real sighting, it starts a new one instead.
+    gate.observe(banner(3), 21 * MIN);
+    gate.observe(banner(4), 22 * MIN);
+    expect(gate.takeStall()).toBeNull();
+  });
+});
+
+describe('tool-permission dialog (agent-e057cca7)', () => {
+  // Verbatim from the stripped screen: a local model hallucinated an absolute
+  // path, and acceptEdits asked a human who was not there.
+  const READ_DIALOG = ' Read(/data.reference/providers.json) Doyouwanttoproceed? ❯1. Yes 2. Yes,allowreadingfrom/data.referenceduringthissession 3. No Esc to cancel · Tab to amend ';
+  const TWO_OPTION_DIALOG = 'Bash(rm -rf build)\nDo you want to proceed?\n❯ 1. Yes\n  2. No\n';
+
+  describe('detectToolPermissionPrompt', () => {
+    it('reads the decline option off the screen, whatever its number', () => {
+      expect(detectToolPermissionPrompt(READ_DIALOG)).toEqual({ noOption: 3, toolCall: 'Read(/data.reference/providers.json)' });
+      expect(detectToolPermissionPrompt(TWO_OPTION_DIALOG)).toEqual({ noOption: 2, toolCall: 'Bash(rm -rf build)' });
+    });
+
+    it('waits for the option list rather than guessing which key declines', () => {
+      expect(detectToolPermissionPrompt(' Read(/etc/hosts) Doyouwanttoproceed? ')).toBeNull();
+    });
+
+    it('ignores prose and the nudge it sends', () => {
+      expect(detectToolPermissionPrompt('Ask the user whether they want to proceed with 3. No changes')).toBeNull();
+      expect(detectToolPermissionPrompt(TOOL_PERMISSION_NUDGE_TEXT)).toBeNull();
+      expect(detectToolPermissionPrompt('')).toBeNull();
+    });
+  });
+
+  describe('createToolPermissionGate', () => {
+    it('declines a dialog once, however many chunks repaint it, then nudges the quiet session', () => {
+      const gate = createToolPermissionGate();
+      // Split across a chunk boundary, as a PTY delivers it.
+      expect(gate.observe(READ_DIALOG.slice(0, 60), 0)).toBeNull();
+      expect(gate.observe(READ_DIALOG.slice(60), 50)).toEqual({ noOption: 3, toolCall: 'Read(/data.reference/providers.json)', count: 1 });
+      // The declined dialog keeps repainting while the keystrokes land.
+      expect(gate.observe(READ_DIALOG, 2000)).toBeNull();
+      expect(gate.observe(READ_DIALOG, TOOL_PERMISSION_REPAINT_COOLDOWN_MS - 1)).toBeNull();
+      // Still repainting: not quiet, so no nudge yet.
+      expect(gate.takeNudge(5000, 4000)).toBe(0);
+      // Quiet for the settle window: nudge, exactly once.
+      const quietAt = 5000;
+      expect(gate.takeNudge(quietAt + OOM_NUDGE_SETTLE_MS, quietAt)).toBe(1);
+      expect(gate.takeNudge(quietAt + OOM_NUDGE_SETTLE_MS + 5000, quietAt)).toBe(0);
+    });
+
+    it('drops the nudge when the session carried on by itself', () => {
+      const gate = createToolPermissionGate();
+      gate.observe(READ_DIALOG, 0);
+      // Output never stops for the whole arm window — the build handed the model
+      // a rejection and it kept working — so a later quiet stretch gets no nudge.
+      const late = OOM_NUDGE_ARM_WINDOW_MS + 1000;
+      expect(gate.takeNudge(late, late - 100)).toBe(0);
+      expect(gate.takeNudge(late + OOM_NUDGE_SETTLE_MS, late)).toBe(0);
+    });
+
+    it('reports exhaustion after TOOL_PERMISSION_DECLINE_MAX declines, nudged or not', () => {
+      // A build that hands the model a rejection and lets it continue never
+      // goes quiet, so no nudge ever fires — the declines alone must cap it.
+      const gate = createToolPermissionGate();
+      let now = 0;
+      for (let i = 1; i <= TOOL_PERMISSION_DECLINE_MAX; i += 1) {
+        now += TOOL_PERMISSION_REPAINT_COOLDOWN_MS + 1;
+        expect(gate.observe(READ_DIALOG, now)).toMatchObject({ count: i });
+      }
+      now += TOOL_PERMISSION_REPAINT_COOLDOWN_MS + 1;
+      expect(gate.observe(TWO_OPTION_DIALOG, now)).toBe('exhausted');
+    });
+
+    it('still sees a different dialog painted inside the repaint cooldown', () => {
+      const gate = createToolPermissionGate();
+      expect(gate.observe(READ_DIALOG, 0)).toMatchObject({ count: 1 });
+      // The model's very next call is also out of scope: its dialog lands
+      // seconds after the decline and is never repainted afterwards.
+      expect(gate.observe(TWO_OPTION_DIALOG, 3000)).toBeNull();
+      expect(gate.observe('\n', TOOL_PERMISSION_REPAINT_COOLDOWN_MS + 1000)).toMatchObject({ noOption: 2, count: 2 });
+    });
+  });
+});
+
+describe('createOomNudgeGate', () => {
+  it('re-arms from a box that outlasted its window, once the repaint stops', () => {
+    // The OOM box repaints past the arm window (the session never went quiet),
+    // then finally does: the expired arm must be replaceable by a sighting
+    // AFTER the cooldown, so a sighting while armed must not refresh it.
+    const gate = createOomNudgeGate();
+    const analysis = { message: 'oom' };
+    expect(gate.arm(analysis, 0)).toBe('armed');
+    expect(gate.arm(analysis, 60_000)).toBeNull();
+    expect(gate.takeNudge(OOM_NUDGE_ARM_WINDOW_MS + 5_000, OOM_NUDGE_ARM_WINDOW_MS + 4_000)).toBe(0);
+    expect(gate.arm(analysis, OOM_NUDGE_COOLDOWN_MS + 10_000)).toBe('armed');
+    const quietAt = OOM_NUDGE_COOLDOWN_MS + 10_000;
+    expect(gate.takeNudge(quietAt + OOM_NUDGE_SETTLE_MS, quietAt)).toBe(1);
+  });
+
+  const analysis = { category: 'resource-exhausted', message: 'Local inference runtime ran out of GPU memory' };
+
+  it('nudges only once the session has actually gone quiet', () => {
+    const gate = createOomNudgeGate();
+    const t0 = 1_000_000;
+    expect(gate.arm(analysis, t0)).toBe('armed');
+    // The TUI is still repainting the error box — nudging here would land on
+    // top of the repaint instead of at an idle composer.
+    expect(gate.takeNudge(t0 + OOM_NUDGE_SETTLE_MS, t0 + 5_000)).toBe(0);
+    expect(gate.takeNudge(t0 + OOM_NUDGE_SETTLE_MS + 5_001, t0 + 5_000)).toBe(1);
+    // Fired once; the arm is spent until the next distinct OOM.
+    expect(gate.takeNudge(t0 + 60_000, t0 + 5_000)).toBe(0);
+  });
+
+  it('treats repaints of the same error box as one OOM', () => {
+    const gate = createOomNudgeGate();
+    const t0 = 0;
+    expect(gate.arm(analysis, t0)).toBe('armed');
+    // Same window: already armed.
+    expect(gate.arm(analysis, t0 + 100)).toBeNull();
+    expect(gate.takeNudge(t0 + OOM_NUDGE_SETTLE_MS + 1, t0)).toBe(1);
+    // Disarmed, but still inside the dedupe cooldown — a repaint must not
+    // spend a second nudge on the same event.
+    expect(gate.arm(analysis, t0 + OOM_NUDGE_COOLDOWN_MS - 1)).toBeNull();
+    expect(gate.arm(analysis, t0 + OOM_NUDGE_COOLDOWN_MS)).toBe('armed');
+  });
+
+  it('drops a stale arm the session never went quiet for', () => {
+    const gate = createOomNudgeGate();
+    const t0 = 0;
+    gate.arm(analysis, t0);
+    // Output kept flowing for the whole window: the run recovered on its own,
+    // so the arm expires rather than waiting to fire into the next quiet spell.
+    expect(gate.takeNudge(t0 + OOM_NUDGE_ARM_WINDOW_MS + 1, t0 + OOM_NUDGE_ARM_WINDOW_MS)).toBe(0);
+    // An expired window costs nothing: the next real OOM still gets attempt 1.
+    const t1 = t0 + OOM_NUDGE_COOLDOWN_MS;
+    expect(gate.arm(analysis, t1)).toBe('armed');
+    expect(gate.takeNudge(t1 + OOM_NUDGE_SETTLE_MS + 1, t1)).toBe(1);
+  });
+
+  it('hands back an exhausted verdict once the nudge budget is spent', () => {
+    const gate = createOomNudgeGate();
+    let t = 0;
+    for (let i = 1; i <= OOM_NUDGE_MAX_ATTEMPTS; i += 1) {
+      expect(gate.arm(analysis, t)).toBe('armed');
+      t += OOM_NUDGE_SETTLE_MS + 1;
+      expect(gate.takeNudge(t, t - OOM_NUDGE_SETTLE_MS - 1)).toBe(i);
+      t += OOM_NUDGE_COOLDOWN_MS;
+    }
+    // A genuinely new OOM after the budget: the context no longer fits the
+    // device, so the caller fails over instead of nudging again.
+    expect(gate.arm(analysis, t)).toBe('exhausted');
+  });
+
+  it('ignores a null analysis', () => {
+    const gate = createOomNudgeGate();
+    expect(gate.arm(null, 0)).toBeNull();
+    expect(gate.takeNudge(OOM_NUDGE_SETTLE_MS + 1, 0)).toBe(0);
+  });
+});
+
+describe('createTruncationNudgeGate', () => {
+  // The gate delegates to createOomNudgeGate (same shape: a dead turn, an
+  // intact session), so the full silence/cooldown/budget policy is pinned by
+  // the OOM suite above. These two prove the delegation stays behavioral —
+  // the truncation gate still nudges on quiet and still hands back the
+  // exhausted verdict — rather than asserting constant equality.
+  const analysis = { category: 'output-length', message: 'Provider cut the response off before completion' };
+
+  it('nudges only once the session has actually gone quiet', () => {
+    const gate = createTruncationNudgeGate();
+    const t0 = 1_000_000;
+    expect(gate.arm(analysis, t0)).toBe('armed');
+    // The banner is still on screen — nudging here lands on chrome, not on an
+    // idle composer.
+    expect(gate.takeNudge(t0 + OOM_NUDGE_SETTLE_MS, t0 + 5_000)).toBe(0);
+    expect(gate.takeNudge(t0 + OOM_NUDGE_SETTLE_MS + 5_001, t0 + 5_000)).toBe(1);
+    // Fired once; the arm is spent until the next distinct truncation.
+    expect(gate.takeNudge(t0 + 60_000, t0 + 5_000)).toBe(0);
+  });
+
+  it('hands back an exhausted verdict once the nudge budget is spent', () => {
+    const gate = createTruncationNudgeGate();
+    let t = 0;
+    for (let i = 1; i <= TRUNCATION_NUDGE_MAX_ATTEMPTS; i += 1) {
+      expect(gate.arm(analysis, t)).toBe('armed');
+      t += OOM_NUDGE_SETTLE_MS + 1;
+      expect(gate.takeNudge(t, t - OOM_NUDGE_SETTLE_MS - 1)).toBe(i);
+      t += OOM_NUDGE_COOLDOWN_MS;
+    }
+    // Truncated again after the budget: this provider is not going to finish
+    // the response, so the caller fails over instead of nudging again.
+    expect(gate.arm(analysis, t)).toBe('exhausted');
+  });
+});
+
+// The four modals a TUI can paint before its prompt can be delivered used to
+// be four booleans in spawnTuiAgent's closure plus four inline arms in its
+// 300ms poll. They are one table here now, so these pin the contract the
+// spawner depends on: table order, one answer per call, the stage split that
+// keeps the "trust choices unrecognized" failure between the two groups, and
+// the per-session record that stops a second answer.
+describe('answerStartupDialogs', () => {
+  const PASTE_OFF = '\x1b[?2004l';
+  const PASTE_ON = '\x1b[?2004h';
+
+  const EXTERNAL_IMPORTS_OFFER = "This project's CLAUDE" + '.md imports files outside the current working directory.\n'
+    + '1. Yes, allow external imports\n2. No, disable external imports\n';
+  const HOOK_REVIEW_OFFER = 'Hooks need review\n1. Review hooks\n'
+    + "3. Continue without trusting (hooks won't run)\n";
+  const TRUST_GATE = 'Is this a project you trust?\n❯ 1. Yes, I trust this folder\n2. No, exit\n';
+  const AUTO_MODE_OFFER = 'Make auto mode your default permission mode?\n'
+    + '   ❯ 1. Yes, set auto mode as my default permission mode\n'
+    + "     2. No, keep don't ask\n";
+
+  // A live tracker, so each row's `asks`/`keys`/`ack` is checked against the
+  // real createInputReadyTracker API rather than a stub that could drift.
+  const composerLive = (...chunks) => {
+    const tracker = createInputReadyTracker();
+    tracker.observe(`${PASTE_OFF}${PASTE_ON}`, '');
+    for (const chunk of chunks) tracker.observe('', chunk);
+    return tracker;
+  };
+
+  const answerOnce = (inputReady, answers, stage = 'before-composer') => {
+    const written = [];
+    const result = answerStartupDialogs({
+      inputReady, answers, stage, command: 'claude', write: (keys) => written.push(keys),
+    });
+    return { result, written };
+  };
+
+  it('starts with every dialog unanswered and answers nothing when none is showing', () => {
+    const answers = createStartupDialogAnswers();
+    expect(Object.values(answers).every((v) => v === false)).toBe(true);
+
+    const tracker = composerLive('Try "fix lint errors"');
+    expect(answerOnce(tracker, answers).result).toBeNull();
+    expect(answerOnce(tracker, answers, 'after-composer').result).toBeNull();
+  });
+
+  it('answers one before-composer dialog per call, in table order, and acks the tracker each time', () => {
+    // All three up at once: order is what stops a later arm from answering a
+    // modal that is not the one currently owning the terminal's input.
+    const tracker = composerLive(EXTERNAL_IMPORTS_OFFER, HOOK_REVIEW_OFFER, TRUST_GATE);
+    const answers = createStartupDialogAnswers();
+
+    const first = answerOnce(tracker, answers);
+    expect(first.result).toEqual({ id: 'external-imports', message: 'Declined claude external instruction imports' });
+    expect(first.written).toEqual(['\x1b[B\r']); // arrow-down to option 2, never a bare Enter
+    expect(tracker.needsExternalImportsChoice).toBe(false);
+
+    const second = answerOnce(tracker, answers);
+    expect(second.result).toEqual({ id: 'hook-review', message: 'Continued claude without trusting startup hooks' });
+    expect(second.written).toEqual(['\x1b[B\x1b[B\r']); // option 3
+    expect(tracker.needsHookReview).toBe(false);
+
+    const third = answerOnce(tracker, answers);
+    expect(third.result).toEqual({ id: 'folder-trust', message: 'Auto-confirmed claude folder-trust prompt' });
+    expect(third.written).toEqual([`${tracker.trustSelectionKey}${SUBMIT_KEY}`]);
+    expect(tracker.needsTrust).toBe(false);
+
+    // Every dialog cleared, so the composer is finally reachable.
+    expect(answerOnce(tracker, answers).result).toBeNull();
+    expect(tracker.ready).toBe(true);
+  });
+
+  it('leaves the folder-trust gate alone until its choices have painted', () => {
+    // The heading matched but no recognizable option did, so trustSelectionKey
+    // has nothing to derive from. Answering here would submit whatever the TUI
+    // highlighted — which can be "No, exit". The spawner's own deadline check
+    // owns this state, and it only runs because nothing was answered.
+    const tracker = composerLive('Is this a project you trust?\n');
+    expect(tracker.needsTrust).toBe(true);
+    expect(tracker.trustChoiceReady).toBe(false);
+
+    const answers = createStartupDialogAnswers();
+    expect(answerOnce(tracker, answers).result).toBeNull();
+    expect(answers.trustAccepted).toBe(false);
+
+    tracker.observe('', '❯ 1. Yes, I trust this folder\n2. No, exit\n');
+    expect(answerOnce(tracker, answers).result?.id).toBe('folder-trust');
+  });
+
+  it('keeps the two stages disjoint so neither can answer the other\'s dialog', () => {
+    // The stage split is load-bearing: the spawner runs before-composer for
+    // every provider, then its trust-choice-unrecognized failure check, and
+    // only then after-composer — for the positive input-ready providers.
+    const trustUp = composerLive(TRUST_GATE);
+    expect(answerOnce(trustUp, createStartupDialogAnswers(), 'after-composer').result).toBeNull();
+    expect(trustUp.needsTrust).toBe(true);
+
+    const autoModeUp = composerLive(AUTO_MODE_OFFER);
+    expect(answerOnce(autoModeUp, createStartupDialogAnswers()).result).toBeNull();
+    expect(autoModeUp.needsAutoModeChoice).toBe(true);
+
+    const answered = answerOnce(autoModeUp, createStartupDialogAnswers(), 'after-composer');
+    expect(answered.result).toEqual({ id: 'auto-mode', message: 'Declined claude auto-mode default offer' });
+    expect(answered.written).toEqual(['\x1b[B\r']);
+    expect(autoModeUp.ready).toBe(true);
+  });
+
+  it('answers each dialog at most once per session, even if the question comes back', () => {
+    // The record is the guard the tracker cannot be: a TUI that re-asks (or a
+    // tracker that re-arms from its rolling tail) must not start a keystroke
+    // loop that outlives the paste deadline.
+    const reAsking = { needsHookReview: true, ackHookReview: () => {} };
+    const answers = createStartupDialogAnswers();
+
+    expect(answerOnce(reAsking, answers).result?.id).toBe('hook-review');
+    expect(answers.hookReviewDeclined).toBe(true);
+
+    const second = answerOnce(reAsking, answers);
+    expect(second.result).toBeNull();
+    expect(second.written).toEqual([]);
+  });
+});
+
+describe('createStallNudgeGate', () => {
+  it('pastes the word a human types, not a paragraph', () => {
+    // A long explanation restates rules the prompt already carries and crowds
+    // the composer. The resume a human types is the single word.
+    expect(STALL_NUDGE_TEXT).toBe('continue');
+  });
+
+  it('nudges a session that went quiet with its task unfinished', () => {
+    const gate = createStallNudgeGate();
+    const quietSince = 0;
+    // Still inside the threshold: a slow tool call is not a stall.
+    expect(gate.takeNudge(STALL_NUDGE_IDLE_MS - 1, quietSince)).toBe(0);
+    expect(gate.takeNudge(STALL_NUDGE_IDLE_MS, quietSince)).toBe(1);
+  });
+
+  it('waits out the threshold from the NUDGE, not from output', () => {
+    // The case this exists for: a session wedged below its composer never
+    // echoes the paste, so lastOutputAt stays put. Measuring from output alone
+    // would re-fire on the very next 5s poll and spend the whole budget in
+    // seconds.
+    const gate = createStallNudgeGate();
+    const quietSince = 0;
+    const firstNudgeAt = STALL_NUDGE_IDLE_MS;
+    expect(gate.takeNudge(firstNudgeAt, quietSince)).toBe(1);
+    expect(gate.takeNudge(firstNudgeAt + 5000, quietSince)).toBe(0);
+    expect(gate.takeNudge(firstNudgeAt + STALL_NUDGE_IDLE_MS - 1, quietSince)).toBe(0);
+    expect(gate.takeNudge(firstNudgeAt + STALL_NUDGE_IDLE_MS, quietSince)).toBe(2);
+  });
+
+  it('reports exhaustion once after STALL_NUDGE_MAX_ATTEMPTS unanswered nudges, then goes quiet', () => {
+    const gate = createStallNudgeGate();
+    let now = 0;
+    for (let i = 1; i <= STALL_NUDGE_MAX_ATTEMPTS; i += 1) {
+      now += STALL_NUDGE_IDLE_MS;
+      expect(gate.takeNudge(now, 0)).toBe(i);
+    }
+    // Wedged below the composer: pasting into it forever only fills raw.txt, so
+    // the verdict is handed back ONCE and the consumer says it out loud.
+    expect(gate.takeNudge(now + STALL_NUDGE_IDLE_MS, 0)).toBe('exhausted');
+    expect(gate.takeNudge(now + STALL_NUDGE_IDLE_MS * 2, 0)).toBe(0);
+    expect(gate.takeNudge(now + STALL_NUDGE_IDLE_MS * 10, 0)).toBe(0);
+  });
+
+  it('does not read the nudge\'s own paste echo as recovery', () => {
+    const gate = createStallNudgeGate();
+    const firstNudgeAt = STALL_NUDGE_IDLE_MS;
+    expect(gate.takeNudge(firstNudgeAt, 0)).toBe(1);
+    // The bracketed-paste echo lands a beat later and is the ONLY output the
+    // wedged session produces. Counting it would reset the streak forever.
+    const echoAt = firstNudgeAt + 1000;
+    expect(gate.takeNudge(echoAt + STALL_NUDGE_IDLE_MS, echoAt)).toBe(2);
+  });
+
+  it('clears an exhausted streak — and re-arms the verdict — once the session comes back to life', () => {
+    const gate = createStallNudgeGate();
+    let now = 0;
+    for (let i = 1; i <= STALL_NUDGE_MAX_ATTEMPTS; i += 1) {
+      now += STALL_NUDGE_IDLE_MS;
+      gate.takeNudge(now, 0);
+    }
+    // It printed well past the paste echo, so the nudges landed after all. A
+    // stall hours later is a fresh one, with the whole budget available again.
+    const revivedAt = now + STALL_NUDGE_RECOVERY_MS + 1;
+    expect(gate.takeNudge(revivedAt + STALL_NUDGE_IDLE_MS, revivedAt)).toBe(1);
+  });
+
+  it('stops nudging a session that answers every nudge and then stalls again', () => {
+    // A local model that has lost the thread replies to each nudge with a
+    // paragraph and goes quiet again. Every reply clears the streak, so only the
+    // lifetime ceiling ends the loop instead of nudging it for hours.
+    const gate = createStallNudgeGate();
+    let lastOutputAt = 0;
+    let now = STALL_NUDGE_IDLE_MS;
+    for (let i = 1; i <= STALL_NUDGE_MAX_TOTAL; i += 1) {
+      expect(gate.takeNudge(now, lastOutputAt)).toBe(1);
+      lastOutputAt = now + STALL_NUDGE_RECOVERY_MS + 1;
+      now = lastOutputAt + STALL_NUDGE_IDLE_MS;
+    }
+    expect(gate.nudgesSent).toBe(STALL_NUDGE_MAX_TOTAL);
+    expect(gate.takeNudge(now, lastOutputAt)).toBe('exhausted');
+    expect(gate.takeNudge(now + STALL_NUDGE_IDLE_MS, lastOutputAt)).toBe(0);
+    expect(gate.nudgesSent).toBe(STALL_NUDGE_MAX_TOTAL);
+  });
+});
+
+// isPasteConfirmed answers "may I stop treating this as swallowed?", so an
+// unverifiable prompt passes. isPasteCommitted answers "has the TUI actually
+// taken it?", which must stay FALSE there — otherwise the patient wait would
+// submit immediately on an empty buffer and the patience would be dead code.
+describe('isPasteCommitted', () => {
+  it('requires real evidence where isPasteConfirmed accepts an unverifiable prompt', () => {
+    expect(isPasteConfirmed('', {})).toBe(true);
+    expect(isPasteCommitted('', {})).toBe(false);
+  });
+
+  it('accepts the commit marker and the rendered prompt text alike', () => {
+    expect(isPasteCommitted('[Pasted Content 900 chars]', { verifiablePrefix: 'never rendered' })).toBe(true);
+    expect(isPasteCommitted('> audit the provider list', { verifiablePrefix: 'audit the provider list' })).toBe(true);
+    expect(isPasteCommitted('> Ask Codex to do anything', { verifiablePrefix: 'audit the provider list' })).toBe(false);
+  });
+});
+
+describe('CODEX_COMPOSER_READY_PATTERN', () => {
+  it('matches the composer placeholder, including the whitespace-collapsed stripped form', () => {
+    expect(CODEX_COMPOSER_READY_PATTERN.test('› Ask Codex to do anything')).toBe(true);
+    // ANSI stripping can drop the cursor-positioned gaps between glyphs.
+    expect(CODEX_COMPOSER_READY_PATTERN.test('AskCodextodoanything')).toBe(true);
+  });
+
+  it('does not match codex startup chrome painted before the composer exists', () => {
+    // The header/border repaint the six 2026-09-20 agents died against.
+    expect(CODEX_COMPOSER_READY_PATTERN.test('╭╭╭╭╭╭gpt-6-astra default · /repo ╭───────╮')).toBe(false);
+    expect(CODEX_COMPOSER_READY_PATTERN.test('Loading MCP servers…')).toBe(false);
+  });
+});
+
+describe('createAgyResumeGate', () => {
+  const ID = '81c97d96-72b6-44d1-a6d1-18f3e283d642';
+
+  it('returns the conversation id once the shell has gone quiet, even split across chunks', async () => {
+    const { createAgyResumeGate } = await import('./tuiHandshake.js');
+    const gate = createAgyResumeGate({ settleMs: 1000 });
+    gate.observe('Resume with -c (or command below):\nagy--conversation=81c97d96-72b6-');
+    gate.observe('44d1-a6d1-18f3e283d642\n');
+    expect(gate.takeResume(1500, 1000)).toBeNull();
+    expect(gate.takeResume(2500, 1000)).toBe(ID);
+    expect(gate.takeResume(9000, 1000)).toBeNull();
+  });
+
+  it('stops relaunching after the attempt budget is spent', async () => {
+    const { createAgyResumeGate } = await import('./tuiHandshake.js');
+    const gate = createAgyResumeGate({ settleMs: 0, maxAttempts: 2 });
+    for (let i = 0; i < 2; i++) {
+      gate.observe(`--conversation=${ID}`);
+      expect(gate.takeResume(1, 0)).toBe(ID);
+      gate.recordRelaunch();
+    }
+    gate.observe(`--conversation=${ID}`);
+    expect(gate.takeResume(1, 0)).toBeNull();
+    expect(gate.attempts).toBe(2);
+  });
+});

@@ -1,0 +1,356 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+const mocks = vi.hoisted(() => ({
+  addTask: vi.fn(),
+  reviveBlockedTask: vi.fn(),
+  emit: vi.fn(),
+  buildTreatmentPrompt: vi.fn(),
+  buildEvaluatePrompt: vi.fn(),
+  buildPlanPrompt: vi.fn(),
+  getToolSpecs: vi.fn(),
+  getSettings: vi.fn(),
+  recordRun: vi.fn(),
+  updateProject: vi.fn(),
+  commissionStagePin: vi.fn(),
+}));
+
+vi.mock('./videoExecution.js', () => ({ effectiveVideoProject: project => project, reserveVideoAttempt: vi.fn(async () => ({ id: 'example-attempt' })), assertVideoAttemptDispatch: vi.fn(async () => ({})), settleVideoAttempt: vi.fn(async () => {}), pauseVideoExecution: vi.fn(async () => {}) }));
+vi.mock('../cos.js', () => ({
+  addTask: mocks.addTask,
+  reviveBlockedTask: mocks.reviveBlockedTask,
+  cosEvents: { emit: mocks.emit },
+}));
+vi.mock('../creativeDirectorPrompts.js', () => ({
+  buildTreatmentPrompt: mocks.buildTreatmentPrompt,
+  buildEvaluatePrompt: mocks.buildEvaluatePrompt,
+  buildPlanPrompt: mocks.buildPlanPrompt,
+}));
+vi.mock('../creative/toolRegistry.js', () => ({ getToolSpecs: mocks.getToolSpecs }));
+vi.mock('../settings.js', () => ({ getSettings: mocks.getSettings }));
+vi.mock('./local.js', () => ({ recordRun: mocks.recordRun, updateProject: mocks.updateProject }));
+vi.mock('../universeBuilder/crud.js', () => ({ getUniverse: vi.fn() }));
+import { settleVideoAttempt } from './videoExecution.js';
+import { getUniverse } from '../universeBuilder/crud.js';
+vi.mock('../pipeline/series.js', () => ({ getSeries: vi.fn() }));
+vi.mock('../tracks/index.js', () => ({ getTrack: vi.fn() }));
+vi.mock('../voice/profiles.js', () => ({ getVoiceProfile: vi.fn() }));
+import { getSeries } from '../pipeline/series.js';
+import { getTrack } from '../tracks/index.js';
+import { getVoiceProfile } from '../voice/profiles.js';
+vi.mock('../creativeCommissions/projectControl.js', () => ({ commissionStagePin: mocks.commissionStagePin }));
+
+const { enqueueTreatmentTask, enqueuePlanTask, enqueueEvaluateTask } = await import('./agentBridge.js');
+
+const project = { id: 'cd-1', name: 'Test project', treatment: { scenes: [] } };
+
+describe('Video planning source context', () => {
+  it('keeps the bounded video tool specification and retires a failed enqueue reservation', async () => {
+    mocks.getToolSpecs.mockReturnValue([
+      { type: 'function', function: { name: 'media_enqueueVideoJob', description: 'Video', parameters: {} } },
+      { type: 'function', function: { name: 'pipeline_runSeriesAutopilot', description: 'Batch', parameters: {} } },
+    ]);
+    const video = { ...project, workspace: 'video', videoDraft: { sources: [], audio: { mode: 'silent' } } };
+    await enqueuePlanTask(video);
+    expect(mocks.buildPlanPrompt.mock.calls[0][1].toolSpecs).toEqual([
+      expect.objectContaining({ function: expect.objectContaining({ name: 'media_enqueueVideoJob', description: expect.stringContaining('exactly one clip') }) }),
+    ]);
+    expect(mocks.addTask.mock.calls[0][0].metadata.context).toContain('Saved Video audio contract: {"mode":"silent"}');
+    mocks.addTask.mockRejectedValueOnce(new Error('store unavailable'));
+    await expect(enqueueTreatmentTask(video)).rejects.toThrow('store unavailable');
+    expect(settleVideoAttempt).toHaveBeenLastCalledWith('cd-1', 'example-attempt', { status: 'failed' });
+  });
+
+  it('includes a series linked canon and selected audio context without voice bindings or audio paths', async () => {
+    const updatedAt = '2026-09-01T00:00:00Z';
+    getSeries.mockResolvedValue({ updatedAt, title: 'Example series', logline: 'A traveler returns', arc: { summary: 'A reunion' }, universeId: 'example-universe' });
+    getUniverse.mockResolvedValue({ updatedAt, name: 'Example universe', characters: [{ name: 'Example traveler', physicalDescription: 'A silver cloak' }] });
+    getTrack.mockResolvedValue({ updatedAt, title: 'Example song', lyrics: 'Invented test lyrics', audioFilename: 'private-audio.wav' });
+    getVoiceProfile.mockResolvedValue({ updatedAt, label: 'Example narrator', kind: 'tts', approval: { status: 'approved' }, binding: { credential: 'example-secret' }, inferencePath: 'private-model.bin' });
+    mocks.buildPlanPrompt.mockImplementationOnce(async p => JSON.stringify(p.resolvedVideoSources));
+    await enqueuePlanTask({ ...project, workspace: 'video', videoDraft: { sources: [
+      { kind: 'series', id: 'example-series' }, { kind: 'music', id: 'example-song' }, { kind: 'voice', id: 'example-voice' },
+    ] } });
+    const { context } = mocks.addTask.mock.calls[0][0].metadata;
+    expect(context).toContain('A reunion');
+    expect(context).toContain('A silver cloak');
+    expect(context).toContain('Invented test lyrics');
+    expect(context).toContain('Example narrator');
+    expect(context).not.toMatch(/example-secret|private-model|private-audio/);
+    expect(mocks.updateProject.mock.calls[0][1].videoPlanningContext.references).toHaveLength(4);
+  });
+
+  it('resolves canon and style before task dispatch while persisting only revision references', async () => {
+    const video = { ...project, workspace: 'video', videoDraft: { sources: [{ kind: 'universe', id: 'example-universe' }] } };
+    getUniverse.mockResolvedValue({ id: 'example-universe', name: 'Example universe', updatedAt: '2026-09-01T00:00:00Z', characters: [{ name: 'Example traveler', physicalDescription: 'A silver cloak' }], influences: { embrace: ['watercolor'] }, privateNotes: 'Do not copy this private field' });
+    mocks.buildTreatmentPrompt.mockImplementationOnce(async p => JSON.stringify(p.resolvedVideoSources));
+    await enqueueTreatmentTask(video);
+    expect(mocks.addTask.mock.calls[0][0].metadata.machineLocal).toBe(true);
+    const context = mocks.addTask.mock.calls[0][0].metadata.context;
+    expect(context).toContain('A silver cloak');
+    expect(context).toContain('watercolor');
+    expect(context).not.toContain('private field');
+    const persisted = mocks.updateProject.mock.calls[0][1].videoPlanningContext;
+    expect(persisted.references[0]).toMatchObject({ kind: 'universe', id: 'example-universe', sourceRevision: expect.any(String) });
+    expect(JSON.stringify(persisted)).not.toMatch(/silver cloak|watercolor|privateNotes/);
+    mocks.addTask.mockClear();
+    getUniverse.mockResolvedValue(null);
+    await expect(enqueuePlanTask(video)).rejects.toMatchObject({ code: 'VIDEO_SOURCE_MISSING' });
+    expect(mocks.addTask).not.toHaveBeenCalled();
+  });
+});
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  mocks.buildTreatmentPrompt.mockResolvedValue('treatment context');
+  mocks.buildPlanPrompt.mockResolvedValue('plan context');
+  mocks.getToolSpecs.mockReturnValue([]);
+  mocks.recordRun.mockResolvedValue();
+  mocks.addTask.mockResolvedValue();
+  mocks.getSettings.mockResolvedValue({});
+  mocks.commissionStagePin.mockResolvedValue(null);
+});
+
+describe('Creative Director agent bridge — commission-owned projects', () => {
+  // A project minted by a commission fire carries NO modelOverrides — the fire
+  // stamps only the back-pointer, and the boot backfill strips the snapshot the
+  // old fire path used to write. So the commission's live pin is what applies.
+  const commissioned = { ...project, commissionId: 'commission-1', modelOverrides: {} };
+
+  it("resolves the owning commission's pin LIVE, so an edited provider reaches a project already in flight", async () => {
+    mocks.commissionStagePin.mockResolvedValue({ providerId: 'lmstudio-tui', model: 'qwen3.6:35b' });
+
+    await enqueuePlanTask(commissioned);
+
+    expect(mocks.commissionStagePin).toHaveBeenCalledWith('commission-1');
+    const [task] = mocks.addTask.mock.calls[0];
+    expect(task.metadata).toMatchObject({
+      provider: 'lmstudio-tui', providerId: 'lmstudio-tui', model: 'qwen3.6:35b',
+    });
+  });
+
+  it("lets a hand-set per-project pin BEAT the commission's — the models drawer must not be a silent no-op", async () => {
+    mocks.commissionStagePin.mockResolvedValue({ providerId: 'lmstudio-tui', model: 'qwen3.6:35b' });
+
+    await enqueuePlanTask({ ...commissioned, modelOverrides: { plan: { providerId: 'drawer-choice-tui' } } });
+
+    const [task] = mocks.addTask.mock.calls[0];
+    expect(task.metadata).toMatchObject({ providerId: 'drawer-choice-tui' });
+    // And it doesn't even pay for the lookup it isn't going to use.
+    expect(mocks.commissionStagePin).not.toHaveBeenCalled();
+  });
+
+  it('consults the commission when the project pins a DIFFERENT stage', async () => {
+    mocks.commissionStagePin.mockResolvedValue({ providerId: 'lmstudio-tui' });
+
+    // An evaluation-only override leaves `plan` to the commission.
+    await enqueuePlanTask({ ...commissioned, modelOverrides: { evaluation: { providerId: 'vision-api' } } });
+
+    const [task] = mocks.addTask.mock.calls[0];
+    expect(task.metadata).toMatchObject({ providerId: 'lmstudio-tui' });
+  });
+
+  it('falls back to the project/global assignment when the commission pins nothing', async () => {
+    mocks.commissionStagePin.mockResolvedValue(null);
+    mocks.getSettings.mockResolvedValue({ creativeDirector: { plan: { providerId: 'global-agent' } } });
+
+    await enqueuePlanTask(commissioned);
+
+    const [task] = mocks.addTask.mock.calls[0];
+    expect(task.metadata).toMatchObject({ providerId: 'global-agent' });
+  });
+
+  it('never looks up a commission for a bare project', async () => {
+    await enqueuePlanTask(project);
+    expect(mocks.commissionStagePin).not.toHaveBeenCalled();
+  });
+
+  it('does not stall the dispatch when the commission lookup fails', async () => {
+    mocks.commissionStagePin.mockRejectedValue(new Error('store down'));
+    mocks.getSettings.mockResolvedValue({ creativeDirector: { plan: { providerId: 'global-agent' } } });
+
+    await enqueuePlanTask(commissioned);
+
+    const [task] = mocks.addTask.mock.calls[0];
+    expect(task.metadata).toMatchObject({ providerId: 'global-agent' });
+  });
+});
+
+describe('Creative Director agent bridge model assignments', () => {
+  it('pins the configured treatment provider and model on its CoS task', async () => {
+    mocks.getSettings.mockResolvedValue({
+      creativeDirector: { treatment: { providerId: 'local-agent', model: 'qwen3' } },
+    });
+
+    await enqueueTreatmentTask(project);
+
+    const [task] = mocks.addTask.mock.calls[0];
+    expect(task.metadata).toMatchObject({
+      provider: 'local-agent',
+      providerId: 'local-agent',
+      model: 'qwen3',
+      context: 'treatment context',
+    });
+  });
+
+  it('leaves planning on the system default when no assignment is saved', async () => {
+    await enqueuePlanTask(project);
+
+    const [task] = mocks.addTask.mock.calls[0];
+    expect(task.metadata).not.toHaveProperty('provider');
+    expect(task.metadata).not.toHaveProperty('model');
+    // A CD agent's deliverable is an HTTP PATCH, not code — it must NOT be told to
+    // /do:push at the end (agentPromptBuilder routes on this flag). (#2705 follow-up)
+    expect(task.metadata.noCodeOutput).toBe(true);
+  });
+
+  it('requests only the tool set matching a commission project output type', async () => {
+    await enqueuePlanTask({
+      ...project,
+      directive: { constraints: { targetAbility: 'image' } },
+    });
+
+    expect(mocks.getToolSpecs).toHaveBeenCalledWith({ targetAbility: 'image' });
+  });
+
+  it('prefers the project-level override over the global assignment', async () => {
+    mocks.getSettings.mockResolvedValue({
+      creativeDirector: { treatment: { providerId: 'global-agent', model: 'global-model' } },
+    });
+
+    await enqueueTreatmentTask({
+      ...project,
+      modelOverrides: { treatment: { providerId: 'project-agent', model: 'project-model' } },
+    });
+
+    const [task] = mocks.addTask.mock.calls[0];
+    expect(task.metadata).toMatchObject({
+      provider: 'project-agent',
+      providerId: 'project-agent',
+      model: 'project-model',
+    });
+  });
+
+  it('inherits the global assignment when the project override omits a provider', async () => {
+    mocks.getSettings.mockResolvedValue({
+      creativeDirector: { plan: { providerId: 'global-agent', model: 'global-model' } },
+    });
+
+    // A model-only override can't resolve (no provider) → inherit the global pin.
+    await enqueuePlanTask({ ...project, modelOverrides: { plan: { model: 'stray-model' } } });
+
+    const [task] = mocks.addTask.mock.calls[0];
+    expect(task.metadata).toMatchObject({
+      provider: 'global-agent',
+      providerId: 'global-agent',
+      model: 'global-model',
+    });
+  });
+});
+
+describe('persistAndEmit duplicate handling (#2614 — addTask dedup also matches blocked tasks)', () => {
+  it('revives a blocked duplicate instead of emitting task:ready for an unpersisted record', async () => {
+    // CD descriptions are deterministic per project+kind, so a re-trigger after
+    // a failure collides with the blocked twin. The enqueue must revive that
+    // task (status flip clears blocked metadata server-side) and emit
+    // task:ready with the EXISTING id — never with the never-persisted one.
+    mocks.addTask.mockResolvedValue({
+      id: 'sys-cd-old',
+      status: 'blocked',
+      duplicate: true,
+      metadata: { blockedCategory: 'max-retries', creativeDirector: { projectId: 'cd-1' } }
+    });
+
+    const result = await enqueueTreatmentTask(project);
+
+    expect(mocks.reviveBlockedTask).toHaveBeenCalledTimes(1);
+    const [taskId, updates, group] = mocks.reviveBlockedTask.mock.calls[0];
+    expect(taskId).toBe('sys-cd-old');
+    expect(updates.metadata.creativeDirector.projectId).toBe('cd-1');
+    expect(group).toBe('internal');
+    // task:ready and the run record both reference the revived (existing) id.
+    expect(result.id).toBe('sys-cd-old');
+    const emitted = mocks.emit.mock.calls.find(([name]) => name === 'task:ready');
+    expect(emitted[1].id).toBe('sys-cd-old');
+    expect(mocks.recordRun.mock.calls[0][1].taskId).toBe('sys-cd-old');
+  });
+
+  it('does not spawn a second agent or record a run for a pending duplicate', async () => {
+    const existing = { id: 'sys-cd-live', status: 'pending', duplicate: true, metadata: { creativeDirector: { projectId: 'cd-1' } } };
+    mocks.addTask.mockResolvedValue(existing);
+
+    const result = await enqueueTreatmentTask(project);
+
+    expect(mocks.reviveBlockedTask).not.toHaveBeenCalled();
+    expect(mocks.emit).not.toHaveBeenCalled();
+    expect(mocks.recordRun).not.toHaveBeenCalled();
+    expect(result).toBe(existing);
+  });
+
+  it('never revives or adopts a duplicate belonging to a DIFFERENT project', async () => {
+    const foreign = { id: 'sys-cd-other', status: 'blocked', duplicate: true, metadata: { creativeDirector: { projectId: 'cd-other' } } };
+    mocks.addTask.mockResolvedValue(foreign);
+
+    const result = await enqueueTreatmentTask(project);
+
+    expect(mocks.reviveBlockedTask).not.toHaveBeenCalled();
+    expect(mocks.emit).not.toHaveBeenCalled();
+    expect(result).toBe(foreign);
+  });
+
+  it('embeds a per-project discriminator in the task description', async () => {
+    // Two projects sharing a name must not dedup against each other: CD tasks
+    // carry no metadata.app, so the first line is the whole dedup key.
+    await enqueueTreatmentTask(project);
+    await enqueueTreatmentTask({ ...project, id: 'cd-2222' });
+    const [taskA] = mocks.addTask.mock.calls[0];
+    const [taskB] = mocks.addTask.mock.calls[1];
+    expect(taskA.description).toContain('[cd:cd-1]');
+    expect(taskB.description).toContain('[cd:cd-2222]');
+    expect(taskA.description).not.toBe(taskB.description);
+  });
+});
+
+describe('deliverable baseline stamped on the run row (#4146)', () => {
+  it('records the plan baseline so completionHook can tell a real PATCH from a no-op', async () => {
+    mocks.addTask.mockResolvedValue();
+    await enqueuePlanTask({ id: 'cd-1', name: 'p', plan: { steps: [{ stepId: 'a' }], replanRounds: 1 } });
+    expect(mocks.recordRun.mock.calls[0][1]).toMatchObject({ kind: 'plan', deliverableMark: 'plan:1' });
+  });
+
+  it('records a NULL baseline (recorded-and-absent, not "unknown") when there is no plan yet', async () => {
+    await enqueuePlanTask({ id: 'cd-1', name: 'p', plan: null });
+    const entry = mocks.recordRun.mock.calls[0][1];
+    expect(entry).toHaveProperty('deliverableMark', null);
+  });
+
+  it('records the treatment baseline', async () => {
+    await enqueueTreatmentTask({ id: 'cd-1', name: 'p', treatment: null });
+    expect(mocks.recordRun.mock.calls[0][1]).toMatchObject({ kind: 'treatment', deliverableMark: null });
+  });
+
+  it('omits the key entirely for a kind with no verifiable PATCH deliverable', async () => {
+    mocks.buildEvaluatePrompt.mockResolvedValue('evaluate context');
+    await enqueueEvaluateTask({ id: 'cd-1', name: 'p', treatment: { scenes: [{ sceneId: 's1', order: 0 }] } }, { sceneId: 's1', order: 0, intent: 'x' });
+    expect(mocks.recordRun.mock.calls[0][1]).not.toHaveProperty('deliverableMark');
+  });
+});
+
+
+describe('cognitive effort dispatch', () => {
+  it('takes the entire project, live commission, or global pin, including effort', async () => {
+    mocks.getSettings.mockResolvedValue({ creativeDirector: { plan: { providerId: 'global', model: 'global-model', effort: 'low' } } });
+    mocks.commissionStagePin.mockResolvedValue({ providerId: 'commission', model: 'commission-model', effort: 'high' });
+    const owned = { ...project, commissionId: 'commission-1' };
+    const first = await enqueuePlanTask({ ...owned, modelOverrides: { plan: { providerId: 'project', model: 'project-model', effort: 'max' } } });
+    expect(first.metadata).toMatchObject({ providerId: 'project', model: 'project-model', effort: 'max' });
+    const providerOnly = await enqueuePlanTask({ ...owned, modelOverrides: { plan: { providerId: 'project' } } });
+    expect(providerOnly.metadata).not.toHaveProperty('effort');
+    expect(providerOnly.metadata).not.toHaveProperty('model');
+    expect((await enqueuePlanTask(owned)).metadata).toMatchObject({ providerId: 'commission', effort: 'high' });
+    mocks.commissionStagePin.mockResolvedValue(null);
+    expect((await enqueuePlanTask(owned)).metadata).toMatchObject({ providerId: 'global', effort: 'low' });
+    const evaluation = await enqueueEvaluateTask({ ...owned, modelOverrides: { evaluation: { providerId: 'vision', effort: 'high' } } }, { sceneId: 'scene-1', order: 0 });
+    expect(evaluation.metadata).not.toHaveProperty('effort');
+    expect(evaluation.metadata).not.toHaveProperty('providerId');
+  });
+});

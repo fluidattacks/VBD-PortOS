@@ -1,0 +1,531 @@
+import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
+import { rmSync, mkdirSync } from 'fs';
+import { join } from 'path';
+import { mockNoPeerSync, mockNoPeers, mockPathsDataRoot } from '../lib/mockPathsDataRoot.js';
+
+// `wrapExports: ['atomicWrite']` exposes a delegating vi.fn at
+// `spies.atomicWrite` so the atomicity test can count writes WITHOUT
+// vi.spyOn-ing the read-only ESM export (which throws in Vitest).
+const { tempRoot, makeProxy, cleanup, spies } = mockPathsDataRoot({
+  prefix: 'portos-universe-promote-',
+  wrapExports: ['atomicWrite'],
+  makeSpy: vi.fn,
+});
+afterAll(cleanup);
+
+vi.mock('../lib/fileUtils.js', async () => {
+  const actual = await vi.importActual('../lib/fileUtils.js');
+  return makeProxy(actual);
+});
+
+let uuidCounter = 0;
+const mockUuid = (n) => `uuid-${String(n).padStart(8, '0')}`;
+vi.mock('crypto', async () => {
+  const actual = await vi.importActual('crypto');
+  return { ...actual, randomUUID: () => mockUuid(++uuidCounter) };
+});
+
+// Stub instances.js so createUniverse's fire-and-forget autoSubscribeRecordToAllPeers
+// doesn't fan the fixture out to real peers (getPeers reads the live registry via a
+// dataPath closure to the real PATHS once the post-return microtask runs outside this
+// file's fileUtils mock window). Mirrors importer.test.js / promoteToPipeline.test.js.
+vi.mock('./instances.js', () => mockNoPeers());
+vi.mock('./sharing/peerSync.js', () => mockNoPeerSync());
+
+// Stub the LLM dispatch so tests don't need a live runner. The
+// `runPromptThroughProvider` mock is overridden per-test to return the
+// per-kind JSON shape we expect from the LLM. `resolveProviderAndModel`
+// is stubbed flat — `promptRunner.test.js` already exercises its real
+// branching, so re-mirroring it here would just double-mock the same
+// contract.
+const resolveProviderAndModelMock = vi.fn();
+const runPromptThroughProviderMock = vi.fn();
+vi.mock('./promptRunner.js', () => ({
+assertProvider: (provider, { message, code, status = 503 } = {}) => {
+    if (provider) return;
+    const err = new Error(message || 'No AI provider available');
+    if (code) { err.status = status; err.code = code; }
+    throw err;
+  },
+  runPromptThroughProvider: (...a) => runPromptThroughProviderMock(...a),
+  resolveProviderAndModel: (...a) => resolveProviderAndModelMock(...a),
+}));
+
+// Pull services AFTER mocks register so module-level imports resolve through
+// the mock chain.
+const svc = await import('./universeBuilder.js');
+const promoteSvc = await import('./universeBuilderPromote.js');
+
+const seedUniverseWithBucket = async (categories, canon = {}) => {
+  const w = await svc.createUniverse({
+    name: 'Test Universe',
+    starterPrompt: 'test seed',
+    influences: { embrace: ['cel-shading'], avoid: ['lowres'] },
+  });
+  // Plant categories + canon directly via updateUniverse so the sanitizer
+  // tags `kind` correctly (handles 'characters' bucket retirement too).
+  return svc.updateUniverse(w.id, { categories, ...canon });
+};
+
+const mockLlm = (entry) => {
+  runPromptThroughProviderMock.mockResolvedValue({
+    text: JSON.stringify(entry),
+    runId: 'run-promote-1',
+    model: 'mock-default',
+  });
+};
+
+beforeEach(() => {
+  rmSync(tempRoot, { recursive: true, force: true });
+  mkdirSync(tempRoot, { recursive: true });
+  uuidCounter = 0;
+  resolveProviderAndModelMock.mockReset();
+  runPromptThroughProviderMock.mockReset();
+  resolveProviderAndModelMock.mockResolvedValue({
+    provider: { id: 'provider-mock', name: 'Mock', type: 'api', defaultModel: 'mock-default' },
+    selectedModel: 'mock-default',
+  });
+});
+
+describe('universeBuilderPromote — happy path', () => {
+  it('promotes a variation from a settings-kinded bucket into universe.places[]', async () => {
+    const w = await seedUniverseWithBucket({
+      landscapes: {
+        kind: 'places',
+        variations: [
+          { label: 'Crystalline canyon', prompt: 'vast crystalline canyon, salt flats' },
+          { label: 'Scrap dune sea', prompt: 'rolling dunes of rusted scrap' },
+        ],
+      },
+    });
+    mockLlm({
+      name: 'Crystalline Canyon',
+      description: 'A vast canyon of luminous salt-crystal walls.',
+      palette: 'pale violet, salt white, dust amber',
+      era: 'post-civilization',
+      weather: 'arid, scoured by dust devils',
+      recurringDetails: 'wind chimes carved from crystal',
+      prompt: 'vast crystalline canyon, salt flats, low horizon',
+      tags: ['signature-place'],
+    });
+
+    const result = await promoteSvc.promoteVariationToCanon(w.id, {
+      category: 'landscapes',
+      label: 'Crystalline canyon',
+      providerId: 'p-explicit',
+      model: 'm-explicit',
+    });
+
+    // Arg-shape pin: a future typo (provider/Provider/etc.) would silently
+    // pass under a flat resolver mock without this assertion.
+    expect(resolveProviderAndModelMock).toHaveBeenCalledWith({ providerId: 'p-explicit', model: 'm-explicit' });
+    expect(result.targetKind).toBe('places');
+    expect(result.entry.name).toBe('Crystalline Canyon');
+    expect(result.entry.palette).toContain('pale violet');
+    expect(result.universe.places.some((e) => e.name === 'Crystalline Canyon')).toBe(true);
+    // The source variation is removed from its bucket.
+    const remainingLabels = result.universe.categories.landscapes.variations.map((v) => v.label);
+    expect(remainingLabels).toEqual(['Scrap dune sea']);
+    expect(result.removed).toEqual({ category: 'landscapes', label: 'Crystalline canyon' });
+  });
+
+  it('promotes a variation from a characters-kinded bucket into universe.characters[]', async () => {
+    const w = await seedUniverseWithBucket({
+      heroes: {
+        kind: 'characters',
+        variations: [
+          { label: 'Ash the Foundling', prompt: 'lone child of the foundry, soot-stained' },
+        ],
+      },
+    });
+    mockLlm({
+      name: 'Ash',
+      physicalDescription: 'A wiry child, 8 years old, soot-stained skin, copper hair, salvaged goggles.',
+      personality: 'Watchful, slow to speak, quick to act.',
+      background: 'Only survivor of the foundry silence.',
+      role: 'protagonist',
+      prompt: 'child of the foundry, soot-stained, copper hair',
+      tags: ['protagonist'],
+    });
+
+    const result = await promoteSvc.promoteVariationToCanon(w.id, {
+      category: 'heroes',
+      label: 'Ash the Foundling',
+    });
+
+    expect(result.targetKind).toBe('characters');
+    expect(result.universe.characters.find((c) => c.name === 'Ash')).toBeTruthy();
+    expect(result.universe.categories.heroes.variations).toEqual([]);
+  });
+
+  it('matches variation labels case-insensitively', async () => {
+    const w = await seedUniverseWithBucket({
+      colonies: {
+        kind: 'places',
+        variations: [{ label: 'Gas-Giant Drifters', prompt: 'balloon settlements in the upper atmosphere' }],
+      },
+    });
+    mockLlm({ name: 'Gas-Giant Drifters', description: 'A balloon-colony civilization.', prompt: 'balloon settlement' });
+
+    const result = await promoteSvc.promoteVariationToCanon(w.id, {
+      category: 'colonies',
+      label: 'gas-giant drifters', // lowercase
+    });
+
+    expect(result.universe.places.find((s) => s.name === 'Gas-Giant Drifters')).toBeTruthy();
+  });
+
+  it('seeds entry.name from the variation label when the LLM omits name', async () => {
+    const w = await seedUniverseWithBucket({
+      vehicles: {
+        kind: 'objects',
+        variations: [{ label: 'Scavenger Walker Mech', prompt: 'rusted bipedal salvage mech' }],
+      },
+    });
+    mockLlm({
+      // name absent — server should default to variation label
+      description: 'A four-story salvage mech.',
+      significance: 'Built from the bones of the silent foundry.',
+      tags: ['hero-vehicle'],
+    });
+
+    const result = await promoteSvc.promoteVariationToCanon(w.id, {
+      category: 'vehicles',
+      label: 'Scavenger Walker Mech',
+    });
+    expect(result.entry.name).toBe('Scavenger Walker Mech');
+  });
+
+  it('seeds entry.prompt from the variation when LLM omits prompt', async () => {
+    const w = await seedUniverseWithBucket({
+      vehicles: {
+        kind: 'objects',
+        variations: [{ label: 'Salvage Mech', prompt: 'rusted bipedal mech, scavenged armor' }],
+      },
+    });
+    mockLlm({ name: 'Salvage Mech', description: 'A walker.' });
+
+    const result = await promoteSvc.promoteVariationToCanon(w.id, {
+      category: 'vehicles',
+      label: 'Salvage Mech',
+    });
+    expect(result.entry.prompt).toBe('rusted bipedal mech, scavenged armor');
+  });
+});
+
+describe('universeBuilderPromote — targetKind override + other-bucket gate', () => {
+  it('requires targetKind for `kind: "other"` buckets', async () => {
+    const w = await seedUniverseWithBucket({
+      myth_archetypes: {
+        // No `kind: 'other'` set explicitly — sanitizer defaults to 'other'.
+        variations: [{ label: 'Solstice Mask', prompt: 'midnight procession' }],
+      },
+    });
+    await expect(
+      promoteSvc.promoteVariationToCanon(w.id, {
+        category: 'myth_archetypes',
+        label: 'Solstice Mask',
+      }),
+    ).rejects.toMatchObject({ status: 400, code: 'UNIVERSE_PROMOTE_NO_TARGET_KIND' });
+  });
+
+  it('promotes from an other-bucket when targetKind is provided', async () => {
+    const w = await seedUniverseWithBucket({
+      myth_archetypes: {
+        variations: [{ label: 'Solstice Mask', prompt: 'midnight procession with bone masks' }],
+      },
+    });
+    mockLlm({
+      name: 'The Solstice Mask',
+      description: 'A ritual mask carved from antler bone.',
+      significance: 'Worn only when the long night begins.',
+      tags: ['ritual'],
+    });
+    const result = await promoteSvc.promoteVariationToCanon(w.id, {
+      category: 'myth_archetypes',
+      label: 'Solstice Mask',
+      targetKind: 'objects',
+    });
+    expect(result.targetKind).toBe('objects');
+    expect(result.universe.objects.find((o) => o.name === 'The Solstice Mask')).toBeTruthy();
+  });
+
+  it('rejects invalid targetKind even for non-other buckets', async () => {
+    const w = await seedUniverseWithBucket({
+      landscapes: {
+        kind: 'places',
+        variations: [{ label: 'Salt flats', prompt: 'horizon-spanning salt flats' }],
+      },
+    });
+    // The bucket kind is 'places', so the server should ignore an
+    // ill-typed targetKind and proceed with the bucket-derived kind. (The
+    // route schema would reject the bad value before reaching here in prod.)
+    mockLlm({ name: 'Salt Flats', description: 'A flat expanse.', prompt: 'horizon salt flats' });
+    const result = await promoteSvc.promoteVariationToCanon(w.id, {
+      category: 'landscapes',
+      label: 'Salt flats',
+      targetKind: 'invalid',
+    });
+    expect(result.targetKind).toBe('places');
+  });
+});
+
+describe('universeBuilderPromote — error paths', () => {
+  it('404s when the category does not exist', async () => {
+    const w = await seedUniverseWithBucket({
+      landscapes: {
+        kind: 'places',
+        variations: [{ label: 'A', prompt: 'a' }],
+      },
+    });
+    await expect(
+      promoteSvc.promoteVariationToCanon(w.id, { category: 'nonexistent', label: 'A' }),
+    ).rejects.toMatchObject({ status: 404, code: 'UNIVERSE_PROMOTE_NO_CATEGORY' });
+  });
+
+  it('404s when the variation label does not match', async () => {
+    const w = await seedUniverseWithBucket({
+      landscapes: {
+        kind: 'places',
+        variations: [{ label: 'A', prompt: 'a' }],
+      },
+    });
+    await expect(
+      promoteSvc.promoteVariationToCanon(w.id, { category: 'landscapes', label: 'B' }),
+    ).rejects.toMatchObject({ status: 404, code: 'UNIVERSE_PROMOTE_VARIATION_NOT_FOUND' });
+  });
+
+  it('400s on missing category', async () => {
+    await expect(
+      promoteSvc.promoteVariationToCanon('any', { label: 'x' }),
+    ).rejects.toMatchObject({ status: 400, code: 'UNIVERSE_PROMOTE_NO_CATEGORY' });
+  });
+
+  it('400s on missing label', async () => {
+    await expect(
+      promoteSvc.promoteVariationToCanon('any', { category: 'landscapes' }),
+    ).rejects.toMatchObject({ status: 400, code: 'UNIVERSE_PROMOTE_NO_LABEL' });
+  });
+
+  it('409s when a canon entry with the same name already exists', async () => {
+    const existing = [{
+      name: 'Crystalline Canyon',
+      slugline: 'EXT. CANYON — DAY',
+      description: 'A pre-existing canon entry.',
+    }];
+    const w = await seedUniverseWithBucket(
+      {
+        landscapes: {
+          kind: 'places',
+          variations: [{ label: 'Crystalline Canyon', prompt: 'salt-crystal walls' }],
+        },
+      },
+      { places: existing },
+    );
+    await expect(
+      promoteSvc.promoteVariationToCanon(w.id, {
+        category: 'landscapes',
+        label: 'Crystalline Canyon',
+      }),
+    ).rejects.toMatchObject({ status: 409, code: 'UNIVERSE_PROMOTE_DUPLICATE' });
+    // LLM should NOT be invoked when the duplicate check fails up front —
+    // we want a cheap rejection, not a wasted model call.
+    expect(runPromptThroughProviderMock).not.toHaveBeenCalled();
+  });
+
+  it('409s on settings slugline collision (name differs, slugline matches)', async () => {
+    // Variation label maps to an existing setting via slugline normalization
+    // — the name-only check would miss this, but the kind-specific slugline
+    // fallback catches it.
+    const existing = [{
+      name: 'Foundry City Bay',
+      slugline: 'EXT. FOUNDRY CITY — DAY',
+      description: 'A pre-existing canon entry keyed by slugline.',
+    }];
+    const w = await seedUniverseWithBucket(
+      {
+        landscapes: {
+          kind: 'places',
+          variations: [{ label: 'EXT. FOUNDRY CITY - DAY', prompt: 'dawn light over docks' }],
+        },
+      },
+      { places: existing },
+    );
+    await expect(
+      promoteSvc.promoteVariationToCanon(w.id, {
+        category: 'landscapes',
+        label: 'EXT. FOUNDRY CITY - DAY',
+      }),
+    ).rejects.toMatchObject({ status: 409, code: 'UNIVERSE_PROMOTE_DUPLICATE' });
+    expect(runPromptThroughProviderMock).not.toHaveBeenCalled();
+  });
+
+  it('throws 502 when the LLM returns invalid JSON', async () => {
+    const w = await seedUniverseWithBucket({
+      landscapes: {
+        kind: 'places',
+        variations: [{ label: 'A', prompt: 'a' }],
+      },
+    });
+    runPromptThroughProviderMock.mockResolvedValue({
+      text: 'this is not json',
+      runId: 'run-x',
+      model: 'mock-default',
+    });
+    await expect(
+      promoteSvc.promoteVariationToCanon(w.id, { category: 'landscapes', label: 'A' }),
+    ).rejects.toMatchObject({ status: 502, code: 'LLM_INVALID_JSON' });
+  });
+
+  it('cherry-picks the first shape-matching inner object when the LLM array-wraps the response', async () => {
+    // jsonExtract.extractJson walks balanced blocks and prefers ones whose
+    // value matches the shape predicate (which keys on `name`). So when the
+    // LLM wraps a single entry in an array, the inner object wins on shape
+    // and is returned directly. The service relies on this contract — there
+    // is no longer a defensive array-unwrap branch.
+    const w = await seedUniverseWithBucket({
+      vehicles: {
+        kind: 'objects',
+        variations: [{ label: 'Salvage Mech', prompt: 'rusted mech' }],
+      },
+    });
+    runPromptThroughProviderMock.mockResolvedValue({
+      text: JSON.stringify([
+        { name: 'Salvage Mech', description: 'A walker.', significance: 'A relic.' },
+      ]),
+      runId: 'run-x', model: 'mock-default',
+    });
+    const result = await promoteSvc.promoteVariationToCanon(w.id, {
+      category: 'vehicles', label: 'Salvage Mech',
+    });
+    expect(result.entry.name).toBe('Salvage Mech');
+    expect(result.entry.description).toBe('A walker.');
+  });
+});
+
+describe('universeBuilderPromote — control field stripping', () => {
+  it('drops hallucinated id / locked / imageRefs from the LLM response', async () => {
+    const w = await seedUniverseWithBucket({
+      landscapes: {
+        kind: 'places',
+        variations: [{ label: 'Salt Flats', prompt: 'horizon salt flats' }],
+      },
+    });
+    mockLlm({
+      id: 'set-hallucinated',
+      name: 'Salt Flats',
+      description: 'A flat expanse.',
+      locked: true, // LLM should NEVER set this
+      imageRefs: ['phantom.png'],
+      primaryImageRef: 'phantom.png',
+      sourceSeriesId: 'srs-phantom',
+    });
+    const result = await promoteSvc.promoteVariationToCanon(w.id, {
+      category: 'landscapes',
+      label: 'Salt Flats',
+    });
+    // ID stripped → sanitizer mints a fresh one.
+    expect(result.entry.id).not.toBe('set-hallucinated');
+    // LLM's `locked` flag is stripped, but promote stamps `locked: true` at
+    // the service layer as part of the universe-builder lock-by-default
+    // contract — promoted identities are user-deliberate so AI rewrite paths
+    // should skip them until the user explicitly unlocks.
+    expect(result.entry.locked).toBe(true);
+    // Image refs stripped → those are operational, owned by the render UI.
+    expect(result.entry.imageRefs).toEqual([]);
+    expect(result.entry.primaryImageRef).toBe(null);
+  });
+});
+
+describe('universeBuilderPromote — atomicity', () => {
+  it('writes the canon entry and variation removal in a single atomicWrite', async () => {
+    const w = await seedUniverseWithBucket({
+      landscapes: {
+        kind: 'places',
+        variations: [
+          { label: 'A', prompt: 'a' },
+          { label: 'B', prompt: 'b' },
+        ],
+      },
+    });
+    mockLlm({ name: 'Place A', description: 'place a', prompt: 'a' });
+    // Spy on the real atomicWrite so we can count the writes that this single
+    // promote operation triggers. Filter to per-record writes (the universe's
+    // index.json) — saveTypeIndex writes that happen elsewhere in the test's
+    // setup are excluded.
+    // join(), not a '/'-joined template: collectionStore composes this with
+    // path.join, so on Windows the real write path is backslash-separated and
+    // this filter matched nothing — the assertion then compared against an
+    // empty list instead of the write it meant to count.
+    const recordIndexPath = join(tempRoot, 'universes', w.id, 'index.json');
+    const beforeCalls = spies.atomicWrite.mock.calls.length;
+    await promoteSvc.promoteVariationToCanon(w.id, {
+      category: 'landscapes',
+      label: 'A',
+    });
+    const recordWrites = spies.atomicWrite.mock.calls
+      .slice(beforeCalls)
+      .filter(([path]) => path === recordIndexPath);
+    // Canon append AND variation removal must land in one persistence write
+    // — not two. A two-write split would expose a half-state window where a
+    // crash leaves the variation gone but the canon entry never written
+    // (or vice versa). updateUniverse writes once, so the per-record write
+    // count is 1.
+    expect(recordWrites).toHaveLength(1);
+    // Re-read from the persistence layer (mirrors what a sibling tab would
+    // see): canon has the new entry AND the bucket has lost the variation.
+    const reread = (await svc.listUniverses())[0];
+    expect(reread.places.find((s) => s.name === 'Place A')).toBeTruthy();
+    expect(reread.categories.landscapes.variations.map((v) => v.label)).toEqual(['B']);
+  });
+});
+
+describe('universeBuilderPromote — prompt content', () => {
+  const { buildPromotePrompt } = promoteSvc.__testing;
+
+  it('embeds universe context (logline, embrace influences) into the prompt', () => {
+    const prompt = buildPromotePrompt({
+      targetKind: 'characters',
+      variation: { label: 'Ash', prompt: 'soot-stained child' },
+      category: 'heroes',
+      universe: {
+        logline: 'A foundry city goes silent.',
+        styleNotes: 'Moebius palette.',
+        influences: { embrace: ['cel-shading', 'dust palette'] },
+      },
+    });
+    expect(prompt).toContain('A foundry city goes silent.');
+    expect(prompt).toContain('Moebius palette.');
+    expect(prompt).toContain('cel-shading, dust palette');
+    expect(prompt).toContain('LABEL: Ash');
+    expect(prompt).toContain('PROMPT: soot-stained child');
+  });
+
+  it('emits the per-kind output contract', () => {
+    const charPrompt = promoteSvc.__testing.buildPromotePrompt({
+      targetKind: 'characters',
+      variation: { label: 'x', prompt: 'x' },
+      category: 'h',
+      universe: {},
+    });
+    expect(charPrompt).toContain('physicalDescription');
+    expect(charPrompt).toContain('personality');
+
+    const settingPrompt = promoteSvc.__testing.buildPromotePrompt({
+      targetKind: 'places',
+      variation: { label: 'x', prompt: 'x' },
+      category: 'h',
+      universe: {},
+    });
+    expect(settingPrompt).toContain('slugline');
+    expect(settingPrompt).toContain('palette');
+
+    const objectPrompt = promoteSvc.__testing.buildPromotePrompt({
+      targetKind: 'objects',
+      variation: { label: 'x', prompt: 'x' },
+      category: 'h',
+      universe: {},
+    });
+    expect(objectPrompt).toContain('significance');
+  });
+});

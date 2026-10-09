@@ -1,0 +1,637 @@
+/**
+ * Tests for the settings-backed Telegram bot service (server/services/telegram.js).
+ *
+ * The rate limiter (token bucket) and the "unauthorized chat" rejection are the
+ * two behaviors called out in the issue. Neither helper is exported, so they are
+ * exercised through the public surface: `init()` wires a fake bot (created via a
+ * mocked `createTelegramBot`) and registers the message/callback handlers, and
+ * `sendMessage()` drives the token bucket. All external modules are mocked so no
+ * network, disk, or real timers are touched.
+ *
+ * Each test re-imports the module via `loadTelegram()` (resetModules) so the
+ * module-level token bucket and `authorizedChatId` start fresh.
+ */
+
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { TELEGRAM_MAX_RAW_CHARS } from '../lib/telegramMessage.js';
+
+// Shared, mutable holder for the fake bot's captured handlers + spies. Reset in
+// beforeEach so each test sees a clean bot. `vi.hoisted` makes it available to
+// the hoisted `vi.mock` factory below.
+const h = vi.hoisted(() => ({
+  textHandlers: [],
+  eventHandlers: {},
+  sendMessage: null,
+  answerCallbackQuery: null,
+  editMessageText: null,
+  getMe: null,
+  stopPolling: null,
+}));
+
+vi.mock('../lib/telegramClient.js', () => ({
+  createTelegramBot: vi.fn(() => ({
+    getMe: (...a) => h.getMe(...a),
+    sendMessage: (...a) => h.sendMessage(...a),
+    answerCallbackQuery: (...a) => h.answerCallbackQuery(...a),
+    editMessageText: (...a) => h.editMessageText(...a),
+    onText: (regex, fn) => h.textHandlers.push({ regex, fn }),
+    on: (event, fn) => { (h.eventHandlers[event] ||= []).push(fn); },
+    stopPolling: (...a) => h.stopPolling(...a),
+  })),
+}));
+
+// Settings supply the token + authorized chat id init() caches. Held in a
+// mutable holder so a test can drop the chatId to exercise the "no chatId
+// configured" send guard; reset to the default in beforeEach.
+const cfg = vi.hoisted(() => ({ settings: null }));
+function defaultSettings() {
+  return {
+    secrets: { telegram: { token: 'test-token' } },
+    telegram: { chatId: '42', forwardTypes: null },
+    backup: { enabled: false },
+  };
+}
+vi.mock('./settings.js', () => ({
+  getSettings: vi.fn(async () => cfg.settings),
+}));
+
+// A minimal EventEmitter stand-in so init()'s notification subscription works.
+const notifEmitter = vi.hoisted(() => {
+  const listeners = {};
+  return {
+    on(event, fn) { (listeners[event] ||= []).push(fn); },
+    removeListener(event, fn) {
+      listeners[event] = (listeners[event] || []).filter((f) => f !== fn);
+    },
+    emit(event, ...args) { (listeners[event] || []).forEach((fn) => fn(...args)); },
+  };
+});
+
+vi.mock('./notifications.js', () => ({
+  notificationEvents: notifEmitter,
+  NOTIFICATION_TYPES: {
+    MEMORY_APPROVAL: 'memory_approval',
+    TASK_APPROVAL: 'task_approval',
+    CODE_REVIEW: 'code_review',
+    HEALTH_ISSUE: 'health_issue',
+    BRIEFING_READY: 'briefing_ready',
+    AUTOBIOGRAPHY_PROMPT: 'autobiography_prompt',
+    PLAN_QUESTION: 'plan_question',
+    DAILY_POST_REMINDER: 'daily_post_reminder',
+  },
+  getNotifications: vi.fn(async () => []),
+}));
+
+vi.mock('./cosState.js', () => ({
+  getDomainAutonomyMode: vi.fn(async () => 'execute'),
+}));
+
+// These fixtures are uncorrelated notifications; queue-backed delivery is
+// covered by telegramForward.test.js. Avoid importing its unrelated app graph.
+vi.mock('./reviewActionAdapters.js', () => ({ adaptNotification: vi.fn(() => null) }));
+
+vi.mock('./domainUsage.js', () => ({
+  getDomainBudgetStatus: vi.fn(async () => ({ withinBudget: true, exceeded: null })),
+  recordDomainUsage: vi.fn(async () => {}),
+}));
+
+// `memory` is what peekMemory resolves to; held in a hoisted holder because
+// loadTelegram() calls vi.resetModules(), which re-evaluates this factory.
+const mem = vi.hoisted(() => ({ memory: null }));
+vi.mock('./memoryBackend.js', () => ({
+  approveMemory: vi.fn(async () => ({ success: true })),
+  rejectMemory: vi.fn(async () => ({ success: true })),
+  peekMemory: vi.fn(async () => mem.memory),
+}));
+
+// Mutable disk stand-in. `strictRead` is what `readJSONFileStrict` returns when
+// set (null = "fall through to the persisted `store`, or the caller's default
+// when nothing has been written yet"); `writes` records every atomicWrite so a
+// test can assert that NOTHING was written. `store` reflects the latest
+// atomicWrite payload so a second read-modify-write cycle in the SAME test sees
+// the first cycle's persisted state — needed to prove the checkins write queue
+// serializes concurrent responses instead of one clobbering the other. Held in
+// a hoisted holder because loadTelegram() calls vi.resetModules(), which
+// re-evaluates this factory and would otherwise hand each test fresh,
+// unreachable spies.
+const fu = vi.hoisted(() => ({ strictRead: null, writes: [], store: null }));
+
+// Exhaustive factory (no importActual spread) — every export telegram.js
+// imports must be listed here or the access throws "not defined on the mock".
+vi.mock('../lib/fileUtils.js', () => ({
+  ensureDir: vi.fn(async () => {}),
+  PATHS: { data: '/mock/data' },
+  readJSONFileStrict: vi.fn(async (_path, def) => fu.strictRead ?? { ok: true, value: fu.store ?? def }),
+  formatDuration: vi.fn(() => '1m'),
+  atomicWrite: vi.fn(async (path, data) => { fu.writes.push({ path, data }); fu.store = data; }),
+}));
+
+vi.mock('./agentManagement.js', () => ({ getActiveAgents: vi.fn(() => []) }));
+vi.mock('./identity.js', () => ({ getGoals: vi.fn(async () => ({ goals: [] })) }));
+vi.mock('../lib/uuid.js', () => ({ v4: vi.fn(() => 'test-uuid') }));
+
+async function loadTelegram() {
+  vi.resetModules();
+  return import('./telegram.js');
+}
+
+describe('telegram service', () => {
+  let logSpy;
+  let errorSpy;
+
+  // The active module instance (set by loadTelegram) so afterEach can always
+  // cleanup() — stopping the real health-check interval even if an assertion
+  // throws before the in-body cleanup runs.
+  let active;
+
+  beforeEach(() => {
+    cfg.settings = defaultSettings();
+    fu.strictRead = null;
+    mem.memory = null;
+    fu.writes = [];
+    fu.store = null;
+    active = null;
+    h.textHandlers = [];
+    h.eventHandlers = {};
+    h.sendMessage = vi.fn(async () => ({ message_id: 1 }));
+    h.answerCallbackQuery = vi.fn(async () => {});
+    h.editMessageText = vi.fn(async () => {});
+    h.getMe = vi.fn(async () => ({ username: 'example_bot' }));
+    h.stopPolling = vi.fn(async () => {});
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+
+  afterEach(async () => {
+    if (active) {
+      await active.cleanup();
+      // Each isolated import registers its own shutdown handlers.
+      process.removeListener('SIGTERM', active.cleanup);
+      process.removeListener('SIGINT', active.cleanup);
+    }
+    logSpy.mockRestore();
+    errorSpy.mockRestore();
+    vi.useRealTimers();
+  });
+
+  async function loadTelegramActive() {
+    active = await loadTelegram();
+    return active;
+  }
+
+  it('stops a failed startup before returning and can connect again', async () => {
+    const telegram = await loadTelegramActive();
+    h.getMe.mockRejectedValueOnce(new Error('Temporary validation outage'));
+    let finishShutdown;
+    const shutdown = new Promise(resolve => { finishShutdown = resolve; });
+    h.stopPolling.mockReturnValueOnce(shutdown);
+
+    let initialized = false;
+    const failedInit = telegram.init(false).then(() => { initialized = true; });
+    await vi.waitFor(() => expect(h.stopPolling).toHaveBeenCalledTimes(1));
+    expect(initialized).toBe(false);
+    finishShutdown();
+    await failedInit;
+    expect(telegram.getStatus()).toMatchObject({ connected: false, botUsername: null });
+    expect(h.textHandlers).toHaveLength(0);
+
+    await telegram.init(false);
+    expect(h.stopPolling).toHaveBeenCalledTimes(1);
+    expect(telegram.getStatus()).toMatchObject({ connected: true, botUsername: 'example_bot' });
+    const help = h.textHandlers.find(({ regex }) => regex.test('/help'));
+    await help.fn({ chat: { id: 42 }, text: '/help' });
+    expect(h.sendMessage).toHaveBeenCalledWith('42', expect.stringContaining('PortOS Bot Commands'), { parse_mode: 'HTML' });
+
+    await telegram.cleanup();
+    expect(h.stopPolling).toHaveBeenCalledTimes(2);
+    expect(telegram.getStatus()).toMatchObject({ connected: false, botUsername: null });
+  });
+
+  describe('rate limiting (token bucket)', () => {
+    it('sends up to the bucket max then rejects further messages in the same window', async () => {
+      const telegram = await loadTelegramActive();
+      await telegram.init(false);
+
+      const results = [];
+      // BUCKET_MAX is 30 in telegram.js; the 31st send must be rate limited.
+      for (let i = 0; i < 31; i++) {
+        results.push(await telegram.sendMessage(`msg ${i}`));
+      }
+
+      const successes = results.filter((r) => r.success).length;
+      expect(successes).toBe(30);
+      expect(results[30]).toEqual({ success: false, error: 'Rate limit exceeded' });
+      // The underlying bot.sendMessage is only called for the 30 that passed the gate.
+      expect(h.sendMessage).toHaveBeenCalledTimes(30);
+    });
+
+    it('refills the bucket after the refill interval elapses', async () => {
+      // Fake timers control both setInterval AND Date.now(), so advancing the
+      // clock past REFILL_INTERVAL (60s) makes refillTokens() reset the bucket.
+      vi.useFakeTimers();
+      const telegram = await loadTelegramActive();
+      await telegram.init(false);
+
+      // Exhaust the bucket, confirm the next send is rate limited.
+      for (let i = 0; i < 30; i++) await telegram.sendMessage(`msg ${i}`);
+      const exhausted = await telegram.sendMessage('over');
+      expect(exhausted).toEqual({ success: false, error: 'Rate limit exceeded' });
+
+      // Advance past the 60s refill window; the next send succeeds again.
+      await vi.advanceTimersByTimeAsync(60_000);
+      const afterRefill = await telegram.sendMessage('after refill');
+      expect(afterRefill).toEqual({ success: true });
+    });
+
+    it('returns "No chatId configured" when a token is set but chatId is missing', async () => {
+      // Token present so init() builds a live bot, but chatId is null — so the
+      // send guard must hit the authorizedChatId branch, not the no-bot branch.
+      cfg.settings = {
+        secrets: { telegram: { token: 'test-token' } },
+        telegram: { chatId: null, forwardTypes: null },
+        backup: { enabled: false },
+      };
+      const telegram = await loadTelegramActive();
+      await telegram.init(false);
+
+      const res = await telegram.sendMessage('hello');
+      expect(res).toEqual({ success: false, error: 'No chatId configured' });
+      expect(h.sendMessage).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('unauthorized chat rejection', () => {
+    it('rejects a message from a non-authorized chat id and notifies that chat', async () => {
+      const telegram = await loadTelegramActive();
+      await telegram.init(false);
+
+      const messageHandler = h.eventHandlers.message[0];
+      expect(messageHandler).toBeTypeOf('function');
+
+      // A message from chat id 999 (authorized is 42) must be rejected.
+      await messageHandler({ chat: { id: 999 }, text: 'let me in' });
+
+      // isAuthorized fires a "not configured for your chat ID" notice to the
+      // sender's own chat, not the authorized one.
+      expect(h.sendMessage).toHaveBeenCalledWith(
+        '999',
+        expect.stringContaining('not configured for your chat ID')
+      );
+    });
+
+    it('does not run command handlers for an unauthorized chat', async () => {
+      const telegram = await loadTelegramActive();
+      await telegram.init(false);
+
+      // /status is guarded by isAuthorized; find its handler.
+      const statusEntry = h.textHandlers.find((t) => t.regex.source.includes('status'));
+      expect(statusEntry).toBeDefined();
+
+      h.sendMessage.mockClear();
+      await statusEntry.fn({ chat: { id: 999 }, text: '/status' });
+
+      // The only send is the rejection notice — the status report never runs, so
+      // getMe/status content is never sent to the unauthorized chat.
+      expect(h.sendMessage).toHaveBeenCalledTimes(1);
+      expect(h.sendMessage).toHaveBeenCalledWith(
+        '999',
+        expect.stringContaining('not configured for your chat ID')
+      );
+    });
+
+    it('rejects a callback_query from a non-authorized chat with an Unauthorized answer', async () => {
+      const telegram = await loadTelegramActive();
+      await telegram.init(false);
+
+      const cbHandler = h.eventHandlers.callback_query[0];
+      expect(cbHandler).toBeTypeOf('function');
+
+      await cbHandler({ id: 'cb-1', message: { chat: { id: 999 } }, data: 'mem_approve:abc' });
+
+      expect(h.answerCallbackQuery).toHaveBeenCalledWith('cb-1', { text: 'Unauthorized' });
+      // The memory action must not run for an unauthorized chat.
+      expect(h.editMessageText).not.toHaveBeenCalled();
+    });
+  });
+
+  /**
+   * Shared notification-forward pipeline (#5688).
+   *
+   * The message body is now built by lib/telegramMessage.js for BOTH transports.
+   * These mirror telegramBridge.test.js so a change that pleases one transport
+   * cannot silently regress the other.
+   */
+  describe('notification forwarding (#5688)', () => {
+    async function forward(notification) {
+      const telegram = await loadTelegramActive();
+      await telegram.init(false);
+      h.sendMessage.mockClear();
+      notifEmitter.emit('added', notification);
+      // Wait for observable delivery: lazy adapter imports can take more than
+      // a fixed number of event-loop turns on a cold or contended CI worker.
+      await vi.waitFor(() => expect(h.sendMessage).toHaveBeenCalled());
+      return h.sendMessage.mock.calls[0];
+    }
+
+    it('attaches the memory approve/reject keyboard to a MEMORY_APPROVAL forward', async () => {
+      mem.memory = { summary: 'Remember the example project deadline' };
+      const call = await forward({
+        type: 'memory_approval',
+        title: 'Approve memory?',
+        description: 'ignored once the memory resolves',
+        priority: 'medium',
+        metadata: { memoryId: 'mem-1' },
+      });
+
+      expect(call, 'a memory approval must be forwarded').toBeDefined();
+      const [chatId, text, options] = call;
+      expect(chatId).toBe('42');
+      expect(text).toContain('Remember the example project deadline');
+      expect(text).not.toContain('ignored once the memory resolves');
+      expect(options.reply_markup.inline_keyboard[0]).toEqual([
+        { text: '✅ Approve', callback_data: 'mem_approve:mem-1' },
+        { text: '❌ Reject', callback_data: 'mem_reject:mem-1' },
+      ]);
+    });
+
+    it('truncates a body past the raw cap before escaping it', async () => {
+      // '&' sits exactly on the cut: escaping first would leave a split '&am'.
+      mem.memory = { content: `${'a'.repeat(TELEGRAM_MAX_RAW_CHARS - 1)}&${'b'.repeat(200)}` };
+      const call = await forward({
+        type: 'memory_approval',
+        title: 'Long one',
+        priority: 'low',
+        metadata: { memoryId: 'mem-2' },
+      });
+
+      const bodyLine = call[1].split('\n')[1];
+      expect(bodyLine.endsWith('&amp;…')).toBe(true);
+      expect(bodyLine).not.toContain('b');
+    });
+  });
+
+  /**
+   * Strict-read regression (#4115).
+   *
+   * `handleCheckinResponse` is `loadCheckins → push → atomicWrite`. While the
+   * read swallowed unreadable files, a corrupt checkins.json read as
+   * { checkins: [] }, so answering one check-in wrote a ONE-entry log over the
+   * user's whole check-in history.
+   *
+   * The fix uses a null sentinel rather than a throw: every caller runs inside a
+   * `bot.on(...)` handler that node-telegram-bot-api never awaits, so a
+   * rejection would leak as an unhandled rejection instead of reaching a caller.
+   */
+  describe('check-in log strict reads (#4115)', () => {
+    async function armPendingCheckin(telegram) {
+      const { getGoals } = await import('./identity.js');
+      getGoals.mockResolvedValue({ goals: [{ id: 'g1', title: 'Example Goal', status: 'active', progress: 40 }] });
+      await telegram.init(false);
+      await telegram.sendCheckin();
+      h.sendMessage.mockClear();
+    }
+
+    it('does not overwrite an unreadable check-in log when an answer arrives', async () => {
+      const telegram = await loadTelegramActive();
+      await armPendingCheckin(telegram);
+
+      // The log becomes unreadable between asking and answering.
+      fu.strictRead = { ok: false, value: { checkins: [] } };
+      fu.writes = [];
+
+      const msgHandler = h.eventHandlers.message[0];
+      await msgHandler({ chat: { id: 42 }, text: 'Made good progress' });
+
+      expect(fu.writes, 'a one-entry log must never replace the real history').toEqual([]);
+      expect(h.sendMessage).toHaveBeenCalledWith(
+        '42',
+        expect.stringContaining('Nothing was overwritten'),
+        expect.anything(),
+      );
+    });
+
+    it('records the answer normally when the log is readable', async () => {
+      const telegram = await loadTelegramActive();
+      await armPendingCheckin(telegram);
+      fu.writes = [];
+
+      const msgHandler = h.eventHandlers.message[0];
+      await msgHandler({ chat: { id: 42 }, text: 'Made good progress' });
+
+      expect(fu.writes).toHaveLength(1);
+      expect(fu.writes[0].data.checkins[0]).toMatchObject({ goalId: 'g1', response: 'Made good progress' });
+    });
+
+    it('skips the scheduled send rather than asking about an arbitrary goal', async () => {
+      const telegram = await loadTelegramActive();
+      const { getGoals } = await import('./identity.js');
+      getGoals.mockResolvedValue({ goals: [{ id: 'g1', title: 'Example Goal', status: 'active', progress: 40 }] });
+      await telegram.init(false);
+      h.sendMessage.mockClear();
+
+      fu.strictRead = { ok: false, value: { checkins: [] } };
+      await telegram.sendCheckin();
+
+      expect(h.sendMessage, 'staleness is unrankable without the log').not.toHaveBeenCalled();
+    });
+
+    it('treats a readable-but-shapeless log as untrustworthy rather than replacing it', async () => {
+      const telegram = await loadTelegramActive();
+      await armPendingCheckin(telegram);
+
+      // Parses fine, but there is no `checkins` array to append to. We cannot
+      // interpret the file, so we must not write over it either.
+      fu.strictRead = { ok: true, value: { unexpected: 'shape' } };
+      fu.writes = [];
+
+      const msgHandler = h.eventHandlers.message[0];
+      await msgHandler({ chat: { id: 42 }, text: 'Made good progress' });
+
+      expect(fu.writes).toEqual([]);
+    });
+  });
+
+  /**
+   * Guarded handlers (#8907).
+   *
+   * node-telegram-bot-api's EventEmitter never awaits `bot.onText`/`bot.on(...)`
+   * callbacks, so an unhandled rejection inside one used to escape straight to
+   * `process.on('unhandledRejection')` instead of being logged and contained.
+   * These prove every registered handler is wrapped so a downstream failure
+   * (a thrown error or a rejected `bot.sendMessage`) is caught and logged
+   * instead of propagating out of the handler.
+   */
+  describe('guarded handlers (#8907)', () => {
+    it('catches a command handler rejection instead of letting it escape', async () => {
+      const telegram = await loadTelegramActive();
+      await telegram.init(false);
+
+      const statusEntry = h.textHandlers.find((t) => t.regex.source.includes('status'));
+      h.sendMessage.mockRejectedValueOnce(new Error('Telegram 429: rate limited'));
+
+      // The handler itself must not throw or return a rejected promise — the
+      // caller (node-telegram-bot-api) never awaits it, so a throw here would
+      // otherwise become an unhandled rejection.
+      await expect(statusEntry.fn({ chat: { id: 42 }, text: '/status' })).resolves.toBeUndefined();
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('handler error'));
+    });
+
+    it('catches a message-handler rejection (check-in response) instead of letting it escape', async () => {
+      const telegram = await loadTelegramActive();
+      const { getGoals } = await import('./identity.js');
+      getGoals.mockResolvedValue({ goals: [{ id: 'g1', title: 'Example Goal', status: 'active', progress: 40 }] });
+      await telegram.init(false);
+      await telegram.sendCheckin();
+
+      const msgHandler = h.eventHandlers.message[0];
+      h.sendMessage.mockRejectedValueOnce(new Error('Telegram 403: bot was blocked by the user'));
+
+      await expect(msgHandler({ chat: { id: 42 }, text: 'Made good progress' })).resolves.toBeUndefined();
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('handler error'));
+    });
+
+    it('catches a callback_query handler exception instead of letting it escape', async () => {
+      const telegram = await loadTelegramActive();
+      await telegram.init(false);
+
+      const cbHandler = h.eventHandlers.callback_query[0];
+      // handleCallbackQuery's internal try/catch only guards approveMemory /
+      // rejectMemory; a malformed `data` (not a string, e.g. a corrupt
+      // callback payload) throws synchronously on `.startsWith` before that
+      // try/catch is reached. That escape is exactly what the outer
+      // `safeHandler` wrap exists to contain.
+      await expect(
+        cbHandler({ id: 'cb-1', message: { chat: { id: 42 }, text: 'orig', message_id: 1 }, data: 12345 })
+      ).resolves.toBeUndefined();
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('handler error'));
+    });
+  });
+
+  /**
+   * Checkins write queue (#8907).
+   *
+   * `handleCheckinResponse` is a `loadCheckins → push → atomicWrite` cycle. Two
+   * concurrent invocations racing against the same on-disk state used to
+   * interleave: both read the same pre-write snapshot, so whichever
+   * `atomicWrite` landed last silently discarded the OTHER entry (and any
+   * pre-existing history it had already read past). The fix routes the cycle
+   * through `createFileWriteQueue` so the second cycle only starts reading
+   * after the first has fully persisted, and re-checks the pending check-in is
+   * still the one it captured before consuming it — so a genuine race (two
+   * messages answering the SAME outstanding question) records the answer
+   * exactly once instead of duplicating it.
+   */
+  describe('checkins write queue (#8907)', () => {
+    it('preserves prior history and records exactly one answer when two responses race the same question', async () => {
+      const telegram = await loadTelegramActive();
+      const { getGoals } = await import('./identity.js');
+      getGoals.mockResolvedValue({ goals: [{ id: 'g1', title: 'Example Goal', status: 'active', progress: 40 }] });
+      await telegram.init(false);
+      await telegram.sendCheckin();
+      h.sendMessage.mockClear();
+      fu.writes = [];
+      // Seed pre-existing history so a clobbered (rather than serialized) RMW
+      // would be visible: the buggy version's stale read would drop this
+      // entry from whichever write "won".
+      fu.store = { checkins: [{ id: 'seed', question: 'Old Q', response: 'Old A', goalId: 'g0', askedAt: '2026-01-01T00:00:00.000Z', answeredAt: '2026-01-01T00:00:01.000Z' }] };
+
+      const msgHandler = h.eventHandlers.message[0];
+      // Fire both "responses" without awaiting between them, so both handler
+      // invocations are in flight before either reaches its persisted write —
+      // exactly the race the un-serialized RMW cycle used to lose.
+      const first = msgHandler({ chat: { id: 42 }, text: 'first response' });
+      const second = msgHandler({ chat: { id: 42 }, text: 'second response' });
+      await Promise.all([first, second]);
+
+      // Only the winner of the race persists a write; the other finds the
+      // pending check-in already consumed and skips silently (no duplicate,
+      // no ack for the loser).
+      expect(fu.writes).toHaveLength(1);
+      expect(h.sendMessage).toHaveBeenCalledTimes(1);
+      expect(h.sendMessage).toHaveBeenCalledWith('42', expect.stringContaining('Check-in recorded'), expect.anything());
+
+      const finalCheckins = fu.writes[0].data.checkins;
+      expect(finalCheckins).toHaveLength(2);
+      expect(finalCheckins[0]).toMatchObject({ id: 'seed', response: 'Old A' });
+      expect(finalCheckins[1]).toMatchObject({ goalId: 'g1', response: 'first response' });
+    });
+
+    it('keeps the pending question intact for a retry when the save itself fails', async () => {
+      const telegram = await loadTelegramActive();
+      const { getGoals } = await import('./identity.js');
+      getGoals.mockResolvedValue({ goals: [{ id: 'g1', title: 'Example Goal', status: 'active', progress: 40 }] });
+      await telegram.init(false);
+      await telegram.sendCheckin();
+      h.sendMessage.mockClear();
+
+      const { atomicWrite } = await import('../lib/fileUtils.js');
+      atomicWrite.mockRejectedValueOnce(new Error('disk full'));
+
+      const msgHandler = h.eventHandlers.message[0];
+      // The rejection propagates out of handleCheckinResponse; safeHandler (the
+      // #8907 handler guard) is what keeps it from becoming an unhandled
+      // rejection here, exactly like a real bot.on('message') dispatch.
+      await expect(msgHandler({ chat: { id: 42 }, text: 'first attempt' })).resolves.toBeUndefined();
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('handler error'));
+      // The failed save must not have consumed the pending check-in — the
+      // delete only runs after `saveCheckins` succeeds — so a retry with the
+      // same text still finds a pending question and records it.
+      h.sendMessage.mockClear();
+      await msgHandler({ chat: { id: 42 }, text: 'retry attempt' });
+
+      expect(fu.writes).toHaveLength(1);
+      expect(fu.writes[0].data.checkins[0]).toMatchObject({ goalId: 'g1', response: 'retry attempt' });
+      expect(h.sendMessage).toHaveBeenCalledWith('42', expect.stringContaining('Check-in recorded'), expect.anything());
+    });
+
+    it('does not clobber a new question armed while a prior response is still saving', async () => {
+      const telegram = await loadTelegramActive();
+      const { getGoals } = await import('./identity.js');
+      getGoals.mockResolvedValue({
+        goals: [
+          { id: 'g1', title: 'First Goal', status: 'active', progress: 10 },
+          { id: 'g2', title: 'Second Goal', status: 'active', progress: 20 },
+        ],
+      });
+      await telegram.init(false);
+      await telegram.sendCheckin(); // arms g1 (oldest/only-ranked checkin so far)
+      h.sendMessage.mockClear();
+
+      const { readJSONFileStrict } = await import('../lib/fileUtils.js');
+      let releaseRead;
+      readJSONFileStrict.mockImplementationOnce(() => new Promise((resolve) => {
+        releaseRead = () => resolve({ ok: true, value: fu.store ?? { checkins: [] } });
+      }));
+
+      const msgHandler = h.eventHandlers.message[0];
+      // Answer g1; its loadCheckins() is now blocked on the deferred read above.
+      const firstResponse = msgHandler({ chat: { id: 42 }, text: 'g1 answer' });
+      // Let the handler's microtask chain actually reach the deferred read
+      // (queueCheckinsWrite schedules the critical section a tick later) before
+      // arming the new question below.
+      await vi.waitFor(() => expect(releaseRead).toBeTypeOf('function'));
+
+      // While that read is still in flight, a new question is armed for the
+      // SAME chat (explicit goalId skips loadCheckins entirely, so this isn't
+      // blocked by the deferred read).
+      await telegram.sendCheckin('g2');
+      expect(h.sendMessage).toHaveBeenCalledWith('42', expect.stringContaining('Second Goal'), expect.anything());
+
+      // Release the delayed read and let the first response finish persisting.
+      releaseRead();
+      await firstResponse;
+
+      // g1's answer still recorded (captured synchronously at dispatch, before
+      // g2 was armed) …
+      expect(fu.writes).toHaveLength(1);
+      expect(fu.writes[0].data.checkins[0]).toMatchObject({ goalId: 'g1', response: 'g1 answer' });
+
+      // … and g2's pending question survived — an unconditional delete here
+      // would have wiped it, silencing the still-unanswered second prompt.
+      fu.writes = [];
+      await msgHandler({ chat: { id: 42 }, text: 'g2 answer' });
+      expect(fu.writes).toHaveLength(1);
+      expect(fu.writes[0].data.checkins[1]).toMatchObject({ goalId: 'g2', response: 'g2 answer' });
+    });
+  });
+});

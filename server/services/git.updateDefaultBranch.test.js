@@ -1,0 +1,239 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+const execGitMock = vi.hoisted(() => vi.fn());
+
+vi.mock('../lib/execGit.js', () => ({ execGit: execGitMock,
+  execGitSafe: (...args) => execGitMock(...args).catch(err => ({ exitCode: 1, stdout: '', stderr: err.message })) }));
+
+// Mocked so the retry/no-retry decision is driven by a stub, not real file
+// mtimes — `lib/gitStaleLock.test.js` owns proving WHICH locks it agrees to
+// remove.
+vi.mock('../lib/gitStaleLock.js', () => ({ clearStaleGitLock: vi.fn(() => null) }));
+
+import { updateDefaultBranch } from './git.js';
+import { clearStaleGitLock } from '../lib/gitStaleLock.js';
+
+const ok = (stdout = '') => ({ stdout, stderr: '', exitCode: 0 });
+const fail = (stderr = '', exitCode = 1) => ({ stdout: '', stderr, exitCode });
+const key = (args) => args.join(' ');
+const commands = () => execGitMock.mock.calls.map(([args]) => key(args));
+
+const base = {
+  'fetch origin': ok(),
+  'symbolic-ref --short refs/remotes/origin/HEAD': ok('origin/main'),
+  'rev-parse --verify refs/remotes/origin/main': ok('a'.repeat(40)),
+  'status --porcelain': ok(),
+  'rev-parse --abbrev-ref HEAD': ok('feature/work'),
+  'checkout main': ok('Switched to branch main'),
+  'pull --ff-only origin main': ok('Already up to date')
+};
+
+const withGit = (overrides = {}) => {
+  const table = { ...base, ...overrides };
+  execGitMock.mockImplementation((args) => Promise.resolve(table[key(args)] ?? ok()));
+};
+
+beforeEach(() => {
+  execGitMock.mockReset();
+  clearStaleGitLock.mockReset();
+  clearStaleGitLock.mockReturnValue(null);
+  withGit();
+});
+
+describe('updateDefaultBranch', () => {
+  it('keeps managed runtime updates on the configured branch', async () => {
+    withGit({ 'config --get portos.runtimeBranch': ok('portos') });
+    expect(await updateDefaultBranch('/repo')).toMatchObject({ success: true, branch: 'portos' });
+    expect(commands()).toContain('pull --ff-only origin portos');
+    expect(commands()).not.toContain('checkout main');
+  });
+
+  it('checks out origin default branch and fast-forwards it without a rebase', async () => {
+    const result = await updateDefaultBranch('/repo');
+
+    expect(result).toMatchObject({ success: true, branch: 'main', conflict: false });
+    expect(commands()).toEqual(expect.arrayContaining([
+      'fetch origin',
+      'checkout main',
+      'pull --ff-only origin main'
+    ]));
+    expect(commands().some(command => command.includes('rebase'))).toBe(false);
+  });
+
+  it('repairs pinned submodules before and after pulling the parent repository', async () => {
+    withGit({ 'rev-parse --abbrev-ref HEAD': ok('main') });
+    const result = await updateDefaultBranch('/repo');
+
+    expect(result).toMatchObject({ success: true, branch: 'main', conflict: false });
+    const pulls = commands().map((command, index) => ({ command, index }))
+      .filter(({ command }) => command === 'pull --ff-only origin main');
+    const updates = commands().map((command, index) => ({ command, index }))
+      .filter(({ command }) => command === 'submodule update --init --recursive');
+
+    expect(updates).toHaveLength(2);
+    expect(pulls).toHaveLength(1);
+    expect(updates[0].index).toBeLessThan(pulls[0].index);
+    expect(updates[1].index).toBeGreaterThan(pulls[0].index);
+  });
+
+  it('stops before pulling when pinned submodules cannot be reconciled', async () => {
+    withGit({
+      'submodule update --init --recursive': fail('fatal: local submodule changes would be overwritten')
+    });
+
+    const result = await updateDefaultBranch('/repo');
+
+    expect(result).toMatchObject({ success: false, branch: 'main', conflict: true });
+    expect(result.error).toContain('local submodule changes would be overwritten');
+    expect(commands()).not.toContain('pull --ff-only origin main');
+  });
+
+  it('rebases with --autostash when the checkout is dirty or diverged', async () => {
+    withGit({
+      'status --porcelain': ok(' M package-lock.json'),
+      'pull --ff-only origin main': fail('fatal: Not possible to fast-forward, aborting.')
+    });
+
+    const result = await updateDefaultBranch('/repo');
+
+    expect(result).toMatchObject({ success: true, branch: 'main', conflict: false, rebased: true });
+    expect(commands()).toContain('pull --rebase --autostash origin main');
+    expect(commands()).toContain('diff --name-only --diff-filter=U');
+    expect(commands()).not.toContain('rebase --abort');
+  });
+
+  it('reports a conflict and aborts the rebase when --autostash cannot reconcile', async () => {
+    withGit({
+      'pull --ff-only origin main': fail('fatal: Not possible to fast-forward, aborting.'),
+      // Git splits a failed pull across both streams: fetch progress on stderr,
+      // the lines naming the colliding files on stdout.
+      'pull --rebase --autostash origin main': {
+        stdout: 'CONFLICT (content): Merge conflict in server/index.js',
+        stderr: 'From github.com:example/example\nerror: could not apply 1a2b3c4',
+        exitCode: 1
+      }
+    });
+
+    const result = await updateDefaultBranch('/repo');
+
+    expect(result).toMatchObject({ success: false, branch: 'main', conflict: true });
+    // The file that collided has to survive into the message — it is the whole
+    // actionable content of the CoS task the caller queues from this.
+    expect(result.error).toContain('CONFLICT (content): Merge conflict in server/index.js');
+    expect(result.error).toContain('could not apply 1a2b3c4');
+    expect(commands()).toContain('rebase --abort');
+  });
+
+  it('reports a conflict when the autostash re-apply collides, which git exits 0 on', async () => {
+    // `--autostash` re-applies the stash AFTER the rebase finishes and git only
+    // WARNS when that apply conflicts, so exit status alone would call this a
+    // clean update and let the caller build and restart on a conflicted tree.
+    withGit({
+      'pull --ff-only origin main': fail('fatal: Not possible to fast-forward, aborting.'),
+      'pull --rebase --autostash origin main': ok('Applying autostash resulted in conflicts.'),
+      'diff --name-only --diff-filter=U': ok('server/index.js\nclient/src/App.jsx\n')
+    });
+
+    const result = await updateDefaultBranch('/repo');
+
+    expect(result).toMatchObject({ success: false, branch: 'main', conflict: true });
+    expect(result.error).toContain('server/index.js, client/src/App.jsx');
+    // The rebase already completed, so there is nothing to abort.
+    expect(commands()).not.toContain('rebase --abort');
+  });
+
+  it('reports a conflict when local changes block the branch switch', async () => {
+    withGit({
+      'checkout main': fail('error: Your local changes to the following files would be overwritten by checkout')
+    });
+
+    const result = await updateDefaultBranch('/repo');
+
+    expect(result).toMatchObject({ success: false, branch: 'main', conflict: true });
+    expect(result.error).toMatch(/local changes/);
+    expect(commands()).not.toContain('pull --ff-only origin main');
+    expect(commands()).not.toContain('rebase --abort');
+  });
+
+  // A killed `fetch` leaves a lock every worktree of the repo shares — without
+  // this, every later "Update App" click fails forever, blaming a git process
+  // that exited long ago (#7513).
+  it('clears an abandoned fetch lock and retries once', async () => {
+    const lockError = new Error("fatal: Unable to create '/repo/.git/refs/remotes/origin/main.lock': File exists");
+    let fetches = 0;
+    execGitMock.mockImplementation((args) => {
+      if (key(args) === 'fetch origin' && ++fetches === 1) return Promise.reject(lockError);
+      return Promise.resolve(base[key(args)] ?? ok());
+    });
+    clearStaleGitLock.mockReturnValue('/repo/.git/refs/remotes/origin/main.lock');
+
+    const result = await updateDefaultBranch('/repo');
+
+    expect(result).toMatchObject({ success: true, branch: 'main' });
+    expect(clearStaleGitLock).toHaveBeenCalledWith(lockError.message);
+    expect(commands().filter((c) => c === 'fetch origin')).toHaveLength(2);
+  });
+
+  it('surfaces the fetch lock failure without retrying when the lock is too young', async () => {
+    const lockError = new Error("fatal: Unable to create '/repo/.git/refs/remotes/origin/main.lock': File exists");
+    execGitMock.mockImplementation((args) => {
+      if (key(args) === 'fetch origin') return Promise.reject(lockError);
+      return Promise.resolve(base[key(args)] ?? ok());
+    });
+    clearStaleGitLock.mockReturnValue(null);
+
+    await expect(updateDefaultBranch('/repo')).rejects.toThrow(/Unable to create/);
+    expect(commands().filter((c) => c === 'fetch origin')).toHaveLength(1);
+  });
+
+  it('clears an abandoned checkout lock without retrying the checkout', async () => {
+    withGit({ 'checkout main': fail("fatal: Unable to create '/repo/.git/index.lock': File exists") });
+    clearStaleGitLock.mockReturnValue('/repo/.git/index.lock');
+
+    const result = await updateDefaultBranch('/repo');
+
+    expect(result).toMatchObject({ success: false, branch: 'main', conflict: true });
+    expect(result.error).toContain('/repo/.git/index.lock');
+    expect(result.error).toMatch(/retry/i);
+    expect(commands().filter((c) => c === 'checkout main')).toHaveLength(1);
+    expect(commands()).not.toContain('pull --ff-only origin main');
+  });
+
+  it('reports checkout contention unchanged when the lock is too young to clear', async () => {
+    withGit({ 'checkout main': fail("fatal: Unable to create '/repo/.git/index.lock': File exists") });
+    clearStaleGitLock.mockReturnValue(null);
+
+    const result = await updateDefaultBranch('/repo');
+
+    expect(result).toMatchObject({ success: false, branch: 'main', conflict: true });
+    expect(result.error).toContain('Unable to create');
+  });
+
+  it('clears an abandoned fast-forward-pull lock without falling through to rebase', async () => {
+    withGit({ 'pull --ff-only origin main': fail("fatal: Unable to create '/repo/.git/refs/remotes/origin/main.lock': File exists") });
+    clearStaleGitLock.mockReturnValue('/repo/.git/refs/remotes/origin/main.lock');
+
+    const result = await updateDefaultBranch('/repo');
+
+    expect(result).toMatchObject({ success: false, branch: 'main', conflict: true });
+    expect(result.error).toContain('/repo/.git/refs/remotes/origin/main.lock');
+    expect(commands()).not.toContain('pull --rebase --autostash origin main');
+  });
+
+  it('clears an abandoned rebase lock, aborts the rebase, and does not retry', async () => {
+    withGit({
+      'pull --ff-only origin main': fail('fatal: Not possible to fast-forward, aborting.'),
+      'pull --rebase --autostash origin main': fail("fatal: Unable to create '/repo/.git/index.lock': File exists")
+    });
+    // The ff-only failure above names no lock — only the rebase failure should
+    // clear one, or this would (wrongly) short-circuit before the rebase runs.
+    clearStaleGitLock.mockImplementation((message) => (message.includes('.lock') ? '/repo/.git/index.lock' : null));
+
+    const result = await updateDefaultBranch('/repo');
+
+    expect(result).toMatchObject({ success: false, branch: 'main', conflict: true });
+    expect(result.error).toContain('/repo/.git/index.lock');
+    expect(commands()).toContain('rebase --abort');
+    expect(commands().filter((c) => c === 'pull --rebase --autostash origin main')).toHaveLength(1);
+  });
+});

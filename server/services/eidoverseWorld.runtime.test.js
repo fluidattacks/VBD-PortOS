@@ -1,0 +1,1529 @@
+import { eidoverseWorldEvents } from './eidoverseWorldEvents.js';
+import { createHash } from 'node:crypto';
+import { homedir, hostname, userInfo } from 'node:os';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+const mocks = vi.hoisted(() => ({
+  persistedState: null,
+  mindName: null,
+  writes: 0,
+  worlds: new Map(),
+  socketUrls: [],
+  sockets: [],
+  connectionError: null,
+  nextSeq: 0,
+  sent: [],
+  deferredVerbAcks: [],
+  deferVerbAcks: 0,
+  rejectVerb: null,
+  rejectedVerb: false,
+  rewriteVerb: null,
+  rewriteArgs: null,
+  appStatuses: [],
+  appStatusReads: 0,
+  featureEnabled: true,
+  eidoverseStatus: {
+    installed: true,
+    runtimeStatus: 'online',
+    appId: 'app-eidoverse',
+    worldDataReady: true,
+  },
+  self: { instanceId: 'instance-example', name: 'Example PortOS' },
+  worldStatePath: '/mock/data/eidoverse/portos-world.json',
+}));
+
+const DEFAULT_HUMAN_NAME = 'portos-8e9b660b05fb';
+
+vi.mock('../lib/fileUtils.js', async (importActual) => {
+  const actual = await importActual();
+  const isWorldStatePath = (path) => String(path).replaceAll('\\', '/') === mocks.worldStatePath;
+  return {
+    ...actual,
+    dataPath: (...segments) => `/mock/data/${segments.join('/')}`,
+    ensureDir: vi.fn(async () => {}),
+    readJSONFile: vi.fn(async (path, fallback) => structuredClone(
+      isWorldStatePath(path) ? (mocks.persistedState ?? fallback) : fallback,
+    )),
+    atomicWrite: vi.fn(async (path, value) => {
+      if (!isWorldStatePath(path)) return;
+      mocks.persistedState = structuredClone(value);
+      mocks.writes += 1;
+    }),
+  };
+});
+
+vi.mock('./persistentMindContext.js', () => ({ readPersistentMindName: vi.fn(async () => mocks.mindName) }));
+
+vi.mock('./instances.js', () => ({
+  getPeers: vi.fn(async () => []),
+}));
+
+vi.mock('./instanceIdentity.js', () => ({
+  getSelf: vi.fn(async () => mocks.self),
+  ensureSelf: vi.fn(async () => mocks.self),
+  getInstanceId: vi.fn(async () => mocks.self?.instanceId ?? 'unknown-instance'),
+}));
+
+vi.mock('./apps.js', () => ({
+  getAllApps: vi.fn(async () => []),
+}));
+vi.mock('./appProcessStatus.js', () => ({
+  getAppStatuses: vi.fn(async () => {
+    mocks.appStatusReads += 1;
+    return mocks.appStatuses;
+  }),
+}));
+
+vi.mock('./eidoverse.js', () => ({
+  EIDOVERSE_PORT: 8940,
+  getEidoverseStatus: vi.fn(async () => structuredClone(mocks.eidoverseStatus)),
+}));
+
+vi.mock('./instanceFeatures.js', () => ({
+  getInstanceFeatures: vi.fn(async () => ({
+    features: [{ id: 'eidoverse', enabled: mocks.featureEnabled }],
+  })),
+}));
+
+// Exercise the public semantic dispatcher with the REAL world adapter; these
+// unrelated adapters must never reach live instance data. All-schema grants
+// bypass lease bookkeeping for these calls.
+vi.mock('./voice/tools.js', () => ({ getToolSpecs: () => [], getToolSpecsForIntent: () => ({ specs: [] }), dispatchTool: vi.fn() }));
+vi.mock('./persistentMindTaskCapability.js', () => ({ executePersistentMindTaskRequests: vi.fn() }));
+vi.mock('./persistentMindMaintenance.js', () => ({ cleanupPersistentMind: vi.fn() }));
+
+vi.mock('ws', () => {
+  class FakeWebSocket {
+    static OPEN = 1;
+    static CLOSED = 3;
+
+    constructor(url) {
+      this.readyState = 0;
+      this.listeners = new Map();
+      this.identity = null;
+      this.world = null;
+      mocks.socketUrls.push(String(url));
+      mocks.sockets.push(this);
+      queueMicrotask(() => {
+        if (mocks.connectionError) {
+          this.emit('error', mocks.connectionError);
+          this.close();
+          return;
+        }
+        this.readyState = FakeWebSocket.OPEN;
+        this.emit('open');
+      });
+    }
+
+    on(event, listener) {
+      const listeners = this.listeners.get(event) || [];
+      listeners.push(listener);
+      this.listeners.set(event, listeners);
+      return this;
+    }
+
+    emit(event, value) {
+      for (const listener of this.listeners.get(event) || []) listener(value);
+    }
+
+    send(raw, callback) {
+      const message = JSON.parse(String(raw));
+      if (message.type === 'join') {
+        this.identity = message.id;
+        this.world = message.world;
+        const state = mocks.worlds.get(message.world) || { roles: {}, entities: {} };
+        if (!Object.keys(state.roles).length) state.roles[message.id] = { role: 'owner' };
+        else state.roles[message.id] ||= { role: 'visitor' };
+        mocks.worlds.set(message.world, state);
+        mocks.sent.push({ type: 'join', world: message.world, actor: message.id, agent: message.agent, guest: message.guest });
+        queueMicrotask(() => {
+          callback?.(null);
+          this.emit('message', JSON.stringify({
+            type: 'snapshot',
+            throughSeq: mocks.nextSeq - 1, entries: [],
+            yourRights: { role: state.roles[message.id].role, gen: false },
+            state: structuredClone(state),
+          }));
+        });
+        return;
+      }
+      if (message.type === 'verb') {
+        const state = mocks.worlds.get(this.world);
+        if (message.verb === 'grant') {
+          state.roles[message.args.id] = {
+            ...(state.roles[message.args.id] || {}),
+            ...(message.args.role ? { role: message.args.role } : {}),
+            ...(message.args.gen !== undefined ? { gen: message.args.gen } : {}),
+          };
+        }
+        mocks.sent.push({
+          type: 'verb',
+          world: this.world,
+          actor: this.identity,
+          verb: message.verb,
+          args: structuredClone(message.args),
+          sentAt: Date.now(),
+        });
+        queueMicrotask(() => callback?.(null));
+        if (message.verb === mocks.rejectVerb && !mocks.rejectedVerb) {
+          mocks.rejectedVerb = true;
+          queueMicrotask(() => this.emit('message', JSON.stringify({
+            type: 'error',
+            error: 'synthetic projection rejection',
+          })));
+          return;
+        }
+        const acknowledge = () => {
+          if (this.readyState !== FakeWebSocket.OPEN) return;
+          // Simulates the world accepting a verb but landing it with
+          // different args than proposed (e.g. a server-side clamp).
+          const ackArgs = message.verb === mocks.rewriteVerb
+            ? { ...message.args, ...mocks.rewriteArgs } : message.args;
+          const log = JSON.stringify({ type: 'log', entry: { seq: mocks.nextSeq++, actor: this.identity, verb: message.verb, args: ackArgs } });
+          if (message.verb === 'say') {
+            for (const socket of mocks.sockets) {
+              if (socket.world === this.world && socket.readyState === FakeWebSocket.OPEN) socket.emit('message', log);
+            }
+          } else this.emit('message', log);
+        };
+        if (mocks.deferVerbAcks > 0) {
+          mocks.deferVerbAcks -= 1;
+          mocks.deferredVerbAcks.push(acknowledge);
+        } else {
+          queueMicrotask(acknowledge);
+        }
+      }
+    }
+
+    close() {
+      if (this.readyState === FakeWebSocket.CLOSED) return;
+      this.readyState = FakeWebSocket.CLOSED;
+      queueMicrotask(() => this.emit('close'));
+    }
+
+    terminate() {
+      this.close();
+    }
+  }
+
+  return { WebSocket: FakeWebSocket };
+});
+
+const TEST_VERB_INTERVAL_MS = 0;
+const PACING_CONTRACT_INTERVAL_MS = 5;
+const testOptions = (options = {}) => ({ verbIntervalMs: TEST_VERB_INTERVAL_MS, ...options });
+const rawWorld = await import('./eidoverseWorld.js');
+const world = new Proxy(rawWorld, {
+  get(target, property, receiver) {
+    const value = Reflect.get(target, property, receiver);
+    if (typeof value !== 'function') return value;
+    if (property === 'augmentEidoverseWorld') {
+      return (operations, options) => value(operations, testOptions(options));
+    }
+    if (property === 'sayInEidoverseWorld') {
+      return (text, options) => value(text, testOptions(options));
+    }
+    if (['ensureEidoverseWorldPresence', 'projectEidoverseWorld', 'reconcilePendingEidoverseWorld',
+      'admitEidoverseGuest'].includes(property)) {
+      return (options) => value(testOptions(options));
+    }
+    return value;
+  },
+});
+const { EIDOVERSE_WORLD_DESIGN_V1 } = await import('../lib/eidoverseWorldDesign.js');
+const { executeCosToolCall, getCosToolCatalog, __testing: semanticTesting } = await import('./cosToolRegistry.js');
+const { eidoverseInspectSceneOutputSchema } = await import('../lib/eidoverseSceneInspection.js');
+
+beforeEach(async () => {
+  semanticTesting.toolCalls.clear();
+  semanticTesting.toolCallFingerprints.clear();
+  vi.unstubAllEnvs();
+  await world.__resetEidoverseWorldForTests();
+  mocks.persistedState = null;
+  mocks.mindName = null;
+  mocks.writes = 0;
+  mocks.worlds.clear();
+  mocks.socketUrls.length = 0;
+  mocks.sockets.length = 0;
+  mocks.connectionError = null;
+  mocks.nextSeq = 0;
+  mocks.sent.length = 0;
+  mocks.deferredVerbAcks.length = 0;
+  mocks.deferVerbAcks = 0;
+  mocks.rejectVerb = null;
+  mocks.rejectedVerb = false;
+  mocks.rewriteVerb = null;
+  mocks.rewriteArgs = null;
+  mocks.appStatuses = [];
+  mocks.appStatusReads = 0;
+  mocks.featureEnabled = true;
+  mocks.eidoverseStatus = {
+    installed: true,
+    runtimeStatus: 'online',
+    appId: 'app-eidoverse',
+    worldDataReady: true,
+  };
+  const libraryFiles = Object.values(world.DEFAULT_EIDOVERSE_PROJECTION_RECIPE.assetRecipe.slots)
+    .flatMap((slot) => [
+      { path: slot.preferredPaths[0], size: Math.min(slot.maxBytes, 1_000_000) },
+      { path: slot.fallback, size: 1_000_000 },
+    ]);
+  const uploadedAssets = new Set();
+  vi.stubGlobal('fetch', vi.fn(async (input, init) => {
+    const url = new URL(String(input));
+    if (url.pathname === '/version') return Response.json({ sha: 'example-build', commitTime: '2026-01-01T00:00:00.000Z' });
+    if (url.pathname === '/library-list') return Response.json(libraryFiles);
+    if (url.pathname === '/library-models') return Response.json([]);
+    if (url.pathname === '/geom') return Response.json({ bbox: { min: [-1, 0, -1], max: [1, 2, 1] } });
+    if (url.pathname === '/upload') {
+      const path = `store/${createHash('sha256').update(init.body).digest('hex').slice(0, 16)}.glb`;
+      uploadedAssets.add(`/library/${path}`);
+      return Response.json({ path });
+    }
+    if (/^\/library\/store\/[0-9a-f]{16}\.glb$/.test(url.pathname) && !uploadedAssets.has(url.pathname)) return new Response(null, { status: 404 });
+    if (url.pathname.startsWith('/library/')) return new Response(init?.method === 'HEAD' ? null : '', { status: 200 });
+    return new Response(null, { status: 404 });
+  }));
+});
+
+it('the eidoverse.js mock port matches the shared leaf so the mock cannot silently diverge from the real constant', async () => {
+  const [{ EIDOVERSE_PORT: mockedPort }, { EIDOVERSE_PORT: leafPort }] = await Promise.all([
+    import('./eidoverse.js'),
+    import('../lib/eidoversePort.js'),
+  ]);
+  expect(mockedPort).toBe(leafPort);
+});
+
+describe('Eidoverse private-world lifecycle', () => {
+  it('reports connection refusal without an unhandled rejection and allows a subsequent retry', async () => {
+    mocks.connectionError = new Error('connect ECONNREFUSED');
+    await expect(world.ensureEidoverseWorldPresence()).rejects.toMatchObject({
+      status: 503,
+      code: 'EIDOVERSE_WORLD_UNAVAILABLE',
+      message: expect.stringContaining('ECONNREFUSED'),
+    });
+    // Let Node report unhandled rejections: Vitest must fail if readiness leaked one.
+    await new Promise((resolve) => setImmediate(resolve));
+    expect((await world.getEidoverseWorldStatus()).presence.connected).toBe(false);
+    mocks.connectionError = null;
+    await expect(world.ensureEidoverseWorldPresence()).resolves.toMatchObject({ connected: true, role: 'owner' });
+  });
+
+  it('keeps status read-only when config has not been persisted yet', async () => {
+    const status = await world.getEidoverseWorldStatus();
+    const compact = await world.getEidoverseWorldStatus({ compact: true });
+    expect(compact).toMatchObject({ setup: { installed: true, runtimeStatus: 'online' }, cos: { connected: false } });
+    expect(JSON.stringify(compact).length).toBeLessThan(4000);
+    expect(compact).not.toHaveProperty('instance');
+    expect(compact).not.toHaveProperty('recipe');
+    expect(compact).not.toHaveProperty('human');
+    expect(mocks.sent).toHaveLength(0);
+
+    expect(status).toMatchObject({
+      world: 'portos',
+      identity: { name: DEFAULT_HUMAN_NAME, source: 'instance-id' },
+      presence: { connected: false },
+    });
+    expect(mocks.writes).toBe(0);
+    expect(mocks.persistedState).toBeNull();
+  });
+
+  it('does not cold-project a fresh install at boot even when the runtime is online', async () => {
+    await world.ensureEidoverseWorldConfig();
+
+    await expect(world.reconcilePendingEidoverseWorld()).resolves.toEqual({
+      reconciled: false,
+      reason: 'current',
+    });
+    expect(fetch).not.toHaveBeenCalled();
+    expect(mocks.sent).toEqual([]);
+    expect(mocks.persistedState.pendingDesignVersion).toBe(3);
+  });
+
+  it('reconciles a migrated V1 world through the normal online boot path', async () => {
+    // Real-timer readiness polling through the boot path: wall-clock bound, so
+    // a contended full-suite worker can exceed 30s. Runner budget, not product
+    // behavior — the reconciliation assertions below are unaffected by it.
+    mocks.persistedState = {
+      schemaVersion: 1,
+      world: 'portos',
+      recipe: EIDOVERSE_WORLD_DESIGN_V1,
+    };
+
+    const result = await world.reconcilePendingEidoverseWorld();
+
+    expect(result.reconciled).toBe(true);
+    expect(mocks.sent).toEqual(expect.arrayContaining([
+      expect.objectContaining({ verb: 'terrain' }),
+      expect.objectContaining({
+        verb: 'spawn',
+        args: expect.objectContaining({ id: expect.stringMatching(/^portos-design-v2-/) }),
+      }),
+    ]));
+    expect(mocks.persistedState).toMatchObject({
+      schemaVersion: 3,
+      lastAppliedDesignVersion: 3,
+      pendingDesignVersion: null,
+      migrationReport: { status: 'applied' },
+      reconciliation: { status: 'complete', checkpoint: 'projection-committed' },
+    });
+  }, 60_000);
+
+  it('announces persisted configuration and projection checkpoints without record payloads', async () => {
+    const checkpoints = [];
+    const onUpdate = vi.fn(() => checkpoints.push(mocks.persistedState?.reconciliation?.checkpoint));
+    eidoverseWorldEvents.on('updated', onUpdate);
+    try {
+      await world.updateEidoverseWorldConfig({ humanName: 'Example User' });
+      expect(onUpdate).toHaveBeenCalledWith();
+      await world.projectEidoverseWorld();
+      expect(checkpoints).toContain('applying-environment');
+      expect(checkpoints.at(-1)).toBe('projection-committed');
+      for (const args of onUpdate.mock.calls) expect(args).toEqual([]);
+    } finally {
+      eidoverseWorldEvents.off('updated', onUpdate);
+    }
+  });
+
+  it('reads projection progress without runtime, app-registry, or library probes', async () => {
+    await world.ensureEidoverseWorldConfig();
+    fetch.mockClear();
+    mocks.appStatusReads = 0;
+
+    const progress = await world.getEidoverseWorldProjectionStatus();
+
+    expect(progress).toMatchObject({
+      design: { selectedVersion: 3, pendingVersion: 3 },
+      projection: { lastRunAt: null },
+    });
+    expect(mocks.appStatusReads).toBe(0);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('leaves a pending upgrade untouched when the Eidoverse feature is disabled', async () => {
+    await world.ensureEidoverseWorldConfig();
+    mocks.persistedState.lastAppliedDesignVersion = 1;
+    mocks.persistedState.migrationReport = {
+      status: 'ready',
+      fromDesignVersion: 1,
+      toDesignVersion: 3,
+    };
+    mocks.featureEnabled = false;
+
+    await expect(world.reconcilePendingEidoverseWorld()).resolves.toEqual({
+      reconciled: false,
+      reason: 'feature-disabled',
+    });
+    expect(fetch).not.toHaveBeenCalled();
+    expect(mocks.sent).toEqual([]);
+    expect(mocks.persistedState.pendingDesignVersion).toBe(3);
+  });
+
+  it('leaves a prepared boot-time design update pending without starting an offline runtime', async () => {
+    await world.ensureEidoverseWorldConfig();
+    mocks.persistedState.lastAppliedDesignVersion = 1;
+    mocks.persistedState.migrationReport = {
+      status: 'ready',
+      fromDesignVersion: 1,
+      toDesignVersion: 3,
+    };
+    mocks.eidoverseStatus.runtimeStatus = 'stopped';
+
+    await expect(world.reconcilePendingEidoverseWorld()).resolves.toEqual({
+      reconciled: false,
+      reason: 'runtime-offline',
+    });
+    expect(fetch).not.toHaveBeenCalled();
+    expect(mocks.sent).toEqual([]);
+    expect(mocks.persistedState.pendingDesignVersion).toBe(3);
+  });
+
+  it('marks a persisted in-flight projection as interrupted before boot reconciliation', async () => {
+    await world.ensureEidoverseWorldConfig();
+    mocks.persistedState.reconciliation = {
+      ...mocks.persistedState.reconciliation,
+      status: 'applying',
+      checkpoint: 'applying-live',
+      operationCount: 20,
+      appliedOperations: 5,
+    };
+    fetch.mockClear();
+
+    await expect(world.reconcilePendingEidoverseWorld()).resolves.toEqual({
+      reconciled: false,
+      reason: 'interrupted',
+    });
+    expect(mocks.persistedState.reconciliation).toMatchObject({
+      status: 'failed',
+      checkpoint: 'interrupted',
+      errorCode: 'EIDOVERSE_PROJECTION_INTERRUPTED',
+      operationCount: 20,
+      appliedOperations: 5,
+    });
+    expect(mocks.persistedState.pendingDesignVersion).toBe(3);
+    expect(fetch).not.toHaveBeenCalled();
+    expect(mocks.sent).toEqual([]);
+  });
+
+  it('gives the human and persistent CoS owner roles and hands ownership to a renamed human', async () => {
+    const first = await world.ensureEidoverseWorldPresence();
+
+    expect(first).toMatchObject({ connected: true, id: 'portos-cos', role: 'owner' });
+    expect(mocks.worlds.get('portos').roles).toMatchObject({
+      [DEFAULT_HUMAN_NAME]: { role: 'owner' },
+      'portos-cos': { role: 'owner' },
+    });
+    expect(JSON.stringify(mocks.sent)).not.toContain(mocks.self.name);
+
+    await world.updateEidoverseWorldConfig({ humanName: 'Second Example User' });
+    expect(await world.getEidoverseWorldStatus()).toMatchObject({
+      identity: { name: 'Second Example User', role: null },
+      presence: { connected: false, role: null },
+    });
+    const reconnected = await world.ensureEidoverseWorldPresence();
+
+    expect(reconnected.role).toBe('owner');
+    expect(mocks.worlds.get('portos').roles['Second Example User']).toMatchObject({ role: 'owner' });
+    expect(mocks.worlds.get('portos').roles[DEFAULT_HUMAN_NAME]).toMatchObject({ role: 'visitor' });
+    expect(mocks.sent).toContainEqual(expect.objectContaining({
+      actor: 'portos-cos',
+      verb: 'grant',
+      args: { id: 'Second Example User', role: 'owner' },
+    }));
+    expect(mocks.sent).toContainEqual(expect.objectContaining({
+      actor: 'portos-cos',
+      verb: 'grant',
+      args: { id: DEFAULT_HUMAN_NAME, role: 'visitor' },
+    }));
+    expect(mocks.persistedState.ownership.retired).toEqual([]);
+  });
+
+  it('follows the chosen mind name, reconnects presence, and retires the previous owner', async () => {
+    await world.ensureEidoverseWorldPresence();
+    mocks.mindName = 'Helm';
+    expect(await world.getEidoverseWorldStatus()).toMatchObject({ cos: { id: 'Helm', connected: false } });
+    await world.ensureEidoverseWorldPresence();
+    expect(mocks.persistedState.cos.id).toBe('Helm');
+    expect(mocks.worlds.get('portos').roles['portos-cos']).toMatchObject({ role: 'visitor' });
+    expect(await world.getEidoverseWorldStatus()).toMatchObject({ cos: { id: 'Helm', connected: true } });
+    mocks.mindName = 'Example Star';
+    const updated = await world.updateEidoverseWorldConfig({ humanName: 'Example User', cosId: 'stale-client-name' });
+    expect(updated.cos.id).toBe('Example Star');
+    expect(updated.human.name).toBe('Example User');
+    await world.ensureEidoverseWorldPresence();
+    expect(mocks.worlds.get('portos').roles.Helm).toMatchObject({ role: 'visitor' });
+    mocks.mindName = null;
+    expect((await world.ensureEidoverseWorldConfig()).cos.id).toBe('Example Star');
+  });
+
+  it('clears observed roles when switching worlds or CoS identities', async () => {
+    await world.ensureEidoverseWorldPresence();
+    await world.updateEidoverseWorldConfig({ world: 'second-world', cosId: 'second-cos' });
+
+    expect(await world.getEidoverseWorldStatus()).toMatchObject({
+      world: 'second-world',
+      identity: { role: null },
+      cos: { id: 'second-cos', connected: false, role: null },
+      presence: { connected: false, role: null },
+    });
+  });
+
+  it('migrates a stale V1 recipe submitted after the update instead of pinning V1 defaults', async () => {
+    const updated = await world.updateEidoverseWorldConfig({ recipe: EIDOVERSE_WORLD_DESIGN_V1 });
+
+    expect(updated.design.userOverrides).toEqual({});
+    expect(updated.recipe).toMatchObject({
+      version: 3,
+      limits: {
+        apps: world.DEFAULT_EIDOVERSE_PROJECTION_RECIPE.limits.apps,
+        tasks: world.DEFAULT_EIDOVERSE_PROJECTION_RECIPE.limits.tasks,
+      },
+      environment: {
+        terrain: {
+          size: world.DEFAULT_EIDOVERSE_PROJECTION_RECIPE.environment.terrain.size,
+          segments: world.DEFAULT_EIDOVERSE_PROJECTION_RECIPE.environment.terrain.segments,
+        },
+      },
+    });
+  });
+
+  it('persists every writable field accepted in a V2 recipe submission', async () => {
+    const recipe = structuredClone(world.DEFAULT_EIDOVERSE_PROJECTION_RECIPE);
+    recipe.name = 'Example Systems Garden';
+    recipe.maxEntities = 12;
+    recipe.districts[0].label = 'Example Nexus';
+    recipe.paths = [{ id: 'example-route', label: 'Example Route', toDistrictId: 'apps', nodes: [[1, 0, 1]] }];
+
+    const updated = await world.updateEidoverseWorldConfig({ recipe });
+
+    expect(updated.design.userOverrides).toMatchObject({
+      name: 'Example Systems Garden',
+      maxEntities: 12,
+    });
+    expect(updated.design.userOverrides.districts[0].label).toBe('Example Nexus');
+    expect(updated.design.userOverrides.paths[0].label).toBe('Example Route');
+    expect(updated.recipe).toMatchObject({
+      name: 'Example Systems Garden',
+      maxEntities: 12,
+    });
+    expect(updated.recipe.districts[0].label).toBe('Example Nexus');
+    expect(updated.recipe.paths[0].label).toBe('Example Route');
+  });
+
+  it('retires the prior human owner when the world and human identity change together', async () => {
+    await world.ensureEidoverseWorldPresence();
+    await world.updateEidoverseWorldConfig({
+      world: 'second-world',
+      humanName: 'Second Example User',
+    });
+    await world.ensureEidoverseWorldPresence();
+
+    expect(mocks.worlds.get('portos').roles[DEFAULT_HUMAN_NAME]).toMatchObject({ role: 'visitor' });
+    expect(mocks.worlds.get('second-world').roles).toMatchObject({
+      'Second Example User': { role: 'owner' },
+      'portos-cos': { role: 'owner' },
+    });
+    expect(mocks.sent).toContainEqual(expect.objectContaining({
+      world: 'portos',
+      actor: 'portos-cos',
+      verb: 'grant',
+      args: { id: DEFAULT_HUMAN_NAME, role: 'visitor' },
+    }));
+    expect(mocks.persistedState.ownership.retired).toEqual([]);
+  });
+
+  it('continues projection when a prior-world actor cannot retire an old owner', async () => {
+    await world.ensureEidoverseWorldConfig();
+    mocks.persistedState.ownership.retired = [{
+      world: 'example-prior-world',
+      id: 'Example Retired Owner',
+      actorId: 'example-retired-actor',
+      actorAvatar: 'eidoverse/assets/vrms/example-retired-actor.vrm',
+    }];
+    mocks.worlds.set('example-prior-world', {
+      roles: {
+        'example-existing-owner': { role: 'owner' },
+        'example-retired-actor': { role: 'visitor' },
+      },
+    });
+
+    const result = await world.projectEidoverseWorld();
+
+    expect(result.success).toBe(true);
+    expect(mocks.persistedState.ownership.retired).toEqual([expect.objectContaining({
+      world: 'example-prior-world',
+      id: 'Example Retired Owner',
+      attempts: 1,
+    })]);
+    expect(mocks.persistedState.reconciliation).toMatchObject({
+      status: 'complete',
+      retiredOwnerCleanup: {
+        status: 'partial',
+        failedCount: 1,
+        retryingCount: 1,
+        droppedCount: 0,
+        codes: ['EIDOVERSE_OWNER_HANDOFF_FAILED'],
+      },
+    });
+    expect(mocks.sent).toContainEqual(expect.objectContaining({ verb: 'terrain' }));
+
+    await world.projectEidoverseWorld();
+    expect(mocks.persistedState.ownership.retired[0]).toMatchObject({ attempts: 2 });
+
+    await world.projectEidoverseWorld();
+    expect(mocks.persistedState.ownership.retired).toEqual([]);
+    expect(mocks.persistedState.reconciliation.retiredOwnerCleanup).toMatchObject({
+      failedCount: 1,
+      retryingCount: 0,
+      droppedCount: 1,
+    });
+
+    await world.projectEidoverseWorld();
+    expect(mocks.persistedState.reconciliation.retiredOwnerCleanup).toBeUndefined();
+  });
+
+  it('retries only a retired owner whose demotion verb failed', async () => {
+    await world.ensureEidoverseWorldConfig();
+    mocks.persistedState.ownership.retired = [
+      { world: 'portos', id: 'Example Failed Owner' },
+      { world: 'portos', id: 'Example Successful Owner' },
+    ];
+    mocks.worlds.set('portos', {
+      roles: {
+        [DEFAULT_HUMAN_NAME]: { role: 'owner' },
+        'portos-cos': { role: 'owner' },
+        'Example Failed Owner': { role: 'owner' },
+        'Example Successful Owner': { role: 'owner' },
+      },
+    });
+    mocks.rejectVerb = 'grant';
+
+    await expect(world.projectEidoverseWorld()).resolves.toMatchObject({ success: true });
+
+    expect(mocks.persistedState.ownership.retired).toEqual([expect.objectContaining({
+      world: 'portos',
+      id: 'Example Failed Owner',
+      attempts: 1,
+    })]);
+    expect(mocks.persistedState.reconciliation.retiredOwnerCleanup).toMatchObject({
+      failedCount: 1,
+      retryingCount: 1,
+      droppedCount: 0,
+      codes: ['EIDOVERSE_WORLD_VERB_REJECTED'],
+    });
+
+    await expect(world.projectEidoverseWorld()).resolves.toMatchObject({ success: true });
+    expect(mocks.persistedState.ownership.retired).toEqual([]);
+    expect(mocks.persistedState.reconciliation.retiredOwnerCleanup).toBeUndefined();
+  });
+
+  it('makes the full reset a recovery for retired ownership and cached roles', async () => {
+    await world.ensureEidoverseWorldPresence();
+    mocks.persistedState.ownership.retired = [{
+      world: 'example-prior-world',
+      id: 'Example Retired Owner',
+    }];
+    mocks.persistedState.human.role = 'owner';
+    mocks.persistedState.cos.role = 'owner';
+    mocks.persistedState.reconciliation.retiredOwnerCleanup = { status: 'partial', failedCount: 1 };
+    mocks.persistedState.migrationReport = {
+      status: 'ready',
+      retiredOwnerCleanup: { status: 'partial', failedCount: 1 },
+    };
+
+    const reset = await world.updateEidoverseWorldConfig({
+      world: 'example-reset-world',
+      humanName: 'Example Reset Human',
+      reset: { scope: 'all' },
+    });
+    const status = await world.getEidoverseWorldStatus();
+
+    expect(reset).toMatchObject({
+      human: { role: null },
+      cos: { role: null },
+      design: {
+        migrationReport: { status: 'ready' },
+        reconciliation: { status: 'pending', checkpoint: 'configuration-saved' },
+      },
+    });
+    expect(status.presence).toMatchObject({ connected: false, role: null });
+    expect(reset.design.migrationReport.retiredOwnerCleanup).toBeUndefined();
+    expect(reset.design.reconciliation.retiredOwnerCleanup).toBeUndefined();
+    expect(mocks.persistedState.ownership.retired).toEqual([]);
+  });
+
+  it('closes the persistent connection when the CoS presence is disabled', async () => {
+    await world.ensureEidoverseWorldPresence();
+    await world.updateEidoverseWorldConfig({ cosEnabled: false });
+
+    expect((await world.getEidoverseWorldStatus()).presence.connected).toBe(false);
+    await expect(world.ensureEidoverseWorldPresence()).rejects.toMatchObject({ code: 'EIDOVERSE_COS_DISABLED' });
+  });
+
+  it('stops a multi-operation augmentation before sending the next verb when canceled', async () => {
+    await world.ensureEidoverseWorldPresence();
+    mocks.sent.length = 0;
+    mocks.deferVerbAcks = 1;
+    const controller = new AbortController();
+    const pending = world.augmentEidoverseWorld([
+      { verb: 'spawn', args: { id: 'example-one', lib: 'eidoverse/assets/models/example.glb' } },
+      { verb: 'spawn', args: { id: 'example-two', lib: 'eidoverse/assets/models/example.glb' } },
+    ], { signal: controller.signal });
+
+    await vi.waitFor(() => {
+      expect(mocks.sent).toContainEqual(expect.objectContaining({ verb: 'spawn', args: expect.objectContaining({ id: 'example-one' }) }));
+    });
+    controller.abort();
+
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+    expect(mocks.sent).not.toContainEqual(expect.objectContaining({ verb: 'spawn', args: expect.objectContaining({ id: 'example-two' }) }));
+  });
+
+  it('drops a canceled verb connection so its late acknowledgement cannot satisfy a retry', async () => {
+    await world.ensureEidoverseWorldPresence();
+    mocks.sent.length = 0;
+    mocks.deferVerbAcks = 2;
+    const operation = [{ verb: 'spawn', args: { id: 'example-one', lib: 'eidoverse/assets/models/example.glb' } }];
+    const controller = new AbortController();
+    const first = world.augmentEidoverseWorld(operation, { signal: controller.signal });
+
+    await vi.waitFor(() => expect(mocks.deferredVerbAcks).toHaveLength(1));
+    controller.abort();
+    await expect(first).rejects.toMatchObject({ name: 'AbortError' });
+
+    let retrySettled = false;
+    const retry = world.augmentEidoverseWorld(operation).finally(() => { retrySettled = true; });
+    await vi.waitFor(() => expect(mocks.deferredVerbAcks).toHaveLength(2));
+    mocks.deferredVerbAcks[0]();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(retrySettled).toBe(false);
+
+    mocks.deferredVerbAcks[1]();
+    await expect(retry).resolves.toMatchObject({ success: true, applied: 1 });
+  });
+
+  // #7454 — proposal vs consequence: each augment operation reports what was
+  // proposed alongside what the world actually committed, so a mind cannot
+  // narrate a side effect that did not land.
+  it('reports an augment operation as accepted when the world commits it unchanged', async () => {
+    await world.ensureEidoverseWorldPresence();
+    const result = await world.augmentEidoverseWorld([
+      { verb: 'spawn', args: { id: 'example-one', lib: 'eidoverse/assets/models/example.glb', pos: [1, 0, 2] } },
+    ]);
+    expect(result).toMatchObject({ success: true, applied: 1 });
+    expect(result.operations).toHaveLength(1);
+    expect(result.operations[0]).toMatchObject({ verb: 'spawn', id: 'example-one', outcome: 'accepted' });
+    expect(result.operations[0].committed).toEqual(result.operations[0].proposed);
+  });
+
+  it('reports a rewritten outcome when the world commits an operation with different args than proposed', async () => {
+    await world.ensureEidoverseWorldPresence();
+    mocks.rewriteVerb = 'spawn';
+    mocks.rewriteArgs = { pos: [0, 0, 0] };
+    const result = await world.augmentEidoverseWorld([
+      { verb: 'spawn', args: { id: 'example-one', lib: 'eidoverse/assets/models/example.glb', pos: [5, 0, 5] } },
+    ]);
+    expect(result.success).toBe(true);
+    expect(result.operations[0].outcome).toBe('rewritten');
+    expect(result.operations[0].proposed.pos).toEqual([5, 0, 5]);
+    expect(result.operations[0].committed.pos).toEqual([0, 0, 0]);
+  });
+
+  it('refuses a locally invalid proposal without blocking a valid operation earlier in the batch', async () => {
+    await world.ensureEidoverseWorldPresence();
+    const result = await world.augmentEidoverseWorld([
+      { verb: 'spawn', args: { id: 'example-one', lib: 'eidoverse/assets/models/example.glb' } },
+      { verb: 'place', args: { id: 'example-one' } },
+    ]);
+    expect(result.success).toBe(false);
+    expect(result.applied).toBe(1);
+    expect(result.operations[0]).toMatchObject({ outcome: 'accepted' });
+    expect(result.operations[1]).toMatchObject({ verb: 'place', outcome: 'refused', committed: null });
+    expect(result.operations[1].reason).toMatch(/pos, yaw, or scale/);
+  });
+
+  it('stops the rest of a batch once the world refuses one operation, leaving the remainder unattempted', async () => {
+    await world.ensureEidoverseWorldPresence();
+    mocks.rejectVerb = 'place';
+    const result = await world.augmentEidoverseWorld([
+      { verb: 'spawn', args: { id: 'example-one', lib: 'eidoverse/assets/models/example.glb' } },
+      { verb: 'place', args: { id: 'example-one', pos: [1, 0, 1] } },
+      { verb: 'light', args: { id: 'example-one-light' } },
+    ]);
+    expect(result.success).toBe(false);
+    expect(result.applied).toBe(1);
+    expect(result.operations[0].outcome).toBe('accepted');
+    expect(result.operations[1]).toMatchObject({ outcome: 'refused', reason: expect.stringContaining('synthetic projection rejection') });
+    expect(result.operations[2]).toMatchObject({ outcome: 'refused', reason: expect.stringMatching(/not attempted/i) });
+  });
+
+  it('reports eidoverse.say as committed only once the world acknowledges the message', async () => {
+    await world.ensureEidoverseWorldPresence();
+    await expect(world.sayInEidoverseWorld('Example message.')).resolves.toMatchObject({
+      success: true,
+      committed: true,
+      proposed: { text: 'Example message.' },
+    });
+  });
+
+  it('releases a canceled projection without waiting for a slow source read', async () => {
+    let resolveAppStatuses;
+    mocks.appStatuses = new Promise((resolve) => {
+      resolveAppStatuses = resolve;
+    });
+    const controller = new AbortController();
+    const pending = world.projectEidoverseWorld({ signal: controller.signal });
+
+    await vi.waitFor(() => expect(mocks.appStatusReads).toBe(1));
+    controller.abort();
+
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+    resolveAppStatuses([]);
+  });
+
+  // Anyone who can reach the Eidoverse door reads this payload, so a field
+  // naming the machine, its network, or its operator would leak on every join.
+  it('names its host opaquely on GET /host, and carries no machine identity', async () => {
+    const descriptor = await world.readEidoverseHostDescriptor();
+
+    expect(Object.keys(descriptor).sort()).toEqual(['caps', 'id', 'kind', 'label', 'version']);
+    expect(descriptor).toMatchObject({
+      id: expect.stringMatching(/^hst_[0-9a-f]{12}$/),
+      kind: 'portos',
+      label: world.DEFAULT_EIDOVERSE_PROJECTION_RECIPE.name,
+      version: expect.any(String),
+      caps: { eido: false },
+    });
+
+    const serialized = JSON.stringify(descriptor);
+    for (const identity of [hostname(), hostname().split('.')[0], homedir(), userInfo().username]) {
+      if (identity) expect(serialized).not.toContain(identity);
+    }
+    expect(serialized).not.toContain(mocks.self.instanceId);
+    expect(serialized).not.toContain(mocks.self.name);
+    expect(serialized).not.toMatch(/\d{1,3}(?:\.\d{1,3}){3}|\.ts\.net|\/Users\/|\/home\//);
+    // Stable across reads: the id is a digest of this install, not a nonce.
+    expect((await world.readEidoverseHostDescriptor()).id).toBe(descriptor.id);
+  });
+
+  // The label is the operator's, not a constant: a renamed world has to reach
+  // the door, or `GET /host` and the world's own meta entity disagree.
+  it('serves the operator-chosen world title as the host descriptor label', async () => {
+    const recipe = structuredClone(world.DEFAULT_EIDOVERSE_PROJECTION_RECIPE);
+    recipe.name = 'Example Systems Garden';
+    const updated = await world.updateEidoverseWorldConfig({ recipe });
+
+    const descriptor = await world.readEidoverseHostDescriptor();
+    expect(descriptor.label).toBe('Example Systems Garden');
+    // The same string the projection hangs on the world's meta entity.
+    expect(updated.design.name).toBe(descriptor.label);
+  });
+
+  // The world says who hosts it. A live projection has to actually supply that
+  // meta, or the reconciliation sweep deletes the carrier on the next run.
+  it('plants the world meta entity, naming its host opaquely and never by machine', async () => {
+    await world.projectEidoverseWorld();
+
+    const metaComp = mocks.sent.find(({ verb, args }) => (
+      verb === 'comp' && args?.id === 'portos-design-v2-meta' && args?.type === 'portos'
+    ));
+    expect(metaComp?.args.data).toMatchObject({
+      kind: 'world-meta',
+      managedBy: 'portos',
+      designVersion: 3,
+      meta: { title: expect.any(String), hostId: expect.stringMatching(/^hst_[0-9a-f]{12}$/) },
+    });
+    expect(JSON.stringify(metaComp.args.data)).not.toContain(mocks.self.instanceId);
+    expect(JSON.stringify(metaComp.args.data)).not.toContain(mocks.self.name);
+  });
+
+  it('keeps scheduled results compact while persisting aliases and the full legend across reconnect', async () => {
+    mocks.appStatuses = [{ id: 'app-example', name: 'Example private title', overallStatus: 'online' }];
+    fetch.mockImplementationOnce(async () => Response.json({
+      sha: 'example-label-build', commitTime: '2026-01-01T00:00:00.000Z',
+      capabilities: { objectLabels: 1, portosNavigation: 1, labelPreferences: 99, largeWorldColliders: 1 },
+    }));
+    const first = await world.projectEidoverseWorld();
+    expect(first.design.reconciliation.runtimeVersion.capabilities).toEqual({ objectLabels: 1, portosNavigation: 1, labelPreferences: null, largeWorldColliders: 1 });
+    expect(first.design.assetResolutions.citySurface.bytes).toBeGreaterThan(1_000_000);
+    const object = first.summary.objects.find(({ kind }) => kind === 'app');
+    expect(object).toBeDefined();
+    await world.updateEidoverseWorldConfig({ labelAliases: { [object.resourceKey]: 'Example tower' } });
+    const { SCRIPT_HANDLERS } = await import('./autonomousJobs/scriptHandlers.js');
+    const next = await SCRIPT_HANDLERS['eidoverse-projection']({ verbIntervalMs: TEST_VERB_INTERVAL_MS });
+    expect(next.summary.objectCount).toBeGreaterThan(0);
+    expect(JSON.stringify(next).length).toBeLessThan(4096);
+    expect(JSON.stringify(next)).not.toContain('Example tower');
+    expect(next).not.toHaveProperty('projection');
+    expect(next).not.toHaveProperty('summary.objects');
+    await world.closeEidoverseWorldConnections();
+    const reloaded = await world.getEidoverseWorldStatus();
+    // A legacy renderer remains usable even though it advertises no label capabilities.
+    expect(reloaded.design.reconciliation.runtimeVersion.capabilities.objectLabels).toBeNull();
+    expect(reloaded.design.labelAliases).toEqual({ [object.resourceKey]: 'Example tower' });
+    const savedObjects = reloaded.projection.lastSummary.objects;
+    expect(savedObjects).toHaveLength(next.summary.objectCount);
+    expect(savedObjects.find(({ id }) => id === object.id).name).toBe('Example tower');
+    expect(JSON.stringify(savedObjects)).not.toContain('Example private title');
+    await world.updateEidoverseWorldConfig({ reset: { scope: 'assets' } });
+    expect((await world.getEidoverseWorldStatus()).design.labelAliases).toEqual({ [object.resourceKey]: 'Example tower' });
+    await world.updateEidoverseWorldConfig({ reset: { scope: 'district', districtId: 'apps' } });
+    expect((await world.getEidoverseWorldStatus()).design.labelAliases).toEqual({});
+  });
+
+  it.each(['district anchor', 'terrain'])('preserves custom %s geometry on a landscape-capable runtime', async (customization) => {
+    const recipe = structuredClone(world.DEFAULT_EIDOVERSE_PROJECTION_RECIPE);
+    if (customization === 'district anchor') recipe.districts.find(({ id }) => id === 'apps').anchor = [50, 0, 50];
+    else recipe.environment.terrain.flatRadius = 100;
+    await world.updateEidoverseWorldConfig({ recipe });
+    fetch.mockImplementationOnce(async () => Response.json({
+      sha: 'example-landscape-build', commitTime: '2026-01-01T00:00:00.000Z',
+      capabilities: { largeWorldColliders: 1 },
+    }));
+
+    const result = await world.projectEidoverseWorld();
+
+    expect(result.design.reconciliation.runtimeVersion.capabilities.largeWorldColliders).toBe(1);
+    expect(result.recipe.districts).toEqual(recipe.districts);
+    expect(result.recipe.environment.terrain).toEqual(recipe.environment.terrain);
+    const upload = fetch.mock.calls.find(([input]) => new URL(String(input)).pathname === '/upload');
+    const bytes = upload[1].body;
+    const gltf = JSON.parse(bytes.subarray(20, 20 + bytes.readUInt32LE(12)).toString());
+    expect(gltf.meshes).toHaveLength(2); // No raised coast or ocean overlays custom land.
+    expect(result.design.assetResolutions.citySurface.bytes).toBeLessThan(1_000_000);
+  });
+
+  it('preflights and locks recipe assets before completing a V2 reconciliation', async () => {
+    const result = await world.projectEidoverseWorld();
+
+    const expectedSlots = ['nexus', 'app', 'agent', 'task', 'goal', 'memory', 'storage', 'peer', 'activity', 'district', 'desk', 'barrel', 'tree', 'citySurface'];
+    expect(Object.keys(result.design.assetResolutions)).toEqual(expectedSlots);
+    expect(Object.keys(mocks.persistedState.assetResolutions)).toEqual(expectedSlots);
+    expect(fetch.mock.calls.filter(([input]) => String(input).includes('/library/eidoverse/'))).toHaveLength(13);
+    expect(result.summary.assetCatalogFingerprint).toEqual(expect.any(String));
+
+    expect(result).toMatchObject({
+      success: true,
+      summary: { designVersion: 3, maxLiveEntities: 48, assetRecipeVersion: 3 },
+      design: {
+        selectedVersion: 3,
+        lastAppliedVersion: 3,
+        pendingVersion: null,
+        reconciliation: { status: 'complete', checkpoint: 'projection-committed' },
+      },
+    });
+    expect(Object.keys(result.design.assetResolutions)).toHaveLength(14);
+    expect(mocks.persistedState).toMatchObject({
+      schemaVersion: 3,
+      lastAppliedDesignVersion: 3,
+      pendingDesignVersion: null,
+      reconciliation: { status: 'complete' },
+    });
+    expect(mocks.sent).toEqual(expect.arrayContaining([
+      expect.objectContaining({ verb: 'sky', args: expect.objectContaining({ system: 'skymesh' }) }),
+      expect.objectContaining({ verb: 'light', args: expect.objectContaining({ id: 'portos-design-v2-light-nexus' }) }),
+    ]));
+    const authoredVerbs = mocks.sent.filter(({ type, verb }) => type === 'verb' && verb !== 'grant');
+    expect(authoredVerbs[0].verb).toBe('terrain');
+    expect(fetch.mock.calls.filter(([input]) => String(input).includes('/library-models')).length).toBe(0);
+
+    fetch.mockClear();
+    await world.projectEidoverseWorld();
+    expect(fetch.mock.calls.filter(([input]) => String(input).includes('/library-list'))).toHaveLength(0);
+    expect(fetch.mock.calls.filter(([input]) => String(input).includes('/library-models'))).toHaveLength(0);
+    expect(fetch.mock.calls.filter(([input]) => String(input).includes('/library/eidoverse/'))).toHaveLength(13);
+
+    await expect(world.reconcilePendingEidoverseWorld()).resolves.toEqual({ reconciled: false, reason: 'current' });
+  });
+
+  it('uses one configured runtime origin for WebSocket projection and HTTP asset preflight', async () => {
+    vi.stubEnv('EIDOVERSE_WS_URL', 'wss://example-eidoverse.test:9443/custom/ws');
+
+    await world.projectEidoverseWorld();
+
+    expect(mocks.socketUrls.length).toBeGreaterThan(0);
+    expect(mocks.socketUrls.every((url) => url === 'wss://example-eidoverse.test:9443/custom/ws')).toBe(true);
+    expect(fetch.mock.calls.length).toBeGreaterThan(0);
+    expect(fetch.mock.calls.every(([input]) => (
+      new URL(String(input)).origin === 'https://example-eidoverse.test:9443'
+    ))).toBe(true);
+  });
+
+  it('keeps the previous atmosphere authoritative until V2 infrastructure exists during an upgrade', async () => {
+    await world.ensureEidoverseWorldConfig();
+    mocks.persistedState.lastAppliedDesignVersion = 1;
+    mocks.persistedState.pendingDesignVersion = 2;
+
+    await rawWorld.projectEidoverseWorld({ verbIntervalMs: PACING_CONTRACT_INTERVAL_MS });
+
+    const authoredVerbs = mocks.sent.filter(({ type, verb }) => type === 'verb' && verb !== 'grant');
+    const firstInfrastructure = authoredVerbs.findIndex(({ verb }) => verb === 'spawn');
+    const firstEnvironment = authoredVerbs.findIndex(({ verb }) => verb === 'terrain');
+    expect(firstInfrastructure).toBeGreaterThanOrEqual(0);
+    expect(firstEnvironment).toBeGreaterThan(firstInfrastructure);
+    expect(authoredVerbs[firstEnvironment].sentAt - authoredVerbs[firstEnvironment - 1].sentAt).toBeGreaterThanOrEqual(4);
+  });
+
+  it('shares verb pacing between ownership retirement and the projection burst', async () => {
+    await world.ensureEidoverseWorldConfig();
+    mocks.persistedState.ownership.retired = [
+      { world: 'portos', id: 'Example Retired Owner A' },
+      { world: 'portos', id: 'Example Retired Owner B' },
+    ];
+
+    await rawWorld.projectEidoverseWorld({ verbIntervalMs: PACING_CONTRACT_INTERVAL_MS });
+
+    const cosVerbs = mocks.sent.filter(({ type, actor }) => type === 'verb' && actor === 'portos-cos');
+    expect(cosVerbs.slice(0, 2).map(({ verb }) => verb)).toEqual(['grant', 'grant']);
+    expect(cosVerbs.some(({ verb }) => verb !== 'grant')).toBe(true);
+    for (let index = 1; index < cosVerbs.length; index += 1) {
+      expect(cosVerbs[index].sentAt - cosVerbs[index - 1].sentAt).toBeGreaterThanOrEqual(4);
+    }
+  });
+
+  it('measures and uploads the shared city once, then reuses its assets', async () => {
+    const first = await world.projectEidoverseWorld();
+    expect(first.design.assetResolutions.citySurface).toMatchObject({ strategy: 'generated', userOverride: false });
+    expect(fetch.mock.calls.filter(([input]) => new URL(String(input)).pathname === '/upload')).toHaveLength(1);
+    expect(fetch.mock.calls.some(([input]) => new URL(String(input)).pathname === '/geom')).toBe(true);
+    fetch.mockClear();
+    await world.projectEidoverseWorld();
+    expect(fetch.mock.calls.filter(([input]) => ['/geom', '/upload'].includes(new URL(String(input)).pathname))).toEqual([]);
+  });
+
+  it('keeps the prior world authoritative if model geometry is invalid', async () => {
+    await world.ensureEidoverseWorldConfig();
+    mocks.persistedState.lastAppliedDesignVersion = 2;
+    const original = fetch.getMockImplementation();
+    fetch.mockImplementation((input, init) => new URL(String(input)).pathname === '/geom'
+      ? Promise.resolve(Response.json({ bbox: { min: [0, 0, 0], max: [0, 0, 0] } }))
+      : original(input, init));
+    await expect(world.projectEidoverseWorld()).rejects.toMatchObject({ code: 'EIDOVERSE_ASSET_GEOMETRY_INVALID' });
+    expect(mocks.persistedState.lastAppliedDesignVersion).toBe(2);
+    expect(mocks.sent.some(({ type }) => type === 'verb')).toBe(false);
+  });
+
+  it('excludes a catalog-listed asset whose bytes disappeared and locks a verified fallback', async () => {
+    const slots = world.DEFAULT_EIDOVERSE_PROJECTION_RECIPE.assetRecipe.slots;
+    const appPreferred = slots.app.preferredPaths[0];
+    const libraryFiles = Object.values(slots).flatMap((slot) => [
+      { path: slot.preferredPaths[0], size: Math.min(slot.maxBytes, 1_000_000) },
+      { path: slot.fallback, size: 1_000_000 },
+    ]);
+    fetch.mockImplementation(async (input, init) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/version') return Response.json({ sha: 'example-build', commitTime: '2026-01-01T00:00:00.000Z' });
+      if (url.pathname === '/library-list') return Response.json(libraryFiles);
+      if (url.pathname === '/library-models') return Response.json([]);
+      if (url.pathname === '/geom') return Response.json({ bbox: { min: [-1, 0, -1], max: [1, 2, 1] } });
+      if (url.pathname === `/library/${appPreferred}` && init?.method === 'HEAD') return new Response(null, { status: 404 });
+      if (url.pathname.startsWith('/library/')) return new Response(null, { status: 200 });
+      return new Response(null, { status: 404 });
+    });
+
+    const result = await world.projectEidoverseWorld();
+
+    expect(result.design.assetResolutions.app).toMatchObject({
+      path: slots.app.fallback,
+      strategy: 'fallback',
+    });
+    expect(fetch.mock.calls.some(([input]) => String(input).includes('/library-models'))).toBe(true);
+  });
+
+  it('writes only opaque resource keys and generic labels to the Eidoverse log', async () => {
+    mocks.appStatuses = [{
+      id: 'example-private-app-record',
+      name: 'Example confidential application',
+      overallStatus: 'online',
+      managed: true,
+    }];
+
+    await world.projectEidoverseWorld();
+
+    const serializedLog = JSON.stringify(mocks.sent.filter(({ type }) => type === 'verb'));
+    expect(serializedLog).toContain('"kind":"app"');
+    expect(serializedLog).toContain('"label":"Managed app"');
+    expect(serializedLog).toContain('"count":1');
+    expect(serializedLog).not.toMatch(/example-private-app-record|Example confidential application/);
+  });
+
+  it('fails before world mutation when the Eidoverse protocol identity is unavailable', async () => {
+    fetch.mockResolvedValueOnce(new Response(null, { status: 404 }));
+
+    await expect(world.projectEidoverseWorld()).rejects.toMatchObject({ code: 'EIDOVERSE_PROTOCOL_INCOMPATIBLE' });
+    expect(mocks.sent.some(({ type }) => type === 'verb')).toBe(false);
+    expect(mocks.persistedState).toMatchObject({
+      lastAppliedDesignVersion: null,
+      pendingDesignVersion: 3,
+      reconciliation: { status: 'failed' },
+    });
+  });
+
+  it('reports a transiently unreachable runtime without false update remediation', async () => {
+    fetch.mockRejectedValueOnce(new Error('Example startup race'));
+
+    await expect(world.projectEidoverseWorld()).rejects.toMatchObject({
+      status: 503,
+      code: 'EIDOVERSE_WORLD_UNAVAILABLE',
+    });
+    expect(mocks.sent.some(({ type }) => type === 'verb')).toBe(false);
+    expect(mocks.persistedState).toMatchObject({
+      pendingDesignVersion: 3,
+      reconciliation: {
+        status: 'failed',
+        errorCode: 'EIDOVERSE_WORLD_UNAVAILABLE',
+        errorContext: null,
+      },
+    });
+  });
+
+  it('preserves the prior design when required asset resolution fails', async () => {
+    await world.ensureEidoverseWorldConfig();
+    mocks.persistedState.lastAppliedDesignVersion = 1;
+    fetch.mockImplementation(async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/version') return Response.json({ sha: 'example-build', commitTime: '2026-01-01T00:00:00.000Z' });
+      if (url.pathname === '/library-list' || url.pathname === '/library-models') return Response.json([]);
+      return new Response(null, { status: 404 });
+    });
+
+    const error = await world.projectEidoverseWorld().then(() => null, (reason) => reason);
+    expect(error).toMatchObject({ code: 'EIDOVERSE_ASSET_RECIPE_UNRESOLVED' });
+    expect(error.message).toMatch(/nexus.*app.*agent/);
+    expect(mocks.sent.some(({ type }) => type === 'verb')).toBe(false);
+    expect(mocks.persistedState).toMatchObject({
+      lastAppliedDesignVersion: 1,
+      pendingDesignVersion: 3,
+      reconciliation: {
+        status: 'failed',
+        errorCode: 'EIDOVERSE_ASSET_RECIPE_UNRESOLVED',
+        errorContext: { missing: expect.arrayContaining(['nexus', 'app', 'agent']) },
+      },
+    });
+  });
+
+  it('verifies semantic and legacy store overrides and explains their provenance in the legend', async () => {
+    await world.updateEidoverseWorldConfig({ assetOverrides: {
+      app: 'store/example-local-asset', operations: 'store/example-legacy-operations',
+    } });
+
+    const result = await world.projectEidoverseWorld();
+
+    expect(result.design.assetResolutions.app).toMatchObject({
+      path: 'store/example-local-asset',
+      userOverride: true,
+      shippedDefault: false,
+    });
+    expect(fetch.mock.calls.some(([input]) => String(input).includes('/library/store/example-local-asset'))).toBe(true);
+    expect(fetch.mock.calls.some(([input]) => String(input).includes('/library/store/example-legacy-operations'))).toBe(true);
+    expect(result.summary.objects.find(({ kind, districtId }) => kind === 'district' && districtId === 'nexus')?.asset)
+      .toEqual({ path: 'store/example-legacy-operations', slot: 'operations', reason: 'user-override' });
+  });
+
+  it('resets only the selected district asset lock and override', async () => {
+    await world.projectEidoverseWorld();
+    await world.updateEidoverseWorldConfig({
+      assetOverrides: {
+        app: 'store/example-local-asset',
+        operations: 'store/example-legacy-operations',
+        district: 'store/example-path-marker',
+      },
+    });
+
+    const reset = await world.updateEidoverseWorldConfig({ reset: { scope: 'district', districtId: 'apps' } });
+
+    expect(reset.design.userOverrides.assets?.app).toBeUndefined();
+    expect(reset.design.assetResolutions.app).toBeUndefined();
+    expect(reset.design.assetResolutions.agent).toBeTruthy();
+    expect(reset.design.pendingVersion).toBe(3);
+
+    const nexusReset = await world.updateEidoverseWorldConfig({ reset: { scope: 'district', districtId: 'nexus' } });
+    expect(nexusReset.design.userOverrides.assets?.operations).toBeUndefined();
+    expect(nexusReset.design.userOverrides.assets?.district).toBeUndefined();
+  });
+
+  it('resets the effective sources and semantic assets for a custom district', async () => {
+    const recipe = structuredClone(world.DEFAULT_EIDOVERSE_PROJECTION_RECIPE);
+    recipe.districts = recipe.districts.map((district) => district.id === 'apps'
+      ? { ...district, id: 'example-yard', label: 'Example Yard', sources: ['goals'] }
+      : district);
+    recipe.includes.goals = false;
+    recipe.limits.goals = 1;
+    recipe.scale.goal = 2.5;
+    await world.updateEidoverseWorldConfig({
+      recipe,
+      assetOverrides: {
+        goal: 'store/example-local-goal',
+        district: 'store/example-local-district',
+      },
+    });
+
+    const reset = await world.updateEidoverseWorldConfig({
+      reset: { scope: 'district', districtId: 'example-yard' },
+    });
+
+    expect(reset.recipe.districts).toContainEqual(expect.objectContaining({
+      id: 'example-yard',
+      sources: ['goals'],
+    }));
+    expect(reset.recipe.includes.goals).toBe(world.DEFAULT_EIDOVERSE_PROJECTION_RECIPE.includes.goals);
+    expect(reset.recipe.limits.goals).toBe(world.DEFAULT_EIDOVERSE_PROJECTION_RECIPE.limits.goals);
+    expect(reset.recipe.scale.goal).toBe(world.DEFAULT_EIDOVERSE_PROJECTION_RECIPE.scale.goal);
+    expect(reset.design.userOverrides.assets?.goal).toBeUndefined();
+    expect(reset.design.userOverrides.assets?.district).toBeUndefined();
+
+    await expect(world.updateEidoverseWorldConfig({
+      reset: { scope: 'district', districtId: 'missing-yard' },
+    })).rejects.toMatchObject({ status: 400, code: 'EIDOVERSE_DISTRICT_NOT_FOUND' });
+  });
+
+  it('compensates partially applied V2 entities and leaves the prior design authoritative', async () => {
+    mocks.rejectVerb = 'comp';
+
+    await expect(world.projectEidoverseWorld()).rejects.toMatchObject({
+      code: 'EIDOVERSE_WORLD_VERB_REJECTED',
+      compensationStatus: 'complete',
+    });
+
+    const firstSpawn = mocks.sent.find((entry) => entry.verb === 'spawn' && entry.args.id.startsWith('portos-design-v2-'));
+    expect(firstSpawn).toBeTruthy();
+    expect(mocks.sent).toContainEqual(expect.objectContaining({
+      verb: 'remove',
+      args: { id: firstSpawn.args.id },
+    }));
+    expect(mocks.persistedState).toMatchObject({
+      lastAppliedDesignVersion: null,
+      pendingDesignVersion: 3,
+      reconciliation: {
+        status: 'failed',
+        checkpoint: 'compensation-complete',
+        compensationStatus: 'complete',
+      },
+    });
+  });
+
+  it('mows a newly applied field when a later environment operation fails', async () => {
+    mocks.rejectVerb = 'light';
+
+    await expect(world.projectEidoverseWorld()).rejects.toMatchObject({
+      code: 'EIDOVERSE_WORLD_VERB_REJECTED',
+      compensationStatus: 'complete',
+    });
+
+    expect(mocks.sent).toContainEqual(expect.objectContaining({
+      verb: 'grass',
+      args: { clear: true },
+    }));
+  });
+});
+
+
+it('admits a visitor before joining and exposes only new live chat to both guest and resident', async () => {
+  await world.ensureEidoverseWorldPresence();
+  expect((await world.readEidoverseWorldChat()).messages).toEqual([]);
+  const guest = await world.admitEidoverseGuest({ agent: true, name: 'Example Explorer' });
+  expect(guest.identity.name).toBe('Example Explorer');
+  const grantIndex = mocks.sent.findIndex((entry) => entry.verb === 'grant' && entry.args.id === guest.identity.name);
+  const joinIndex = mocks.sent.findIndex((entry) => entry.type === 'join' && entry.actor === guest.identity.name);
+  expect(grantIndex).toBeLessThan(joinIndex);
+  expect(mocks.sent[grantIndex].args).toEqual({ id: guest.identity.name, role: 'visitor', gen: false });
+  expect(mocks.sent[joinIndex]).toMatchObject({ agent: true, guest: true });
+  expect(guest.connection.readChat().messages).toEqual([]);
+  await guest.connection.sendVerb('say', { text: 'Example visitor greeting.' });
+  const incoming = await world.readEidoverseWorldChat();
+  expect(incoming.messages).toEqual([{ seq: expect.any(Number), actor: guest.identity.name, text: 'Example visitor greeting.' }]);
+  await world.sayInEidoverseWorld('Example resident reply.');
+  expect(guest.connection.readChat(incoming.cursor).messages).toEqual([{ seq: expect.any(Number), actor: 'portos-cos', text: 'Example resident reply.' }]);
+  for (let index = 0; index < 3; index += 1) await guest.connection.sendVerb('say', { text: 'Example text '.repeat(150) });
+  const page = guest.connection.readChat(incoming.cursor);
+  expect(JSON.stringify(page).length).toBeLessThan(3500);
+  expect(page.hasMore).toBe(true);
+  expect(guest.connection.readChat(page.cursor).cursor).toBeGreaterThan(page.cursor);
+  await guest.connection.close();
+});
+
+
+it('keeps occupied identities intact and disambiguates repeated browser admissions', async () => {
+  await world.ensureEidoverseWorldPresence();
+  const roles = mocks.worlds.get('portos').roles;
+  const owner = structuredClone(roles['portos-cos']);
+  const first = await world.admitEidoverseGuest({ name: 'portos-cos' });
+  const second = await world.admitEidoverseGuest({ name: 'portos-cos' });
+  expect(first.identity.name).toBe('portos-cos (2)');
+  expect(second.identity.name).toBe('portos-cos (3)');
+  expect(roles['portos-cos']).toEqual(owner);
+  const legacy = await world.admitEidoverseGuest();
+  expect(legacy.identity.name).toMatch(/^guest-/);
+  const reserved = await world.admitEidoverseGuest({ name: 'world' });
+  expect(reserved.identity.name).toMatch(/^guest-/);
+});
+
+
+it('reserves names seen in live grants after the resident snapshot and bounds collision suffixes', async () => {
+  await world.ensureEidoverseWorldPresence();
+  const name = 'Example Explorer '.repeat(4).trim().slice(0, 64);
+  for (const socket of mocks.sockets) {
+    if (socket.identity === 'portos-cos' && socket.readyState === 1) {
+      socket.emit('message', JSON.stringify({ type: 'log', entry: {
+        seq: mocks.nextSeq++, actor: DEFAULT_HUMAN_NAME, verb: 'grant', args: { id: name, role: 'owner' },
+      } }));
+    }
+  }
+  const guest = await world.admitEidoverseGuest({ name });
+  expect(guest.identity.name).toBe(`${name.slice(0, 60)} (2)`);
+});
+
+describe('bounded scene inspection through semantic dispatch', () => {
+  const authority = { scope: 'mind', capabilities: { manageEidoverse: true, readPortos: true, toolExposureAllSchemas: true } };
+  let callIndex = 0;
+  const dispatch = (name, args = {}, grants = authority) => executeCosToolCall({
+    call: { requestId: `scene-contract-${++callIndex}`, name, arguments: args }, authority: grants,
+  });
+  const inspect = async (args = { anchor: [0, 0, 0], radius: 5 }) => {
+    const response = await dispatch('eidoverse.inspect-scene', args);
+    expect(response.state).toBe('completed');
+    expect(JSON.stringify(response).length).toBeLessThan(4000);
+    eidoverseInspectSceneOutputSchema.parse(response.result);
+    return response.result;
+  };
+  const seed = async (entities, extra = {}) => {
+    mocks.worlds.set('portos', { roles: {}, entities, ...extra });
+    await world.ensureEidoverseWorldPresence();
+  };
+  const model = (pos = [0, 0, 0], extra = {}) => ({ lib: 'eidoverse/assets/models/example.glb', pos, ...extra });
+  const emit = (verb, args) => {
+    const socket = mocks.sockets.findLast((row) => row.identity === 'portos-cos' && row.readyState === 1);
+    socket.emit('message', JSON.stringify({ type: 'log', entry: { seq: mocks.nextSeq++, actor: 'synthetic-builder', verb, args } }));
+  };
+
+  it('finds an existing structure, selects another anchor and submits an original build in five calls', async () => {
+    await seed({ 'existing-structure': model([0, 0, 0], { comp: { portos: { managedBy: 'portos', privateRecord: 'synthetic-private-record' } } }) });
+    // This is a synthetic workflow only, never a live placement.
+    await dispatch('eidoverse.status');
+    const occupied = await inspect();
+    expect(occupied).toMatchObject({ availability: 'current', complete: true, boundsComplete: true, unknownBounds: 0 });
+    expect(occupied.entities).toEqual([expect.objectContaining({ id: 'existing-structure', portosManaged: true,
+      bounds: { min: [-1, 0, -1], max: [1, 2, 1] }, boundsState: 'known' })]);
+    const anchor = [20, 0, 0];
+    expect((await inspect({ anchor, radius: 3 })).entities).toEqual([]);
+    const submitted = await dispatch('eidoverse.augment', { operations: [{ verb: 'spawn', args: {
+      id: 'original-example', lib: occupied.entities[0].asset, pos: anchor, yaw: 0, scale: 1,
+    } }] });
+    expect(submitted.result.operations[0].outcome).toBe('accepted');
+    expect((await inspect({ anchor, radius: 3 })).entities[0].id).toBe('original-example');
+  });
+
+  it('reflects live added, moved, and removed objects and rotation/scale rather than the handshake', async () => {
+    await seed({});
+    emit('spawn', { id: 'live-model', lib: 'eidoverse/assets/models/example.glb', pos: [10, 0, 0], yaw: Math.PI / 2, scale: 2 });
+    // Origin outside the sphere, measured box overlaps its edge.
+    const added = await inspect({ anchor: [7, 0, 0], radius: 1 });
+    expect(added.entities[0]).toMatchObject({ id: 'live-model', scale: 2 });
+    expect(added.entities[0].bounds.min[0]).toBeCloseTo(8);
+    expect(added.entities[0].bounds.max[1]).toBe(4);
+    emit('place', { id: 'live-model', pos: [30, 0, 0] });
+    expect((await inspect()).entities).toEqual([]);
+    expect((await inspect({ anchor: [30, 0, 0], radius: 2 })).entities).toHaveLength(1);
+    emit('remove', { id: 'live-model' });
+    expect(await inspect({ anchor: [30, 0, 0], radius: 2 })).toMatchObject({ entities: [], complete: true, boundsComplete: true });
+    const sequence = mocks.nextSeq;
+    emit('use', { id: 'example-affordance' });
+    emit('kick', { id: 'example-principal' });
+    expect(await inspect()).toMatchObject({ availability: 'current', sequence: sequence + 1, entities: [], complete: true, boundsComplete: true });
+  });
+
+  it('denies missing grants, validates strict bounded inputs, and publishes a typed schema', async () => {
+    await expect(dispatch('eidoverse.inspect-scene', { anchor: [0, 0, 0], radius: 1 }, { scope: 'mind', capabilities: { readPortos: true } }))
+      .rejects.toMatchObject({ code: 'TOOL_CAPABILITY_DENIED' });
+    for (const args of [
+      { anchor: [0, 0], radius: 1 }, { anchor: [Infinity, 0, 0], radius: 1 }, { anchor: [10001, 0, 0], radius: 1 },
+      { anchor: [0, 0, 0], radius: 0 }, { anchor: [0, 0, 0], radius: 101 }, { anchor: [0, 0, 0], radius: 1, limit: 13 },
+      { anchor: [0, 0, 0], radius: 1, limit: 0 }, { anchor: [0, 0, 0], radius: 1, limit: 1.5 },
+      { anchor: [0, 0, 0], radius: 1, peerId: 'example-peer' },
+    ]) await expect(dispatch('eidoverse.inspect-scene', args)).rejects.toMatchObject({ code: 'TOOL_VALIDATION_ERROR' });
+    expect(mocks.sent).toEqual([]);
+    const tool = getCosToolCatalog({ scope: 'mind', capabilities: authority.capabilities }).tools.find((row) => row.name === 'eidoverse.inspect-scene');
+    expect(tool).toMatchObject({ granted: true, output_schema: { properties: { complete: { type: 'boolean' } } } });
+  });
+
+  it('returns a detached object at its stamped absolute pose after a live mount/dismount', async () => {
+    await seed({ parent: model([20, 0, 0]), child: model() });
+    emit('mount', { id: 'child', to: 'parent', offset: [1, 0, 0] });
+    expect(await inspect()).toMatchObject({ invalidEntities: 1, complete: false, entities: [] });
+    emit('dismount', { id: 'child', pos: [2, 0, 0], yaw: 1 });
+    const detached = await inspect();
+    expect(detached).toMatchObject({ invalidEntities: 0, complete: true, boundsComplete: false });
+    expect(detached.entities).toEqual([expect.objectContaining({ id: 'child', pos: [2, 0, 0], yaw: 1, boundsState: 'unknown' })]);
+  });
+
+  it('bounds dense results without exporting components, chat, tickets, credentials or arbitrary paths', async () => {
+    const entities = Object.fromEntries(Array.from({ length: 30 }, (_, n) => [`model-${n}`, model([0, 0, 0], {
+      actor: 'synthetic-private-person', comp: { portos: { managedBy: 'portos', ticket: 'synthetic-private-ticket', token: 'Bearer synthetic-secret' },
+        label: { description: 'synthetic-private-description' } },
+    })]));
+    entities['unsafe-asset'] = model([20, 0, 0], { lib: 'https://example.com/private?token=synthetic-secret' });
+    entities['unsafe-path'] = model([20, 0, 0], { lib: '/private/example/model.glb' });
+    await seed(entities, { recentChat: [{ text: 'synthetic-private-chat' }] });
+    const dense = await inspect({ anchor: [0, 0, 0], radius: 5, limit: 12 });
+    expect(dense).toMatchObject({ complete: false, truncated: true, boundsComplete: false, unknownBounds: 2 });
+    expect(dense.entities.length).toBeLessThanOrEqual(12);
+    expect(JSON.stringify(dense).length).toBeLessThanOrEqual(3000);
+    expect(JSON.stringify(dense)).not.toMatch(/synthetic-private|synthetic-secret|https:|\/private\/|"comp":|recentChat/);
+    expect((await inspect({ anchor: [0, 0, 0], radius: 5, limit: 1 })).entities).toHaveLength(1);
+    const unsafe = await inspect({ anchor: [20, 0, 0], radius: 1 });
+    expect(unsafe.entities).toHaveLength(2);
+    expect(unsafe.entities.every((row) => row.asset === null && row.bounds === null)).toBe(true);
+  });
+
+  it('keeps missing, malformed, procedural, dynamic and out-of-range geometry explicitly unknown', async () => {
+    await seed({
+      missing: model([0, 0, 0], { lib: 'store/aaaaaaaaaaaaaaaa.glb' }),
+      procedural: model([0, 0, 0], { comp: { structure: { privateDescription: 'synthetic-private' } } }),
+      far: model([500, 0, 0], { lib: 'store/bbbbbbbbbbbbbbbb.glb' }),
+      invalid: model([0, 0, 0], { scale: 101 }),
+      mounted: model([0, 0, 0], { parent: { to: 'procedural' } }),
+    });
+    vi.stubGlobal('fetch', vi.fn(async (input) => {
+      const url = new URL(String(input));
+      if (url.searchParams.get('lib')?.startsWith('store/')) return Response.json({ bbox: { min: [2, 0, 0], max: [1, 1, 1] }, secret: 'Bearer synthetic-secret' });
+      return Response.json({ bbox: { min: [-1, 0, -1], max: [1, 2, 1] } });
+    }));
+    const result = await inspect();
+    expect(result).toMatchObject({ complete: false, boundsComplete: false, unknownBounds: 3, invalidEntities: 2 });
+    expect(result.entities.every((row) => row.bounds === null && row.boundsState === 'unknown')).toBe(true);
+    expect(result.entities.find((row) => row.id === 'missing').asset).toBe('store/aaaaaaaaaaaaaaaa.glb');
+    expect(JSON.stringify(result)).not.toContain('synthetic-secret');
+    emit('place', { id: 'missing', pos: [20000, 0, 0] });
+    expect((await inspect()).invalidEntities).toBe(3);
+  });
+
+  it('distinguishes disconnected, sequence gaps, reset and invalid snapshots from empty current geometry', async () => {
+    expect(await inspect()).toMatchObject({ availability: 'unavailable', complete: false, boundsComplete: false, entities: [] });
+    expect(mocks.sent).toEqual([]);
+    await seed({ existing: model() });
+    const socket = mocks.sockets.findLast((row) => row.identity === 'portos-cos');
+    // State includes the tail already: a stale spawn in the tail must NOT undo
+    // a later move reflected in the snapshot state.
+    socket.emit('message', JSON.stringify({ type: 'snapshot', throughSeq: 10,
+      entries: [{ seq: 11, verb: 'spawn', args: { id: 'existing', pos: [0, 0, 0] } }],
+      state: { entities: { existing: model([20, 0, 0]) } } }));
+    expect(await inspect()).toMatchObject({ availability: 'current', sequence: 11, entities: [] });
+    socket.emit('message', JSON.stringify({ type: 'log', entry: { seq: 13, verb: 'remove', args: { id: 'existing' } } }));
+    expect(await inspect()).toMatchObject({ availability: 'incomplete', complete: false, boundsComplete: false });
+    socket.emit('message', JSON.stringify({ type: 'snapshot', throughSeq: 13, entries: [], state: { entities: {} } }));
+    expect((await inspect()).complete).toBe(true);
+    socket.emit('message', JSON.stringify({ type: 'world-reset' }));
+    expect((await inspect()).availability).toBe('incomplete');
+    socket.emit('message', JSON.stringify({ type: 'snapshot', state: { entities: {} } }));
+    expect((await inspect()).availability).toBe('unavailable');
+    socket.emit('message', JSON.stringify({ type: 'snapshot', throughSeq: 13, entries: [], state: {
+      entities: Object.fromEntries(Array.from({ length: 2001 }, (_, n) => [`dense-${n}`, model()])),
+    } }));
+    expect(await inspect({ anchor: [9000, 0, 0], radius: 1 })).toMatchObject({ availability: 'incomplete', complete: false, boundsComplete: false });
+    socket.close();
+    expect((await inspect()).availability).toBe('unavailable');
+  });
+
+  it('caps geometry requests and bodies, and treats renderer motion as unknown', async () => {
+    await seed(Object.fromEntries(Array.from({ length: 20 }, (_, n) => [`asset-${n}`, {
+      lib: `store/${n.toString(16).padStart(16, '0')}.glb`, pos: [0, 0, 0],
+    }])));
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({ bbox: { min: [-1, 0, -1], max: [1, 2, 1] }, oversized: 'x'.repeat(66000) })));
+    const oversized = await inspect();
+    expect(fetch).toHaveBeenCalledTimes(16);
+    expect(oversized).toMatchObject({ unknownBounds: 20, boundsComplete: false, truncated: true });
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({ bbox: { min: [-1, 0, -1], max: [1, 2, 1] } })));
+    expect((await inspect()).unknownBounds).toBe(4);
+    emit('motion', { id: 'asset-0', type: 'spin', speed: 1 });
+    expect((await inspect()).entities.find((row) => row.id === 'asset-0').boundsState).toBe('unknown');
+    emit('epoch', { sim: 'example-sim', tickMs: 66 });
+    expect((await inspect()).unknownBounds).toBe(20);
+  });
+
+  it('does not let failed geometry or an update during geometry loading certify old occupancy', async () => {
+    await seed({ existing: model() });
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('Bearer synthetic-secret', { status: 503 })));
+    expect(await inspect()).toMatchObject({ unknownBounds: 1, boundsComplete: false });
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      emit('place', { id: 'existing', pos: [20, 0, 0] });
+      return Response.json({ bbox: { min: [-10001, 0, -1], max: [1, 2, 1] } });
+    }));
+    expect(await inspect()).toMatchObject({ entities: [], unknownBounds: 1, boundsComplete: false });
+  });
+
+  it('returns unknown geometry when the shared deadline aborts, without a production sleep', async () => {
+    await seed({ existing: model() });
+    const controller = new AbortController();
+    const timeout = vi.spyOn(AbortSignal, 'timeout').mockImplementation((ms) => {
+      expect(ms).toBe(2000);
+      queueMicrotask(() => controller.abort());
+      return controller.signal;
+    });
+    vi.stubGlobal('fetch', vi.fn((_input, { signal }) => new Promise((_resolve, reject) => {
+      signal.addEventListener('abort', () => reject(new Error('synthetic deadline')), { once: true });
+    })));
+    try {
+      expect(await inspect()).toMatchObject({ availability: 'current', complete: true, boundsComplete: false, unknownBounds: 1 });
+    } finally { timeout.mockRestore(); }
+  });
+});

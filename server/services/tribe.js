@@ -1,0 +1,660 @@
+/**
+ * Tribe — relationship/CRM graph (PostgreSQL: tribe_people, tribe_touchpoints,
+ * tribe_memory_links).
+ *
+ * INTENTIONALLY MACHINE-LOCAL — not federated. See ADR
+ * docs/decisions/2026-06-26-tribe-and-universe-runs-local.md (#1724). It mirrors
+ * the deliberate "relationship data is instance-local" boundary already drawn by
+ * memorySync.js (memory NODES federate; memory_links do not), and is coupled to
+ * machine-local domains: tribe_memory_links extends the non-federated memory_links
+ * layer, and tribe_touchpoints carry per-machine calendar-account refs
+ * (calendar_account_id / calendar_event_id). There is no sync hook here by design;
+ * adding one is a conscious act (revisit the ADR + the guard in
+ * sharing/peerSync.test.js).
+ */
+import { v4 as uuidv4 } from '../lib/uuid.js';
+import { ensureSchema, query, withTransaction } from '../lib/db.js';
+import { ServerError } from '../lib/errorHandler.js';
+import { cadenceStatus, DEFAULT_RING_CADENCE } from '../lib/tribeCadence.js';
+import { buildPersonMatchIndex, calendarTouchpointDedupeKey, matchPeople, normalizeIdentifier, normalizePhone } from '../lib/tribeMatch.js';
+import { toUserDayKey } from '../lib/activeDays.js';
+import { getUserTimezone } from './userTimezone.js';
+import * as calendarSync from './calendarSync.js';
+
+export function isoDate(value) {
+  if (!value) return null;
+  if (value instanceof Date) return value.toISOString().slice(0, 10);
+  return String(value).slice(0, 10);
+}
+
+export function isoDateTime(value) {
+  if (!value) return null;
+  if (value instanceof Date) return value.toISOString();
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+}
+
+export function normalizeTags(tags) {
+  if (!tags) return [];
+  if (Array.isArray(tags)) return tags.map((tag) => String(tag).trim()).filter(Boolean);
+  return String(tags).split(',').map((tag) => tag.trim()).filter(Boolean);
+}
+
+// Known emails/handles used to match a person to calendar attendees / message
+// counterparts. Lowercased + trimmed + de-duplicated so matching (which also
+// lowercases) is stable and the stored set has no near-duplicates.
+export function normalizeEmails(emails) {
+  const list = Array.isArray(emails)
+    ? emails
+    : (emails == null ? [] : String(emails).split(','));
+  const seen = new Set();
+  for (const raw of list) {
+    const key = normalizeIdentifier(raw);
+    if (key) seen.add(key);
+  }
+  return [...seen];
+}
+
+// Phone handles used to match a person to iMessage/Signal counterparts (#2151).
+// E.164-normalized + de-duplicated so matching (which also normalizes) is stable.
+export function normalizePhones(phones) {
+  const list = Array.isArray(phones)
+    ? phones
+    : (phones == null ? [] : String(phones).split(','));
+  const seen = new Set();
+  for (const raw of list) {
+    const key = normalizePhone(raw);
+    if (key) seen.add(key);
+  }
+  return [...seen];
+}
+
+export function rowToPerson(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    relationship: row.relationship || '',
+    ring: row.ring || 'tribe',
+    // cadence_days is NOT NULL DEFAULT 45, so it's always present on a real row.
+    cadenceDays: row.cadence_days,
+    lastContact: isoDate(row.last_contact_on),
+    channel: row.channel || '',
+    energy: row.energy || 'steady',
+    tags: row.tags || [],
+    emails: row.emails || [],
+    phones: row.phones || [],
+    nextMove: row.next_move || '',
+    notes: row.notes || '',
+    touchpointCount: Number(row.touchpoint_count || 0),
+    linkedMemoryCount: Number(row.linked_memory_count || 0),
+    createdAt: row.created_at?.toISOString?.() ?? row.created_at,
+    updatedAt: row.updated_at?.toISOString?.() ?? row.updated_at,
+  };
+}
+
+export function rowToTouchpoint(row) {
+  return {
+    id: row.id,
+    personId: row.person_id,
+    happenedAt: isoDateTime(row.happened_at),
+    channel: row.channel || '',
+    summary: row.summary || '',
+    source: row.source || 'user',
+    calendarAccountId: row.calendar_account_id || null,
+    calendarEventId: row.calendar_event_id || null,
+    metadata: row.metadata || {},
+    createdAt: row.created_at?.toISOString?.() ?? row.created_at,
+  };
+}
+
+export function rowToMemoryLink(row) {
+  return {
+    personId: row.person_id,
+    memoryId: row.memory_id,
+    note: row.note || '',
+    createdAt: row.created_at?.toISOString?.() ?? row.created_at,
+    memory: row.memory_id ? {
+      id: row.memory_id,
+      type: row.type,
+      summary: row.summary,
+      content: row.content,
+      category: row.category,
+      tags: row.memory_tags || [],
+      createdAt: row.memory_created_at?.toISOString?.() ?? row.memory_created_at,
+    } : null,
+  };
+}
+
+async function ensureReady() {
+  await ensureSchema();
+}
+
+// Cadence health for a person — the server-side entry point into the shared,
+// authoritative cadence rules in server/lib/tribeCadence.js (mirrored to the
+// client). Kept as a named re-export so existing callers/tests importing
+// `personCadenceStatus` from this service stay stable while the rules live in
+// exactly one place. See tribeCadence.js for the state semantics.
+export const personCadenceStatus = cadenceStatus;
+
+// Care summary for the dashboard widget + proactive alert: who in the active
+// tribe (external excluded) is overdue or has no touchpoint yet, most-overdue
+// first. `missing` (never contacted) sorts above any dated-overdue person.
+export async function getCareSummary(limit = 5) {
+  await ensureReady();
+  // Deliberately NOT listPeople(): this runs on every Dashboard mount and on the
+  // 2-minute proactive-alerts poll, and listPeople() hydrates every column
+  // (notes, next_move, tags/emails/phones arrays) for the whole table just to
+  // date-check a handful of people. Project only what cadenceStatus() reads
+  // (ring, cadence_days, last_contact_on) plus the response fields (id, name,
+  // channel), and push the `external` exclusion into SQL (#6024).
+  const result = await query(
+    `SELECT id, name, ring, cadence_days, last_contact_on, channel
+     FROM tribe_people
+     WHERE deleted = FALSE AND ring <> 'external'`,
+  );
+  const tribe = result.rows.map((row) => ({
+    id: row.id,
+    name: row.name,
+    ring: row.ring || 'tribe',
+    cadenceDays: row.cadence_days,
+    lastContact: isoDate(row.last_contact_on),
+    channel: row.channel || '',
+  }));
+  const overdue = [];
+  for (const person of tribe) {
+    const status = personCadenceStatus(person);
+    if (status.state === 'overdue' || status.state === 'missing') {
+      overdue.push({ person, status });
+    }
+  }
+  // missing (daysOverdue null) first, then by daysOverdue desc, then by name.
+  overdue.sort((a, b) => {
+    const aMissing = a.status.daysOverdue == null;
+    const bMissing = b.status.daysOverdue == null;
+    if (aMissing !== bMissing) return aMissing ? -1 : 1;
+    if (!aMissing && b.status.daysOverdue !== a.status.daysOverdue) {
+      return b.status.daysOverdue - a.status.daysOverdue;
+    }
+    return String(a.person.name).localeCompare(String(b.person.name));
+  });
+  return {
+    hasPeople: tribe.length > 0,
+    peopleCount: tribe.length,
+    overdueCount: overdue.length,
+    overdue: overdue.slice(0, Math.max(0, limit)).map(({ person, status }) => ({
+      id: person.id,
+      name: person.name,
+      ring: person.ring,
+      channel: person.channel,
+      lastContact: person.lastContact,
+      state: status.state,
+      daysOverdue: status.daysOverdue,
+    })),
+  };
+}
+
+/**
+ * Identifiers (emails/phones) held by more than one tracked person, using the SAME
+ * normalization the matcher uses — so a case-only email variant or a formatting-only
+ * phone variant collides here exactly as it would during identity matching.
+ *
+ * Pure and non-blocking by design (#5908): `tribe_people` has no uniqueness on
+ * `emails[]`/`phones[]`, and nothing checks across rows, so two people can end up
+ * sharing one. When that happens, `buildPersonMatchIndex` (`lib/tribeMatch.js`) keeps
+ * whichever person it sees first — and `listPeople`'s sort key includes
+ * `last_contact_on`, which routine auto-logging advances, so a shared identifier can
+ * silently re-target from one person to the other on a later sync. This is a report
+ * only: it never merges, writes, or blocks a save.
+ *
+ * @param {Array<{id: string, name: string, emails?: string[], phones?: string[]}>} people
+ *   Already-loaded, non-deleted people — `listPeople()` already filters `deleted = FALSE`.
+ */
+export function findDuplicateTribeIdentifiers(people) {
+  const collect = (getRaw, normalize) => {
+    const owners = new Map(); // normalized identifier -> [{id, name}]
+    for (const person of people || []) {
+      // One hit per person per identifier — a person listing the same email twice in
+      // different casings must not count as two "owners" of it.
+      const seen = new Set();
+      for (const raw of getRaw(person) || []) {
+        const key = normalize(raw);
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        if (!owners.has(key)) owners.set(key, []);
+        owners.get(key).push({ id: person.id, name: person.name });
+      }
+    }
+    return [...owners.entries()]
+      .filter(([, owned]) => owned.length > 1)
+      .map(([identifier, owned]) => ({ identifier, people: owned }));
+  };
+  return {
+    emails: collect((p) => p.emails, normalizeIdentifier),
+    phones: collect((p) => p.phones, normalizePhone),
+  };
+}
+
+/** DB-backed wrapper for the route: loads every tracked person and runs the pure
+ * detector above. */
+export async function checkDuplicateTribeIdentifiers() {
+  return findDuplicateTribeIdentifiers(await listPeople());
+}
+
+export async function listPeople(options = {}) {
+  await ensureReady();
+  const conditions = ['deleted = FALSE'];
+  const params = [];
+  let idx = 1;
+  if (options.ring && options.ring !== 'all') {
+    conditions.push(`ring = $${idx++}`);
+    params.push(options.ring);
+  }
+  if (options.search) {
+    conditions.push(`(
+      name ILIKE $${idx} OR relationship ILIKE $${idx} OR channel ILIKE $${idx}
+      OR next_move ILIKE $${idx} OR notes ILIKE $${idx} OR array_to_string(tags, ' ') ILIKE $${idx}
+    )`);
+    params.push(`%${options.search}%`);
+    idx++;
+  }
+
+  // No touchpoint/memory-link counts here: they cost 2N correlated subqueries
+  // per list, no client view reads them, and `rowToPerson` already defaults both
+  // to 0 when the column is absent. Detail views get them from getPerson() (#6024).
+  const result = await query(
+    `SELECT *
+     FROM tribe_people
+     WHERE ${conditions.join(' AND ')}
+     ORDER BY
+       CASE ring WHEN 'support' THEN 1 WHEN 'core' THEN 2 WHEN 'tribe' THEN 3 WHEN 'village' THEN 4 WHEN 'external' THEN 5 ELSE 6 END,
+       COALESCE(last_contact_on, DATE '1900-01-01') ASC,
+       name ASC`,
+    params,
+  );
+  return result.rows.map(rowToPerson);
+}
+
+export async function getPerson(id) {
+  await ensureReady();
+  const result = await query(
+    `SELECT p.*,
+       (SELECT COUNT(*) FROM tribe_touchpoints t WHERE t.person_id = p.id) AS touchpoint_count,
+       (SELECT COUNT(*) FROM tribe_memory_links ml WHERE ml.person_id = p.id) AS linked_memory_count
+     FROM tribe_people p
+     WHERE p.id = $1 AND p.deleted = FALSE`,
+    [id],
+  );
+  return result.rows[0] ? rowToPerson(result.rows[0]) : null;
+}
+
+export async function createPerson(data) {
+  await ensureReady();
+  const id = data.id || uuidv4();
+  const ring = data.ring || 'tribe';
+  const cadenceDays = data.cadenceDays ?? DEFAULT_RING_CADENCE[ring] ?? 45;
+  const result = await query(
+    `INSERT INTO tribe_people (
+      id, name, relationship, ring, cadence_days, last_contact_on, channel,
+      energy, tags, emails, phones, next_move, notes, updated_at
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW())
+    RETURNING *, 0 AS touchpoint_count, 0 AS linked_memory_count`,
+    [
+      id,
+      data.name,
+      data.relationship || '',
+      ring,
+      cadenceDays,
+      data.lastContact || null,
+      data.channel || '',
+      data.energy || 'steady',
+      normalizeTags(data.tags),
+      normalizeEmails(data.emails),
+      normalizePhones(data.phones),
+      data.nextMove || '',
+      data.notes || '',
+    ],
+  );
+  return rowToPerson(result.rows[0]);
+}
+
+export async function updatePerson(id, updates) {
+  await ensureReady();
+  const current = await getPerson(id);
+  if (!current) return null;
+  const next = { ...current, ...updates };
+  const result = await query(
+    `UPDATE tribe_people
+     SET name = $2,
+         relationship = $3,
+         ring = $4,
+         cadence_days = $5,
+         last_contact_on = $6,
+         channel = $7,
+         energy = $8,
+         tags = $9,
+         emails = $10,
+         phones = $11,
+         next_move = $12,
+         notes = $13,
+         updated_at = NOW()
+     WHERE id = $1 AND deleted = FALSE
+     RETURNING *,
+       (SELECT COUNT(*) FROM tribe_touchpoints t WHERE t.person_id = tribe_people.id) AS touchpoint_count,
+       (SELECT COUNT(*) FROM tribe_memory_links ml WHERE ml.person_id = tribe_people.id) AS linked_memory_count`,
+    [
+      id,
+      next.name,
+      next.relationship || '',
+      next.ring || 'tribe',
+      next.cadenceDays ?? DEFAULT_RING_CADENCE[next.ring] ?? 45,
+      next.lastContact || null,
+      next.channel || '',
+      next.energy || 'steady',
+      normalizeTags(next.tags),
+      normalizeEmails(next.emails),
+      normalizePhones(next.phones),
+      next.nextMove || '',
+      next.notes || '',
+    ],
+  );
+  return result.rows[0] ? rowToPerson(result.rows[0]) : null;
+}
+
+// Days a deleted person stays recoverable before `purgeDeletedPeople` erases
+// them for good. It is also the retention for the `record_audit` snapshots of
+// the tribe tables: a third party's contact details and conversation summaries
+// must not outlive the user's delete, and the audit log copies the full row
+// (#8459).
+export const DELETED_PERSON_RETENTION_DAYS = 30;
+const TRIBE_AUDITED_TABLES = ['tribe_people', 'tribe_touchpoints', 'tribe_identities'];
+
+// Soft delete. The row keeps every field until `purgeDeletedPeople` hard-deletes
+// it DELETED_PERSON_RETENTION_DAYS later. Tribe is machine-local, so the
+// tombstone is never needed for sync — it is only a short recovery window.
+export async function deletePerson(id) {
+  await ensureReady();
+  const result = await query(
+    `UPDATE tribe_people
+     SET deleted = TRUE, deleted_at = NOW(), updated_at = NOW()
+     WHERE id = $1 AND deleted = FALSE
+     RETURNING id`,
+    [id],
+  );
+  return result.rowCount > 0;
+}
+
+/**
+ * Erase people deleted more than `olderThanDays` ago, and expire the tribe
+ * tables' `record_audit` snapshots on the same window (#8459).
+ *
+ * The hard delete cascades to touchpoints, identities and memory links, and
+ * sets `beeper_participants.tribe_person_id` to NULL. The audit trigger writes a
+ * `hard_delete` snapshot for every row the cascade removes; those are erased in
+ * the same transaction, together with the person's earlier tombstone snapshot.
+ * Audit rows for the creative tables are never touched — there the log is the
+ * data-loss recovery source.
+ *
+ * Returns counts only, so callers can log without naming anyone.
+ */
+export async function purgeDeletedPeople({ olderThanDays = DELETED_PERSON_RETENTION_DAYS } = {}) {
+  if (!Number.isInteger(olderThanDays) || olderThanDays < 0) {
+    throw new ServerError('olderThanDays must be a non-negative integer', { status: 400, code: 'BAD_REQUEST' });
+  }
+  await ensureReady();
+  return withTransaction(async (client) => {
+    const purged = await client.query(
+      `DELETE FROM tribe_people
+       WHERE deleted = TRUE AND deleted_at < NOW() - make_interval(days => $1::int)
+       RETURNING id`,
+      [olderThanDays],
+    );
+    const ids = purged.rows.map((row) => String(row.id));
+    let auditRows = 0;
+    if (ids.length > 0) {
+      const snapshots = await client.query(
+        `DELETE FROM record_audit
+         WHERE (table_name = 'tribe_people' AND record_id = ANY($1::text[]))
+            OR (table_name IN ('tribe_touchpoints', 'tribe_identities')
+                AND row_snapshot->>'person_id' = ANY($1::text[]))`,
+        [ids],
+      );
+      auditRows += snapshots.rowCount;
+    }
+    const expired = await client.query(
+      `DELETE FROM record_audit
+       WHERE table_name = ANY($1::text[])
+         AND occurred_at < NOW() - make_interval(days => $2::int)`,
+      [TRIBE_AUDITED_TABLES, olderThanDays],
+    );
+    auditRows += expired.rowCount;
+    return { people: ids.length, auditRows };
+  });
+}
+
+export async function listTouchpoints(personId, limit = 50) {
+  await ensureReady();
+  const result = await query(
+    `SELECT * FROM tribe_touchpoints
+     WHERE person_id = $1
+     ORDER BY happened_at DESC
+     LIMIT $2`,
+    [personId, limit],
+  );
+  return result.rows.map(rowToTouchpoint);
+}
+
+export async function createTouchpoint(personId, data = {}) {
+  await ensureReady();
+  const person = await getPerson(personId);
+  if (!person) throw new ServerError('Person not found', { status: 404 });
+  const happenedAt = data.happenedAt || new Date().toISOString();
+  const contactDate = data.localDate || happenedAt;
+
+  const dedupeKey = data.dedupeKey || null;
+  return withTransaction(async (client) => {
+    // With a dedupeKey the insert is idempotent per person (partial unique index
+    // idx_tribe_touchpoints_dedupe): a retry, a double-click, or an event the
+    // calendar sync already auto-logged returns the existing row untouched.
+    const result = await client.query(
+      `INSERT INTO tribe_touchpoints (
+        id, person_id, happened_at, channel, summary, source,
+        calendar_account_id, calendar_event_id, dedupe_key, metadata
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+      ON CONFLICT (person_id, dedupe_key) WHERE dedupe_key IS NOT NULL
+      DO NOTHING
+      RETURNING *`,
+      [
+        data.id || uuidv4(),
+        personId,
+        happenedAt,
+        data.channel || '',
+        data.summary || '',
+        data.source || 'user',
+        data.calendarAccountId || null,
+        data.calendarEventId || null,
+        dedupeKey,
+        data.metadata || {},
+      ],
+    );
+    if (!result.rows[0]) {
+      const existing = await client.query(
+        'SELECT * FROM tribe_touchpoints WHERE person_id = $1 AND dedupe_key = $2',
+        [personId, dedupeKey],
+      );
+      return rowToTouchpoint(existing.rows[0]);
+    }
+
+    await client.query(
+      `UPDATE tribe_people
+       SET last_contact_on = GREATEST(COALESCE(last_contact_on, DATE '1900-01-01'), $2::date),
+           channel = CASE WHEN $3::text = '' THEN channel ELSE $3::text END,
+           updated_at = NOW()
+       WHERE id = $1`,
+      [personId, contactDate, data.channel || ''],
+    );
+    return rowToTouchpoint(result.rows[0]);
+  });
+}
+
+export async function createCalendarTouchpoint(personId, { accountId, eventId, summary }) {
+  const event = await calendarSync.getEvent(accountId, eventId);
+  if (!event) throw new ServerError('Calendar event not found', { status: 404 });
+  const happenedAt = event.startTime || event.endTime || new Date().toISOString();
+  // `last_contact_on` is a user-facing calendar day, not a UTC one — an evening
+  // event must land on the day the user experienced it, not tomorrow's UTC date
+  // (#8451). `createTouchpoint` uses `localDate` (falling back to the raw instant
+  // only when the caller doesn't supply one).
+  const localDate = toUserDayKey(happenedAt, await getUserTimezone());
+  return createTouchpoint(personId, {
+    happenedAt,
+    localDate,
+    channel: event.location || 'Calendar',
+    summary: summary || event.title || 'Calendar touchpoint',
+    source: 'calendar',
+    calendarAccountId: accountId,
+    calendarEventId: eventId,
+    dedupeKey: calendarTouchpointDedupeKey(accountId, event),
+    metadata: {
+      title: event.title,
+      description: event.description,
+      location: event.location,
+      startTime: event.startTime,
+      endTime: event.endTime,
+      organizer: event.organizer,
+      attendees: event.attendees,
+      subcalendarId: event.subcalendarId,
+      subcalendarName: event.subcalendarName,
+    },
+  });
+}
+
+// Insert an auto-logged touchpoint for one person, idempotent on `dedupeKey`
+// (the partial unique index idx_tribe_touchpoints_dedupe). Returns the created
+// touchpoint, or `null` when this person+dedupeKey was already logged (re-sync).
+// Only advances last_contact_on when a row is actually inserted.
+//
+// Exported (in addition to being used internally by autoLogTouchpoints below)
+// so a caller that has ALREADY resolved a personId through a different axis —
+// server/services/beeperTribe.js resolves via tribe_identities / the
+// beeper_participants cache, not the email/phone/name matcher in
+// tribeMatch.js — can reuse this exact dedupe-keyed insert + last_contact_on
+// advance instead of re-implementing it (#34).
+export async function autoCreateTouchpoint(personId, data) {
+  const happenedAt = data.happenedAt || new Date().toISOString();
+  // Advance last_contact_on by the user's LOCAL calendar day, not the UTC day the
+  // raw instant's date part happens to fall on — an evening meeting/message must
+  // not advance the contact date to a day that, locally, hasn't happened yet
+  // (#8451). Falls back to the raw instant only if it doesn't parse as a date at
+  // all (toUserDayKey returns null), matching the manual-touchpoint fallback.
+  const contactDay = toUserDayKey(happenedAt, await getUserTimezone()) || happenedAt;
+  return withTransaction(async (client) => {
+    const result = await client.query(
+      `INSERT INTO tribe_touchpoints (
+        id, person_id, happened_at, channel, summary, source,
+        calendar_account_id, calendar_event_id, dedupe_key, metadata
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+      ON CONFLICT (person_id, dedupe_key) WHERE dedupe_key IS NOT NULL
+      DO NOTHING
+      RETURNING *`,
+      [
+        uuidv4(),
+        personId,
+        happenedAt,
+        data.channel || '',
+        data.summary || '',
+        data.source || 'user',
+        data.calendarAccountId || null,
+        data.calendarEventId || null,
+        data.dedupeKey || null,
+        data.metadata || {},
+      ],
+    );
+    if (!result.rows[0]) return null; // duplicate — already logged for this key
+
+    // Advance last_contact_on only. Unlike a manual touchpoint, an auto-log must
+    // NOT overwrite the person's curated `channel` (their preferred way to
+    // connect): it fires silently on every sync and would otherwise churn the
+    // preference to the last meeting location / account type. The synced
+    // channel is still preserved on the touchpoint row itself.
+    await client.query(
+      `UPDATE tribe_people
+       SET last_contact_on = GREATEST(COALESCE(last_contact_on, DATE '1900-01-01'), $2::date),
+           updated_at = NOW()
+       WHERE id = $1`,
+      [personId, contactDay],
+    );
+    return rowToTouchpoint(result.rows[0]);
+  });
+}
+
+/**
+ * Auto-log touchpoints from a batch of sync candidates (calendar events /
+ * messages). Each candidate:
+ *   { identities: [{ email, name } | string], source, happenedAt, channel,
+ *     summary, dedupeKey, calendarAccountId?, calendarEventId?, metadata? }
+ *
+ * Identities are matched deterministically (email/handle, unique exact name) to
+ * tracked people via the shared matcher; one deduped touchpoint is inserted per
+ * matched person. `dedupeKey` MUST be set for idempotency across re-syncs.
+ * Returns `{ created, matched }`. No LLM calls.
+ */
+export async function autoLogTouchpoints(candidates = []) {
+  if (!Array.isArray(candidates) || candidates.length === 0) return { created: 0, matched: 0 };
+  await ensureReady();
+  const people = await listPeople();
+  if (people.length === 0) return { created: 0, matched: 0 };
+
+  const index = buildPersonMatchIndex(people);
+  let created = 0;
+  let matched = 0;
+  for (const candidate of candidates) {
+    if (!candidate?.dedupeKey) continue; // no idempotency key → refuse to log
+    const personIds = matchPeople(candidate.identities, index);
+    for (const personId of personIds) {
+      matched++;
+      const touchpoint = await autoCreateTouchpoint(personId, candidate);
+      if (touchpoint) created++;
+    }
+  }
+  return { created, matched };
+}
+
+export async function listMemoryLinks(personId) {
+  await ensureReady();
+  const result = await query(
+    `SELECT ml.*, m.type, m.summary, m.content, m.category, m.tags AS memory_tags, m.created_at AS memory_created_at
+     FROM tribe_memory_links ml
+     JOIN memories m ON m.id = ml.memory_id
+     WHERE ml.person_id = $1
+     ORDER BY ml.created_at DESC`,
+    [personId],
+  );
+  return result.rows.map(rowToMemoryLink);
+}
+
+export async function linkMemory(personId, memoryId, note = '') {
+  await ensureReady();
+  const person = await getPerson(personId);
+  if (!person) throw new ServerError('Person not found', { status: 404 });
+  const result = await query(
+    `INSERT INTO tribe_memory_links (person_id, memory_id, note)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (person_id, memory_id)
+     DO UPDATE SET note = EXCLUDED.note
+     RETURNING *`,
+    [personId, memoryId, note],
+  ).catch((err) => {
+    if (err?.code === '23503') throw new ServerError('Memory not found', { status: 404 });
+    throw err;
+  });
+  return result.rows[0];
+}
+
+export async function unlinkMemory(personId, memoryId) {
+  await ensureReady();
+  const result = await query(
+    'DELETE FROM tribe_memory_links WHERE person_id = $1 AND memory_id = $2',
+    [personId, memoryId],
+  );
+  return result.rowCount > 0;
+}

@@ -1,0 +1,130 @@
+/**
+ * This install's last-known subscription-quota readings, persisted so they can
+ * be federated.
+ *
+ * The quota cards themselves live in an in-memory stale-while-revalidate cache
+ * (see `providerUsage.js`) because reading one costs a 10-20s CLI/TUI spawn.
+ * That cache cannot be shared: it dies with the process, and the `usage` sync
+ * category's checksum is invalidated by FILE fingerprints, so a reading that
+ * exists only in memory would never move the checksum and would never reach a
+ * peer. Writing the cards to `data/provider-quotas.json` fixes both — and
+ * survives a restart, so a card is not blank until the next scrape.
+ *
+ * AI Provider Usage Policy: nothing here reads a provider. It only records what
+ * a user-triggered reading already produced, and serves it back.
+ */
+
+import { join } from 'path';
+import { atomicWrite, readJSONFile, PATHS } from '../lib/fileUtils.js';
+import { isPlainObject } from '../lib/objects.js';
+import { createMutex } from '../lib/asyncMutex.js';
+import { sanitizeQuotaCards, latestFetchedAt } from '../lib/fleetQuotas.js';
+import { compareNewerWins, parseTsMs } from '../lib/lwwTimestamp.js';
+import { isNonBlankStr } from '../lib/textUtils.js';
+
+export const PROVIDER_QUOTAS_FILE = join(PATHS.data, 'provider-quotas.json');
+
+const withLock = createMutex();
+
+/**
+ * The cards this instance last read, newest-known per family, plus WHEN THIS
+ * STORE LAST CHANGED. Never throws.
+ *
+ * `capturedAt` is the federated slot's LWW stamp and manifest fingerprint (see
+ * `buildSelfEntry` in services/peerUsage.js), so it has to move whenever
+ * anything in the entry does. It is therefore the WRITE clock, not the freshest
+ * card's `fetchedAt` — those coincide only while every adapter stamps its read
+ * clock, and an adapter that honestly reports older telemetry (Codex, stamped
+ * with the turn that produced it) breaks the equivalence: a corrected Codex
+ * reading whose timestamp sits behind a sibling card's stamp would leave
+ * `capturedAt` pinned, and no peer would ever pull the correction.
+ *
+ * A store written before `capturedAt` existed falls back to the old derivation,
+ * which is exactly what those installs already published.
+ */
+export async function readLocalQuotaCards() {
+  // Read-only projection; this fallback is never used by the merge writer below.
+  const raw = await readJSONFile(PROVIDER_QUOTAS_FILE, null);
+  const quotas = sanitizeQuotaCards(isPlainObject(raw) ? raw.quotas : null);
+  const capturedAt = isNonBlankStr(raw?.capturedAt) ? raw.capturedAt : latestFetchedAt(quotas);
+  return { quotas, capturedAt };
+}
+
+/**
+ * What a stored card claims, ignoring WHEN it was read.
+ *
+ * A card whose only difference is its `fetchedAt` is the same reading: some
+ * adapters stamp the current clock on every call (the image-gen card is derived
+ * on read, not scraped), so comparing whole cards would rewrite this file — and
+ * invalidate the `usage` sync checksum — on every page poll, handing peers a
+ * new slot to pull that says nothing new.
+ */
+const claimOf = ({ fetchedAt, ...rest }) => JSON.stringify(rest);
+
+/**
+ * Is `card` a reading taken STRICTLY BEFORE `incumbent`? The shared LWW
+ * predicate, asked the other way round — so this guard and the federated merge
+ * that consumes the result (`lib/fleetQuotas.js`) rank by one rule.
+ *
+ * Only "strictly older" is rejected, not "not newer": two readings stamped the
+ * same instant with different claims are a correction, and the later write
+ * should still apply.
+ */
+const isOlderReading = (card, incumbent) => compareNewerWins(incumbent?.fetchedAt, card?.fetchedAt);
+
+/**
+ * The next strictly-increasing write stamp after `prior` — the current clock,
+ * nudged a millisecond past `prior` when the clock has not moved (or has gone
+ * backwards, as it can across an NTP correction).
+ */
+function nextStamp(prior) {
+  const nowMs = Date.now();
+  const priorMs = parseTsMs(prior);
+  return new Date(priorMs !== null && nowMs <= priorMs ? priorMs + 1 : nowMs).toISOString();
+}
+
+/**
+ * Merge a batch of freshly-read cards into the store, keyed by family.
+ *
+ * MERGE, not replace: a read narrowed to one family (`?family=`) must not
+ * retire the other families' stored readings, or a per-card Refresh would drop
+ * this machine out of the fleet view for every provider the user didn't click.
+ *
+ * The write is skipped when no card's claim changed. Every write invalidates
+ * the `usage` sync category's checksum, and a page poll that re-serves
+ * identical cached cards is not new information for a peer to pull.
+ */
+export async function recordLocalQuotaCards(cards) {
+  const incoming = sanitizeQuotaCards(cards);
+  if (!incoming.length) return null;
+  return withLock(async () => {
+    const raw = await readJSONFile(PROVIDER_QUOTAS_FILE, null, { strict: true });
+    const stored = sanitizeQuotaCards(isPlainObject(raw) ? raw.quotas : null);
+    const byFamily = new Map(stored.map((card) => [card.family, card]));
+    let changed = false;
+    for (const card of incoming) {
+      const incumbent = byFamily.get(card.family);
+      if (incumbent && claimOf(incumbent) === claimOf(card)) continue;
+      // A reading taken EARLIER than the one on file is not an update: a card
+      // stamps when its READING was taken, so a source that lags (Codex rollout
+      // telemetry, stamped with the turn that produced it) can arrive after a
+      // current one while describing an older moment. Federation ranks these by
+      // `fetchedAt`, so letting it through would hand every peer a reading this
+      // machine already knows is superseded.
+      if (incumbent && isOlderReading(card, incumbent)) continue;
+      byFamily.set(card.family, card);
+      changed = true;
+    }
+    const quotas = [...byFamily.values()];
+    const storedAt = isNonBlankStr(raw?.capturedAt) ? raw.capturedAt : latestFetchedAt(quotas);
+    if (!changed) return { quotas, capturedAt: storedAt, changed: false };
+    // Stamped on the WRITE, so the slot moves whenever its contents do — see
+    // readLocalQuotaCards for why the freshest card's `fetchedAt` can't serve.
+    // Forced STRICTLY forward: peers compare this stamp newer-wins, so two
+    // writes inside one millisecond would stamp the same instant and the second
+    // reading would never be pulled.
+    const capturedAt = nextStamp(storedAt);
+    await atomicWrite(PROVIDER_QUOTAS_FILE, { capturedAt, quotas });
+    return { quotas, capturedAt, changed: true };
+  });
+}

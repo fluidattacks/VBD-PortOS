@@ -1,0 +1,1144 @@
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { basename, join } from 'node:path';
+import { tmpdir } from 'node:os';
+
+const state = vi.hoisted(() => ({
+  settings: {},
+  peer: null,
+  jobs: [],
+  nextId: 1,
+  capabilities: { engines: [], defaultEngine: 'musicgen' },
+  cancelResult: { ok: true, status: 'canceled' },
+  imageModels: [],
+  videoModels: [],
+  videoHolds: [],
+  maintenanceHeld: false,
+  failAudioCopy: false,
+  failAudioCleanup: false,
+  cachedRepos: new Set(),
+  laneWidthByKind: {},
+}));
+
+vi.mock('node:fs/promises', async (load) => {
+  const fs = await load();
+  return { ...fs,
+    writeFile: async (path, bytes, options) => {
+      if (state.failAudioCopy && basename(path).startsWith('federated-audio-')) {
+        await fs.writeFile(path, bytes.subarray(0, 12), options);
+        throw Object.assign(new Error('Fixture disk write failure'), { code: 'EIO' });
+      }
+      return fs.writeFile(path, bytes, options);
+    },
+    unlink: async (path) => {
+      if (state.failAudioCleanup && basename(path).startsWith('federated-audio-')) {
+        throw Object.assign(new Error('Fixture cleanup failure'), { code: 'EIO' });
+      }
+      return fs.unlink(path);
+    },
+  };
+});
+
+vi.mock('../lib/maintenanceAdmission.js', () => ({ maintenance: {
+  held: () => state.maintenanceHeld, markCurrentUnsettled: vi.fn(),
+  run: async (_kind, _resource, fn) => {
+    if (state.maintenanceHeld) throw Object.assign(new Error('Maintenance holds new work'), { code: 'MAINTENANCE_HELD' });
+    return fn();
+  },
+} }));
+
+vi.mock('./settings.js', () => ({
+  getSettings: vi.fn(async () => state.settings),
+}));
+
+// Only the CATALOG accessors are stubbed — the pure row-shape helpers come from
+// the real module, so a change to what "must be cached" is felt here rather than
+// re-stated in a mock that could drift from it.
+vi.mock('../lib/mediaModels.js', async (importOriginal) => ({
+  ...await importOriginal(),
+  getImageModels: vi.fn(() => state.imageModels),
+  getVideoModels: vi.fn(() => state.videoModels),
+  isEditOnly: (model) => model?.editOnly === true,
+  isFlux2: (model) => model?.runner === 'flux2',
+  repoForModel: (model) => model?.repo ?? null,
+}));
+
+vi.mock('../lib/hfCache.js', () => ({
+  inspectModelCache: vi.fn(async (repo) => ({ cached: state.cachedRepos.has(repo) })),
+  findCachedRepoFiles: vi.fn(async (repo, files) => (
+    state.cachedRepos.has(repo) ? files.map((file) => `/cached/${file}`) : null
+  )),
+}));
+
+vi.mock('./videoGen/runtimes.js', async () => {
+  const actual = await vi.importActual('./videoGen/runtimes.js');
+  return { ...actual, isByovRuntimeReady: vi.fn(async () => true) };
+});
+
+vi.mock('./sharing/peerPullAuthorization.js', () => ({
+  readCallerInstanceId: (req) => req.headers?.['x-portos-instance-id'] || null,
+}));
+
+vi.mock('./sharing/peerSyncShared.js', () => ({
+  findPeerById: vi.fn(async (id) => state.peer?.instanceId === id ? state.peer : null),
+}));
+
+vi.mock('./musicEngineCapabilities.js', () => ({
+  listMusicEngineCapabilities: vi.fn(async () => state.capabilities),
+}));
+
+vi.mock('./mediaJobQueue/index.js', () => ({
+  listJobs: vi.fn(() => state.jobs),
+  isVideoModelHeld: vi.fn((modelId, runtime = 'mlx_video') => state.videoHolds.some((hold) => hold.modelId === modelId && hold.runtime === runtime)),
+  // Widths deliberately differ per kind so a test can tell a minimum from a sum
+  // or a max; the real queue routes every federated kind to the same lane, but
+  // that is the thing under test, not a premise of it.
+  laneConcurrencyFor: vi.fn((job) => state.laneWidthByKind[job?.kind] ?? 1),
+  isRemoteMediaJob: (job) => job?.kind === 'audio' && job.params?.remoteMedia !== undefined,
+  getJob: vi.fn((id) => state.jobs.find((job) => job.id === id) || null),
+  enqueueJob: vi.fn(async ({ kind, owner, params }) => {
+    const suffix = String(state.nextId++).padStart(12, '0');
+    const id = `00000000-0000-4000-8000-${suffix}`;
+    const job = {
+      id, kind, owner, params, status: 'queued', position: state.jobs.length + 1,
+      queuedAt: '2026-08-16T00:00:00.000Z',
+    };
+    state.jobs.push(job);
+    return { jobId: id, position: job.position, status: job.status };
+  }),
+  cancelJob: vi.fn(async (id) => {
+    const job = state.jobs.find((candidate) => candidate.id === id);
+    if (state.cancelResult.ok && job) {
+      job.status = 'canceled';
+      job.completedAt = '2026-08-16T00:01:00.000Z';
+    }
+    return state.cancelResult;
+  }),
+}));
+
+import {
+  authorizeFederatedMediaPeer,
+  describeFederatedMediaJob,
+  getFederatedMediaProviderStatus,
+  normalizeFederatedMediaProviderConfig,
+  submitFederatedMediaJob,
+  __resetFederatedMediaProviderForTests,
+} from './federatedMediaProvider.js';
+import { enqueueJob, laneConcurrencyFor } from './mediaJobQueue/index.js';
+import { PATHS, sha256Text } from '../lib/fileUtils.js';
+import { canonicalStringify } from '../lib/objects.js';
+
+const originalMusicPath = PATHS.music;
+const originalImagesPath = PATHS.images;
+const originalVideosPath = PATHS.videos;
+let tempMusicPath;
+let tempImagesPath;
+let tempVideosPath;
+
+beforeAll(() => {
+  tempMusicPath = mkdtempSync(join(tmpdir(), 'portos-federated-media-service-'));
+  tempImagesPath = mkdtempSync(join(tmpdir(), 'portos-federated-media-images-'));
+  tempVideosPath = mkdtempSync(join(tmpdir(), 'portos-federated-media-videos-'));
+  PATHS.music = tempMusicPath;
+  PATHS.images = tempImagesPath;
+  PATHS.videos = tempVideosPath;
+});
+
+afterAll(() => {
+  PATHS.music = originalMusicPath;
+  PATHS.images = originalImagesPath;
+  PATHS.videos = originalVideosPath;
+  rmSync(tempMusicPath, { recursive: true, force: true });
+  rmSync(tempImagesPath, { recursive: true, force: true });
+  rmSync(tempVideosPath, { recursive: true, force: true });
+});
+
+const selection = { engine: 'minimax-music3', modelId: 'minimax-music3' };
+const config = () => ({
+  enabled: true, maxQueuedJobs: 2, audioModels: [selection], imageModels: [], videoModels: [],
+});
+const SAFE_PROMPT = 'Instrumental synthwave music with a dreamy mood, slow tempo, medium energy. No vocals or spoken words.';
+const OTHER_SAFE_PROMPT = 'Instrumental ambient music with a calm mood, slow tempo, low energy. No vocals or spoken words.';
+const input = () => ({ ...selection, kind: 'audio', prompt: SAFE_PROMPT, durationSec: 60, durationMode: 'manual' });
+
+function readyEngine(overrides = {}) {
+  return {
+    id: 'minimax-music3',
+    name: 'MiniMax Music 3',
+    models: [{ id: 'minimax-music3', name: 'MiniMax Music 3', userAdded: false }],
+    fixedModelInstall: true,
+    modelReadyById: { 'minimax-music3': true },
+    runtimeReady: true,
+    platformSupported: true,
+    cudaRequired: true,
+    cudaState: 'available',
+    minDurationSec: 1,
+    maxDurationSec: 300,
+    defaultDurationSec: 60,
+    lyrics: true,
+    autoDuration: true,
+    ...overrides,
+  };
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  state.settings = { federation: { mediaProvider: config() } };
+  state.peer = { instanceId: 'peer-example', name: 'Example Peer', enabled: true };
+  state.jobs = [];
+  state.maintenanceHeld = false;
+  state.failAudioCopy = false; state.failAudioCleanup = false;
+  state.nextId = 1;
+  state.capabilities = { engines: [readyEngine()], defaultEngine: 'musicgen' };
+  state.cancelResult = { ok: true, status: 'canceled' };
+  state.imageModels = [];
+  state.videoModels = [];
+  state.videoHolds = [];
+  state.cachedRepos = new Set();
+  state.laneWidthByKind = { audio: 1, image: 1, video: 1 };
+  __resetFederatedMediaProviderForTests();
+});
+
+describe('federated media provider authorization', () => {
+  it('defaults absent settings to disabled with conservative limits', () => {
+    expect(normalizeFederatedMediaProviderConfig({})).toEqual({
+      enabled: false, maxQueuedJobs: 2, audioModels: [], imageModels: [], videoModels: [],
+    });
+  });
+
+  it('requires verified Basic auth and an enabled registered peer', async () => {
+    const baseReq = { headers: { 'x-portos-instance-id': 'peer-example' } };
+    await expect(authorizeFederatedMediaPeer(baseReq)).rejects.toMatchObject({
+      status: 403, code: 'MEDIA_PROVIDER_PEER_AUTH_REQUIRED',
+    });
+    await expect(authorizeFederatedMediaPeer(baseReq, { statusProbe: true })).rejects.toMatchObject({
+      status: 403, code: 'MEDIA_PROVIDER_PEER_AUTH_REQUIRED', severity: 'warning',
+    });
+    await expect(authorizeFederatedMediaPeer({
+      ...baseReq,
+      portosAuthContext: { enabled: true, authenticated: true, method: 'session' },
+    })).rejects.toMatchObject({
+      status: 403, code: 'MEDIA_PROVIDER_PEER_AUTH_REQUIRED',
+    });
+
+    const req = {
+      ...baseReq,
+      portosAuthContext: { enabled: true, authenticated: true, method: 'basic' },
+    };
+    await expect(authorizeFederatedMediaPeer(req)).resolves.toEqual({
+      callerId: 'peer-example', config: config(),
+    });
+    // The paired peer token (#8356) is the scoped successor to Basic here.
+    await expect(authorizeFederatedMediaPeer({
+      ...baseReq,
+      portosAuthContext: { enabled: true, authenticated: true, method: 'peer', peerId: 'peer-record' },
+    })).resolves.toEqual({ callerId: 'peer-example', config: config() });
+
+    state.peer.enabled = false;
+    await expect(authorizeFederatedMediaPeer(req)).rejects.toMatchObject({
+      status: 403, code: 'MEDIA_PROVIDER_PEER_FORBIDDEN',
+    });
+  });
+
+  it('keeps periodic disabled-provider discovery quiet while naming real job callers', async () => {
+    state.settings = { federation: { mediaProvider: { ...config(), enabled: false } } };
+    const req = {
+      headers: { 'x-portos-instance-id': 'peer-example' },
+      portosAuthContext: { enabled: true, authenticated: true, method: 'basic' },
+    };
+
+    await expect(authorizeFederatedMediaPeer(req, { statusProbe: true })).rejects.toMatchObject({
+      status: 503,
+      code: 'MEDIA_PROVIDER_DISABLED',
+      severity: 'warning',
+      message: 'Federated media provider is disabled — refused request from peer "Example Peer"',
+      responseMessage: 'Federated media provider is disabled',
+    });
+    await expect(authorizeFederatedMediaPeer(req)).rejects.toMatchObject({
+      status: 503,
+      code: 'MEDIA_PROVIDER_DISABLED',
+      severity: 'error',
+      message: 'Federated media provider is disabled — refused request from peer "Example Peer"',
+      responseMessage: 'Federated media provider is disabled',
+    });
+
+    // Provider config stays hidden until the caller proves both its credential
+    // and registered peer identity, even when the provider is disabled.
+    await expect(authorizeFederatedMediaPeer({
+      ...req,
+      portosAuthContext: { enabled: true, authenticated: false, method: null },
+    })).rejects.toMatchObject({
+      status: 403, code: 'MEDIA_PROVIDER_PEER_AUTH_REQUIRED',
+    });
+    state.peer = null;
+    await expect(authorizeFederatedMediaPeer(req)).rejects.toMatchObject({
+      status: 403, code: 'MEDIA_PROVIDER_PEER_FORBIDDEN',
+    });
+  });
+});
+
+describe('federated media provider capacity and idempotency', () => {
+  it('reports CUDA unknown as unavailable instead of optimistic capacity', async () => {
+    state.capabilities.engines = [readyEngine({ cudaState: 'unknown' })];
+    const status = await getFederatedMediaProviderStatus(config());
+    expect(status).toMatchObject({ status: 'unavailable', wireVersion: 1, kinds: ['audio'] });
+    expect(status.capabilities[0]).toMatchObject({
+      ready: false, cudaState: 'unknown', unavailableReason: 'cuda-unknown',
+    });
+    expect(status.capabilities[0]).not.toHaveProperty('_engine');
+  });
+
+  it('reports an unmeasured CUDA VRAM profile as unavailable instead of optimistic capacity', async () => {
+    state.capabilities.engines = [readyEngine({ vramState: 'unknown-size' })];
+    const status = await getFederatedMediaProviderStatus(config());
+    expect(status).toMatchObject({ status: 'unavailable' });
+    expect(status.capabilities[0]).toMatchObject({
+      ready: false, unavailableReason: 'vram-unknown-size',
+    });
+  });
+
+  // The bug this replaced: summing every local lane told an audio-only provider
+  // it "runs 4 at a time" because the parallel cloud-CLI lane is wide, when its
+  // music renders serialize one at a time. Widths differ per kind here so a sum
+  // (12), a max (10), and the fail-closed minimum (1) are all distinguishable.
+  it('reports the narrowest lane a negotiated kind lands on, never a sum or a max', async () => {
+    state.laneWidthByKind = { audio: 1, image: 10, video: 1 };
+    const status = await getFederatedMediaProviderStatus(config(), { kinds: ['audio', 'image', 'video'] });
+    expect(status.queue.concurrency).toBe(1);
+    // And it asks about the job shape the provider actually enqueues: adding a
+    // cloud `mode` would route the probe to a lane no federated job uses.
+    expect(laneConcurrencyFor).toHaveBeenCalledWith({ kind: 'image', params: {} });
+  });
+
+  it('reports the width of the one negotiated kind when only one was asked for', async () => {
+    state.laneWidthByKind = { audio: 4, image: 1, video: 1 };
+    const status = await getFederatedMediaProviderStatus(config());
+    expect(status.queue.concurrency).toBe(4);
+  });
+
+  it('breaks the shared queue down by federated kind, excluding outgoing proxy jobs', async () => {
+    state.jobs = [
+      { id: 'a', kind: 'audio', status: 'running', owner: 'federated-media:peer-example' },
+      { id: 'b', kind: 'audio', status: 'queued', owner: null },
+      { id: 'c', kind: 'image', status: 'queued', owner: null },
+      // Outgoing proxy work: rendered on a peer, so it occupies no lane here.
+      { id: 'd', kind: 'audio', status: 'running', owner: null, params: { remoteMedia: {} } },
+      // A kind this contract does not federate still holds a local lane, so it
+      // counts toward totalActive while having no bucket of its own.
+      { id: 'e', kind: 'training', status: 'running', owner: null },
+    ];
+    const status = await getFederatedMediaProviderStatus(config(), { kinds: ['audio', 'image', 'video'] });
+    expect(status.queue.byKind).toEqual({
+      audio: { running: 1, queued: 1 },
+      image: { running: 0, queued: 1 },
+    });
+    // byKind is machine-wide while these are the federated share, counted in
+    // the same pass — only job 'a' is owned by a federated caller. The training
+    // job holds a lane but has no bucket, which is why byKind need not sum to
+    // totalActive.
+    expect(status.queue).toMatchObject({
+      providerActive: 1, running: 1, queued: 0, totalActive: 4,
+    });
+  });
+
+  // Reporting image/video occupancy to a consumer that negotiated audio only
+  // would leave byKind as the one part of the payload the kind projection does
+  // not govern.
+  it('scopes the per-kind breakdown to the negotiated kinds', async () => {
+    state.jobs = [
+      { id: 'a', kind: 'image', status: 'running', owner: null },
+      // Federated work of a kind this caller did not negotiate: invisible in
+      // byKind, but still part of the federated share of the machine — so a
+      // kind filter applied before the owner check would under-report it.
+      { id: 'b', kind: 'image', status: 'running', owner: 'federated-media:peer-example' },
+    ];
+    const status = await getFederatedMediaProviderStatus(config());
+    expect(status.queue.byKind).toEqual({});
+    expect(status.queue).toMatchObject({ totalActive: 2, providerActive: 1, running: 1, queued: 0 });
+  });
+
+  it('admits unrelated peer audio while retained local videos reach the queue cap', async () => {
+    state.jobs = [1, 2, 3].map((id) => ({ id: `held-${id}`, kind: 'video', status: 'queued',
+      hold: { cause: 'local diagnostic' }, owner: null }));
+    const status = await getFederatedMediaProviderStatus(config());
+    expect(status.queue).toMatchObject({ accepting: true, totalActive: 0 });
+    expect(JSON.stringify(status)).not.toContain('local diagnostic');
+    const result = await submitFederatedMediaJob({ callerId: 'peer-example', config: config(), input: input(), idempotencyKey: 'while-held' });
+    expect(result.job).toMatchObject({ status: 'queued', kind: 'audio' });
+  });
+
+  it('queues allowlisted audio without exposing the prompt in its response', async () => {
+    const result = await submitFederatedMediaJob({
+      callerId: 'peer-example', config: config(), input: input(), idempotencyKey: 'commission-1',
+    });
+    expect(result).toMatchObject({ replayed: false, job: { status: 'queued', kind: 'audio', wireVersion: 1 } });
+    expect(result.job).not.toHaveProperty('params');
+    expect(enqueueJob).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'audio', owner: 'federated-media:peer-example',
+      params: expect.objectContaining({
+        prompt: SAFE_PROMPT, engine: 'minimax-music3', modelId: 'minimax-music3',
+        durationMode: 'manual',
+        federatedMedia: expect.objectContaining({
+          callerInstanceId: 'peer-example', idempotencyKey: 'commission-1',
+        }),
+      }),
+    }));
+  });
+
+  // ADR docs/decisions/2026-08-22-federated-media-input-assets.md rule 2: lyrics
+  // cross to an allowlisted peer because no fixed vocabulary encodes them
+  // without discarding them — but only into a model that sings.
+  it('advertises what this BUILD speaks in a status-root features list', async () => {
+    // Emitted verbatim from what the build implements, NOT derived from the
+    // configured models — that is the whole point of moving it off the
+    // capability: a peer with only instrumental models allowlisted must still
+    // be distinguishable from a peer whose code predates lyrical federation.
+    state.capabilities.engines = [readyEngine({ lyrics: false })];
+    const status = await getFederatedMediaProviderStatus(config());
+    expect(status.features).toEqual(['lyrics', 'inputAssets', 'sourceAudio']);
+    expect(status.capabilities[0].lyrics).toBe(false);
+  });
+
+  it('renders lyrics on a lyric-capable model and advertises the lyrics feature', async () => {
+    await submitFederatedMediaJob({
+      callerId: 'peer-example', config: config(),
+      input: { ...input(), lyrics: '[verse]\nwords' }, idempotencyKey: 'commission-lyrics',
+    });
+    expect(enqueueJob).toHaveBeenCalledWith(expect.objectContaining({
+      params: expect.objectContaining({ lyrics: '[verse]\nwords' }),
+    }));
+
+    const status = await getFederatedMediaProviderStatus(config());
+    expect(status.capabilities[0]).toMatchObject({ lyrics: true });
+    expect(status.capabilities[0]).not.toHaveProperty('acceptsLyrics');
+  });
+
+  it('refuses lyrics for an instrumental-only model rather than dropping them', async () => {
+    state.capabilities.engines = [readyEngine({ lyrics: false })];
+    await expect(submitFederatedMediaJob({
+      callerId: 'peer-example', config: config(),
+      input: { ...input(), lyrics: '[verse]\nwords' }, idempotencyKey: 'commission-lyrics',
+    })).rejects.toMatchObject({ status: 400, code: 'MEDIA_PROVIDER_LYRICS_UNSUPPORTED' });
+    expect(enqueueJob).not.toHaveBeenCalled();
+
+    const status = await getFederatedMediaProviderStatus(config());
+    expect(status.capabilities[0]).toMatchObject({ lyrics: false });
+    expect(status.capabilities[0]).not.toHaveProperty('acceptsLyrics');
+  });
+
+  // An instrumental take on a lyrical engine sends `lyrics: ''`. Gating on
+  // presence rather than content would refuse a submission carrying no
+  // conditioning at all.
+  it('admits an empty lyrics field on an instrumental-only model', async () => {
+    state.capabilities.engines = [readyEngine({ lyrics: false })];
+    await expect(submitFederatedMediaJob({
+      callerId: 'peer-example', config: config(),
+      input: { ...input(), lyrics: '' }, idempotencyKey: 'commission-instrumental',
+    })).resolves.toMatchObject({ replayed: false });
+  });
+
+  it('replays a matching key and rejects a key reused with different input', async () => {
+    const first = await submitFederatedMediaJob({
+      callerId: 'peer-example', config: config(), input: input(), idempotencyKey: 'commission-1',
+    });
+    const replay = await submitFederatedMediaJob({
+      callerId: 'peer-example', config: config(), input: input(), idempotencyKey: 'commission-1',
+    });
+    expect(replay.replayed).toBe(true);
+    expect(replay.job.id).toBe(first.job.id);
+    expect(enqueueJob).toHaveBeenCalledTimes(1);
+
+    await expect(submitFederatedMediaJob({
+      callerId: 'peer-example', config: config(),
+      input: { ...input(), prompt: OTHER_SAFE_PROMPT }, idempotencyKey: 'commission-1',
+    })).rejects.toMatchObject({ status: 409, code: 'MEDIA_PROVIDER_IDEMPOTENCY_CONFLICT' });
+  });
+
+  it('replays a kind-less audio job created before the explicit kind field existed', async () => {
+    const legacyInput = { ...input() };
+    delete legacyInput.kind;
+    state.jobs = [{
+      id: '00000000-0000-4000-8000-000000000099',
+      kind: 'audio',
+      owner: 'federated-media:peer-example',
+      status: 'queued',
+      queuedAt: '2026-08-16T00:00:00.000Z',
+      params: {
+        federatedMedia: {
+          wireVersion: 1,
+          callerInstanceId: 'peer-example',
+          idempotencyKey: 'legacy-audio',
+          requestHash: sha256Text(canonicalStringify(legacyInput)),
+        },
+      },
+    }];
+
+    const replay = await submitFederatedMediaJob({
+      callerId: 'peer-example', config: config(), input: input(), idempotencyKey: 'legacy-audio',
+    });
+    expect(replay.replayed).toBe(true);
+    expect(replay.job.id).toBe('00000000-0000-4000-8000-000000000099');
+    expect(enqueueJob).not.toHaveBeenCalled();
+  });
+
+  it('counts all active local media work against the conservative provider cap', async () => {
+    state.jobs = [
+      { id: 'local-1', owner: null, status: 'running' },
+      { id: 'local-2', owner: null, status: 'queued' },
+    ];
+    await expect(submitFederatedMediaJob({
+      callerId: 'peer-example', config: config(), input: input(), idempotencyKey: 'commission-2',
+    })).rejects.toMatchObject({ status: 429, code: 'MEDIA_PROVIDER_BUSY' });
+    expect(enqueueJob).not.toHaveBeenCalled();
+  });
+
+  it('reports a full local media queue to the peer as retryable provider capacity', async () => {
+    enqueueJob.mockImplementationOnce(async () => {
+      throw Object.assign(new Error('The media queue is full'), { status: 429, code: 'MEDIA_QUEUE_FULL' });
+    });
+    await expect(submitFederatedMediaJob({
+      callerId: 'peer-example', config: config(), input: input(), idempotencyKey: 'queue-full',
+    })).rejects.toMatchObject({ status: 429, code: 'MEDIA_PROVIDER_BUSY', context: { retryable: true } });
+  });
+
+  it('does not count outgoing proxy jobs against this machine provider capacity', async () => {
+    state.jobs = [
+      {
+        id: 'remote-outgoing',
+        kind: 'audio',
+        owner: null,
+        status: 'running',
+        params: { remoteMedia: { wireVersion: 1, peerId: '00000000-0000-4000-8000-000000000001' } },
+      },
+      { id: 'local-1', kind: 'video', owner: null, status: 'running', params: {} },
+    ];
+
+    await expect(submitFederatedMediaJob({
+      callerId: 'peer-example', config: config(), input: input(), idempotencyKey: 'commission-remote-capacity',
+    })).resolves.toMatchObject({ replayed: false, job: { status: 'queued' } });
+  });
+
+  it('fails closed when CUDA readiness is unknown', async () => {
+    state.capabilities.engines = [readyEngine({ cudaState: 'unknown' })];
+    await expect(submitFederatedMediaJob({
+      callerId: 'peer-example', config: config(), input: input(), idempotencyKey: 'commission-3',
+    })).rejects.toMatchObject({
+      status: 503,
+      code: 'MEDIA_PROVIDER_MODEL_UNAVAILABLE',
+      context: { reason: 'cuda-unknown' },
+    });
+  });
+
+  it('hides jobs owned by another caller', async () => {
+    const created = await submitFederatedMediaJob({
+      callerId: 'peer-example', config: config(), input: input(), idempotencyKey: 'commission-4',
+    });
+    await expect(describeFederatedMediaJob('other-peer', created.job.id)).rejects.toMatchObject({
+      status: 404, code: 'MEDIA_PROVIDER_JOB_NOT_FOUND',
+    });
+  });
+
+  it('describes only generator-shaped result files with verified byte integrity', async () => {
+    const created = await submitFederatedMediaJob({
+      callerId: 'peer-example', config: config(), input: input(), idempotencyKey: 'commission-5',
+    });
+    const job = state.jobs.find((candidate) => candidate.id === created.job.id);
+    const filename = 'music-gen-11111111-1111-4111-8111-111111111111.wav';
+    const bytes = Buffer.from('RIFF-fake-audio');
+    writeFileSync(join(tempMusicPath, filename), bytes);
+    Object.assign(job, {
+      status: 'completed',
+      completedAt: '2026-08-16T00:02:00.000Z',
+      result: { filename, durationSec: 60, engine: selection.engine, modelId: selection.modelId },
+    });
+
+    const described = await describeFederatedMediaJob('peer-example', job.id);
+    expect(described.result).toEqual({
+      available: true,
+      mimeType: 'audio/wav',
+      sizeBytes: bytes.length,
+      sha256: sha256Text(bytes),
+      downloadUrl: `/api/federation/media/v1/jobs/${job.id}/result`,
+      engine: selection.engine,
+      modelId: selection.modelId,
+      durationSec: 60,
+    });
+    expect(described.result).not.toHaveProperty('path');
+    expect(described.result).not.toHaveProperty('filename');
+
+    job.result.filename = `../${filename}`;
+    await expect(describeFederatedMediaJob('peer-example', job.id)).rejects.toMatchObject({
+      status: 410, code: 'MEDIA_PROVIDER_RESULT_UNAVAILABLE',
+    });
+  });
+});
+
+describe('federated media provider — image/video kinds', () => {
+  const imageSelection = { engine: 'local', modelId: 'flux-dev' };
+  const imageConfig = () => ({
+    enabled: true, maxQueuedJobs: 2, audioModels: [], imageModels: [imageSelection], videoModels: [],
+  });
+  const imageInput = () => ({
+    ...imageSelection, kind: 'image', prompt: 'a lighthouse at dawn', width: 1024, height: 1024,
+  });
+
+  beforeEach(() => {
+    state.imageModels = [{ id: 'flux-dev', name: 'FLUX.1 dev', repo: 'black-forest-labs/FLUX.1-dev' }];
+    state.videoModels = [{ id: 'ltx2', name: 'LTX2', repo: 'example/ltx2' }];
+  });
+
+  it('reports an image capability unavailable when no local runtime is configured', async () => {
+    state.settings = { federation: { mediaProvider: imageConfig() } };
+    const status = await getFederatedMediaProviderStatus(imageConfig(), { kinds: ['image'] });
+    expect(status.kinds).toEqual(['image']);
+    expect(status.capabilities).toEqual([expect.objectContaining({
+      kind: 'image', engine: 'local', modelId: 'flux-dev',
+      ready: false, unavailableReason: 'runtime-unavailable',
+    })]);
+    expect(status.status).toBe('unavailable');
+  });
+
+  it('reports an image capability ready once the runtime and model weights are present', async () => {
+    state.settings = {
+      federation: { mediaProvider: imageConfig() },
+      imageGen: { local: { pythonPath: '/usr/bin/python3' } },
+    };
+    state.cachedRepos = new Set(['black-forest-labs/FLUX.1-dev']);
+    const status = await getFederatedMediaProviderStatus(imageConfig(), { kinds: ['image'] });
+    expect(status.capabilities[0]).toMatchObject({ ready: true, unavailableReason: null });
+    expect(status.status).toBe('ready');
+  });
+
+  it('does not gate bundled image runtimes on the legacy mflux python path', async () => {
+    state.settings = { federation: { mediaProvider: imageConfig() } };
+    state.imageModels = [{
+      id: 'flux-dev', name: 'FLUX.2', runner: 'flux2', repo: 'example/flux2',
+    }];
+    state.cachedRepos = new Set(['example/flux2']);
+    const status = await getFederatedMediaProviderStatus(imageConfig(), { kinds: ['image'] });
+    expect(status.capabilities[0]).toMatchObject({
+      ready: true, runtimeReady: true, unavailableReason: null,
+    });
+  });
+
+  it('does not gate BYOV video runtimes on the legacy mflux python path', async () => {
+    const videoConfig = () => ({
+      enabled: true, maxQueuedJobs: 2, audioModels: [], imageModels: [],
+      videoModels: [{ engine: 'local', modelId: 'ltx2' }],
+    });
+    state.settings = { federation: { mediaProvider: videoConfig() } };
+    state.cachedRepos = new Set(['example/ltx2']);
+    state.videoModels = [{
+      id: 'ltx2', name: 'LTX2', runtime: 'ltx2', repo: 'example/ltx2', supportedModes: ['text'],
+    }];
+    const status = await getFederatedMediaProviderStatus(videoConfig(), { kinds: ['video'] });
+    expect(status.capabilities[0]).toMatchObject({
+      ready: true, runtimeReady: true, unavailableReason: null,
+    });
+  });
+
+  it('refuses held video cohorts even with no retained jobs while admitting another model', async () => {
+    state.videoModels = ['held-video', 'ready-video'].map((id) => ({
+      id, name: id, runtime: 'ltx2', repo: `example/${id}`, supportedModes: ['text'],
+    }));
+    state.cachedRepos = new Set(state.videoModels.map((model) => model.repo));
+    const providerConfig = { ...config(), videoModels: state.videoModels.map(({ id }) => ({ engine: 'local', modelId: id })) };
+    state.videoHolds = [{ modelId: 'held-video', runtime: 'ltx2', cause: 'private diagnostic' }];
+    const status = await getFederatedMediaProviderStatus(providerConfig, { kinds: ['video'] });
+    expect(status.capabilities).toEqual([
+      expect.objectContaining({ modelId: 'held-video', ready: false, unavailableReason: 'runtime-unavailable' }),
+      expect.objectContaining({ modelId: 'ready-video', ready: true }),
+    ]);
+    expect(JSON.stringify(status)).not.toContain('private diagnostic');
+    await expect(submitFederatedMediaJob({ callerId: 'peer-example', config: providerConfig,
+      input: { kind: 'video', engine: 'local', modelId: 'held-video', prompt: 'an invented clip' }, idempotencyKey: 'held-video' }))
+      .rejects.toMatchObject({ code: 'MEDIA_PROVIDER_MODEL_UNAVAILABLE' });
+    expect(enqueueJob).not.toHaveBeenCalled();
+    const accepted = await submitFederatedMediaJob({ callerId: 'peer-example', config: providerConfig,
+      input: { kind: 'video', engine: 'local', modelId: 'ready-video', prompt: 'an invented clip' }, idempotencyKey: 'ready-video' });
+    expect(accepted.job).toMatchObject({ status: 'queued', kind: 'video' });
+  });
+
+  // These two models used to be hidden entirely: neither can render text-only,
+  // and the wire carried no conditioning for them to render FROM. Now that
+  // conditioning images cross (ADR
+  // docs/decisions/2026-08-22-federated-media-input-assets.md rule 1) they are
+  // advertisable — but only with `inputAssets.required`, which is what tells a
+  // consumer the model is unusable without an init/source image.
+  it('advertises input-only image and video models as requiring conditioning', async () => {
+    const incompatibleImageConfig = () => ({
+      enabled: true, maxQueuedJobs: 2, audioModels: [], videoModels: [],
+      imageModels: [{ engine: 'local', modelId: 'edit-only' }],
+    });
+    state.settings = { federation: { mediaProvider: incompatibleImageConfig() }, imageGen: { local: { pythonPath: '/usr/bin/python3' } } };
+    state.imageModels = [{
+      id: 'edit-only', name: 'Edit only', repo: 'example/edit', editOnly: true,
+    }];
+    state.cachedRepos = new Set(['example/edit']);
+    const imageStatus = await getFederatedMediaProviderStatus(incompatibleImageConfig(), { kinds: ['image'] });
+    expect(imageStatus.capabilities[0]).toMatchObject({
+      ready: true,
+      unavailableReason: null,
+      inputAssets: expect.objectContaining({ required: true, roles: ['initImage'] }),
+    });
+
+    const incompatibleVideoConfig = () => ({
+      enabled: true, maxQueuedJobs: 2, audioModels: [], imageModels: [],
+      videoModels: [{ engine: 'local', modelId: 'image-only' }],
+    });
+    state.videoModels = [{
+      id: 'image-only', name: 'Image only', runtime: 'ltx2', repo: 'example/image-only', supportedModes: ['image'],
+    }];
+    state.cachedRepos = new Set(['example/image-only']);
+    const videoStatus = await getFederatedMediaProviderStatus(incompatibleVideoConfig(), { kinds: ['video'] });
+    expect(videoStatus.capabilities[0]).toMatchObject({
+      ready: true,
+      unavailableReason: null,
+      inputAssets: expect.objectContaining({ required: true, roles: ['sourceImage'] }),
+    });
+  });
+
+  // The other half of that trade: an older consumer cannot read `inputAssets`,
+  // so it will submit text-only against a required-input model. It must get a
+  // typed refusal it can surface, not a queued job that dies when a worker
+  // picks it up minutes later.
+  it('refuses a text-only submission to a model that requires conditioning', async () => {
+    const editOnlyConfig = () => ({
+      enabled: true, maxQueuedJobs: 2, audioModels: [], videoModels: [],
+      imageModels: [{ engine: 'local', modelId: 'edit-only' }],
+    });
+    state.settings = { federation: { mediaProvider: editOnlyConfig() }, imageGen: { local: { pythonPath: '/usr/bin/python3' } } };
+    state.imageModels = [{ id: 'edit-only', name: 'Edit only', repo: 'example/edit', editOnly: true }];
+    state.cachedRepos = new Set(['example/edit']);
+
+    await expect(submitFederatedMediaJob({
+      callerId: 'peer-example',
+      config: editOnlyConfig(),
+      input: { kind: 'image', engine: 'local', modelId: 'edit-only', prompt: 'a lighthouse at dawn' },
+      idempotencyKey: 'commission-edit-1',
+    })).rejects.toMatchObject({ status: 400, code: 'MEDIA_PROVIDER_INPUT_REQUIRED' });
+    expect(enqueueJob).not.toHaveBeenCalled();
+  });
+
+  it('refuses a conditioning role the selected model does not advertise', async () => {
+    state.settings = {
+      federation: { mediaProvider: imageConfig() },
+      imageGen: { local: { pythonPath: '/usr/bin/python3' } },
+    };
+    state.cachedRepos = new Set(['black-forest-labs/FLUX.1-dev']);
+    // FLUX.1-dev is not a FLUX.2 model, so only `initImage` is advertised —
+    // its runner branch never passes reference images through.
+    await expect(submitFederatedMediaJob({
+      callerId: 'peer-example',
+      config: imageConfig(),
+      input: {
+        ...imageInput(),
+        referenceImages: [{ assetId: `${'0'.repeat(16)}-${'a'.repeat(64)}` }],
+      },
+      idempotencyKey: 'commission-refs-1',
+    })).rejects.toMatchObject({ status: 400, code: 'MEDIA_PROVIDER_INPUT_UNSUPPORTED' });
+    expect(enqueueJob).not.toHaveBeenCalled();
+  });
+
+  // 410 rather than 404: the id was well-formed and caller-scoped, so "gone"
+  // is the actionable reading — re-upload (same content, same id) and retry.
+  it('refuses a submission naming an asset that is not staged, without queueing it', async () => {
+    state.settings = {
+      federation: { mediaProvider: imageConfig() },
+      imageGen: { local: { pythonPath: '/usr/bin/python3' } },
+    };
+    state.cachedRepos = new Set(['black-forest-labs/FLUX.1-dev']);
+    await expect(submitFederatedMediaJob({
+      callerId: 'peer-example',
+      config: imageConfig(),
+      input: { ...imageInput(), initImage: { assetId: `${'0'.repeat(16)}-${'a'.repeat(64)}` } },
+      idempotencyKey: 'commission-missing-asset',
+    })).rejects.toMatchObject({ status: 410, code: 'MEDIA_PROVIDER_ASSET_NOT_FOUND' });
+    expect(enqueueJob).not.toHaveBeenCalled();
+  });
+
+  it('does not report image/video capabilities unless the caller opts into that kind', async () => {
+    state.settings = {
+      federation: { mediaProvider: imageConfig() },
+      imageGen: { local: { pythonPath: '/usr/bin/python3' } },
+    };
+    state.cachedRepos = new Set(['black-forest-labs/FLUX.1-dev']);
+    const status = await getFederatedMediaProviderStatus(imageConfig());
+    expect(status.kinds).toEqual(['audio']);
+    expect(status.capabilities).toEqual([]);
+  });
+
+  it('rejects a configured non-local engine as unknown rather than admitting it', async () => {
+    const nonLocalConfig = () => ({
+      enabled: true, maxQueuedJobs: 2, audioModels: [], videoModels: [],
+      imageModels: [{ engine: 'sdapi', modelId: 'flux-dev' }],
+    });
+    state.settings = { federation: { mediaProvider: nonLocalConfig() } };
+    await expect(submitFederatedMediaJob({
+      callerId: 'peer-example',
+      config: nonLocalConfig(),
+      input: { kind: 'image', engine: 'sdapi', modelId: 'flux-dev', prompt: 'a lighthouse at dawn' },
+      idempotencyKey: 'commission-image-1',
+    })).rejects.toMatchObject({ status: 503, code: 'MEDIA_PROVIDER_MODEL_UNAVAILABLE', context: { reason: 'unknown-engine' } });
+    expect(enqueueJob).not.toHaveBeenCalled();
+  });
+
+  it('queues an allowlisted local image job with the local runner param shape', async () => {
+    state.settings = {
+      federation: { mediaProvider: imageConfig() },
+      imageGen: { local: { pythonPath: '/usr/bin/python3' } },
+    };
+    state.cachedRepos = new Set(['black-forest-labs/FLUX.1-dev']);
+    const result = await submitFederatedMediaJob({
+      callerId: 'peer-example', config: imageConfig(), input: imageInput(), idempotencyKey: 'commission-image-2',
+    });
+    expect(result).toMatchObject({ replayed: false, job: { status: 'queued', kind: 'image' } });
+    expect(enqueueJob).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'image',
+      owner: 'federated-media:peer-example',
+      params: expect.objectContaining({
+        pythonPath: '/usr/bin/python3',
+        prompt: 'a lighthouse at dawn',
+        modelId: 'flux-dev',
+        width: 1024,
+        height: 1024,
+      }),
+    }));
+    // Audio-only fields never leak into the image job's queue params.
+    const [call] = enqueueJob.mock.calls;
+    expect(call[0].params).not.toHaveProperty('lyrics');
+    expect(call[0].params).not.toHaveProperty('durationSec');
+  });
+
+  it('describes a completed image result with an image/png projection', async () => {
+    state.settings = {
+      federation: { mediaProvider: imageConfig() },
+      imageGen: { local: { pythonPath: '/usr/bin/python3' } },
+    };
+    state.cachedRepos = new Set(['black-forest-labs/FLUX.1-dev']);
+    const created = await submitFederatedMediaJob({
+      callerId: 'peer-example', config: imageConfig(), input: imageInput(), idempotencyKey: 'commission-image-3',
+    });
+    const job = state.jobs.find((candidate) => candidate.id === created.job.id);
+    const filename = `${job.id}.png`;
+    const bytes = Buffer.from('fake-png-bytes');
+    writeFileSync(join(tempImagesPath, filename), bytes);
+    Object.assign(job, {
+      status: 'completed', completedAt: '2026-08-16T00:02:00.000Z',
+      result: { filename, engine: 'local', modelId: 'flux-dev' },
+    });
+
+    const described = await describeFederatedMediaJob('peer-example', job.id);
+    expect(described.kind).toBe('image');
+    expect(described.result).toMatchObject({ available: true, mimeType: 'image/png', sizeBytes: bytes.length });
+  });
+
+});
+
+// ADR docs/decisions/2026-08-20-federated-visual-prompts.md draws the privacy
+// line at payload *class*, not at the prompt: a submitted job body may carry
+// the prompt the peer is being asked to render, but a status/capability payload
+// and the read-back job projection must never carry prompt or record content.
+// A prompt is generated from project records, so a leak here would put universe
+// canon and character names into a payload the ADR says is absolutely
+// prompt-free. Both guarded paths (getFederatedMediaProviderStatus,
+// describeFederatedMediaJob) are kind-agnostic allowlists, so every kind is
+// exercised — a per-kind field added to either is exactly the regression.
+describe('federated media provider — prompt-free status and projection payloads', () => {
+  const IMAGE_PROMPT = 'a lighthouse at dawn over Example Bay';
+  const VIDEO_PROMPT = 'a tram climbing a hill in Example City';
+
+  const kinds = [
+    {
+      kind: 'audio',
+      // Audio prompts are already restricted to a canonical profile string, so
+      // the sentinel is a fragment of that rather than free text.
+      sentinel: 'dreamy',
+      resultDir: () => tempMusicPath,
+      resultName: (id) => `music-gen-${id}.wav`,
+      setup: () => {
+        state.settings = { federation: { mediaProvider: config() } };
+      },
+      config: () => config(),
+      input: () => input(),
+    },
+    {
+      kind: 'image',
+      sentinel: IMAGE_PROMPT,
+      resultDir: () => tempImagesPath,
+      resultName: (id) => `${id}.png`,
+      setup: () => {
+        state.imageModels = [{ id: 'flux-dev', name: 'FLUX.1 dev', repo: 'black-forest-labs/FLUX.1-dev' }];
+        state.cachedRepos = new Set(['black-forest-labs/FLUX.1-dev']);
+        state.settings = {
+          federation: { mediaProvider: imagePrivacyConfig() },
+          imageGen: { local: { pythonPath: '/usr/bin/python3' } },
+        };
+      },
+      config: () => imagePrivacyConfig(),
+      input: () => ({
+        engine: 'local', modelId: 'flux-dev', kind: 'image',
+        prompt: IMAGE_PROMPT, width: 1024, height: 1024,
+      }),
+    },
+    {
+      kind: 'video',
+      sentinel: VIDEO_PROMPT,
+      resultDir: () => tempVideosPath,
+      resultName: (id) => `${id}.mp4`,
+      setup: () => {
+        state.videoModels = [{
+          id: 'ltx2', name: 'LTX2', runtime: 'ltx2', repo: 'example/ltx2', supportedModes: ['text'],
+        }];
+        state.cachedRepos = new Set(['example/ltx2']);
+        state.settings = { federation: { mediaProvider: videoPrivacyConfig() } };
+      },
+      config: () => videoPrivacyConfig(),
+      input: () => ({ engine: 'local', modelId: 'ltx2', kind: 'video', prompt: VIDEO_PROMPT }),
+    },
+  ];
+
+  const imagePrivacyConfig = () => ({
+    enabled: true, maxQueuedJobs: 2, audioModels: [],
+    imageModels: [{ engine: 'local', modelId: 'flux-dev' }], videoModels: [],
+  });
+  const videoPrivacyConfig = () => ({
+    enabled: true, maxQueuedJobs: 2, audioModels: [], imageModels: [],
+    videoModels: [{ engine: 'local', modelId: 'ltx2' }],
+  });
+
+  it.each(kinds)('keeps the $kind prompt out of the status payload and both job projections', async (scenario) => {
+    scenario.setup();
+    const created = await submitFederatedMediaJob({
+      callerId: 'peer-example',
+      config: scenario.config(),
+      input: scenario.input(),
+      idempotencyKey: `privacy-${scenario.kind}`,
+    });
+    const payload = (value) => JSON.stringify(value ?? null);
+
+    // Bypass probe: these assertions only mean something if the sentinel is
+    // findable at all. The queued job params legitimately carry it — that is
+    // the local render input, not a wire payload.
+    expect(payload(enqueueJob.mock.calls.at(-1)[0].params)).toContain(scenario.sentinel);
+
+    // submitFederatedMediaJob returns describeFederatedMediaJob's projection,
+    // so this is both the submit response and the queued poll response.
+    expect(payload(created.job)).not.toContain(scenario.sentinel);
+
+    const status = await getFederatedMediaProviderStatus(scenario.config(), { kinds: [scenario.kind] });
+    expect(payload(status)).not.toContain(scenario.sentinel);
+    // The underscore-prefixed internals publicCapability strips are not prompts,
+    // but _pythonPath is an absolute local interpreter path — record content by
+    // the same rule, and the one field this payload could realistically regress
+    // into leaking if that map is ever dropped.
+    expect(status.capabilities[0]).not.toHaveProperty('_pythonPath');
+    expect(status.capabilities[0]).not.toHaveProperty('_model');
+
+    // The completed projection is the third payload class: it gains a result
+    // block built per kind from the rendered file, which must not reintroduce
+    // the prompt.
+    const job = state.jobs.find((candidate) => candidate.id === created.job.id);
+    const filename = scenario.resultName(job.id);
+    const resultPath = join(scenario.resultDir(), filename);
+    // Job ids restart at 1 per test while the temp dirs live for the whole
+    // file, so an earlier test's render can already sit at this path — drop it,
+    // or this case would still pass with its own write removed.
+    rmSync(resultPath, { force: true });
+    writeFileSync(resultPath, Buffer.from('fake-media-bytes'));
+    Object.assign(job, {
+      status: 'completed',
+      completedAt: '2026-08-16T00:02:00.000Z',
+      result: { filename, engine: scenario.input().engine, modelId: scenario.input().modelId },
+    });
+    const completed = await describeFederatedMediaJob('peer-example', job.id);
+    expect(completed.result).toMatchObject({ available: true });
+    expect(payload(completed)).not.toContain(scenario.sentinel);
+  });
+
+  it.each(['wan22', 'wan22_cuda'])('rejects off-grid %s frames before federated enqueue', async (runtime) => {
+    state.videoModels = [{
+      id: 'wan_test', name: 'Test Wan', runtime, repo: 'example/wan-test',
+      supportedModes: ['text'], frameStride: 4, defaultFrames: 120,
+    }];
+    state.cachedRepos = new Set(['example/wan-test']);
+    const providerConfig = {
+      ...config(), audioModels: [], videoModels: [{ engine: 'local', modelId: 'wan_test' }],
+    };
+    state.settings = { federation: { mediaProvider: providerConfig } };
+    const submit = (frames) => submitFederatedMediaJob({
+      callerId: 'peer-example', config: providerConfig,
+      input: { kind: 'video', engine: 'local', modelId: 'wan_test', prompt: 'a lighthouse', ...frames },
+    });
+    const error = {
+      status: 400, code: 'WAN22_INVALID_FRAME_COUNT',
+      message: 'Test Wan requires a 4n+1 frame count; got 120.',
+    };
+    await expect(submit({ numFrames: 120 })).rejects.toMatchObject(error);
+    await expect(submit({})).rejects.toMatchObject(error);
+    expect(enqueueJob).not.toHaveBeenCalled();
+    await expect(submit({ numFrames: 81 })).resolves.toHaveProperty('job');
+  });
+
+  it('populates frameStride, maxNumFrames, and resolutionOptions for visual models and null for audio', async () => {
+    state.videoModels = [{
+      id: 'wan22_t2v_a14b',
+      name: 'Wan 2.2 T2V A14B',
+      runtime: 'wan22',
+      repo: 'example/wan22',
+      supportedModes: ['text'],
+      frameStride: 4,
+      maxNumFrames: 1017,
+      frameOptions: [25, 49, 73, 97, 121],
+      resolutionOptions: [{ label: '1344x768 (16:9)', w: 1344, h: 768 }],
+    }];
+    state.cachedRepos = new Set(['example/wan22']);
+    const providerConfig = {
+      enabled: true,
+      maxQueuedJobs: 2,
+      audioModels: [selection],
+      imageModels: [],
+      videoModels: [{ engine: 'local', modelId: 'wan22_t2v_a14b' }],
+    };
+    state.settings = { federation: { mediaProvider: providerConfig } };
+
+    const status = await getFederatedMediaProviderStatus(providerConfig, { kinds: ['audio', 'video'] });
+    const audioCap = status.capabilities.find((c) => c.kind === 'audio');
+    const videoCap = status.capabilities.find((c) => c.kind === 'video');
+
+    expect(audioCap).toMatchObject({
+      frameStride: null,
+      maxNumFrames: null,
+      frameOptions: null,
+      fpsOptions: null,
+      resolutionOptions: null,
+    });
+    expect(videoCap).toMatchObject({
+      frameStride: 4,
+      maxNumFrames: 1017,
+      frameOptions: [25, 49, 73, 97, 121],
+      resolutionOptions: [{ label: '1344x768 (16:9)', w: 1344, h: 768 }],
+    });
+  });
+
+  it('sanitizes out-of-range, non-integer, and oversized constraint arrays provider-side', async () => {
+    state.videoModels = [{
+      id: 'custom_model',
+      name: 'Custom Model',
+      runtime: 'wan22',
+      repo: 'example/wan22',
+      supportedModes: ['text'],
+      frameStride: -4,
+      maxNumFrames: 'not-a-number',
+      frameOptions: [25, 33.5, -10, 'invalid', 49],
+      resolutionOptions: [
+        { label: 'valid', w: 1344, h: 768 },
+        { label: '4k-too-large', w: 3840, h: 2160 },
+        { label: 'too-small', w: 32, h: 32 },
+        { label: 'invalid-w', w: 'NaN', h: 768 },
+      ],
+    }];
+    state.cachedRepos = new Set(['example/wan22']);
+    const providerConfig = {
+      enabled: true,
+      maxQueuedJobs: 2,
+      audioModels: [],
+      imageModels: [],
+      videoModels: [{ engine: 'local', modelId: 'custom_model' }],
+    };
+    state.settings = { federation: { mediaProvider: providerConfig } };
+
+    const status = await getFederatedMediaProviderStatus(providerConfig, { kinds: ['video'] });
+    const cap = status.capabilities[0];
+
+    expect(cap.frameStride).toBeNull();
+    expect(cap.maxNumFrames).toBe(49);
+    expect(cap.frameOptions).toEqual([25, 49]);
+    expect(cap.resolutionOptions).toEqual([{ label: 'valid', w: 1344, h: 768 }]);
+  });
+});
+
+
+describe('supplied audio provider admission', () => {
+  it('does not negotiate A2V runtimes with a different audio-output contract', async () => {
+    const cfg = { ...config(), videoModels: [{ engine: 'local', modelId: 'other-audio-runtime' }] };
+    state.settings.imageGen = { local: { pythonPath: '/example/python' } };
+    state.videoModels = [{ id: 'other-audio-runtime', runtime: 'minimax_h3_ref2va', repo: 'example/other-audio', supportedModes: ['a2v'] }];
+    state.cachedRepos.add('example/other-audio');
+    const status = await getFederatedMediaProviderStatus(cfg, { kinds: ['video'] });
+    expect(status.capabilities[0]?.sourceAudio).toBeUndefined();
+    expect(status.capabilities[0]).toMatchObject({ ready: false, unavailableReason: 'unsupported-input' });
+  });
+
+  it('keeps maintenance private and idempotent replay available during a hold', async () => {
+    const admitted = await submitFederatedMediaJob({ callerId: 'peer-example', config: config(), input: input(), idempotencyKey: 'before-hold' });
+    state.maintenanceHeld = true;
+    const status = await getFederatedMediaProviderStatus(config());
+    expect(status.queue).toMatchObject({ accepting: false, maintenanceHeld: true });
+    expect(JSON.stringify(status)).not.toMatch(/owner|blockers|requestedAt/);
+    await expect(submitFederatedMediaJob({ callerId: 'peer-example', config: config(), input: input(), idempotencyKey: 'before-hold' }))
+      .resolves.toMatchObject({ replayed: true, job: { id: admitted.job.id } });
+    await expect(submitFederatedMediaJob({ callerId: 'peer-example', config: config(), input: input(), idempotencyKey: 'new-during-hold' }))
+      .rejects.toMatchObject({ code: 'MAINTENANCE_HELD' });
+    expect(enqueueJob).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not advertise a cached runtime as hardware eligible above its memory floor', async () => {
+    const cfg = { ...config(), videoModels: [{ engine: 'local', modelId: 'oversized' }] };
+    state.settings.imageGen = { local: { pythonPath: '/example/python' } };
+    state.videoModels = [{ id: 'oversized', repo: 'example/large', memoryGb: 100000, supportedModes: ['image'] }];
+    state.cachedRepos.add('example/large');
+    const status = await getFederatedMediaProviderStatus(cfg, { kinds: ['video'] });
+    expect(status.capabilities[0]).toMatchObject({ runtimeReady: true, ready: false, hardwareEligible: false, unavailableReason: 'hardware-ineligible' });
+  });
+
+  it('copies only verified caller-owned PCM into the uploads lane and binds idempotency to the audio provenance', async () => {
+    const { storeFederatedMediaAsset } = await import('./federatedMedia/assetStore.js');
+    const { readFileSync } = await import('node:fs');
+    const original = { uploads: PATHS.uploads, federatedMediaInbox: PATHS.federatedMediaInbox };
+    const root = mkdtempSync(join(tmpdir(), 'provider-audio-test-'));
+    PATHS.uploads = join(root, 'uploads'); PATHS.federatedMediaInbox = root;
+    try {
+      const cfg = { ...config(), videoModels: [{ engine: 'local', modelId: 'audio-model' }] };
+      state.settings.imageGen = { local: { pythonPath: '/example/python' } };
+      state.videoModels = [{ id: 'audio-model', runtime: 'ltx2', repo: 'example/audio-video', supportedModes: ['image', 'a2v'] }];
+      state.cachedRepos.add('example/audio-video');
+      const bytes = Buffer.alloc(44 + 48000 * 4);
+      bytes.write('RIFF'); bytes.writeUInt32LE(bytes.length - 8, 4); bytes.write('WAVEfmt ', 8);
+      bytes.writeUInt32LE(16, 16); bytes.writeUInt16LE(1, 20); bytes.writeUInt16LE(2, 22);
+      bytes.writeUInt32LE(48000, 24); bytes.writeUInt32LE(192000, 28); bytes.writeUInt16LE(4, 32);
+      bytes.writeUInt16LE(16, 34); bytes.write('data', 36); bytes.writeUInt32LE(48000 * 4, 40);
+      const upload = (body, mimeType) => storeFederatedMediaAsset({ callerId: 'peer-example', body, mimeType, declaredSha256: sha256Text(body) });
+      const audio = await upload(bytes, 'audio/wav');
+      const frame = await upload(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), 'image/png');
+      const body = { kind: 'video', engine: 'local', modelId: 'audio-model', prompt: 'Example light', fps: 24, numFrames: 25,
+        sourceImage: { assetId: frame.assetId }, sourceAudio: { assetId: audio.assetId },
+        audioConditioning: { sourceSha256: 'b'.repeat(64), clipSha256: audio.sha256, sampleRate: 48000, channels: 2, startSample: 0, endSample: 48000, sampleCount: 48000 } };
+      const args = { callerId: 'peer-example', config: cfg, input: body, idempotencyKey: 'audio-window' };
+      for (const field of ['fps', 'numFrames']) {
+        await expect(submitFederatedMediaJob({ ...args, input: { ...body, [field]: undefined } }))
+          .rejects.toMatchObject({ code: 'MEDIA_PROVIDER_ASSET_INTEGRITY' });
+      }
+      await expect(submitFederatedMediaJob({ ...args, input: { ...body, audioConditioning: { ...body.audioConditioning, sampleCount: 47999 } } }))
+        .rejects.toMatchObject({ code: 'MEDIA_PROVIDER_ASSET_INTEGRITY' });
+      state.failAudioCopy = true;
+      await expect(submitFederatedMediaJob(args)).rejects.toMatchObject({ code: 'EIO' });
+      expect(enqueueJob).not.toHaveBeenCalled();
+      expect(readdirSync(PATHS.uploads)).toEqual([]);
+      state.failAudioCleanup = true;
+      await expect(submitFederatedMediaJob(args)).rejects.toMatchObject({ code: 'EIO' });
+      const { maintenance } = await import('../lib/maintenanceAdmission.js');
+      expect(maintenance.markCurrentUnsettled).toHaveBeenCalled();
+      expect(enqueueJob).not.toHaveBeenCalled();
+      for (const name of readdirSync(PATHS.uploads)) rmSync(join(PATHS.uploads, name));
+      state.failAudioCopy = false; state.failAudioCleanup = false;
+      const result = await submitFederatedMediaJob(args);
+      const params = state.jobs.find((job) => job.id === result.job.id).params;
+      expect(params).toMatchObject({ mode: 'a2v', audioStartSec: 0, disableAudio: true, audioConditioning: body.audioConditioning });
+      expect(params.audioFilePath).toMatch(/federated-audio-.*\.wav$/);
+      expect(readFileSync(params.audioFilePath)).toEqual(bytes);
+      await expect(submitFederatedMediaJob({ ...args, input: { ...body, audioConditioning: { ...body.audioConditioning, startSample: 48000, endSample: 96000 } } }))
+        .rejects.toMatchObject({ code: 'MEDIA_PROVIDER_IDEMPOTENCY_CONFLICT' });
+    } finally { Object.assign(PATHS, original); rmSync(root, { recursive: true, force: true }); }
+  });
+});

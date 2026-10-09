@@ -1,0 +1,157 @@
+import { describe, it, expect, vi } from 'vitest';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { MemoryRouter } from 'react-router';
+
+// The widget owns only what to show from a fetched list; the subscription belongs
+// to useSocketResource, which has its own suite.
+const mockUseSocketResource = vi.fn();
+vi.mock('../../../hooks/useSocketResource', () => ({
+  useSocketResource: (...args) => mockUseSocketResource(...args),
+}));
+vi.mock('../../../services/api', () => ({ listThreads: vi.fn(), updateThread: vi.fn() }));
+vi.mock('../../ui/Toast', () => ({ default: { error: vi.fn() } }));
+
+import * as api from '../../../services/api';
+import toast from '../../ui/Toast';
+import OpenThreadsWidget from './OpenThreadsWidget';
+
+const renderWidget = () => render(<MemoryRouter><OpenThreadsWidget /></MemoryRouter>);
+
+describe('OpenThreadsWidget', () => {
+  it('keeps navigation and a loading status until the first list arrives', () => {
+    mockUseSocketResource.mockReturnValue({ data: null, loading: true });
+    renderWidget();
+    expect(screen.getByRole('link', { name: 'Open Threads' })).toHaveAttribute('href', '/brain/threads');
+    expect(screen.getByRole('status')).toHaveTextContent('Loading threads');
+    expect(screen.queryByText(/No open loops/)).toBeNull();
+  });
+
+  it('asks the server for the first page of open + waiting threads only', () => {
+    mockUseSocketResource.mockReturnValue({ data: null, loading: true });
+    renderWidget();
+    const fetchFn = mockUseSocketResource.mock.calls.at(-1)[0];
+    fetchFn();
+    expect(api.listThreads).toHaveBeenCalledWith({ status: 'open,waiting', limit: 6, offset: 0 }, { silent: true });
+  });
+
+  it('shows the next action on each row and deep-links it to its drawer', () => {
+    mockUseSocketResource.mockReturnValue({
+      loading: false,
+      data: {
+        total: 2,
+        threads: [
+          { id: 'a b', title: 'Renew domain', status: 'open', nextAction: 'Log in to registrar', dueAt: '2000-01-01T00:00:00.000Z' },
+          { id: 't2', title: 'Vendor quote', status: 'waiting', waitingOn: 'Acme Corp' },
+        ],
+      },
+    });
+    renderWidget();
+    expect(screen.getByText('Renew domain').closest('a')).toHaveAttribute('href', '/brain/threads?thread=a%20b');
+    expect(screen.getByText('Log in to registrar')).toBeTruthy();
+    expect(screen.getByText('Waiting on Acme Corp')).toBeTruthy();
+    expect(screen.getByText('2 open')).toBeTruthy();
+  });
+
+  it('links the overflow the page did not ship to the tab', () => {
+    mockUseSocketResource.mockReturnValue({
+      loading: false,
+      data: { total: 8, threads: Array.from({ length: 6 }, (_, i) => ({ id: `t${i}`, title: `Loop ${i}`, status: 'open' })) },
+    });
+    renderWidget();
+    expect(screen.getAllByRole('listitem')).toHaveLength(6);
+    expect(screen.getByText('+2 more').closest('a')).toHaveAttribute('href', '/brain/threads');
+  });
+
+  it('offers completion only for an unfinished thread with a positively closed source', () => {
+    mockUseSocketResource.mockReturnValue({ loading: false, data: { threads: [
+      { id: 'open', title: 'Open source', status: 'open', externalState: 'open' },
+      { id: 'unknown', title: 'Unknown source', status: 'waiting', externalState: 'unknown' },
+      { id: 'manual', title: 'Manual loop', status: 'open' },
+      { id: 'done', title: 'Done loop', status: 'done', externalState: 'closed' },
+      { id: 'archived', title: 'Archived loop', status: 'archived', externalState: 'closed' },
+      { id: 'closed', title: 'Closed source', status: 'waiting', externalState: 'closed' },
+    ] } });
+    renderWidget();
+    expect(screen.getAllByText('Source closed — mark done?')).toHaveLength(1);
+    expect(screen.getByRole('button', { name: 'Mark "Closed source" done' }).closest('a')).toBeNull();
+    expect(api.updateThread).not.toHaveBeenCalled();
+  });
+
+  it('removes a completed row and updates the count without fetching, tolerating stale polls and later reopening', async () => {
+    const thread = { id: 'closed', title: 'Closed source', status: 'waiting', externalState: 'closed', updatedAt: '2026-01-01T00:00:00.000Z' };
+    mockUseSocketResource.mockReturnValue({ loading: false, data: { total: 8, threads: [thread] } });
+    let finish;
+    api.updateThread.mockImplementation(() => new Promise((resolve) => { finish = resolve; }));
+    const view = renderWidget();
+    const button = screen.getByRole('button', { name: 'Mark "Closed source" done' });
+    fireEvent.click(button);
+    fireEvent.click(button);
+    expect(button).toBeDisabled();
+    expect(api.updateThread).toHaveBeenCalledTimes(1);
+    expect(api.updateThread).toHaveBeenCalledWith('closed', { status: 'done' }, { silent: true });
+    await act(async () => { finish({ ...thread, status: 'done', updatedAt: '2026-01-02T00:00:00.000Z' }); });
+    expect(screen.queryByText('Closed source')).toBeNull();
+    expect(screen.getByText('7 open')).toBeTruthy();
+    expect(screen.queryByText(/No open loops/)).toBeNull();
+    expect(api.listThreads).not.toHaveBeenCalled();
+    mockUseSocketResource.mockReturnValue({ loading: false, data: { total: 8, threads: [{ ...thread }] } });
+    view.rerender(<MemoryRouter><OpenThreadsWidget /></MemoryRouter>);
+    expect(screen.queryByText('Closed source')).toBeNull();
+    mockUseSocketResource.mockReturnValue({ loading: false, data: { total: 8, threads: [{ ...thread, updatedAt: '2026-01-03T00:00:00.000Z' }] } });
+    view.rerender(<MemoryRouter><OpenThreadsWidget /></MemoryRouter>);
+    expect(screen.getByText('Closed source')).toBeTruthy();
+    expect(screen.getByText('8 open')).toBeTruthy();
+  });
+
+  it('keeps the row after a failed completion, reports the error once and permits retry', async () => {
+    const thread = { id: 'closed', title: 'Closed source', status: 'open', externalState: 'closed' };
+    mockUseSocketResource.mockReturnValue({ loading: false, data: { total: 1, threads: [thread] } });
+    api.updateThread.mockRejectedValueOnce(new Error('Connection lost')).mockResolvedValueOnce({ ...thread, status: 'done', updatedAt: '2026-01-02T00:00:00.000Z' });
+    renderWidget();
+    const button = screen.getByRole('button', { name: 'Mark "Closed source" done' });
+    fireEvent.click(button);
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith('Connection lost'));
+    expect(toast.error).toHaveBeenCalledTimes(1);
+    expect(screen.getByText('1 open')).toBeTruthy();
+    expect(button).not.toBeDisabled();
+    fireEvent.click(button);
+    await waitFor(() => expect(screen.queryByText('Closed source')).toBeNull());
+    expect(api.updateThread).toHaveBeenCalledTimes(2);
+  });
+
+  it('offers retry on initial failure and recovers to genuine empty results', () => {
+    const refetch = vi.fn();
+    mockUseSocketResource.mockReturnValue({ data: null, loading: false, error: new Error('Unavailable'), refetch });
+    const view = renderWidget();
+    expect(screen.getByRole('status')).toHaveTextContent('Threads unavailable');
+    expect(screen.queryByText(/No open loops/)).toBeNull();
+    expect(screen.queryByText(/open$/)).toBeNull();
+    expect(screen.getByRole('link', { name: 'Open Brain Threads' })).toHaveAttribute('href', '/brain/threads');
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    expect(refetch).toHaveBeenCalledTimes(1);
+    mockUseSocketResource.mockReturnValue({ data: null, loading: true, error: new Error('Unavailable'), refetch });
+    view.rerender(<MemoryRouter><OpenThreadsWidget /></MemoryRouter>);
+    expect(screen.getByRole('button', { name: 'Retrying…' })).toBeDisabled();
+    mockUseSocketResource.mockReturnValue({ data: { total: 0, threads: [] }, loading: false, error: null, refetch });
+    view.rerender(<MemoryRouter><OpenThreadsWidget /></MemoryRouter>);
+    expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull();
+    expect(screen.getByText('Track one')).toBeTruthy();
+  });
+
+  it('identifies retained rows and counts as stale after reconciliation failure', () => {
+    const refetch = vi.fn();
+    mockUseSocketResource.mockReturnValue({ data: { total: 1, threads: [{ id: 'retained', title: 'Retained loop', status: 'open' }] }, loading: false, error: new Error('Unavailable'), refetch });
+    renderWidget();
+    expect(screen.getByRole('status')).toHaveTextContent('Showing last-loaded results');
+    expect(screen.getByText('1 open')).toBeTruthy();
+    expect(screen.getByText('Retained loop').closest('a')).toHaveAttribute('href', '/brain/threads?thread=retained');
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    expect(refetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('offers to track one when the list is empty', () => {
+    mockUseSocketResource.mockReturnValue({ loading: false, data: { total: 0, threads: [] } });
+    renderWidget();
+    expect(screen.getByText('Track one').closest('a')).toHaveAttribute('href', '/brain/threads');
+  });
+});

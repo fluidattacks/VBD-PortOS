@@ -1,0 +1,602 @@
+import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
+import express from 'express';
+import { mkdir, mkdtemp, readdir, rm, writeFile } from 'fs/promises';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { request } from '../lib/testHelper.js';
+
+// Code-engine takes land in the shared music library; point it at a temp dir
+// and keep the WAV (no ffmpeg in tests).
+const { musicDir } = await vi.hoisted(async () => {
+  const { mkdtemp } = await import('fs/promises');
+  const { tmpdir } = await import('os');
+  const { join } = await import('path');
+  return { musicDir: await mkdtemp(join(tmpdir(), 'tracks-code-take-')) };
+});
+vi.mock('../lib/fileUtils.js', async (importOriginal) => {
+  const actual = await importOriginal();
+  return { ...actual, PATHS: { ...actual.PATHS, music: musicDir } };
+});
+// The drawn-waveform draw route runs one LLM call — stub the provider seam.
+const { readSuperColliderPreview } = vi.hoisted(() => ({ readSuperColliderPreview: vi.fn() }));
+vi.mock('../services/superColliderRender.js', () => ({ readSuperColliderPreview }));
+vi.mock('../services/promptRunner.js', async () => ({
+  ...(await vi.importActual('../services/promptRunner.js')),
+  resolveProviderAndModel: vi.fn(async () => ({ provider: { id: 'prov-1', type: 'api' }, selectedModel: 'model-x' })),
+  runPromptThroughProvider: vi.fn(),
+}));
+vi.mock('../lib/ffmpeg.js', () => ({
+  findFfmpeg: vi.fn().mockResolvedValue(null),
+  runFfmpegProcess: vi.fn(),
+  probeVideoDuration: vi.fn().mockResolvedValue(null),
+}));
+
+vi.mock('../services/tracks/index.js', () => ({
+  TITLE_MAX: 200,
+  ALBUM_ID_MAX: 80,
+  ARTIST_ID_MAX: 80,
+  ARTIST_NAME_MAX: 120,
+  CONCEPT_MAX: 8000,
+  LYRICS_MAX: 20000,
+  PROMPT_MAX: 8000,
+  ENGINE_MAX: 60,
+  MODEL_ID_MAX: 120,
+  AUDIO_FILENAME_MAX: 256,
+  DURATION_MIN_SEC: 1,
+  DURATION_MAX_SEC: 3600,
+  TRACK_ID_RE: /^track-/,
+  RENDER_SOURCES: { UPLOAD: 'upload', SUNO: 'suno', YOUTUBE: 'youtube' },
+  listTracks: vi.fn(async () => [{ id: 'track-1', title: 'Intro' }]),
+  getTrack: vi.fn(),
+  createTrack: vi.fn(async (input) => ({ id: 'track-new', ...input })),
+  updateTrack: vi.fn(async (id, patch) => ({ id, ...patch })),
+  deleteTrack: vi.fn(async (id) => ({ id })),
+  buildRenderAppend: vi.fn((track, input) => {
+    const render = { id: 'render-x', ...input };
+    return { render, renders: [...(track?.renders || []), render] };
+  }),
+  selectRenderPatch: vi.fn((track, renderId) => {
+    const r = (track.renders || []).find((x) => x.id === renderId);
+    return r ? { audioFilename: r.audioFilename, engine: r.engine, modelId: r.modelId, durationSec: r.durationSec } : null;
+  }),
+  appendActiveTake: vi.fn(async (id, take, patch) => ({ id, ...take, ...patch })),
+  deleteRenderPatch: vi.fn((track, renderId) => {
+    const renders = track.renders || [];
+    if (!renders.some((x) => x.id === renderId)) return null;
+    return { renders: renders.filter((x) => x.id !== renderId) };
+  }),
+}));
+
+const lib = vi.hoisted(() => ({
+  store: new Map(),
+}));
+vi.mock('../services/pipeline/musicLibrary.js', () => ({
+  MUSIC_UPLOAD_MAX_BYTES: 50 * 1024 * 1024,
+  isSupportedMusicUpload: () => true,
+  assertSafeMusicFilename: (f) => { if (f.includes('..') || f.includes('/')) throw Object.assign(new Error('bad'), { status: 400, code: 'X' }); },
+  listMusicLibrary: vi.fn(async () => [{ filename: 'music-1.mp3', label: 'theme', sizeBytes: 10, updatedAt: '2026-05-15T00:00:00.000Z' }]),
+  // The real importUploadedTrack copies tempPath into the library then
+  // unlinks it (best-effort) — the route's real (unmocked) multipart parser
+  // stages the upload under the OS temp dir before this is called, so the
+  // mock must consume it the same way or that staged file leaks (#9032).
+  importUploadedTrack: vi.fn(async (tempPath) => {
+    const { rm: rmTemp } = await import('fs/promises');
+    if (tempPath) await rmTemp(tempPath, { force: true }).catch(() => {});
+    return { filename: 'music-up.mp3', sizeBytes: 11 };
+  }),
+  statMusicTrack: vi.fn(async (f) => (lib.store.has(f) ? { filename: f, label: f, sizeBytes: 10 } : null)),
+}));
+
+import * as tracks from '../services/tracks/index.js';
+vi.mock('../services/albums/index.js', () => ({
+  getAlbum: vi.fn(async () => null),
+  updateAlbum: vi.fn(async (id, patch) => ({ id, ...patch })),
+}));
+// The URL rule is NOT mocked: it lives in `lib/youtubeUrl.js` and the route
+// imports it from there, so these cases exercise the real accept/reject regex.
+vi.mock('../services/trackYoutubeImport.js', () => ({
+  startYoutubeImport: vi.fn(async () => ({ jobId: 'job-1' })),
+  attachImportSseClient: vi.fn(() => true),
+  cancelYoutubeImport: vi.fn(() => true),
+}));
+vi.mock('../services/trackSunoImport.js', () => ({
+  startSunoImport: vi.fn(async () => ({ jobId: 'suno-job' })),
+  attachSunoImportSseClient: vi.fn(() => false),
+  cancelSunoImport: vi.fn(() => false),
+}));
+import * as sunoImport from '../services/trackSunoImport.js';
+
+import * as musicLibrary from '../services/pipeline/musicLibrary.js';
+import * as albums from '../services/albums/index.js';
+import { TRACK_IDS_MAX } from '../services/albums/logic.js';
+import * as ytImport from '../services/trackYoutubeImport.js';
+import { errorMiddleware } from '../lib/errorHandler.js';
+import * as promptRunner from '../services/promptRunner.js';
+import { probeVideoDuration } from '../lib/ffmpeg.js';
+import tracksRoutes from './tracks.js';
+
+function makeApp() {
+  const app = express();
+  app.use(express.json());
+  app.use('/api/tracks', tracksRoutes);
+  app.use(errorMiddleware);
+  return app;
+}
+
+describe('tracks routes', () => {
+  let app;
+  beforeEach(() => { app = makeApp(); vi.clearAllMocks(); lib.store.clear(); });
+
+  it('GET / returns the track list', async () => {
+    const r = await request(app).get('/api/tracks');
+    expect(r.status).toBe(200);
+    expect(r.body).toEqual([{ id: 'track-1', title: 'Intro' }]);
+  });
+
+  // Regression guard: every client caller (apiTracks.listTracks) calls this
+  // with no query params. If it ever returns an envelope instead of a bare
+  // array, those lists silently render empty.
+  it('GET / without pagination params returns the unbounded bare array', async () => {
+    tracks.listTracks.mockResolvedValueOnce(
+      Array.from({ length: 120 }, (_, i) => ({ id: `track-${i}`, title: `T${i}` }))
+    );
+    const r = await request(app).get('/api/tracks');
+    expect(r.status).toBe(200);
+    expect(Array.isArray(r.body)).toBe(true);
+    expect(r.body).toHaveLength(120);
+  });
+
+  it('GET / returns a bounded envelope when pagination is requested', async () => {
+    tracks.listTracks.mockResolvedValueOnce(
+      Array.from({ length: 5 }, (_, i) => ({ id: `track-${i}`, title: `T${i}` }))
+    );
+    const r = await request(app).get('/api/tracks?limit=2&offset=1');
+    expect(r.status).toBe(200);
+    expect(r.body.items).toHaveLength(2);
+    expect(r.body.items[0].id).toBe('track-1');
+    expect(r.body.total).toBe(5);
+    expect(r.body.limit).toBe(2);
+    expect(r.body.offset).toBe(1);
+  });
+
+  it('GET /library returns the shared music library (not read as an id)', async () => {
+    const r = await request(app).get('/api/tracks/library');
+    expect(r.status).toBe(200);
+    expect(r.body.tracks[0].filename).toBe('music-1.mp3');
+    expect(tracks.getTrack).not.toHaveBeenCalled();
+  });
+
+  describe('YouTube import (#1945)', () => {
+    it('POST /import/youtube starts a job for a valid URL', async () => {
+      const r = await request(app).post('/api/tracks/import/youtube').send({ url: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ' });
+      expect(r.status).toBe(202);
+      expect(r.body).toEqual({ jobId: 'job-1' });
+      expect(ytImport.startYoutubeImport).toHaveBeenCalledWith('https://www.youtube.com/watch?v=dQw4w9WgXcQ');
+    });
+
+    it('POST /import/youtube accepts a youtu.be short link', async () => {
+      const r = await request(app).post('/api/tracks/import/youtube').send({ url: 'https://youtu.be/dQw4w9WgXcQ' });
+      expect(r.status).toBe(202);
+    });
+
+    it.each([
+      'https://music.youtube.com/watch?v=dQw4w9WgXcQ',
+      'https://www.youtube.com/shorts/dQw4w9WgXcQ',
+      'https://www.youtube.com/live/dQw4w9WgXcQ',
+      'https://www.youtube.com/embed/dQw4w9WgXcQ',
+    ])('POST /import/youtube accepts %s (#6014 — the drifted regex rejected these)', async (url) => {
+      const r = await request(app).post('/api/tracks/import/youtube').send({ url });
+      expect(r.status).toBe(202);
+      expect(ytImport.startYoutubeImport).toHaveBeenCalledWith(url);
+    });
+
+    it('POST /import/youtube rejects a non-YouTube URL (never reaches the service)', async () => {
+      const r = await request(app).post('/api/tracks/import/youtube').send({ url: 'https://vimeo.com/12345' });
+      expect(r.status).toBe(400);
+      expect(ytImport.startYoutubeImport).not.toHaveBeenCalled();
+    });
+
+    it('GET /import/:jobId/events 404s when the job is unknown', async () => {
+      ytImport.attachImportSseClient.mockReturnValueOnce(false);
+      const r = await request(app).get('/api/tracks/import/missing/events');
+      expect(r.status).toBe(404);
+    });
+
+    it('POST /import/:jobId/cancel proxies to the service', async () => {
+      const r = await request(app).post('/api/tracks/import/job-1/cancel');
+      expect(r.status).toBe(200);
+      expect(r.body).toEqual({ ok: true });
+      expect(ytImport.cancelYoutubeImport).toHaveBeenCalledWith('job-1');
+    });
+  });
+
+  describe('Suno import', () => {
+    it.each([
+      'https://suno.com/song/62cd2904-a9ad-41fc-8097-c85cebe08586',
+      'https://suno.com/s/AbCdEf123456',
+    ])('POST /import/suno starts a job for %s', async (url) => {
+      const r = await request(app).post('/api/tracks/import/suno').send({ url });
+      expect(r.status).toBe(202);
+      expect(r.body).toEqual({ jobId: 'suno-job' });
+      expect(sunoImport.startSunoImport).toHaveBeenCalledWith(url);
+    });
+
+    it('POST /import/suno rejects a non-Suno URL (never reaches the service)', async () => {
+      const r = await request(app).post('/api/tracks/import/suno').send({ url: 'https://example.com/song/62cd2904-a9ad-41fc-8097-c85cebe08586' });
+      expect(r.status).toBe(400);
+      expect(sunoImport.startSunoImport).not.toHaveBeenCalled();
+    });
+
+    it('a Suno job streams and cancels through the shared import routes', async () => {
+      ytImport.attachImportSseClient.mockReturnValueOnce(false);
+      sunoImport.attachSunoImportSseClient.mockImplementationOnce((_id, res) => { res.status(200).end(); return true; });
+      expect((await request(app).get('/api/tracks/import/suno-job/events')).status).toBe(200);
+      ytImport.cancelYoutubeImport.mockReturnValueOnce(false);
+      sunoImport.cancelSunoImport.mockReturnValueOnce(true);
+      const r = await request(app).post('/api/tracks/import/suno-job/cancel');
+      expect(r.body).toEqual({ ok: true });
+      expect(sunoImport.cancelSunoImport).toHaveBeenCalledWith('suno-job');
+    });
+  });
+
+  it('POST / creates a track', async () => {
+    const r = await request(app).post('/api/tracks').send({ title: 'Intro', engine: 'acestep' });
+    expect(r.status).toBe(201);
+    expect(tracks.createTrack).toHaveBeenCalledWith(expect.objectContaining({ title: 'Intro', engine: 'acestep' }));
+    expect(r.body.id).toBe('track-new');
+  });
+
+  it('POST / rejects a path-ish audioFilename (same guard as /audio/attach)', async () => {
+    const r = await request(app).post('/api/tracks').send({ title: 'Intro', audioFilename: '../escape.mp3' });
+    expect(r.status).toBe(400);
+    expect(tracks.createTrack).not.toHaveBeenCalled();
+  });
+
+  it('POST / accepts an empty audioFilename (clears the pointer)', async () => {
+    const r = await request(app).post('/api/tracks').send({ title: 'Intro', audioFilename: '' });
+    expect(r.status).toBe(201);
+  });
+
+  it('POST / with albumId appends the track to the album tracklist', async () => {
+    albums.getAlbum.mockResolvedValueOnce({ id: 'album-1', trackIds: ['track-0'] });
+    tracks.createTrack.mockResolvedValueOnce({ id: 'track-new', title: 'Intro', albumId: 'album-1' });
+    const r = await request(app).post('/api/tracks').send({ title: 'Intro', albumId: 'album-1' });
+    expect(r.status).toBe(201);
+    expect(albums.updateAlbum).toHaveBeenCalledWith('album-1', { trackIds: ['track-0', 'track-new'] });
+  });
+
+  it('PATCH /:id moving albums drops from the old tracklist and appends to the new', async () => {
+    tracks.getTrack.mockResolvedValueOnce({ id: 'track-1', title: 'Intro', albumId: 'album-old' });
+    tracks.updateTrack.mockResolvedValueOnce({ id: 'track-1', title: 'Intro', albumId: 'album-new' });
+    albums.getAlbum.mockImplementation(async (id) => (
+      id === 'album-old' ? { id, trackIds: ['track-1'] } : { id, trackIds: [] }
+    ));
+    const r = await request(app).patch('/api/tracks/track-1').send({ albumId: 'album-new' });
+    expect(r.status).toBe(200);
+    expect(albums.updateAlbum).toHaveBeenCalledWith('album-old', { trackIds: [] });
+    expect(albums.updateAlbum).toHaveBeenCalledWith('album-new', { trackIds: ['track-1'] });
+  });
+
+  // The capacity/existence contract itself is covered at the service boundary
+  // (services/trackAlbumMembership.test.js). These two pin the ROUTE wiring:
+  // a regression that reinstates the old best-effort reconcile would persist
+  // the track and answer 2xx instead of surfacing the refusal.
+  it('POST / refuses a create into a full album without persisting the track', async () => {
+    albums.getAlbum.mockResolvedValueOnce({ id: 'album-full', trackIds: Array.from({ length: TRACK_IDS_MAX }, (_, i) => `track-${i}`) });
+    const r = await request(app).post('/api/tracks').send({ title: 'Intro', albumId: 'album-full' });
+    expect(r.status).toBe(409);
+    expect(r.body.code).toBe('ALBUM_FULL');
+    expect(tracks.createTrack).not.toHaveBeenCalled();
+    expect(albums.updateAlbum).not.toHaveBeenCalled();
+  });
+
+  it('PATCH /:id refuses a move into an album that no longer exists', async () => {
+    tracks.getTrack.mockResolvedValueOnce({ id: 'track-1', title: 'Intro', albumId: 'album-old' });
+    // An earlier case left a mockImplementation on getAlbum; clearAllMocks keeps
+    // implementations, so state the missing destination explicitly.
+    albums.getAlbum.mockResolvedValueOnce(null);
+    const r = await request(app).patch('/api/tracks/track-1').send({ albumId: 'album-missing' });
+    expect(r.status).toBe(404);
+    expect(r.body.code).toBe('ALBUM_NOT_FOUND');
+    expect(tracks.updateTrack).not.toHaveBeenCalled();
+    expect(albums.updateAlbum).not.toHaveBeenCalled();
+  });
+
+  it('POST / rejects a missing title', async () => {
+    expect((await request(app).post('/api/tracks').send({ engine: 'x' })).status).toBe(400);
+    expect(tracks.createTrack).not.toHaveBeenCalled();
+  });
+
+  it('PATCH /:id rejects an empty patch; updates otherwise', async () => {
+    tracks.getTrack.mockResolvedValue({ id: 'track-1', title: 'Intro' });
+    expect((await request(app).patch('/api/tracks/track-1').send({})).status).toBe(400);
+    const r = await request(app).patch('/api/tracks/track-1').send({ prompt: 'warm folk' });
+    expect(r.status).toBe(200);
+    expect(tracks.updateTrack).toHaveBeenCalledWith('track-1', { prompt: 'warm folk' });
+  });
+
+  it('PATCH /:id accepts a saved music-designer concept', async () => {
+    tracks.getTrack.mockResolvedValue({ id: 'track-1', title: 'Intro' });
+    const r = await request(app).patch('/api/tracks/track-1').send({ concept: 'A dusk-time pulse' });
+    expect(r.status).toBe(200);
+    expect(tracks.updateTrack).toHaveBeenCalledWith('track-1', { concept: 'A dusk-time pulse' });
+  });
+
+  it('DELETE /:id soft-deletes a track', async () => {
+    tracks.getTrack.mockResolvedValue({ id: 'track-1', title: 'Intro' });
+    const r = await request(app).delete('/api/tracks/track-1');
+    expect(r.status).toBe(200);
+    expect(r.body).toEqual({ id: 'track-1' });
+  });
+
+  it('POST /:id/audio/attach 404s when the track is missing', async () => {
+    tracks.getTrack.mockResolvedValueOnce(null);
+    const r = await request(app).post('/api/tracks/track-x/audio/attach').send({ filename: 'music-1.mp3' });
+    expect(r.status).toBe(404);
+  });
+
+  it('POST /:id/audio/attach 404s when the file is not in the library', async () => {
+    tracks.getTrack.mockResolvedValue({ id: 'track-1', title: 'Intro' });
+    const r = await request(app).post('/api/tracks/track-1/audio/attach').send({ filename: 'missing.mp3' });
+    expect(r.status).toBe(404);
+    expect(r.body.code).toBe('TRACK_AUDIO_NOT_IN_LIBRARY');
+  });
+
+  it('POST /:id/audio/attach attaches an existing library track and records it as a render', async () => {
+    tracks.getTrack.mockResolvedValue({ id: 'track-1', title: 'Intro' });
+    lib.store.set('music-1.mp3', true);
+    const r = await request(app).post('/api/tracks/track-1/audio/attach').send({ filename: 'music-1.mp3' });
+    expect(r.status).toBe(200);
+    expect(tracks.updateTrack).toHaveBeenCalledWith('track-1', expect.objectContaining({
+      audioFilename: 'music-1.mp3',
+      engine: '',
+      renders: expect.arrayContaining([expect.objectContaining({ audioFilename: 'music-1.mp3' })]),
+    }));
+  });
+
+  it('POST /:id/audio/attach re-selects (no duplicate card) when the file is already in the history', async () => {
+    tracks.getTrack.mockResolvedValue({
+      id: 'track-1', title: 'Intro', audioFilename: 'other.mp3',
+      renders: [{ id: 'render-1', audioFilename: 'music-1.mp3', engine: 'musicgen', modelId: 'm', durationSec: 5 }],
+    });
+    lib.store.set('music-1.mp3', true);
+    const r = await request(app).post('/api/tracks/track-1/audio/attach').send({ filename: 'music-1.mp3' });
+    expect(r.status).toBe(200);
+    // Re-select path: no `renders` key in the patch (the take already exists).
+    expect(tracks.updateTrack).toHaveBeenCalledWith('track-1', { audioFilename: 'music-1.mp3', engine: 'musicgen', modelId: 'm', durationSec: 5 });
+  });
+
+  it('POST /:id/audio/attach appends onto the FRESHEST track state (re-reads before write)', async () => {
+    // A render added to this track between the route's initial load and the write
+    // (e.g. a long generation finishing) must not be dropped — the append must
+    // build on the re-read track, not the snapshot from requireTrack.
+    const stale = { id: 'track-1', title: 'S', renders: [{ id: 'r-old', audioFilename: 'old.mp3' }] };
+    const fresh = { id: 'track-1', title: 'S', renders: [{ id: 'r-old', audioFilename: 'old.mp3' }, { id: 'r-concurrent', audioFilename: 'concurrent.mp3' }] };
+    tracks.getTrack.mockResolvedValueOnce(stale).mockResolvedValueOnce(fresh);
+    lib.store.set('music-1.mp3', true);
+    const r = await request(app).post('/api/tracks/track-1/audio/attach').send({ filename: 'music-1.mp3' });
+    expect(r.status).toBe(200);
+    expect(tracks.buildRenderAppend).toHaveBeenCalledWith(fresh, expect.objectContaining({ audioFilename: 'music-1.mp3' }));
+  });
+
+  it('DELETE /:id/audio clears the pointer', async () => {
+    tracks.getTrack.mockResolvedValue({ id: 'track-1', title: 'Intro' });
+    const r = await request(app).delete('/api/tracks/track-1/audio');
+    expect(r.status).toBe(200);
+    expect(tracks.updateTrack).toHaveBeenCalledWith('track-1', { audioFilename: '' });
+  });
+
+  it('POST /:id/renders/:renderId/select makes a past render active', async () => {
+    tracks.getTrack.mockResolvedValue({
+      id: 'track-1', title: 'Intro', audioFilename: 'b.wav',
+      renders: [{ id: 'render-a', audioFilename: 'a.wav', engine: 'musicgen', modelId: 'm1', durationSec: 10 }],
+    });
+    const r = await request(app).post('/api/tracks/track-1/renders/render-a/select');
+    expect(r.status).toBe(200);
+    expect(tracks.updateTrack).toHaveBeenCalledWith('track-1', { audioFilename: 'a.wav', engine: 'musicgen', modelId: 'm1', durationSec: 10 });
+  });
+
+  it('POST /:id/renders/:renderId/select 404s for an unknown render', async () => {
+    tracks.getTrack.mockResolvedValue({ id: 'track-1', title: 'Intro', renders: [] });
+    const r = await request(app).post('/api/tracks/track-1/renders/missing/select');
+    expect(r.status).toBe(404);
+    expect(r.body.code).toBe('TRACK_RENDER_NOT_FOUND');
+  });
+
+  it('DELETE /:id/renders/:renderId removes a render', async () => {
+    tracks.getTrack.mockResolvedValue({
+      id: 'track-1', title: 'Intro', audioFilename: 'a.wav',
+      renders: [{ id: 'render-a', audioFilename: 'a.wav' }, { id: 'render-b', audioFilename: 'b.wav' }],
+    });
+    const r = await request(app).delete('/api/tracks/track-1/renders/render-a');
+    expect(r.status).toBe(200);
+    expect(tracks.updateTrack).toHaveBeenCalledWith('track-1', { renders: [{ id: 'render-b', audioFilename: 'b.wav' }] });
+  });
+
+  it('DELETE /:id/renders/:renderId 404s for an unknown render', async () => {
+    tracks.getTrack.mockResolvedValue({ id: 'track-1', title: 'Intro', renders: [] });
+    const r = await request(app).delete('/api/tracks/track-1/renders/missing');
+    expect(r.status).toBe(404);
+    expect(r.body.code).toBe('TRACK_RENDER_NOT_FOUND');
+  });
+
+  describe('POST /:id/audio/upload (library upload + Suno export import, #8967)', () => {
+    const boundary = '----portosupload';
+    const upload = (fields = {}) => request(app).post('/api/tracks/track-1/audio/upload')
+      .set('content-type', `multipart/form-data; boundary=${boundary}`)
+      .send(Buffer.concat([
+        ...Object.entries(fields).map(([k, v]) => Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${k}"\r\n\r\n${v}\r\n`)),
+        Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="track"; filename="song.mp3"\r\nContent-Type: audio/mpeg\r\n\r\nID3fake\r\n--${boundary}--\r\n`),
+      ]));
+
+    it('lands a Suno export as the active take with its provenance, style prompt, lyrics and duration', async () => {
+      tracks.getTrack.mockResolvedValue({ id: 'track-1', renders: [] });
+      probeVideoDuration.mockResolvedValueOnce(187.4);
+      const r = await upload({ source: 'suno', prompt: 'dreamy synth-pop', lyrics: 'la la la' });
+      expect(r.status).toBe(200);
+      expect(musicLibrary.importUploadedTrack).toHaveBeenCalledWith(expect.any(String), 'song.mp3');
+      expect(tracks.updateTrack).toHaveBeenCalledWith('track-1', expect.objectContaining({
+        audioFilename: 'music-up.mp3', engine: '', modelId: '', durationSec: 187.4,
+        renders: [expect.objectContaining({
+          audioFilename: 'music-up.mp3', source: 'suno', prompt: 'dreamy synth-pop', lyrics: 'la la la', durationSec: 187.4,
+        })],
+      }));
+    });
+
+    it('records a plain upload as source "upload" when no provenance is sent', async () => {
+      tracks.getTrack.mockResolvedValue({ id: 'track-1', renders: [] });
+      const r = await upload();
+      expect(r.status).toBe(200);
+      const patch = tracks.updateTrack.mock.calls[0][1];
+      expect(patch.renders[0]).toMatchObject({ source: 'upload', prompt: '', lyrics: '' });
+      expect(patch.durationSec).toBeNull(); // ffprobe unavailable → unknown, not 0
+    });
+
+    it('refuses an unsupported source before importing anything', async () => {
+      tracks.getTrack.mockResolvedValue({ id: 'track-1', renders: [] });
+      const r = await upload({ source: 'suno-api' });
+      expect(r.status).toBe(400);
+      expect(musicLibrary.importUploadedTrack).not.toHaveBeenCalled();
+      expect(tracks.updateTrack).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('POST /:id/code/render (code-engine take, #8375)', () => {
+    afterAll(async () => { await rm(musicDir, { recursive: true, force: true }); });
+
+    // A 2-second 16-bit stereo 8 kHz PCM WAV.
+    const wav = (() => {
+      const dataBytes = 8000 * 4 * 2;
+      const buf = Buffer.alloc(44 + dataBytes);
+      buf.write('RIFF', 0); buf.writeUInt32LE(36 + dataBytes, 4); buf.write('WAVE', 8);
+      buf.write('fmt ', 12); buf.writeUInt32LE(16, 16); buf.writeUInt16LE(1, 20); buf.writeUInt16LE(2, 22);
+      buf.writeUInt32LE(8000, 24); buf.writeUInt32LE(8000 * 4, 28); buf.writeUInt16LE(4, 32); buf.writeUInt16LE(16, 34);
+      buf.write('data', 36); buf.writeUInt32LE(dataBytes, 40);
+      return buf;
+    })();
+    const boundary = '----portoscodetake';
+    const multipart = (fileBytes, fields = {}) => Buffer.concat([
+      ...Object.entries(fields).map(([k, v]) => Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${k}"\r\n\r\n${v}\r\n`)),
+      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="track"; filename="code-take.wav"\r\nContent-Type: audio/wav\r\n\r\n`),
+      fileBytes,
+      Buffer.from(`\r\n--${boundary}--\r\n`),
+    ]);
+    const post = (body) => request(app).post('/api/tracks/track-1/code/render')
+      .set('content-type', `multipart/form-data; boundary=${boundary}`).send(body);
+
+    it('lands the recorded WAV in the library and appends it as the active code take', async () => {
+      tracks.getTrack.mockResolvedValue({ id: 'track-1', prompt: 'saved prompt', renders: [] });
+      const r = await post(multipart(wav, { prompt: 'neon synthwave', title: 'Night Drive' }));
+      expect(r.status).toBe(200);
+      expect(r.body.durationSec).toBe(2);
+      expect(r.body.filename).toMatch(/^music-.+\.wav$/);
+      expect(await readdir(musicDir)).toContain(r.body.filename);
+      expect(tracks.appendActiveTake).toHaveBeenCalledWith('track-1', {
+        audioFilename: r.body.filename, prompt: 'neon synthwave', engine: 'code', durationSec: 2,
+      }, { title: 'Night Drive' });
+    });
+
+    it('rejects an upload that is not a PCM WAV, or no upload at all', async () => {
+      tracks.getTrack.mockResolvedValue({ id: 'track-1', renders: [] });
+      const notWav = await post(multipart(Buffer.from('OggS not a wav at all')));
+      expect(notWav.status).toBe(400);
+      expect(notWav.body.code).toBe('MUSIC_CODE_TAKE_NOT_WAV');
+      const noFile = await request(app).post('/api/tracks/track-1/code/render')
+        .set('content-type', `multipart/form-data; boundary=${boundary}`)
+        .send(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="prompt"\r\n\r\nx\r\n--${boundary}--\r\n`));
+      expect(noFile.status).toBe(400);
+      expect(tracks.appendActiveTake).not.toHaveBeenCalled();
+    });
+
+    it('404s for an unknown track', async () => {
+      tracks.getTrack.mockResolvedValue(null);
+      const r = await post(multipart(wav));
+      expect(r.status).toBe(404);
+    });
+  });
+
+  describe('POST /:id/supercollider/take (#9414)', () => {
+    let previewDir;
+    afterAll(async () => {
+      await rm(musicDir, { recursive: true, force: true });
+      if (previewDir) await rm(previewDir, { recursive: true, force: true });
+    });
+    const preview = {
+      jobId: 'job-12345678', language: 'supercollider', source: 'Pbind(\\degree, 0)', sourceHash: 'a'.repeat(64), seed: 7,
+      settings: { durationSec: 2, sampleRate: 8000, channels: 2, tempoBpm: 120 }, runtime: { version: '3.14.1-portos.1', policyVersion: 1 },
+    };
+    const wavBytes = (() => {
+      const dataBytes = 8000 * 4 * 2;
+      const buf = Buffer.alloc(44 + dataBytes);
+      buf.write('RIFF', 0); buf.writeUInt32LE(36 + dataBytes, 4); buf.write('WAVE', 8);
+      buf.write('fmt ', 12); buf.writeUInt32LE(16, 16); buf.writeUInt16LE(1, 20); buf.writeUInt16LE(2, 22);
+      buf.writeUInt32LE(8000, 24); buf.writeUInt32LE(8000 * 4, 28); buf.writeUInt16LE(4, 32); buf.writeUInt16LE(16, 34);
+      buf.write('data', 36); buf.writeUInt32LE(dataBytes, 40);
+      return buf;
+    })();
+    const take = (body) => request(app).post('/api/tracks/track-1/supercollider/take').send(body);
+
+    it('stores the preview audio with its source, hash, seed and runtime as the active take', async () => {
+      await mkdir(musicDir, { recursive: true });
+      previewDir = await mkdtemp(join(tmpdir(), 'sc-preview-'));
+      const wavPath = join(previewDir, 'preview-src.wav');
+      await writeFile(wavPath, wavBytes);
+      tracks.getTrack.mockResolvedValue({ id: 'track-1', prompt: 'saved prompt', renders: [] });
+      readSuperColliderPreview.mockResolvedValue({ wavPath, preview });
+      const r = await take({ jobId: 'job-12345678', title: 'Night Drive' });
+      expect(r.status).toBe(200);
+      expect(await readdir(musicDir)).toContain(r.body.filename);
+      expect(tracks.appendActiveTake).toHaveBeenCalledWith('track-1', {
+        audioFilename: r.body.filename, prompt: 'saved prompt', engine: 'code', durationSec: 2,
+        codeProvenance: {
+          language: 'supercollider', source: preview.source, sourceHash: preview.sourceHash, seed: 7,
+          runtimeVersion: '3.14.1-portos.1', policyVersion: 1, settings: preview.settings,
+        },
+      }, { title: 'Night Drive' });
+    });
+
+    it('404s for an expired preview and never touches the track', async () => {
+      readSuperColliderPreview.mockResolvedValue(null);
+      const r = await take({ jobId: 'job-12345678' });
+      expect(r.status).toBe(404);
+      expect(r.body.code).toBe('SUPERCOLLIDER_PREVIEW_NOT_FOUND');
+      expect(tracks.appendActiveTake).not.toHaveBeenCalled();
+    });
+
+    it('rejects a job id that is not a plain id', async () => {
+      expect((await take({ jobId: '../etc/passwd' })).status).toBe(400);
+    });
+  });
+
+  describe('drawn waveform (#8376, painted canvas #8464)', () => {
+    // One passage's reply: a single tonal stroke.
+    const sketch = { title: 'Glass Tide', strokes: [{ path: [{ t: 0, hz: 440, a: 0.5 }, { t: 1, hz: 440, a: 0.5 }] }] };
+
+    it('POST /:id/waveform/draw persists the painting on the track', async () => {
+      tracks.getTrack.mockResolvedValue({ id: 'track-1', renders: [] });
+      promptRunner.runPromptThroughProvider.mockResolvedValue({ text: JSON.stringify(sketch) });
+      const r = await request(app).post('/api/tracks/track-1/waveform/draw')
+        .send({ description: 'glassy tidal ambient', durationSec: 12, revise: true, review: false, providerId: '' });
+      expect(r.status).toBe(200);
+      expect(r.body.sketch).toMatchObject({ version: 2, title: 'Glass Tide', durationSec: 12 });
+      expect(tracks.updateTrack).toHaveBeenCalledWith('track-1', expect.objectContaining({
+        waveSketch: expect.objectContaining({ title: 'Glass Tide' }), waveSketchPrompt: 'glassy tidal ambient',
+      }));
+      expect(r.body.track.waveSketchPrompt).toBe('glassy tidal ambient');
+    });
+
+    it('POST /:id/waveform/draw requires a description', async () => {
+      const r = await request(app).post('/api/tracks/track-1/waveform/draw').send({});
+      expect(r.status).toBe(400);
+      expect(promptRunner.runPromptThroughProvider).not.toHaveBeenCalled();
+    });
+
+    it('POST /:id/waveform/render renders the stored painting, never a client-supplied one', async () => {
+      tracks.getTrack.mockResolvedValue({ id: 'track-1', renders: [], waveSketch: null });
+      const r = await request(app).post('/api/tracks/track-1/waveform/render').send({ sketch });
+      expect(r.status).toBe(400);
+      expect(r.body.code).toBe('WAVEFORM_EMPTY');
+      expect(tracks.appendActiveTake).not.toHaveBeenCalled();
+    });
+  });
+});

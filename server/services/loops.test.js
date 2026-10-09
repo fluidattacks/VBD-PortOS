@@ -1,0 +1,777 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+
+/**
+ * Tests for loops.js
+ *
+ * Mocks: fs/promises (file I/O), runner.js (AI execution), providers.js (provider lookup).
+ * Tests: createLoop, stopLoop, triggerLoop, executeIteration error logging.
+ */
+
+vi.mock('fs/promises', () => ({
+  readFile: vi.fn().mockResolvedValue('[]'),
+  writeFile: vi.fn().mockResolvedValue(undefined)
+}));
+
+vi.mock('../lib/fileUtils.js', () => ({
+  tryReadFile: vi.fn().mockResolvedValue(null),
+  ensureDir: vi.fn().mockResolvedValue(undefined),
+  atomicWrite: vi.fn().mockResolvedValue(undefined),
+  PATHS: { data: '/fake/data', root: '/fake/root' },
+  readJSONFile: vi.fn()
+}));
+
+vi.mock('./runner.js', () => ({
+  createRun: vi.fn()
+}));
+
+vi.mock('./promptRunner.js', () => ({
+assertProvider: (provider, { message, code, status = 503 } = {}) => {
+    if (provider) return;
+    const err = new Error(message || 'No AI provider available');
+    if (code) { err.status = status; err.code = code; }
+    throw err;
+  },
+  runPromptThroughProvider: vi.fn(),
+  resolveProviderAndModel: vi.fn(),
+}));
+
+vi.mock('./providers.js', () => ({
+  listSelectableProviders: vi.fn(),
+  getActiveProvider: vi.fn(),
+}));
+
+import { tryReadFile, atomicWrite } from '../lib/fileUtils.js';
+import { createRun } from './runner.js';
+import { runPromptThroughProvider, resolveProviderAndModel } from './promptRunner.js';
+import { getActiveProvider, listSelectableProviders } from './providers.js';
+import {
+  createLoop,
+  stopLoop,
+  triggerLoop,
+  updateLoop,
+  getLoops,
+  getAvailableProviders,
+  loopEvents
+} from './loops.js';
+
+// Convenience aliases after import
+const mockCreateRun = createRun;
+const mockRunPrompt = runPromptThroughProvider;
+const mockResolveProvider = resolveProviderAndModel;
+const mockGetProviderById = { mockResolvedValue: (v) => mockResolveProvider.mockResolvedValue({ provider: v, selectedModel: null }) };
+const mockGetActiveProvider = getActiveProvider;
+const mockListSelectableProviders = listSelectableProviders;
+
+const MOCK_PROVIDER = {
+  id: 'claude',
+  name: 'Claude',
+  defaultModel: 'claude-3-sonnet',
+  command: 'claude'
+};
+
+const MOCK_RUN_RESULT = {
+  metadata: { id: 'run-123' },
+  provider: MOCK_PROVIDER
+};
+
+// executeIteration re-reads the loop record from disk before dispatching, so the
+// promise chain a fire-and-forget iteration walks is a few microtask turns deep.
+// Flush generously rather than pinning an exact turn count.
+async function flushAsync(turns = 20) {
+  for (let i = 0; i < turns; i++) await Promise.resolve();
+}
+
+function setupProviderMocks() {
+  mockGetProviderById.mockResolvedValue(MOCK_PROVIDER);
+  mockGetActiveProvider.mockResolvedValue(MOCK_PROVIDER);
+  mockListSelectableProviders.mockResolvedValue([]);
+  mockCreateRun.mockResolvedValue(MOCK_RUN_RESULT);
+  // runPromptThroughProvider is fire-and-forget in loops.js (started, then
+  // .then chains onComplete). Resolve quickly so the iteration completes.
+  mockRunPrompt.mockResolvedValue({ text: '', runId: 'run-123', model: 'test' });
+}
+
+describe('loops.js', () => {
+  // Track IDs of loops created in each test so afterEach can stop them reliably.
+  // getLoops() reads from the mocked tryReadFile (which stays '[]'), so we cannot
+  // rely on it to discover active loops; instead we intercept atomicWrite.
+  let createdLoopIds = [];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    createdLoopIds = [];
+    // Default: file has no saved loops
+    tryReadFile.mockResolvedValue('[]');
+    atomicWrite.mockImplementation((_path, data) => {
+      try {
+        // atomicWrite receives the data object directly (not JSON string)
+        const loops = Array.isArray(data) ? data : JSON.parse(typeof data === 'string' ? data : JSON.stringify(data));
+        if (Array.isArray(loops)) {
+          for (const l of loops) {
+            if (l.id && !createdLoopIds.includes(l.id)) createdLoopIds.push(l.id);
+          }
+        }
+      } catch { /* ignore non-loop writes */ }
+      return Promise.resolve(undefined);
+    });
+    setupProviderMocks();
+  });
+
+  afterEach(async () => {
+    // Stop all loops created in this test to clear timers and prevent cross-test interference
+    for (const id of createdLoopIds) {
+      await stopLoop(id).catch(() => {});
+    }
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  });
+
+  describe('getAvailableProviders', () => {
+    it('returns selectable models and keeps only the active disabled provider', async () => {
+      const activeDisabled = {
+        id: 'active-disabled',
+        name: 'Active Disabled',
+        type: 'cli',
+        command: 'codex',
+        defaultModel: 'example-active-model',
+        enabled: false,
+        models: ['example-active-model'],
+        apiKey: 'must-not-leak',
+      };
+      const enabled = {
+        id: 'enabled-provider',
+        name: 'Enabled Provider',
+        type: 'api',
+        defaultModel: 'example-enabled-model',
+        enabled: true,
+        models: ['example-enabled-model', 'example-second-model'],
+        harnessId: 'direct',
+      };
+      const disabled = {
+        id: 'disabled-provider',
+        name: 'Disabled Provider',
+        type: 'api',
+        enabled: false,
+        models: ['example-hidden-model'],
+      };
+      mockListSelectableProviders.mockResolvedValue([activeDisabled, enabled, disabled]);
+      mockGetActiveProvider.mockResolvedValue(activeDisabled);
+
+      const payload = await getAvailableProviders();
+      expect(payload).toEqual({
+        providers: [
+          expect.objectContaining({
+            id: 'active-disabled',
+            enabled: false,
+            models: ['example-active-model'],
+            isActive: true,
+          }),
+          expect.objectContaining({
+            id: 'enabled-provider',
+            enabled: true,
+            models: ['example-enabled-model', 'example-second-model'],
+            isActive: false,
+            harnessId: 'direct',
+          }),
+        ],
+        activeProviderId: 'active-disabled',
+      });
+
+      expect(payload.providers.find(provider => provider.id === 'disabled-provider')).toBeUndefined();
+      expect(payload.providers[0]).not.toHaveProperty('apiKey');
+      expect(mockListSelectableProviders).toHaveBeenCalledOnce();
+    });
+  });
+
+  // ===========================================================================
+  // createLoop
+  // ===========================================================================
+  describe('createLoop', () => {
+    it('creates a loop with the expected shape and status:running', async () => {
+      const loop = await createLoop({
+        prompt: 'check system health',
+        interval: '1m',
+        name: 'Health Check',
+        runImmediately: false
+      });
+
+      expect(loop.prompt).toBe('check system health');
+      expect(loop.name).toBe('Health Check');
+      expect(loop.status).toBe('running');
+      expect(loop.intervalMs).toBe(60_000);
+      expect(typeof loop.id).toBe('string');
+      expect(loop.id).toHaveLength(8);
+    });
+
+    it('persists the loop to disk via atomicWrite', async () => {
+      await createLoop({ prompt: 'test loop', interval: '30s', runImmediately: false });
+      expect(atomicWrite).toHaveBeenCalled();
+      // atomicWrite receives the data object directly (not a JSON string)
+      const saved = atomicWrite.mock.calls[0][1];
+      expect(Array.isArray(saved)).toBe(true);
+      expect(saved[0].prompt).toBe('test loop');
+    });
+
+    it('emits a created event with the loop data', async () => {
+      const emitted = [];
+      loopEvents.on('created', (data) => emitted.push(data));
+
+      await createLoop({ prompt: 'emit test', interval: '15s', runImmediately: false });
+
+      expect(emitted).toHaveLength(1);
+      expect(emitted[0].loop.prompt).toBe('emit test');
+      loopEvents.removeAllListeners('created');
+    });
+
+    it('throws when interval is shorter than 10 seconds', async () => {
+      await expect(
+        createLoop({ prompt: 'fast loop', interval: '5s', runImmediately: false })
+      ).rejects.toThrow('Interval must be at least 10 seconds');
+    });
+
+    it('throws when prompt is empty', async () => {
+      await expect(
+        createLoop({ prompt: '   ', interval: '1m', runImmediately: false })
+      ).rejects.toThrow('Prompt is required');
+    });
+  });
+
+  // ===========================================================================
+  // stopLoop
+  // ===========================================================================
+  describe('stopLoop', () => {
+    it('removes loop from activeLoops and persists stopped status', async () => {
+      const loop = await createLoop({
+        prompt: 'stop me',
+        interval: '30s',
+        runImmediately: false
+      });
+
+      // Capture the loop data that was written to disk
+      // atomicWrite receives the data object directly; stringify it for tryReadFile mock
+      const savedBefore = atomicWrite.mock.calls[0][1];
+      tryReadFile.mockResolvedValue(JSON.stringify(savedBefore));
+
+      await stopLoop(loop.id);
+
+      // atomicWrite called again with updated status
+      const lastWriteCall = atomicWrite.mock.calls[atomicWrite.mock.calls.length - 1];
+      // atomicWrite receives the data object directly (not a JSON string)
+      const savedAfter = lastWriteCall[1];
+      const stoppedEntry = savedAfter.find(l => l.id === loop.id);
+      expect(stoppedEntry.status).toBe('stopped');
+    });
+
+    it('emits a stopped event with the loop id', async () => {
+      const loop = await createLoop({
+        prompt: 'emit stop',
+        interval: '30s',
+        runImmediately: false
+      });
+
+      // atomicWrite receives the data object directly; stringify it for tryReadFile mock
+      const savedBefore = atomicWrite.mock.calls[0][1];
+      tryReadFile.mockResolvedValue(JSON.stringify(savedBefore));
+
+      const emitted = [];
+      loopEvents.on('stopped', (data) => emitted.push(data));
+
+      await stopLoop(loop.id);
+
+      expect(emitted).toHaveLength(1);
+      expect(emitted[0].id).toBe(loop.id);
+      loopEvents.removeAllListeners('stopped');
+    });
+
+    it('throws when loop is not running', async () => {
+      await expect(stopLoop('nonexistent-id')).rejects.toThrow('not running');
+    });
+  });
+
+  // ===========================================================================
+  // triggerLoop
+  // ===========================================================================
+  describe('triggerLoop', () => {
+    it('returns { triggered: true } immediately', async () => {
+      const loop = await createLoop({
+        prompt: 'trigger test',
+        interval: '30s',
+        runImmediately: false
+      });
+
+      // atomicWrite receives the data object directly; stringify it for tryReadFile mock
+      const savedBefore = atomicWrite.mock.calls[0][1];
+      tryReadFile.mockResolvedValue(JSON.stringify(savedBefore));
+
+      const result = await triggerLoop(loop.id);
+      expect(result).toEqual({ triggered: true });
+    });
+
+    it('throws when loop id does not exist in saved file', async () => {
+      tryReadFile.mockResolvedValue('[]');
+      await expect(triggerLoop('ghost-id')).rejects.toThrow('not found');
+    });
+
+    it('throws when loop is not in activeLoops (not running)', async () => {
+      // Write a loop to disk but don't start it in activeLoops
+      const loopRecord = [{
+        id: 'test-stopped',
+        prompt: 'stopped loop',
+        intervalMs: 30_000,
+        status: 'stopped'
+      }];
+      tryReadFile.mockResolvedValue(JSON.stringify(loopRecord));
+      await expect(triggerLoop('test-stopped')).rejects.toThrow('not running');
+    });
+  });
+
+  // ===========================================================================
+  // executeIteration error logging via triggerLoop
+  // ===========================================================================
+  describe('error handling in executeIteration', () => {
+    it('logs console.error when the central prompt runner rejects', async () => {
+      const loop = await createLoop({
+        prompt: 'error test',
+        interval: '30s',
+        runImmediately: false
+      });
+
+      // atomicWrite receives the data object directly; stringify it for tryReadFile mock
+      const savedBefore = atomicWrite.mock.calls[0][1];
+      tryReadFile.mockResolvedValue(JSON.stringify(savedBefore));
+
+      // Make runPromptThroughProvider reject (replaces the old executeCliRun
+      // rejection path — same failure surface, new dispatcher).
+      mockRunPrompt.mockRejectedValue(new Error('CLI execution failed'));
+
+      const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+      await triggerLoop(loop.id);
+
+      await flushAsync();
+
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining('CLI execution failed')
+      );
+      consoleSpy.mockRestore();
+    });
+
+    it('logs console.error when createRun rejects', async () => {
+      const loop = await createLoop({
+        prompt: 'createRun error test',
+        interval: '30s',
+        runImmediately: false
+      });
+
+      // atomicWrite receives the data object directly; stringify it for tryReadFile mock
+      const savedBefore = atomicWrite.mock.calls[0][1];
+      tryReadFile.mockResolvedValue(JSON.stringify(savedBefore));
+
+      mockCreateRun.mockRejectedValue(new Error('createRun blew up'));
+      const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+      await triggerLoop(loop.id);
+      await flushAsync();
+
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining('createRun blew up')
+      );
+      consoleSpy.mockRestore();
+    });
+
+    it('emits iteration:error event when no provider is available', async () => {
+      mockGetProviderById.mockResolvedValue(null);
+      mockGetActiveProvider.mockResolvedValue(null);
+
+      const loop = await createLoop({
+        prompt: 'no-provider test',
+        interval: '30s',
+        runImmediately: false
+      });
+
+      // atomicWrite receives the data object directly; stringify it for tryReadFile mock
+      const savedBefore = atomicWrite.mock.calls[0][1];
+      tryReadFile.mockResolvedValue(JSON.stringify(savedBefore));
+
+      const errors = [];
+      loopEvents.on('iteration:error', (data) => errors.push(data));
+
+      await triggerLoop(loop.id);
+      await flushAsync();
+
+      expect(errors.length).toBeGreaterThan(0);
+      expect(errors[0].error).toBe('No AI provider available');
+      loopEvents.removeAllListeners('iteration:error');
+    });
+  });
+
+  // ===========================================================================
+  // successful-completion persistence (regression: onComplete called a bare
+  // `writeFile` that was no longer imported — a ReferenceError thrown inside
+  // the success branch was swallowed by the wrapper but skipped the
+  // updatePersistedLoop call after it, so lastRun/iterationCount never landed)
+  // ===========================================================================
+  describe('successful iteration persistence', () => {
+    it('completes the success branch without throwing and writes the iteration output', async () => {
+      const loop = await createLoop({
+        prompt: 'success test',
+        interval: '30s',
+        runImmediately: false,
+      });
+      const savedBefore = atomicWrite.mock.calls[0][1];
+      tryReadFile.mockResolvedValue(JSON.stringify(savedBefore));
+
+      const completes = [];
+      loopEvents.on('iteration:complete', (data) => completes.push(data));
+      let finishSave;
+      atomicWrite.mockImplementation((path, data) => {
+        if (Array.isArray(data) && data.some(record => record.iterationCount === 1)) {
+          return new Promise(resolve => { finishSave = resolve; });
+        }
+        return Promise.resolve();
+      });
+      const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      atomicWrite.mockClear();
+
+      await triggerLoop(loop.id);
+      await flushAsync();
+
+      expect(finishSave).toBeTypeOf('function');
+      expect(completes).toHaveLength(0);
+      finishSave();
+      await flushAsync();
+
+      // The success branch must NOT log its swallowed-throw message — that only
+      // fires if onComplete threw (the bare-writeFile ReferenceError regression).
+      expect(consoleSpy).not.toHaveBeenCalledWith(
+        expect.stringContaining('onComplete (success branch) threw')
+      );
+      expect(completes.length).toBeGreaterThan(0);
+      // onComplete reached its output write (line that previously crashed).
+      const wroteOutput = atomicWrite.mock.calls.some(
+        ([p]) => typeof p === 'string' && p.includes(`${loop.id}-`) && p.endsWith('.txt')
+      );
+      expect(wroteOutput).toBe(true);
+
+      loopEvents.removeAllListeners('iteration:complete');
+      consoleSpy.mockRestore();
+    });
+  });
+
+  // ===========================================================================
+  // provider-fallback branch (#1155 regression)
+  // ===========================================================================
+  describe('provider fallback rebind', () => {
+    it('does not throw when createRun returns a different provider (const → let fix)', async () => {
+      // Set up: resolveProviderAndModel returns primary provider, but createRun
+      // returns a fallback provider with a different id. Before the fix, the
+      // reassignment `provider = runResult.provider` would throw
+      // "Assignment to constant variable" at runtime.
+      const FALLBACK_PROVIDER = {
+        id: 'fallback-provider',
+        name: 'Fallback',
+        defaultModel: 'fallback-model',
+        command: 'fallback'
+      };
+      const FALLBACK_RUN_RESULT = {
+        metadata: { id: 'run-fallback' },
+        provider: FALLBACK_PROVIDER,
+        fallbackModel: 'pinned-fallback-model',
+      };
+      mockCreateRun.mockResolvedValue(FALLBACK_RUN_RESULT);
+      // runPromptThroughProvider resolves successfully using fallback provider
+      mockRunPrompt.mockResolvedValue({ text: 'done', runId: 'run-fallback', model: 'fallback-model' });
+
+      const loop = await createLoop({
+        prompt: 'fallback test',
+        interval: '30s',
+        runImmediately: false
+      });
+
+      // atomicWrite receives the data object directly; stringify it for tryReadFile mock
+      const savedBefore = atomicWrite.mock.calls[0][1];
+      tryReadFile.mockResolvedValue(JSON.stringify(savedBefore));
+
+      // Should not throw — the `let` fix allows provider reassignment
+      let threw = false;
+      try {
+        await triggerLoop(loop.id);
+        await flushAsync();
+      } catch (_err) {
+        threw = true;
+      }
+      expect(threw).toBe(false);
+
+      // The fallback provider's id should be used by runPromptThroughProvider
+      // (it was called with a provider arg — verify it was actually invoked)
+      expect(mockRunPrompt).toHaveBeenCalled();
+      const callArg = mockRunPrompt.mock.calls[0][0];
+      expect(callArg.provider.id).toBe('fallback-provider');
+      expect(callArg.model).toBe('pinned-fallback-model');
+    });
+  });
+
+  // ===========================================================================
+  // live edits reach the running interval (#5648) — the timer used to close
+  // over the record it was armed with, so an edit persisted to disk but the
+  // interval kept running the OLD prompt/provider/cwd/timeout until restart.
+  // Driven through the TIMER (not triggerLoop, which always re-read) because
+  // the timer is the only seam that exposed the stale closure.
+  // ===========================================================================
+  describe('edits reach the running interval', () => {
+    let disk;
+
+    beforeEach(() => {
+      disk = [];
+      tryReadFile.mockImplementation(async (path) =>
+        String(path).endsWith('loops.json') ? JSON.stringify(disk) : null
+      );
+      atomicWrite.mockImplementation(async (path, data) => {
+        if (String(path).endsWith('loops.json') && Array.isArray(data)) {
+          disk = JSON.parse(JSON.stringify(data));
+          for (const l of disk) {
+            if (l.id && !createdLoopIds.includes(l.id)) createdLoopIds.push(l.id);
+          }
+        }
+      });
+    });
+
+    it('runs the next scheduled iteration with the edited prompt, provider, cwd and timeout', async () => {
+      const loop = await createLoop({
+        prompt: 'old prompt',
+        interval: '30s',
+        cwd: '/old/cwd',
+        providerId: 'old-provider',
+        runImmediately: false,
+      });
+
+      await updateLoop(loop.id, {
+        prompt: 'new prompt',
+        providerId: 'new-provider',
+        cwd: '/new/cwd',
+        timeout: 12_345,
+      });
+
+      await vi.advanceTimersByTimeAsync(30_000);
+
+      expect(mockResolveProvider).toHaveBeenCalledWith({ providerId: 'new-provider' });
+      expect(mockCreateRun).toHaveBeenCalledTimes(1);
+      expect(mockCreateRun.mock.calls[0][0]).toMatchObject({
+        prompt: 'new prompt',
+        workspacePath: '/new/cwd',
+      });
+      expect(mockRunPrompt).toHaveBeenCalledTimes(1);
+      expect(mockRunPrompt.mock.calls[0][0]).toMatchObject({
+        prompt: 'new prompt',
+        cwd: '/new/cwd',
+        timeout: 12_345,
+      });
+    });
+
+    it('re-arms on an interval change without leaking the old timer', async () => {
+      const loop = await createLoop({
+        prompt: 'interval test',
+        interval: '30s',
+        runImmediately: false,
+      });
+
+      await updateLoop(loop.id, { interval: '60s' });
+
+      // The old 30s handle must have been cleared — nothing fires at 30s.
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(mockRunPrompt).not.toHaveBeenCalled();
+
+      // The new 60s handle fires on its own schedule.
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(mockRunPrompt).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // ===========================================================================
+  // Early rejection recovery (#9649) — if loadLoops rejects or setup fails
+  // before the main run, active.running must be reset so subsequent ticks
+  // can proceed without permanent wedge.
+  // ===========================================================================
+  describe('early rejection recovery and active.running reset', () => {
+    let disk;
+
+    beforeEach(() => {
+      disk = [];
+      tryReadFile.mockImplementation(async (path) =>
+        String(path).endsWith('loops.json') ? JSON.stringify(disk) : null
+      );
+      atomicWrite.mockImplementation(async (path, data) => {
+        if (String(path).endsWith('loops.json') && Array.isArray(data)) {
+          disk = JSON.parse(JSON.stringify(data));
+          for (const l of disk) {
+            if (l.id && !createdLoopIds.includes(l.id)) createdLoopIds.push(l.id);
+          }
+        }
+      });
+    });
+
+    it('resets active.running when loadLoops rejects during iteration', async () => {
+      const loop = await createLoop({
+        prompt: 'loadLoops test',
+        interval: '30s',
+        runImmediately: false,
+      });
+
+      // First call succeeds (when loop was created), but subsequent calls fail
+      let callCount = 0;
+      tryReadFile.mockImplementation(async (path) => {
+        if (String(path).endsWith('loops.json')) {
+          callCount++;
+          if (callCount === 1) return JSON.stringify(disk);
+          throw new Error('Disk I/O failed');
+        }
+        return null;
+      });
+
+      const errors = [];
+      loopEvents.on('iteration:error', (data) => errors.push(data));
+
+      await triggerLoop(loop.id);
+      await flushAsync();
+
+      expect(errors.length).toBeGreaterThan(0);
+      expect(errors[0].error).toContain('Disk I/O failed');
+
+      // Try to trigger again — if active.running wasn't reset, this would
+      // no-op silently. With the fix, it should attempt the iteration.
+      mockResolveProvider.mockResolvedValue({ provider: MOCK_PROVIDER, selectedModel: null });
+      mockCreateRun.mockResolvedValue(MOCK_RUN_RESULT);
+      mockRunPrompt.mockResolvedValue({ text: '', runId: 'run-2', model: 'test' });
+
+      // Reset the tryReadFile mock so the second attempt can succeed
+      callCount = 0;
+      tryReadFile.mockImplementation(async (path) =>
+        String(path).endsWith('loops.json') ? JSON.stringify(disk) : null
+      );
+
+      errors.length = 0;
+      await triggerLoop(loop.id);
+      await flushAsync();
+
+      // Second trigger should have succeeded (no error from loadLoops)
+      // Either it succeeds silently or only hits the createRun rejection if we
+      // configured it to fail. But crucially, it does NOT immediately return
+      // without trying because active.running stayed true.
+      expect(mockResolveProvider).toHaveBeenCalled();
+
+      loopEvents.removeAllListeners('iteration:error');
+    });
+
+    it('emits iteration:error when setup fails with unhandled rejection', async () => {
+      const loop = await createLoop({
+        prompt: 'early error test',
+        interval: '30s',
+        runImmediately: false,
+      });
+
+      // Make loadLoops throw an unhandled error (no .catch on this call)
+      let callCount = 0;
+      tryReadFile.mockImplementation(async (path) => {
+        if (String(path).endsWith('loops.json')) {
+          callCount++;
+          if (callCount > 1) {  // First call is from createLoop, next is from trigger
+            throw new Error('Unhandled loadLoops rejection');
+          }
+          return JSON.stringify(disk);
+        }
+        return null;
+      });
+
+      const errors = [];
+      loopEvents.on('iteration:error', (data) => errors.push(data));
+
+      await triggerLoop(loop.id);
+      await flushAsync();
+
+      expect(errors.length).toBeGreaterThan(0);
+      expect(errors[0].error).toContain('Unhandled loadLoops rejection');
+
+      loopEvents.removeAllListeners('iteration:error');
+    });
+
+    it('allows subsequent iterations after an early rejection when using the timer', async () => {
+      const _loop = await createLoop({
+        prompt: 'timer recovery test',
+        interval: '30s',
+        runImmediately: false,
+      });
+
+      // First tick: make loadLoops fail to simulate transient error
+      let failOnce = true;
+      tryReadFile.mockImplementation(async (path) => {
+        if (String(path).endsWith('loops.json')) {
+          if (failOnce) {
+            failOnce = false;
+            throw new Error('Transient I/O error');
+          }
+          return JSON.stringify(disk);
+        }
+        return null;
+      });
+
+      const errors = [];
+      const starts = [];
+      loopEvents.on('iteration:error', (data) => errors.push(data));
+      loopEvents.on('iteration:start', (data) => starts.push(data));
+
+      // First interval tick hits the error
+      await vi.advanceTimersByTimeAsync(30_000);
+      await flushAsync();
+      expect(errors.length).toBeGreaterThan(0);
+      expect(starts).toHaveLength(0);
+
+      // Second interval tick should proceed because active.running was reset
+      mockResolveProvider.mockResolvedValue({ provider: MOCK_PROVIDER, selectedModel: null });
+      mockCreateRun.mockResolvedValue(MOCK_RUN_RESULT);
+      mockRunPrompt.mockResolvedValue({ text: '', runId: 'run-ok', model: 'test' });
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      await flushAsync();
+
+      // Iteration should have started successfully (iteration:start emitted)
+      expect(starts.length).toBeGreaterThan(0);
+
+      loopEvents.removeAllListeners('iteration:error');
+      loopEvents.removeAllListeners('iteration:start');
+    });
+
+    it('does not log false "iteration setup failed" when createRun error is handled', async () => {
+      const loop = await createLoop({
+        prompt: 'createRun error test',
+        interval: '30s',
+        runImmediately: false,
+      });
+
+      mockCreateRun.mockRejectedValue(new Error('createRun failed as expected'));
+
+      const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+      await triggerLoop(loop.id);
+      await flushAsync();
+
+      // The error is caught by createRun's .catch handler, which emits
+      // iteration:error and logs "createRun failed". The outer catch handler
+      // should NOT log an additional "iteration setup failed" message because
+      // the error was handled inside the try block.
+      const setupFailedLogs = consoleSpy.mock.calls.filter(call =>
+        call[0]?.includes?.('iteration setup failed')
+      );
+      expect(setupFailedLogs).toHaveLength(0);
+
+      // But the createRun error IS logged
+      const createRunLogs = consoleSpy.mock.calls.filter(call =>
+        call[0]?.includes?.('createRun failed')
+      );
+      expect(createRunLogs.length).toBeGreaterThan(0);
+
+      consoleSpy.mockRestore();
+    });
+  });
+
+});

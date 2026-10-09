@@ -1,0 +1,185 @@
+import { calendar } from '@googleapis/calendar';
+import { v4 as uuidv4 } from '../lib/uuid.js';
+import { ServerError } from '../lib/errorHandler.js';
+import { getAuthenticatedClient, needsScopeUpgrade, getTokens } from './googleAuth.js';
+import { loadJSON, mutateGoals, GOALS_FILE, DEFAULT_GOALS } from './identity/store.js';
+
+const TIME_SLOT_HOURS = {
+  morning: 9,
+  afternoon: 13,
+  evening: 18
+};
+
+const DAY_MAP = {
+  sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6
+};
+
+function resolveTimeSlotHour(timeSlot) {
+  if (TIME_SLOT_HOURS[timeSlot] !== undefined) return TIME_SLOT_HOURS[timeSlot];
+  return parseInt(timeSlot.split(':')[0], 10);
+}
+
+function resolveTimeSlotMinute(timeSlot) {
+  if (TIME_SLOT_HOURS[timeSlot] !== undefined) return 0;
+  return parseInt(timeSlot.split(':')[1], 10) || 0;
+}
+
+export async function scheduleTimeBlocks(goalId) {
+  const tokens = await getTokens();
+  if (needsScopeUpgrade(tokens)) {
+    throw new ServerError('Calendar write access required. Please re-authorize Google Calendar.', { status: 403, code: 'SCOPE_UPGRADE_NEEDED' });
+  }
+
+  const auth = await getAuthenticatedClient();
+  if (!auth) throw new ServerError('Google OAuth not configured', { status: 401, code: 'NO_AUTH' });
+
+  // This read is only to find the goal and its milestones/config for building the
+  // calendar event batch below — it is not the snapshot that gets saved. The
+  // Google Calendar round-trips can take a while; `mutateGoals` re-reads
+  // goals.json right before persisting so a concurrent edit survives (#8755).
+  const goals = await loadJSON(GOALS_FILE, DEFAULT_GOALS, { strict: true });
+  const goal = goals.goals.find(g => g.id === goalId);
+  if (!goal) throw new ServerError('Goal not found', { status: 404, code: 'NOT_FOUND' });
+  if (!goal.timeBlockConfig) throw new ServerError('Time block config not set', { status: 400, code: 'NO_CONFIG' });
+  if (!goal.targetDate) throw new ServerError('Target date not set', { status: 400, code: 'NO_TARGET_DATE' });
+
+  const milestones = [...(goal.milestones || [])].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+  if (!milestones.length) throw new ServerError('No milestones/phases to schedule', { status: 400, code: 'NO_MILESTONES' });
+
+  const cal = calendar({ version: 'v3', auth });
+  const { preferredDays, timeSlot, sessionDurationMinutes, subcalendarId } = goal.timeBlockConfig;
+  const calendarId = subcalendarId || 'primary';
+  const preferredDayNums = new Set(preferredDays.map(d => DAY_MAP[d]));
+  const hour = resolveTimeSlotHour(timeSlot);
+  const minute = resolveTimeSlotMinute(timeSlot);
+  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  // Collect all events to create
+  const eventDefs = [];
+  for (let i = 0; i < milestones.length; i++) {
+    const ms = milestones[i];
+    if (ms.completedAt) continue;
+
+    const rangeStart = i === 0 ? today : new Date(milestones[i - 1].targetDate + 'T00:00:00');
+    const rangeEnd = ms.targetDate ? new Date(ms.targetDate + 'T00:00:00') : new Date(goal.targetDate + 'T00:00:00');
+
+    const cursor = new Date(Math.max(rangeStart.getTime(), today.getTime()));
+    while (cursor <= rangeEnd) {
+      if (preferredDayNums.has(cursor.getDay())) {
+        const startTime = new Date(cursor);
+        startTime.setHours(hour, minute, 0, 0);
+        const endTime = new Date(startTime);
+        endTime.setMinutes(endTime.getMinutes() + sessionDurationMinutes);
+
+        eventDefs.push({
+          milestoneId: ms.id,
+          date: cursor.toISOString().slice(0, 10),
+          requestBody: {
+            summary: `${goal.title} - ${ms.title}`,
+            description: `${ms.description || ''}\n\nGoal: ${goal.title}`.trim(),
+            start: { dateTime: startTime.toISOString(), timeZone: tz },
+            end: { dateTime: endTime.toISOString(), timeZone: tz }
+          }
+        });
+      }
+      cursor.setDate(cursor.getDate() + 1);
+    }
+  }
+
+  // Create events in parallel batches of 10 to avoid rate limiting
+  const BATCH_SIZE = 10;
+  const scheduledEvents = [];
+  for (let i = 0; i < eventDefs.length; i += BATCH_SIZE) {
+    const batch = eventDefs.slice(i, i + BATCH_SIZE);
+    const results = await Promise.all(batch.map(def =>
+      cal.events.insert({ calendarId, requestBody: def.requestBody })
+    ));
+    for (let j = 0; j < results.length; j++) {
+      scheduledEvents.push({
+        id: `sched-${uuidv4()}`,
+        googleEventId: results[j].data.id,
+        calendarId,
+        milestoneId: batch[j].milestoneId,
+        date: batch[j].date,
+        createdAt: new Date().toISOString()
+      });
+    }
+  }
+
+  // Apply to a freshly re-read goal by id rather than the snapshot captured
+  // before the calendar batch above — see the note on the initial read.
+  let goalDeleted = false;
+  await mutateGoals(freshGoals => {
+    const freshGoal = freshGoals.goals.find(g => g.id === goalId);
+    if (!freshGoal) {
+      goalDeleted = true;
+      return freshGoals;
+    }
+    freshGoal.scheduledEvents = scheduledEvents;
+    freshGoal.updatedAt = new Date().toISOString();
+    freshGoals.updatedAt = new Date().toISOString();
+    return freshGoals;
+  });
+
+  if (goalDeleted) {
+    // The deleted goal cannot retain event IDs for later removal. Compensate
+    // every event created by this batch before reporting the lost target.
+    const cleanup = await Promise.allSettled(scheduledEvents.map(evt =>
+      cal.events.delete({ calendarId: evt.calendarId, eventId: evt.googleEventId })
+    ));
+    const failed = cleanup.filter(result => result.status === 'rejected'
+      && result.reason?.code !== 404 && result.reason?.code !== 410);
+    if (failed.length) {
+      throw new ServerError(`Goal was deleted during scheduling; ${failed.length} calendar events could not be removed. Remove the remaining time blocks in Google Calendar.`, { code: 'CALENDAR_CLEANUP_FAILED' });
+    }
+    throw new ServerError('Goal was deleted during scheduling. Created calendar events were removed.', { status: 404, code: 'NOT_FOUND' });
+  }
+
+  console.log(`📅 Scheduled ${scheduledEvents.length} time blocks for goal "${goal.title}"`);
+  return { count: scheduledEvents.length, events: scheduledEvents };
+}
+
+export async function removeScheduledEvents(goalId) {
+  const auth = await getAuthenticatedClient();
+  if (!auth) throw new ServerError('Google OAuth not configured', { status: 401, code: 'NO_AUTH' });
+
+  // Same pattern as scheduleTimeBlocks: this read only locates the events to
+  // delete from Google Calendar; the write below re-reads fresh (#8755).
+  const goals = await loadJSON(GOALS_FILE, DEFAULT_GOALS, { strict: true });
+  const goal = goals.goals.find(g => g.id === goalId);
+  if (!goal) throw new ServerError('Goal not found', { status: 404, code: 'NOT_FOUND' });
+
+  const cal = calendar({ version: 'v3', auth });
+  const events = goal.scheduledEvents || [];
+
+  // Delete events in parallel
+  await Promise.all(events.map(evt =>
+    cal.events.delete({
+      calendarId: evt.calendarId || 'primary',
+      eventId: evt.googleEventId
+    }).catch(err => {
+      if (err.code !== 410 && err.code !== 404) console.log(`📅 Failed to delete event ${evt.googleEventId}: ${err.message}`);
+    })
+  ));
+
+  await mutateGoals(freshGoals => {
+    const freshGoal = freshGoals.goals.find(g => g.id === goalId);
+    if (freshGoal) {
+      freshGoal.scheduledEvents = [];
+      freshGoal.updatedAt = new Date().toISOString();
+    }
+    freshGoals.updatedAt = new Date().toISOString();
+    return freshGoals;
+  });
+
+  console.log(`📅 Removed ${events.length} scheduled events for goal "${goal.title}"`);
+  return { deleted: events.length };
+}
+
+export async function rescheduleTimeBlocks(goalId) {
+  await removeScheduledEvents(goalId);
+  return scheduleTimeBlocks(goalId);
+}

@@ -1,0 +1,2781 @@
+import { federatedSourceAudioSchema } from './federatedMediaWire.js';
+import { MAX_IMAGE_EDGE, MAX_IMAGE_PIXELS } from './imageLimits.js';
+export { MAX_IMAGE_EDGE, MAX_IMAGE_PIXELS } from './imageLimits.js';
+import { CREDENTIALS } from './credentialRegistry.js';
+import { DEFAULT_BACKUP_CRON, MIN_RETENTION_COUNT, MAX_RETENTION_COUNT } from './backupConfig.js';
+import { z } from 'zod';
+import { ServerError } from './errorHandler.js';
+import { isSafeGitRef } from './gitArgs.js';
+import { partialWithoutDefaults, emptyToUndefined, emptyToNull, optionalBooleanMap, presetProviderIdSchema, providerRefSchema } from './zodCompat.js';
+import { WORK_TRACKERS } from './workTracker.js';
+import { LAYERED_INTELLIGENCE_SOURCE_KEYS } from './layeredIntelligenceSourceKeys.js';
+import { PROVIDER_FAMILY_IDS } from './providerFamilies.js';
+import { APP_FEATURE_IDS, INSTANCE_FEATURE_IDS, INSTANCE_FEATURE_GROUP_IDS } from './instanceFeatureRegistry.js';
+import { MAX_MONTHLY_COST } from './subscriptionSavings.js';
+import { MAX_PLAN_TIER_LENGTH } from './subscriptionPlanTiers.js';
+import { QUEUEABLE_IMAGE_MODES, VIDEO_GEN_MODES } from './generationModes.js';
+import { FAL_IMAGE_MODEL_IDS } from './falImageModels.js';
+import { RENDER_TARGETS, RENDER_TARGET_BACKEND_AUTO } from './renderTargets.js';
+import {
+  grokVideoDurationSchema, cloudModelIdString, recordRenderPinFields, isSafeSnapshotSource, isSafeSubdirFilter, csvIdsParam,
+  EXCLUDE_PATTERN_MAX_LENGTH, isSafeExcludePattern,
+  AUTO_UPDATE_CHANNELS, AUTO_UPDATE_MIN_INTERVAL_HOURS_MIN, AUTO_UPDATE_MIN_INTERVAL_HOURS_MAX,
+} from './sharedSchemas.js';
+import { PR_COMPLETION_VALUES } from './prDisposition.js';
+import { EFFORT_LEVELS } from './providerModels.js';
+import { knownFilmStyleIdSchema } from './filmStyleGrammars.js';
+import { MODEL_ALIAS_LIMITS } from './providerModelAliases.js';
+import { PROVIDER_HARNESS_IDS, ROUTE_MODES } from './providerHarnesses.js';
+import { parseProviderRef } from './providerRef.js';
+import { SERVICE_CREDENTIAL_VIAS, SERVICE_PLANS, SERVICE_SLUG_RE } from './serviceDefinitions.js';
+import { MAX_TIMEOUT as AI_RUN_TIMEOUT_MAX_MS, MIN_TIMEOUT as AI_RUN_TIMEOUT_MIN_MS } from './aiToolkit/constants.js';
+import {
+  FEDERATED_MEDIA_ASSET_MAX_COUNT,
+  FEDERATED_MEDIA_MAX_VIDEO_FRAMES,
+  federatedMediaInputAssetRefSchema,
+  isFederatedMediaAudioPrompt,
+} from './federatedMediaWire.js';
+import { isPlainObject } from './objects.js';
+import { isValidCronExpression, isCronShaped } from './cronValidation.js';
+import { USER_ACTION_ACTORS, USER_ACTION_TYPES } from './userActionTypes.js';
+import { MIND_BUNDLE_GROUP_CHOICES, MIND_BUNDLE_MAX_CHARS, MIND_BUNDLE_PASSPHRASE_MAX_CHARS, MIND_BUNDLE_PASSPHRASE_MIN_CHARS, PERSISTENT_MIND_BUNDLE_GROUPS, PERSISTENT_MIND_BUNDLE_SCOPES } from './mindBundleFormat.js';
+
+// ---- Git write-route bodies (#9154) -----------------------------------------
+// Refs and files become argv entries for git, so a leading "-" would be parsed
+// as an option; the ref grammar rejects that plus git's own invalid-ref forms.
+export const gitRefNameSchema = z.string().min(1).max(255).refine(isSafeGitRef, {
+  message: 'not a valid git ref name',
+});
+const gitPathField = z.string().min(1);
+
+export const gitPathBodySchema = z.object({ path: gitPathField });
+export const gitStageBodySchema = z.object({
+  path: gitPathField,
+  files: z.array(z.string().min(1)).min(1).max(500),
+});
+export const gitCommitBodySchema = z.object({
+  path: gitPathField,
+  message: z.string().min(1).max(10000),
+});
+export const gitBranchBodySchema = z.object({ path: gitPathField, branch: gitRefNameSchema });
+export const gitOptionalBranchBodySchema = z.object({
+  path: gitPathField,
+  branch: gitRefNameSchema.nullish(),
+});
+export const gitBranchComparisonBodySchema = z.object({
+  path: gitPathField,
+  base: gitRefNameSchema.nullish(),
+  head: gitRefNameSchema.nullish(),
+});
+export const gitDiffBodySchema = z.object({ path: gitPathField, staged: z.boolean().default(false) });
+export const gitCommitsBodySchema = z.object({
+  path: gitPathField,
+  limit: z.number().int().min(1).max(100).default(10),
+});
+export const gitRemoteBranchesBodySchema = z.object({ path: gitPathField, force: z.boolean().default(false) });
+export const gitDeleteBranchBodySchema = z.object({
+  path: gitPathField,
+  branch: gitRefNameSchema,
+  local: z.boolean().default(false),
+  remote: z.boolean().default(false),
+}).refine(({ local, remote }) => local || remote, {
+  message: 'at least one of local or remote must be true',
+});
+
+
+export const imageEdgeSchema = z.number().int().min(64).max(MAX_IMAGE_EDGE).optional();
+export const refineImagePixelCap = (d) =>
+  !(d.width && d.height) || d.width * d.height <= MAX_IMAGE_PIXELS;
+export const PIXEL_CAP_MESSAGE = `Total pixels (width × height) must be ≤ ${MAX_IMAGE_PIXELS.toLocaleString()}`;
+
+// Reject a record id that isn't a bare filename segment. Use before a
+// peer-supplied / externally-sourced id is interpolated into a filesystem path
+// (e.g. the sharing importer's raw `join(bucket, …, `${id}.json`)` reads, or
+// the conflict journal's `recordDir(id)`), so a `../`-bearing id can't turn the
+// read/delete into a path-traversal oracle. Records persisted through a
+// collectionStore are already gated by its `idPattern`; this guards the raw
+// path sites that don't go through a store.
+export const isSafeRecordId = (id) =>
+  typeof id === 'string' && id.length > 0
+  && id !== '.' && id !== '..'
+  && !id.includes('/') && !id.includes('\\') && !id.includes('\0');
+
+// `optionalBooleanMap` now lives in zodCompat.js (so per-domain schema files can
+// use it without a cycle through this module) — re-exported for deep imports.
+export { optionalBooleanMap };
+
+// Cross-domain Zod fragments now live in sharedSchemas.js for the same
+// no-cycle reason (spriteValidation.js and this module both need them) —
+// re-exported so every existing `import { … } from '../lib/validation.js'`
+// keeps working unchanged.
+export {
+  grokVideoDurationSchema, cloudModelIdString, recordRenderPinFields, isSafeSnapshotSource, isSafeSubdirFilter,
+};
+
+// =============================================================================
+// EXISTING SCHEMAS
+// =============================================================================
+
+// `ports` is an open-ended label→port map so app-specific keys derived from
+// *_PORT env vars (coinbaseIpc, geminiIpc, etc.) survive validation alongside
+// the well-known labels (api, ui, devUi, cdp, health).
+export const processListQuerySchema = z.object({ appId: z.string().min(1).optional() });
+
+// Reject option-shaped names before PM2 interprets positional arguments.
+export const pm2ProcessNameSchema = z.string().min(1).max(120)
+  .regex(/^[A-Za-z0-9_][A-Za-z0-9._-]*$/, 'Must start with an alphanumeric character or underscore');
+
+export const logsQuerySchema = z.object({
+  lines: z.coerce.number().int().min(1).max(5000).default(100),
+  follow: z.enum(['true', 'false']).optional(),
+});
+
+export const processActionSchema = z.object({
+  action: z.enum(['start', 'stop', 'restart']),
+  appId: z.string().min(1).optional()
+});
+
+export const processSchema = z.object({
+  name: z.string().min(1),
+  port: z.number().int().min(1).max(65535).nullable().optional(),
+  ports: z.record(z.number().int().min(1).max(65535)).optional(),
+  description: z.string().optional()
+});
+
+// JIRA integration config for apps
+export const jiraConfigSchema = z.object({
+  enabled: z.boolean().default(false),
+  instanceId: z.string().optional(),
+  projectKey: z.string().optional(),
+  boardId: z.string().optional(),
+  issueType: z.string().optional().default('Task'),
+  labels: z.array(z.string()).optional().default([]),
+  assignee: z.string().optional(),
+  epicKey: z.string().optional(),
+  createPR: z.boolean().optional().default(true)
+});
+
+// DataDog integration config for apps
+export const datadogConfigSchema = z.object({
+  enabled: z.boolean().default(false),
+  instanceId: z.string().optional(),
+  serviceName: z.string().optional(),
+  environment: z.string().optional()
+});
+
+// Per-managed-app feature participation. An absent key or null means inherit
+// the install-wide Settings > Features value; true/false is an app override.
+// The app-level list intentionally excludes POST, which has no managed-app tab.
+export const appFeatureOverridesSchema = z.object(
+  Object.fromEntries(APP_FEATURE_IDS.map((id) => [id, z.boolean().nullable().optional()]))
+).strict();
+
+// POST /api/datadog/instances. API keys may be empty when updating an
+// existing instance because the route preserves the stored secret in that
+// case.
+export const datadogInstanceRequestSchema = z.object({
+  // Preserve the exact key for updates. Older installs may have stored IDs
+  // outside the current preferred length/whitespace convention, and changing
+  // the lookup key here would make those instances impossible to edit.
+  id: z.string().min(1),
+  // Existing installs may have stored names longer than the current preferred
+  // display length, and updates should not make those records uneditable.
+  name: z.string().trim().min(1),
+  site: z.string().trim().min(1).max(253),
+  apiKey: z.string().max(512).optional(),
+  appKey: z.string().max(512).optional(),
+});
+
+// POST /api/datadog/instances/:id/search-errors.
+export const datadogSearchErrorsRequestSchema = z.object({
+  serviceName: z.string().trim().min(1),
+  environment: z.string().trim().optional(),
+  fromTime: z.preprocess(emptyToUndefined, z.string().trim().refine(value => !Number.isNaN(Date.parse(value)), {
+    message: 'fromTime must be a valid ISO 8601 date string',
+  }).optional()),
+});
+
+// App schema for registration/update
+// Workspace Context (#902) — the only input is an app id (the apps-registry
+// key, or the fixed 'portos-default' baseline). Mirrors the apps-registry id
+// shape: uuid-style ids plus the literal baseline id, so a hand-crafted path
+// segment can't reach the service with a junk id.
+export const workspaceContextParamsSchema = z.object({
+  appId: z.string().min(1).max(128).regex(/^[A-Za-z0-9_-]+$/, 'invalid app id')
+});
+
+// Layered Intelligence per-app config (the self-improvement loop). Off by
+// default; the loop is a user-enabled scheduled automation. `lastRunAt` is
+// server-managed run bookkeeping (cadence, not issue memory) but accepted here
+// so a round-tripped config doesn't 400. See server/services/layeredIntelligence.js.
+export const LAYERED_INTELLIGENCE_SCOPES = ['app-improvement', 'app-data-gap', 'loop-meta', 'portos-self'];
+export const layeredIntelligenceConfigSchema = z.object({
+  enabled: z.boolean().optional(),
+  intervalMs: z.number().int().min(60_000).optional(),
+  providerId: providerRefSchema.nullable().optional(),
+  model: z.string().nullable().optional(),
+  sources: z.object({
+    // One optional toggle per built-in Layer-1 source; the ordered key list (and
+    // what each source means) lives in layeredIntelligenceSources.js.
+    ...Object.fromEntries(LAYERED_INTELLIGENCE_SOURCE_KEYS.map(key => [key, z.boolean().optional()])),
+    // Custom Layer-1 sources. Discriminated on `type`: a repo-relative `file`,
+    // an `http`(s) URL, or a shell `cmd`. All three carry an optional display
+    // `label`. gatherSources also re-enforces the file confinement + the
+    // http scheme + a cmd timeout at read time (defense in depth).
+    custom: z.array(z.discriminatedUnion('type', [
+      z.object({
+        type: z.literal('file'),
+        // A safe repo-relative path — reject absolute paths and `..` traversal so a
+        // custom source can't read files outside the app repo into the LLM prompt.
+        ref: z.string().min(1).max(500)
+          .refine(r => !r.startsWith('/') && !r.split(/[/\\]/).includes('..'), {
+            message: 'ref must be a repo-relative path (no leading / and no ".." segments)'
+          }),
+        label: z.string().max(120).optional()
+      }),
+      z.object({
+        type: z.literal('http'),
+        // Only http/https — gatherSources rejects any other scheme at read time too.
+        url: z.string().url().max(2000)
+          .refine(u => /^https?:\/\//i.test(u), { message: 'url must be http(s)' }),
+        label: z.string().max(120).optional()
+      }),
+      z.object({
+        type: z.literal('cmd'),
+        cmd: z.string().min(1).max(2000),
+        label: z.string().max(120).optional()
+      })
+    ])).optional()
+  }).optional(),
+  rules: z.string().max(8000).optional(),
+  allowedScopes: z.array(z.enum(LAYERED_INTELLIGENCE_SCOPES)).optional(),
+  // Engine-A hand-off: when enabled, a reasoner-marked trivial+safe proposal is
+  // also enqueued as an approval-gated CoS coding-agent task. Off by default.
+  handoff: z.object({
+    enabled: z.boolean().optional()
+  }).optional(),
+  lastRunAt: z.string().nullable().optional()
+});
+
+// Install-level Layered Intelligence settings (data/settings.json, distinct from
+// the per-app config above). `trustShellSources` unlocks full-shell custom `cmd`
+// sources for the whole install — off by default; when false/absent, custom cmd
+// sources are restricted to the allowlisted-binary + shell:false runner. See the
+// threat-model comment on runShellCommand in server/services/layeredIntelligence.js
+// (issue #2515).
+export const layeredIntelligenceSettingsSchema = z.object({
+  trustShellSources: z.boolean().optional()
+});
+
+export const nativeLaunchSchema = z.object({
+  label: z.string().trim().min(1).max(40),
+  command: z.string().trim().min(1).max(500),
+  processName: z.string().regex(/^[a-zA-Z0-9._-]+$/).max(120)
+});
+
+export const appSchema = z.object({
+  name: z.string().min(1).max(100),
+  repoPath: z.string().min(1),
+  companionRepoPaths: z.array(z.string().min(1)).max(8).optional(),
+  type: z.string().optional().default('express'),
+  uiPort: z.number().int().min(1).max(65535).nullable().optional(),
+  devUiPort: z.number().int().min(1).max(65535).nullable().optional(),
+  apiPort: z.number().int().min(1).max(65535).nullable().optional(),
+  // Optional HTTPS port — set by the "Upgrade to TLS" action. When present,
+  // the Launch button prefers `https://<host>:<tlsPort>/` over the plain
+  // uiPort. See lib/tailscale-https.js for the helper apps use.
+  tlsPort: z.number().int().min(1).max(65535).nullable().optional(),
+  buildCommand: z.string().max(200).optional(),
+  // Explicit lifecycle hook for managed-app updates. PortOS runs its own
+  // update.sh/update.ps1; other apps must opt in instead of inheriting that
+  // lifecycle from their package.json.
+  updateCommand: z.string().trim().min(1).max(500).optional(),
+  uiUrl: z.string().url().optional(),
+  startCommands: z.array(z.string()).optional(),
+  pm2ProcessNames: z.array(z.string()).optional(),
+  // Optional native/GUI action shown alongside the standard browser Launch.
+  // Its PM2 process exits normally when the user closes the app window.
+  nativeLaunch: nativeLaunchSchema.nullable().optional(),
+  processes: z.array(processSchema).optional(), // Per-process port configs from ecosystem.config
+  envFile: z.string().optional(),
+  icon: z.string().nullable().optional(),
+  appIconPath: z.string().nullable().optional(), // Absolute path to detected app icon image
+  editorCommand: z.string().optional(),
+  description: z.string().optional(),
+  archived: z.boolean().optional(),
+  pm2Home: z.string().optional(), // Custom PM2_HOME path for apps that run in their own PM2 instance
+  disabledTaskTypes: z.array(z.string()).optional(), // Legacy: migrated to taskTypeOverrides
+  taskTypeOverrides: z.record(z.object({
+    enabled: z.boolean().optional(),
+    // A cron-SHAPED override must also be in range, or this generic PUT would
+    // persist an enabled schedule the walker can never match (#6634). A
+    // non-cron-shaped string is a named/legacy cadence the route decodes, and
+    // null clears the override back to inherit — both pass through untouched.
+    interval: z.string().refine(
+      (v) => !isCronShaped(v) || isValidCronExpression(v),
+      'interval must be a valid 5-field cron expression'
+    ).nullable().optional(),
+    // Per-app scheduling fields for handler-backed tasks (e.g. layered-intelligence);
+    // persisted by updateAppTaskTypeOverride. Nullable = "clear back to inherit/default".
+    // Declared here so a generic PUT /api/apps/:id can't silently strip them (Zod drops
+    // unknown keys and updateApp replaces taskTypeOverrides wholesale).
+    intervalMs: z.number().positive().nullable().optional(),
+    // PRESET-ONLY: an app pin is read straight off `providers.json` by the task
+    // walker, so a composite (`harness.method@service`) would name a record
+    // that never exists there (#7564).
+    providerId: presetProviderIdSchema.nullable().optional(),
+    model: z.string().nullable().optional(),
+    taskMetadata: z.record(z.any()).nullable().optional()
+  })).optional(), // Per-task overrides: { [taskType]: { enabled, interval, intervalMs, providerId, model, taskMetadata } }
+  defaultUseWorktree: z.boolean().optional(),
+  defaultOpenPR: z.boolean().optional(),
+  defaultPrCompletion: z.enum(PR_COMPLETION_VALUES).optional(),
+  // After a CoS agent completes against this app, audit the repo for the state the
+  // task asked for (worktree removed, branch deleted, PR merged) and file a recovery
+  // task when it diverges. See lib/repoStateExpectations.js. Unset = ON: an install
+  // that never hears about a leaked branch just accumulates them.
+  verifyRepoStateOnCompletion: z.boolean().optional(),
+  // Unset/false = off (default); true = land a `.quality.json` quality snapshot through an immediately-merged PR after each audit.
+  publishQualitySnapshot: z.boolean().optional(),
+  featureOverrides: appFeatureOverridesSchema.optional(),
+  jira: jiraConfigSchema.optional().nullable(),
+  datadog: datadogConfigSchema.optional().nullable(),
+  // Where this app's autonomous work items live (single source per app).
+  // 'auto' (default) resolves to a concrete tracker from the git origin host
+  // — see server/lib/workTracker.js + the `claim-work` router in
+  // cosTaskGenerator.js. WORK_TRACKERS is the single source of truth for the
+  // value set.
+  workTracker: z.enum(WORK_TRACKERS).optional(),
+  // The `gh` account login PortOS authenticates AND commits as for this app's
+  // repo — how one install drives repos belonging to several GitHub accounts.
+  // Unset (the default) keeps the owner-match inference in services/forgeAuth.js
+  // and leaves commit authorship to the machine's ambient git config; setting it
+  // pins both the token and the GIT_AUTHOR/GIT_COMMITTER identity to that
+  // account. Empty string clears the pin.
+  forgeAccount: z.string().trim().max(120).optional(),
+  // Layered Intelligence per-app config (the self-improvement loop). Full config
+  // accepted on create/update; the dedicated updateAppLayeredIntelligence merge
+  // (server/services/apps.js) preserves untouched fields on partial PATCHes.
+  layeredIntelligence: layeredIntelligenceConfigSchema.optional()
+  // referenceRepos is INTENTIONALLY not part of the create/update API
+  // surface. createApp() doesn't persist it and updateApp() (via the
+  // omit() in appUpdateSchema) ignores it — the dedicated
+  // /api/apps/:appId/reference-repos endpoints own the lifecycle so
+  // server-managed fields (status, lastError, createdAt) can't be
+  // clobbered through the generic apps API.
+});
+
+// Used by routes that POST a NEW reference repo (id/createdAt are server-
+// assigned, lastReviewedSha/lastCheckedAt populate after the first check).
+// `.trim()` runs before `min(1)` so a name/repoUrl that's just whitespace
+// fails validation rather than slipping through and producing confusing
+// git failures downstream — matches the project convention used elsewhere
+// in this file.
+// Reference-repo entry. Each app can list upstream repos it watches for
+// clean-room reimplementation; the `reference-watch` scheduled task fetches
+// each one, finds commits since `lastReviewedSha`, and files proposals in the
+// app's configured tracker (PLAN.md checklist IDs or forge issue numbers) for
+// `/claim` / `plan-task` / `claim-issue*` to pick up. `notes` is the free-text
+// "what we use from this repo" field, fed into the review prompt so the agent
+// knows which features in our app are load-bearing for the watch. `repoUrl` is
+// either a clonable URL (https://github.com/owner/repo or scp-style
+// user@host:owner/repo.git) or a local filesystem path; the service detects
+// remote URLs by matching
+// `scheme://` or scp-style `user@host:path` (see isLocalPath in
+// services/referenceRepos.js) and treats anything else as a local path.
+// The persisted record's server-owned fields (id, status, lastError,
+// lastCheckedAt, lastKnownGoodSnapshot, createdAt) are stamped by
+// services/referenceRepos.js and never accepted from a request body.
+export const referenceRepoCreateSchema = z.object({
+  name: z.string().trim().min(1).max(120),
+  repoUrl: z.string().trim().min(1).max(500),
+  branch: z.string().trim().max(120).optional(),
+  notes: z.string().max(4000).optional()
+});
+
+// Patch schema — every field optional. `lastReviewedSha` is also accepted
+// here so the UI's "mark as reviewed" button (and the post-check service
+// path) can pin a SHA. Same trim-before-min-length convention as the
+// create schema. lastReviewedSha is hex-validated so a bad PATCH can't
+// persist a non-SHA into apps.json.
+export const referenceRepoUpdateSchema = z.object({
+  name: z.string().trim().min(1).max(120).optional(),
+  repoUrl: z.string().trim().min(1).max(500).optional(),
+  branch: z.string().trim().max(120).optional(),
+  notes: z.string().max(4000).optional(),
+  lastReviewedSha: z.string().regex(/^[0-9a-f]{40}$/i, 'must be a 40-char hex SHA').nullable().optional()
+});
+
+// Partial schema for updates. referenceRepos is intentionally absent
+// from appSchema (see comment there) so it can't sneak in via PUT
+// either — all ref CRUD goes through /api/apps/:appId/reference-repos.
+export const appUpdateSchema = partialWithoutDefaults(appSchema);
+
+const standardizePlanFileSchema = z.string().trim().min(1).max(500)
+  .refine((file) => {
+    const segments = file.split(/[/\\]/);
+    return !file.startsWith('/')
+      && !file.startsWith('\\')
+      && !/^[A-Za-z]:/.test(file)
+      && !segments.includes('..');
+  }, { message: 'file must be a repo-relative path without parent traversal' });
+
+const standardizePlanProcessSchema = z.object({
+  name: z.string().trim().min(1).max(120)
+}).passthrough();
+
+const standardizePlanStrayPortSchema = z.object({
+  file: standardizePlanFileSchema,
+  variable: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/).max(120),
+  value: z.number().int().min(1).max(65535),
+  line: z.number().int().positive(),
+  action: z.enum(['remove', 'keep'])
+}).passthrough();
+
+export const standardizePlanSchema = z.object({
+  currentState: z.object({
+    hasGit: z.boolean()
+  }).passthrough(),
+  proposedChanges: z.object({
+    createEcosystem: z.boolean(),
+    ecosystemContent: z.string().min(1).max(1_000_000),
+    processes: z.array(standardizePlanProcessSchema).max(100),
+    strayPorts: z.array(standardizePlanStrayPortSchema).max(500)
+  }).passthrough()
+}).passthrough();
+
+export const standardizeApplySchema = z.object({
+  repoPath: z.string().trim().min(1).max(4096).optional(),
+  appId: z.string().trim().min(1).max(200).optional(),
+  plan: standardizePlanSchema,
+  overwriteEcosystem: z.boolean().optional().default(false)
+});
+
+// Game studio (#3177): managed-app binding, reusable asset bindings, bundle
+// compile, and user-triggered AI feedback.
+const gameNameSchema = z.string().trim().min(1).max(120);
+const gameAppIdSchema = z.string().trim().min(1).max(128);
+const gameAssetIdSchema = z.string().trim().min(1).max(128);
+
+export const gameCreateSchema = z.object({
+  appId: gameAppIdSchema,
+  name: gameNameSchema,
+}).strict();
+
+export const gameUpdateSchema = z.object({
+  appId: gameAppIdSchema.optional(),
+  name: gameNameSchema.optional(),
+}).strict().refine((patch) => Object.keys(patch).length > 0, {
+  message: 'at least one field is required',
+});
+
+export const gameSpriteBindingSchema = z.object({
+  spriteId: gameAssetIdSchema,
+}).strict();
+
+// Repo-relative publish destination inside the managed app repository. The
+// extension gate is per-lane (PNG artwork vs library audio); the traversal
+// refinements are shared so the two lanes can't drift.
+const gameDestinationSchema = (extensionPattern, extensionMessage) => z.string()
+  .trim()
+  .min(1)
+  .max(500)
+  .regex(extensionPattern, extensionMessage)
+  .refine((value) => !value.startsWith('/') && !value.includes('\\'), 'must be a repo-relative path')
+  .refine((value) => !value.split('/').includes('..'), 'must not traverse outside the app repository');
+const gameMusicDestinationSchema = gameDestinationSchema(
+  /\.(?:mp3|wav|m4a|ogg|flac)$/i,
+  'must end in a supported audio extension',
+);
+const gamePublishOptionsSchema = z.object({
+  acknowledgeOverwrite: z.boolean().optional(),
+}).strict();
+
+export const gameMusicBindingSchema = z.object({
+  trackId: gameAssetIdSchema,
+  destinationPath: gameMusicDestinationSchema.optional(),
+}).strict();
+
+export const gameMusicBindingUpdateSchema = z.object({
+  destinationPath: gameMusicDestinationSchema,
+}).strict();
+
+export const gameMusicPublishSchema = gamePublishOptionsSchema;
+
+export const GAME_ARTWORK_ROLES = [
+  'title-key-art',
+  'game-logo',
+  'biome-luminous-wilds',
+  'biome-mineral-steppe',
+  'biome-tide-meadow',
+  'loading-screen',
+  'other',
+];
+
+const gameArtworkFilenameSchema = z.string()
+  .trim()
+  .regex(/^[A-Za-z0-9][A-Za-z0-9._-]*\.png$/i, 'must be a gallery PNG filename')
+  .max(255);
+const gameArtworkDestinationSchema = gameDestinationSchema(/\.png$/i, 'must end in .png');
+
+export const gameArtworkBindingSchema = z.object({
+  imageFilename: gameArtworkFilenameSchema,
+  label: z.string().trim().min(1).max(120),
+  role: z.enum(GAME_ARTWORK_ROLES),
+  destinationPath: gameArtworkDestinationSchema,
+}).strict();
+
+export const gameArtworkBindingUpdateSchema = z.object({
+  label: z.string().trim().min(1).max(120).optional(),
+  role: z.enum(GAME_ARTWORK_ROLES).optional(),
+  destinationPath: gameArtworkDestinationSchema.optional(),
+}).strict().refine((patch) => Object.keys(patch).length > 0, {
+  message: 'at least one field is required',
+});
+
+export const gameArtworkPublishSchema = gamePublishOptionsSchema;
+
+export const gameFeedbackSchema = z.object({
+  providerId: z.string().trim().min(1).max(128),
+  model: z.string().trim().min(1).max(256).optional(),
+  effort: z.enum(EFFORT_LEVELS).nullable().optional(),
+  prompt: z.string().trim().min(1).max(4_000),
+}).strict();
+
+// Provider schema
+const providerHardwareRequirementsSchema = z.object({
+  platforms: z.array(z.string().trim().min(1).max(32)).min(1).max(8).optional(),
+  architectures: z.array(z.string().trim().min(1).max(32)).min(1).max(8).optional(),
+  requiresAppleSilicon: z.boolean().optional(),
+  requiresNvidiaGpu: z.boolean().optional(),
+  minMemoryGb: z.number().positive().max(4096).optional(),
+  minVramGb: z.number().positive().max(4096).optional(),
+  minCudaComputeCapability: z.number().positive().max(20).optional(),
+}).strict();
+
+/** A service or bootstrap slug on a preset (#7565), clearable with `null`. */
+const presetSlugField = z.string().trim().min(1).max(64).regex(SERVICE_SLUG_RE).nullable().optional();
+
+export const providerSchema = z.object({
+  name: z.string().min(1).max(100),
+  type: z.enum(['cli', 'api', 'tui']),
+  command: z.string().optional(),
+  args: z.array(z.string()).optional(),
+  endpoint: z.string().url().optional(),
+  apiKey: z.string().optional(),
+  models: z.array(z.string()).optional(),
+  hardwareRequirements: providerHardwareRequirementsSchema.optional(),
+  modelHardwareRequirements: z.record(providerHardwareRequirementsSchema).optional(),
+  defaultModel: z.string().nullable().optional(),
+  timeout: z.number().int().min(AI_RUN_TIMEOUT_MIN_MS).max(AI_RUN_TIMEOUT_MAX_MS).optional(),
+  enabled: z.boolean().optional(),
+  // Marks a harness wrapper whose backend is the LM Studio server on this
+  // machine. Unlike the containers below, its context window and reasoning are
+  // chosen when the model instance is LOADED, so PortOS forwards neither.
+  lmstudioBacked: z.boolean().optional(),
+  // Kept in schema parity with aiToolkit's provider schema. Marks OpenCode
+  // wrappers for a separately started local MTPLX native-MTP server.
+  mtplxBacked: z.boolean().optional(),
+  // Marks an OpenCode CLI/TUI wrapper for a separately started local llama.cpp
+  // server (e.g. DFlash 2 speculative decoding).
+  llamaBacked: z.boolean().optional(),
+  // Marks an OpenCode CLI/TUI wrapper for a separately started local vLLM
+  // container (the Qwen3.8-27B DFlash 2 stack on an RTX 3090).
+  vllmBacked: z.boolean().optional(),
+  // Marks an OpenCode CLI/TUI wrapper for a separately started local SGLang
+  // container (Qwen3.8-27B on a Hopper/Blackwell card).
+  sglangBacked: z.boolean().optional(),
+  // Marks an OpenCode CLI/TUI wrapper for a hosted OpenAI-compatible gateway
+  // ('orcarouter', 'openrouter', 'nvidia-nim' — see server/lib/providerGateways.js). The
+  // sibling API record whose id equals this value owns the key.
+  gatewayBacked: z.string().optional(),
+  // Legacy per-gateway marker, superseded by `gatewayBacked`. Still accepted and
+  // still READ (providerGateways.js resolves it), because records written before
+  // the registry existed are never rewritten — installs upgrade on their own
+  // schedule.
+  orcarouterBacked: z.boolean().optional(),
+  // Explicit opt-in to attach the API key to an arbitrary (non-local,
+  // non-allowlisted) endpoint — mirrors the aiToolkit providerSchema. Guards
+  // SSRF / key exfiltration (server/lib/aiToolkit/endpointGuard.js).
+  allowCustomEndpoint: z.boolean().optional(),
+  // Kept in schema parity with aiToolkit's provider schema. Marks a CLI/TUI
+  // provider whose harness auth is provisioned by an external CLI at spawn
+  // time (a short-lived token for a proxy) rather than a static apiKey.
+  // `setupCommand` is advisory only — PortOS never executes it. Nullable so
+  // the editor can explicitly clear a previously-set bootstrap.
+  credentialBootstrap: z.object({
+    setupCommand: z.string().trim().max(500).optional(),
+    command: z.string().trim().min(1).max(200),
+    args: z.array(z.string().max(200)).max(20).optional(),
+    envCommand: z.array(z.string().min(1).max(500)).min(1).max(21).optional(),
+    harnessId: z.string().trim().min(1).max(100).optional(),
+    argsSeparator: z.string().trim().max(20).optional(),
+  }).strict().nullable().optional(),
+  envVars: z.record(z.string()).optional(),
+  headlessArgs: z.array(z.string()).optional(),
+  tuiPromptDelayMs: z.number().int().min(250).max(60000).optional(),
+  tuiIdleTimeoutMs: z.number().int().min(1000).max(86400000).optional(),
+  // Kept in schema parity with aiToolkit's provider schema. This opt-in applies
+  // only to interactive Claude TUI runs after the session-limit banner.
+  lowPriorityOnUsageLimit: z.boolean().optional(),
+  // Preset structure (#7565), in parity with the toolkit schema: the harness,
+  // method and service slug a DERIVED preset is materialized from, the
+  // optional catalog narrowing, and the bootstrap app it spawns through.
+  harnessId: z.enum(PROVIDER_HARNESS_IDS).nullable().optional(),
+  method: z.enum(ROUTE_MODES).nullable().optional(),
+  serviceId: presetSlugField,
+  catalogNarrowing: z.array(z.string().trim().min(1).max(512)).max(1000).nullable().optional(),
+  credentialBootstrapId: presetSlugField,
+});
+
+// POST /api/providers/:id/test-vision.
+export const providerVisionTestSchema = z.object({
+  imagePath: z.string().trim().min(1).max(255),
+  prompt: z.string().max(8_000).optional(),
+  expectedContent: z.preprocess(emptyToUndefined, z.union([
+    z.string().trim().min(1).max(128),
+    z.array(z.string().trim().min(1).max(128)).max(50),
+  ]).optional()),
+  model: z.preprocess(emptyToUndefined, z.string().trim().min(1).max(256).optional()),
+});
+
+// POST /api/providers/codex/account/login/cancel. The id is minted by the Codex
+// app-server and only ever echoed back, so this bounds the shape and nothing
+// more — the service still refuses an id that isn't the pending login's.
+export const codexLoginCancelSchema = z.object({
+  loginId: z.string().trim().min(1).max(200),
+});
+
+// POST /api/providers/codex/account/login. `deviceCode` picks the device-code
+// flow (a URL plus a short code) over opening a browser URL directly.
+export const codexLoginStartSchema = z.object({
+  deviceCode: z.boolean().optional().default(false),
+});
+
+// POST /api/providers/model-pins/clear (#7315) — clear ONE stored model pin
+// back to "inherit" by the id `GET /model-pins` reported. Addressed by pin id
+// rather than a "clear everything stale" verb so an audit landing between the
+// user's click and this write cannot widen what they approved. The id is
+// resolved against a freshly collected pin list, so this bounds the shape only.
+export const modelPinClearSchema = z.object({
+  pinId: z.string().trim().min(1).max(300),
+});
+
+// POST /api/providers/bindings/:id/link  (and /link/preview).
+//
+// Every revision the caller reviewed is named explicitly. Omitting one is
+// allowed for a PREVIEW (there is nothing to be stale against yet), but the
+// service refuses to APPLY a link whose named revisions have moved -- a link is
+// a decision about a specific difference, so a changed row invalidates it.
+export const providerBindingLinkSchema = z.object({
+  targetConnectionId: z.string().uuid(),
+  expectedRevisions: z.object({
+    binding: z.number().int().positive().optional(),
+    sourceConnection: z.number().int().positive().optional(),
+    targetConnection: z.number().int().positive().optional(),
+  }).strict().optional().default({}),
+}).strict();
+
+// POST /api/providers/bindings/:id/unlink. No target: unlink clones the
+// connection this binding already uses, so only the binding and its source
+// participate.
+export const providerBindingUnlinkSchema = z.object({
+  expectedRevisions: z.object({
+    binding: z.number().int().positive().optional(),
+    sourceConnection: z.number().int().positive().optional(),
+  }).strict().optional().default({}),
+}).strict();
+
+// POST /api/providers/connections (#6369) — a NEW backend.
+//
+// This schema bounds the SHAPE only. Which backend kinds and transport
+// protocols are real is checked by `connectionBlocker` in the service, which
+// already owns the harness/transport registries — importing them here would
+// pull that subtree into the one module nearly every route validates through
+// (`lib/importScoping.test.js`), for two enum lists and no extra safety.
+//
+// Exactly ONE transport, and this is the load-bearing rule: a provider record
+// names one endpoint, so the profile a minted route reports always declares one
+// transport. A connection declaring two would not be the connection its own
+// routes describe, and reconciliation would clone each binding onto a fresh
+// single-transport row on the next pass — silently undoing the create.
+//
+// Credentials take no `null` here, unlike the PATCH above: there is nothing yet
+// to clear, so a null would only be a typo with a destructive reading.
+export const providerConnectionCreateSchema = z.object({
+  kind: z.string().trim().min(1).max(64),
+  label: z.string().trim().min(1).max(200),
+  transports: z.record(
+    z.string().trim().min(1).max(64),
+    z.object({ baseUrl: z.string().trim().min(1).max(2048) }).strict(),
+  ).refine((value) => Object.keys(value).length === 1, {
+    message: 'Declare exactly one transport protocol for this backend',
+  }),
+  credentials: z.record(
+    z.string().trim().min(1).max(128),
+    z.string().min(1).max(4096),
+  ).optional().default({}),
+}).strict();
+
+// POST /api/providers/bindings (#6369) — a NEW harness configuration on an
+// existing backend, and the executable routes it owns.
+//
+// `harnessId` accepts every registry id, not only the creatable ones: a harness
+// with no command recipe gets the service's explanation of WHY it cannot be
+// pointed at a backend, which is more useful than a schema enum error. `null`
+// is the direct API binding and is spelled explicitly rather than by omission,
+// because "no harness" is a real choice here, not a missing field.
+export const providerBindingCreateSchema = z.object({
+  connectionId: z.string().uuid(),
+  harnessId: z.enum(PROVIDER_HARNESS_IDS).nullable(),
+  modes: z.array(z.enum(ROUTE_MODES)).min(1).max(ROUTE_MODES.length)
+    .refine((value) => new Set(value).size === value.length, { message: 'Name each mode once' }),
+  label: z.string().trim().min(1).max(200).optional(),
+}).strict();
+
+// PATCH /api/providers/connections/:id (#6369).
+//
+// `expectedRevision` is REQUIRED, unlike the link schemas where a preview may
+// omit it: this endpoint always writes, and a shared backend edit that lands on
+// a row the human never saw is exactly the silent overwrite the graph exists to
+// prevent.
+//
+// Credentials are three-valued on purpose — absent preserves, `null` clears, a
+// string sets — so a client that never received the secret (the DTO carries
+// only `hasCredentials`) can edit a label without wiping the key.
+export const providerConnectionUpdateSchema = z.object({
+  expectedRevision: z.number().int().positive(),
+  label: z.string().trim().max(200).optional(),
+  transports: z.record(
+    z.string().trim().min(1).max(64),
+    z.object({ baseUrl: z.string().trim().min(1).max(2048) }).strict(),
+  ).optional(),
+  credentials: z.record(z.string().trim().min(1).max(128), z.string().max(4096).nullable()).optional(),
+}).strict();
+
+// --- service instances (#7563) ------------------------------------------------
+// The vocabulary comes from `serviceDefinitions.js`, a zero-import leaf this
+// module already reaches, so nothing here can drift from the definitions.
+export const serviceSlugSchema = z.string().trim().min(1).max(64).regex(SERVICE_SLUG_RE, {
+  message: 'A service slug is lowercase letters, digits and dashes, starting with a letter or digit',
+});
+export const servicePlanSchema = z.enum(SERVICE_PLANS);
+export const serviceCredentialViaSchema = z.enum(SERVICE_CREDENTIAL_VIAS);
+
+const serviceTransportsSchema = z.record(
+  z.string().trim().min(1).max(64),
+  z.object({ baseUrl: z.string().trim().min(1).max(2048) }).strict(),
+);
+
+// POST /api/providers/services — a NEW instance of a definition. The
+// definition decides which transports and plans are legal (`resolveServiceInstance`
+// in the service), so this bounds shape only. Credentials take no `null`, as
+// on the connection create: nothing exists yet to clear.
+export const providerServiceCreateSchema = z.object({
+  definitionId: z.string().trim().min(1).max(64),
+  slug: serviceSlugSchema.optional(),
+  label: z.string().trim().min(1).max(200).optional(),
+  plan: servicePlanSchema.optional(),
+  enabled: z.boolean().optional(),
+  transports: serviceTransportsSchema.optional(),
+  credentials: z.record(z.string().trim().min(1).max(128), z.string().min(1).max(4096)).optional().default({}),
+  credentialVia: serviceCredentialViaSchema.optional(),
+}).strict();
+
+// PATCH /api/providers/services/:slug — the connection update plus the
+// instance's own plan / enabled / credential mode. Same three-valued
+// credential rule, same required `expectedRevision`.
+export const providerServiceUpdateSchema = providerConnectionUpdateSchema.extend({
+  plan: servicePlanSchema.optional(),
+  enabled: z.boolean().optional(),
+  credentialVia: serviceCredentialViaSchema.optional(),
+}).strict();
+
+// PATCH /api/providers/bindings/:id (#6369). Management state only: no
+// `enabled`, because route enablement is an executable-record field that
+// PATCH /api/providers/:id owns and a binding toggle must never grant it.
+export const providerBindingUpdateSchema = z.object({
+  expectedRevision: z.number().int().positive(),
+  label: z.string().trim().max(200).optional(),
+  selectedModels: z.array(z.string().trim().min(1).max(512)).max(1000).optional(),
+}).strict();
+
+// PATCH /api/providers/routes/:providerId (#6369) — ONE route's mode overrides.
+//
+// Deliberately not `providerSchema.partial()`: that would reopen the whole
+// executable record, including the connection-owned endpoint/key the graph
+// projects and the `enabled` flag that grants execution consent. The accepted
+// keys are exactly the route-owned table in `providerRouteSettings.js`;
+// `providerRouteSettings.test.js` fails if the two ever drift.
+//
+// `expectedRevision` is a FINGERPRINT of the values on disk, not a row counter
+// — these fields live in providers.json, which the route editor and a model
+// refresh also write. An empty patch is refused rather than written: it would
+// rewrite the provider file to say nothing.
+//
+// `timeout` takes no `null`. The executable record's own schema has no null
+// timeout, so storing one here would 400 the next save from the route editor;
+// clearing a custom timeout stays that editor's job.
+const nullableModelPin = z.preprocess(emptyToNull, z.string().trim().max(512).nullable());
+export const providerRouteSettingsUpdateSchema = z.object({
+  expectedRevision: z.string().trim().min(1).max(64),
+  settings: z.object({
+    args: z.array(z.string().trim().min(1).max(2048)).max(200).optional(),
+    timeout: z.number().int().min(AI_RUN_TIMEOUT_MIN_MS).max(AI_RUN_TIMEOUT_MAX_MS).optional(),
+    effort: z.preprocess(emptyToNull, z.enum(EFFORT_LEVELS).nullable()).optional(),
+    defaultModel: nullableModelPin.optional(),
+    lightModel: nullableModelPin.optional(),
+    mediumModel: nullableModelPin.optional(),
+    heavyModel: nullableModelPin.optional(),
+    ultraModel: nullableModelPin.optional(),
+  }).strict().refine((value) => Object.keys(value).length > 0, {
+    message: 'Name at least one setting to change',
+  }),
+}).strict();
+
+// PATCH /api/providers/routes/:providerId/model-aliases (#6369) — ONE route's
+// HAND-AUTHORED canonical→executable model aliases.
+//
+// Three-valued like the connection credentials above, and for the same reason:
+// a panel that read three aliases and changed one must be able to send one. An
+// absent key is preserved, a string sets, and `null` DELETES — the only way an
+// override is ever removed, because a refresh must never delete a correction.
+//
+// The keys are model names, so the record is not enumerable and each key is
+// length-checked. `expectedRevision` is a FINGERPRINT of the current override
+// map (`ai_route_bindings` has no revision column), and an empty patch is
+// refused rather than written: it would rewrite a row to say nothing.
+export const providerRouteModelAliasSchema = z.object({
+  expectedRevision: z.string().trim().min(1).max(64),
+  aliases: z.record(
+    z.string().trim().min(1).max(MODEL_ALIAS_LIMITS.maxLength),
+    z.string().trim().min(1).max(MODEL_ALIAS_LIMITS.maxLength).nullable(),
+  ).refine((value) => Object.keys(value).length > 0, { message: 'Name at least one alias to change' })
+    .refine((value) => Object.keys(value).length <= MODEL_ALIAS_LIMITS.maxEntries, {
+      message: `At most ${MODEL_ALIAS_LIMITS.maxEntries} aliases at a time`,
+    }),
+}).strict();
+
+// POST /api/providers/:id/vision-suite.
+export const providerVisionSuiteSchema = z.object({
+  model: z.preprocess(emptyToUndefined, z.string().trim().min(1).max(256).optional()),
+});
+
+// POST /api/harnesses/action. Both values are TABLE KEYS, not free text: the
+// service rejects a `runtime` that names no row and an `action` outside this
+// enum before any child is spawned. This bounds the shape at the HTTP boundary
+// so a malformed query fails as a 400 rather than as a lookup miss mid-stream.
+export const harnessActionSchema = z.object({
+  runtime: z.string().trim().min(1).max(64),
+  action: z.enum(['install', 'update', 'uninstall']).optional().default('install'),
+});
+
+// POST /api/harnesses/models/refresh.
+export const harnessRefreshSchema = z.object({
+  runtime: z.string().trim().min(1).max(64),
+});
+
+// POST /api/uploads and POST /api/attachments. The shared upload helper
+// enforces decoded-byte limits and extension allowlists; this schema bounds
+// the JSON shape before the helper receives it.
+export const base64FileUploadSchema = z.object({
+  data: z.string().trim().min(1, 'data is required (base64)').max(64 * 1024 * 1024),
+  // The upload helper prefixes the sanitized name with a 9-byte UUID marker.
+  filename: z.string().min(1, 'filename is required').max(246),
+});
+
+export const uploadRequestSchema = base64FileUploadSchema;
+export const attachmentUploadRequestSchema = base64FileUploadSchema;
+
+// Run command schema
+export const runSchema = z.object({
+  type: z.enum(['ai', 'command']),
+  providerId: providerRefSchema.optional(),
+  model: z.string().optional(),
+  workspaceId: z.string(),
+  command: z.string().optional(),
+  prompt: z.string().optional(),
+  timeout: z.number().int().min(AI_RUN_TIMEOUT_MIN_MS).max(AI_RUN_TIMEOUT_MAX_MS).optional()
+});
+
+// =============================================================================
+// SOCIAL ACCOUNT SCHEMAS (Digital Twin)
+// =============================================================================
+
+export const socialPlatformSchema = z.enum([
+  'github', 'instagram', 'facebook', 'linkedin', 'x',
+  'substack', 'medium', 'youtube', 'tiktok', 'reddit',
+  'bluesky', 'mastodon', 'threads', 'other'
+]);
+
+export const socialAccountSchema = z.object({
+  platform: socialPlatformSchema,
+  username: z.string().min(1).max(200),
+  displayName: z.string().max(200).optional(),
+  url: z.string().url().optional(),
+  bio: z.string().max(2000).optional().default(''),
+  contentTypes: z.array(z.string().max(50)).optional().default([]),
+  ingestionEnabled: z.boolean().optional().default(false),
+  notes: z.string().max(2000).optional().default('')
+});
+
+// Bulk create: each entry is validated per-account (a bad one is reported, not fatal).
+export const socialAccountBulkBodySchema = z.object({ accounts: z.array(z.unknown()).min(1, 'accounts array is required') });
+export const socialAccountUpdateSchema = partialWithoutDefaults(socialAccountSchema);
+
+// =============================================================================
+// GITHUB REPOS SCHEMAS
+// =============================================================================
+
+export const githubRepoUpdateSchema = z.object({
+  flags: z.record(z.boolean()).optional(),
+  managedSecrets: z.array(z.string().min(1)).optional()
+});
+
+export const githubSecretSchema = z.object({
+  value: z.string().min(1)
+});
+
+// =============================================================================
+// INSIGHTS SCHEMAS
+// =============================================================================
+
+export const insightRefreshSchema = z.object({
+  providerId: providerRefSchema.optional(),
+  model: z.string().optional()
+});
+
+// Goal effectiveness scorecard (#2157).
+export const scorecardComputeSchema = z.object({
+  weekStart: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional()
+});
+
+export const scorecardSettingsSchema = z.object({
+  enabled: z.boolean().optional(),
+  provider: providerRefSchema.nullable().optional(),
+  model: z.string().nullable().optional(),
+  feedBrainDigest: z.boolean().optional(),
+  weekStartsOn: z.number().int().min(1).max(7).optional()
+});
+
+// Per-goal mapping overrides: { [goalId]: { keywords?, personIds?, subcalendarIds?, enabled? } }.
+const scorecardRuleOverrideSchema = z.object({
+  keywords: z.array(z.string()).optional(),
+  personIds: z.array(z.string()).optional(),
+  subcalendarIds: z.array(z.string()).optional(),
+  enabled: z.boolean().optional()
+});
+export const scorecardRulesSchema = z.record(z.string(), scorecardRuleOverrideSchema);
+
+// =============================================================================
+// SEARCH SCHEMAS
+// =============================================================================
+
+export const searchQuerySchema = z.object({
+  q: z.string().min(2).max(200).trim()
+});
+
+// =============================================================================
+// MEDIA SKETCH / ANNOTATION SCHEMAS (issue #2036, phase 1)
+// =============================================================================
+
+// Vector strokes drawn over a generated image. Points are stored in the
+// image's natural-pixel space so they restore exactly regardless of the
+// display size (see AnnotationCanvas.jsx). The service (mediaSketches.js)
+// re-sanitizes + clamps beyond this schema; the Zod layer rejects the
+// obviously-malformed shapes early with a 400.
+const sketchPointSchema = z.object({
+  x: z.number().finite(),
+  y: z.number().finite()
+});
+
+const sketchStrokeSchema = z.object({
+  mode: z.enum(['draw', 'erase']).optional(),
+  color: z.string().max(32).optional(),
+  size: z.number().positive().max(512).optional(),
+  points: z.array(sketchPointSchema).min(1).max(20000)
+});
+
+export const mediaSketchSaveSchema = z.object({
+  width: z.number().positive(),
+  height: z.number().positive(),
+  strokes: z.array(sketchStrokeSchema).max(5000),
+  // Flattened raster (image + strokes) as a PNG data URL. Optional so a caller
+  // can persist just the vector layer; the service decodes + stores the bytes.
+  png: z.string().startsWith('data:image/png;base64,').optional()
+});
+
+// =============================================================================
+// BACKUP SCHEMAS
+// =============================================================================
+
+// Used by both the settings PUT route (.partial() for incremental updates) and
+// any direct backup-config endpoint. destPath is nullable: the UI persists an
+// empty string when the field is cleared, and the route handler treats empty/
+// missing destPath as "not configured" rather than rejecting the save.
+// The enabled/cron defaults here are the SAME interpretation `backupConfig.js`
+// declares (omitted enabled = enabled, blank cron = midnight) and are sourced
+// from it, so the boundary schema can never drift from the module the scheduler
+// and the settings GET both resolve through (#6632).
+export const backupConfigSchema = z.object({
+  destPath: z.string().nullable().optional(),
+  cronExpression: z.string().optional().default(DEFAULT_BACKUP_CRON),
+  enabled: z.boolean().optional().default(true),
+  // rsync filter patterns, bounded and kept inside the data root. `..` (any
+  // segment) and NUL are rejected rather than sanitized, so a hand-edited
+  // settings.json can't hand rsync a pattern that walks upward or smuggles a
+  // separator. Anchoring itself happens at READ time in
+  // `computeEffectiveExcludes` — the stored value stays what the user typed —
+  // but the length bound is measured on the ANCHORED form, so this accepts
+  // exactly what that normalizer will keep. The outer .max() is a cheap ceiling
+  // on a pathological payload; isSafeExcludePattern owns the real rule.
+  excludePaths: z.array(
+    z.string().trim().min(1).max(EXCLUDE_PATTERN_MAX_LENGTH + 1)
+      .refine(isSafeExcludePattern, { message: `Exclude pattern must be at most ${EXCLUDE_PATTERN_MAX_LENGTH} characters once anchored, and may not contain ".." or a NUL byte` })
+  ).optional().default([]),
+  disabledDefaultExcludes: z.array(z.string()).optional().default([]),
+  // Per-source completed-snapshot retention. `null` (and an omitted field, via
+  // `resolveRetentionCount`) both mean unlimited — see backupConfig.js for why
+  // an existing install must never see this default itself. `.nullable()`
+  // rather than `emptyToUndefined`: the UI's explicit "Unlimited" choice IS a
+  // value worth persisting distinctly from "never touched this setting".
+  retentionCount: z.number().int().min(MIN_RETENTION_COUNT).max(MAX_RETENTION_COUNT).nullable().optional()
+});
+
+// Automatic PortOS self-update (Update tab). Stored under the top-level
+// `autoUpdate` key and OFF by default — an install must never start restarting
+// itself merely because it upgraded into this code. The accepted interpretation
+// of a sparse slice (omitted channel, omitted interval) is `sharedSchemas.js`'s
+// `resolveAutoUpdateConfig`, which the scheduler and the settings GET both read
+// through, so this boundary schema cannot drift away from it.
+export const autoUpdateSettingsSchema = z.object({
+  enabled: z.boolean().optional(),
+  channel: z.enum(AUTO_UPDATE_CHANNELS).optional(),
+  // Hours to wait after the last update before looking for an idle window.
+  minIntervalHours: z.number().min(AUTO_UPDATE_MIN_INTERVAL_HOURS_MIN).max(AUTO_UPDATE_MIN_INTERVAL_HOURS_MAX).optional(),
+  // Whether a checkout no script may safely repair queues a CoS agent.
+  resolveBlockersWithAgent: z.boolean().optional(),
+}).strict();
+
+// Scheduled Series Autopilot (#2174). Machine-local per-series cron schedules
+// that fire `startSeriesAutopilot` unattended — the AI Provider Usage Policy's
+// sanctioned "scheduled automation" exception. Stored under the top-level
+// `seriesAutopilot` settings key (NOT on the federated series record — a
+// schedule that synced to a peer would double-run the same series). Each entry
+// is OFF by default (`enabled` defaults false); the run itself still passes
+// through the cos-domain autonomy gate + daily budget inside startSeriesAutopilot.
+// provider/model are OPTIONAL overrides — when absent the run uses the series'
+// own `series.llm` (or the active provider); the scheduler maps them to the
+// pipeline's providerOverride/modelOverride. A blank provider/model (UI sentinel
+// for "use the series default") is coerced to undefined so it doesn't pin an
+// empty string. Other autopilot run options are intentionally NOT accepted here:
+// there's no UI producing them, so a scheduled run uses the series' persisted
+// defaults for those (add a field only when a control exists to set it).
+// Cron syntax/range validation lives in the pure leaf `cronValidation.js` so the
+// scheduler, every save boundary, and the browser cron editor share ONE
+// implementation (#6634). Re-exported here because callers already reach for
+// `isValidCronExpression` through validation.js. Rejects a 5-token-but-out-of-
+// range cron like `99 99 * * *` at the PUT boundary (a 400 the UI surfaces)
+// instead of letting it be saved+enabled and then silently dropped by
+// activeSchedules — which would leave the user with an "enabled" schedule that
+// never fires (#2174).
+export { isValidCronExpression, isCronShaped, findCronExpressionError } from './cronValidation.js';
+
+export const seriesAutopilotScheduleSchema = z.object({
+  seriesId: z.string().min(1).max(64),
+  enabled: z.boolean().optional().default(false),
+  cron: z.string().min(1).max(120).refine(isValidCronExpression, 'invalid cron expression'),
+  timezone: z.string().min(1).max(64).optional(),
+  provider: z.preprocess((v) => (v === '' ? undefined : v), providerRefSchema.optional()),
+  model: z.preprocess((v) => (v === '' ? undefined : v), z.string().min(1).max(200).optional()),
+  // Optional per-schedule reasoning effort (#3641), mapped to the run's
+  // `effortOverride`. Validated against the union of accepted levels across
+  // effort-capable CLIs; the runner clamps a level the chosen provider doesn't
+  // offer and drops it for a provider with no effort control.
+  effort: z.preprocess((v) => (v === '' ? undefined : v), z.enum(EFFORT_LEVELS).optional()),
+  // Run every stage on the provider/model above, ignoring the per-stage pins
+  // from the Prompts page. Absent falls through to the persisted
+  // pipelineEditorialChecks setting, then off.
+  overrideStagePins: z.boolean().optional(),
+}).strict();
+
+export const seriesAutopilotSettingsSchema = z.object({
+  schedules: z.array(seriesAutopilotScheduleSchema).optional().default([]),
+}).strict();
+
+// Per-API external-access flags (issue: public API surface). Stored under the
+// top-level `apiAccess` settings key (client-readable — NOT under `secrets`).
+// Drives `server/lib/apiRegistry.js`: an entry that is `exposed && !requireAuth`
+// re-opens its public mount even when the PortOS password is on. Both flags are
+// optional so a partial PUT only patches what it carries; the registry fills
+// absent flags from its per-API defaults (exposed:false, requireAuth:false).
+export const apiAccessEntrySchema = z.object({
+  exposed: z.boolean().optional(),
+  requireAuth: z.boolean().optional(),
+}).strict();
+
+export const apiAccessSettingsSchema = z.object({
+  voice: apiAccessEntrySchema.optional(),
+  sdapi: apiAccessEntrySchema.optional(),
+}).strict();
+
+// Install-local feature participation flags. `instanceFeatureRegistry.js` owns
+// the available feature ids and both schemas derive from it, so registering a
+// feature there needs no edit here; the schemas keep generic settings saves from
+// persisting an unknown or malformed feature state.
+export const instanceFeatureSettingsSchema = z.object(
+  Object.fromEntries(INSTANCE_FEATURE_IDS.map((id) => [
+    id,
+    z.object({ enabled: z.boolean().optional() }).strict().optional(),
+  ]))
+).strict();
+
+export const instanceFeatureIdSchema = z.enum([...INSTANCE_FEATURE_IDS]);
+
+// `enabled: null` is the tri-state override going back to "inherit" — it clears
+// the stored value rather than writing a third sentinel, so a grouped feature's
+// resolution falls through to its group's `enabled` flag (see resolveOne in
+// services/instanceFeatures.js). Every existing caller sends a real boolean;
+// only the grouped-feature override control in Settings > Features sends null.
+export const instanceFeatureUpdateSchema = z.object({
+  enabled: z.boolean().nullable(),
+}).strict();
+
+// Install-local feature GROUP participation flags. A group has no inherit
+// state of its own — just an on/off default-true toggle — so unlike
+// instanceFeatureUpdateSchema above this stays non-nullable.
+export const instanceFeatureGroupSettingsSchema = z.object(
+  Object.fromEntries(INSTANCE_FEATURE_GROUP_IDS.map((id) => [
+    id,
+    z.object({ enabled: z.boolean().optional() }).strict().optional(),
+  ]))
+).strict();
+
+export const instanceFeatureGroupIdSchema = z.enum([...INSTANCE_FEATURE_GROUP_IDS]);
+
+export const instanceFeatureGroupUpdateSchema = z.object({
+  enabled: z.boolean(),
+}).strict();
+
+export const subdirFilterSchema = z.string()
+  .refine(isSafeSubdirFilter, 'subdirFilter must be a relative path with no wildcard, ".." , or leading "/" segments');
+
+export const snapshotSourceSchema = z.string()
+  .refine(isSafeSnapshotSource, 'source must be "@legacy" or a single machine-name segment');
+
+export const snapshotDownloadQuerySchema = z.object({
+  source: snapshotSourceSchema.optional(),
+}).strict();
+
+export const restoreRequestSchema = z.object({
+  snapshotId: z.string().min(1),
+  source: snapshotSourceSchema.optional(),
+  subdirFilter: subdirFilterSchema.optional().nullable(),
+  dryRun: z.boolean().optional().default(true)
+});
+
+export const restoreDbRequestSchema = z.object({
+  snapshotId: z.string().min(1),
+  source: snapshotSourceSchema.optional(),
+  dryRun: z.boolean().optional().default(true)
+});
+
+// Resume a committed snapshot database restore awaiting recovery (#9725). The
+// id must name the pending operation; recovery never replays the dump.
+export const restoreDbRecoverRequestSchema = z.object({
+  id: z.string().uuid(),
+}).strict();
+
+// Per-feature AI provider assignment: which configured CLI provider/model a
+// feature runs through (e.g. `settings.autofixer`, `settings.calendarSync`).
+// Empty string (UI "unset" sentinel) is coerced to undefined so it round-trips
+// as "use the default" rather than a bogus id. Both the autofixer (file edits
+// + pm2) and Google Calendar MCP sync require an agentic CLI provider; the
+// picker resolution layer (`pickCliProvider`) enforces type 'cli'.
+// `emptyToUndefined` now lives in zodCompat.js (so per-domain schema files can
+// use it without a cycle through this module) — re-exported for deep imports.
+export { emptyToUndefined };
+export const featureProviderConfigSchema = z.object({
+  providerId: z.preprocess(emptyToUndefined, providerRefSchema.optional()),
+  model: z.preprocess(emptyToUndefined, z.string().optional()),
+});
+
+// Autofixer settings extend the shared provider assignment with its isolation
+// controls. `autoPromote` (default off) is the explicit promotion gate: when
+// false the autonomous repair only STAGES a validated patch for review; when
+// true a validated (and, if set, verified) diff is applied to the live checkout
+// and the process restarted. `verifyCommand` runs in the isolated worktree
+// before any change reaches live. See autofixer/sandbox.js.
+export const autofixerSettingsSchema = featureProviderConfigSchema.extend({
+  autoPromote: z.boolean().optional(),
+  verifyCommand: z.preprocess(emptyToUndefined, z.string().max(500).optional()),
+});
+
+// Music settings slice (#2911). `chiptune` remembers the Track editor's last
+// chiptune generation provider/model pin plus the publish preferences (target
+// managed app + subdir inside its repo). `designer` (#4305) is the Generate
+// tab's stepped music designer: its provider/model/effort pin plus optional
+// meta-prompt overrides for the describe + lyrics steps (a blank override falls
+// back to the shipped default server-side, in services/musicDesigner.js).
+// Reuses the shared feature-provider shape so an empty-string picker value
+// normalizes to unset. Every key stays optional so an older client PUTting only
+// `{ chiptune }` — or only `{ designer }` — still validates.
+export const musicSettingsSchema = z.object({
+  chiptune: featureProviderConfigSchema.extend({
+    publishAppId: z.preprocess(emptyToUndefined, z.string().max(120).optional()),
+    publishSubdir: z.preprocess(emptyToUndefined, z.string().max(200).optional()),
+  }).partial().optional(),
+  designer: featureProviderConfigSchema.extend({
+    effort: z.preprocess(emptyToUndefined, z.string().max(64).optional()),
+    describeTemplate: z.preprocess(emptyToUndefined, z.string().max(8000).optional()),
+    lyricsTemplate: z.preprocess(emptyToUndefined, z.string().max(8000).optional()),
+  }).partial().optional(),
+});
+
+// Federated media is an opt-in provider surface. The outer objects remain
+// passthrough for mixed-version peers/settings UIs: a rolled-back install must
+// preserve fields introduced by a newer build while still validating every
+// field this build understands.
+export const federatedMediaModelSchema = z.object({
+  engine: z.string().trim().min(1).max(80),
+  modelId: z.string().trim().min(1).max(256),
+}).passthrough();
+
+const federatedMediaModelListSchema = z.array(federatedMediaModelSchema).max(100).refine(
+  (models) => new Set(models.map((model) => `${model.engine}\u0000${model.modelId}`)).size === models.length,
+  { message: 'models must not contain duplicate engine/model pairs' },
+);
+
+// Image/video federation shares this same model-pair shape (`{ engine,
+// modelId }`) as audio for wire uniformity, but only `engine: 'local'`
+// resolves to a live capability today — the provider only has readiness
+// signals for this install's own local generator, not the cloud-CLI image/
+// video backends (codex/grok/agy/external), which spend a *provider's own*
+// account quota rather than sharing this machine's GPU. A peer that
+// configures a non-local engine simply reports 'unknown-engine' and never
+// admits a job, so this schema doesn't need to special-case it.
+export const federatedMediaProviderSettingsSchema = z.object({
+  enabled: z.boolean().optional(),
+  maxQueuedJobs: z.number().int().min(1).max(20).optional(),
+  audioModels: federatedMediaModelListSchema.optional(),
+  imageModels: federatedMediaModelListSchema.optional(),
+  videoModels: federatedMediaModelListSchema.optional(),
+}).passthrough();
+
+// Consumer-side peer selection is independent from the provider's local queue
+// limit. Unknown fields stay round-trip-safe across mixed-version Instances
+// clients while known model pairs remain unique and bounded.
+export const federatedMediaPeerSettingsSchema = z.object({
+  enabled: z.boolean().optional(),
+  audioModels: federatedMediaModelListSchema.optional(),
+  imageModels: federatedMediaModelListSchema.optional(),
+  videoModels: federatedMediaModelListSchema.optional(),
+}).passthrough();
+
+// Where UNATTENDED jobs (Creative Director / Creative Commission) of a given
+// kind render. One peer + one model per kind, chosen by the local operator and
+// stored server-side, so an LLM planner never names a peer. Nullable because
+// clearing a kind is how routing is turned back off — an absent key means
+// "unchanged", an explicit null means "render locally again".
+export const federatedMediaRouteSchema = z.object({
+  peerId: z.string().trim().min(1).max(200),
+  engine: z.string().trim().min(1).max(80),
+  modelId: z.string().trim().min(1).max(256),
+}).strict();
+
+export const federatedMediaRoutingSchema = z.object({
+  image: federatedMediaRouteSchema.nullable().optional(),
+  video: federatedMediaRouteSchema.nullable().optional(),
+}).passthrough();
+
+export const federationSettingsSchema = z.object({
+  strictPullAuthorization: z.boolean().optional(),
+  mediaProvider: federatedMediaProviderSettingsSchema.optional(),
+  mediaRouting: federatedMediaRoutingSchema.optional(),
+}).passthrough();
+
+export const federatedMediaJobRoutingSchema = z.object({
+  engine: z.string().trim().min(1).max(80),
+  modelId: z.string().trim().min(1).max(256),
+  durationSec: z.number().finite().min(1).max(3600).optional(),
+  durationMode: z.enum(['auto', 'manual']).optional(),
+}).strict();
+
+// Provider submissions accept model selection, the canonical fixed-vocabulary
+// instrumental prompt, and — since ADR
+// docs/decisions/2026-08-22-federated-media-input-assets.md rule 2 — free-form
+// lyrics. The asymmetry between the two text fields is deliberate rather than
+// inconsistent: a style/mood/instrument profile renders `prompt` with no
+// expressive loss, so the privacy-safe canonical form is required there; lyrics
+// ARE the words, so no alphabet encodes them without discarding them, and they
+// cross verbatim under the same submission-body rule image/video prompts do.
+// The provider still refuses them for a model whose capability reports
+// `lyrics: false`. URLs, paths, commands, provider credentials, and unknown
+// fields are excluded by the strict object as before.
+const federatedMediaAudioJobSubmissionSchema = federatedMediaJobRoutingSchema.extend({
+  kind: z.literal('audio'),
+  prompt: z.string().trim().min(1).max(8000),
+  lyrics: z.string().max(50_000).optional(),
+}).strict().superRefine((value, ctx) => {
+  if (!isFederatedMediaAudioPrompt(value.prompt)) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['prompt'],
+      message: 'prompt must be rendered from a privacy-safe federated audio profile',
+    });
+  }
+});
+
+// Image/video prompts cross as submitted, with no fixed-vocabulary rendering
+// like audio's: there is no closed taxonomy for arbitrary visual/motion content
+// the way audio has a finite style/mood/instrument alphabet. Why that does not
+// breach the "no PII on federation" rule — a submitted job body is not a status
+// payload, and status/capability payloads stay absolutely prompt-free — is
+// ADR docs/decisions/2026-08-20-federated-visual-prompts.md.
+//
+// Conditioning IMAGES ride the same rule (ADR
+// docs/decisions/2026-08-22-federated-media-input-assets.md rule 1), by id
+// rather than by value: the bytes went up through the authenticated,
+// digest-verified asset endpoint first. What is still refused here — and refused
+// by the routes, since neither has a field to name it — is a MODEL (LoRA
+// weights, rule 3) and multi-step CHAIN STATE (a video to extend, chained
+// chunks, IC-LoRA references, rule 4).
+// Exported UN-REFINED as well, and the split is load-bearing rather than
+// cosmetic. The cross-field rule below pairs `initImageStrength` with
+// `initImage` — but a conditioning image reaches the body as an asset id
+// resolved immediately BEFORE submission, so the persisted marker legitimately
+// carries the strength with no image beside it yet. The marker and the request
+// builder validate against the base; the provider route, which sees the fully
+// assembled body, validates against the refined schema.
+export const federatedMediaImageJobSubmissionBaseSchema = federatedMediaJobRoutingSchema.omit({
+  durationSec: true, durationMode: true,
+}).extend({
+  kind: z.literal('image'),
+  prompt: z.string().trim().min(1).max(4000),
+  negativePrompt: z.string().trim().max(4000).optional(),
+  width: imageEdgeSchema,
+  height: imageEdgeSchema,
+  steps: z.number().int().min(1).max(150).optional(),
+  guidance: z.number().finite().min(0).max(30).optional(),
+  seed: z.number().int().min(0).optional(),
+  initImage: federatedMediaInputAssetRefSchema.optional(),
+  initImageStrength: z.number().finite().min(0).max(1).optional(),
+  referenceImages: z.array(federatedMediaInputAssetRefSchema)
+    .max(FEDERATED_MEDIA_ASSET_MAX_COUNT).optional(),
+}).strict()
+  .refine(refineImagePixelCap, { message: PIXEL_CAP_MESSAGE, path: ['width'] });
+
+export const federatedMediaImageJobSubmissionSchema = federatedMediaImageJobSubmissionBaseSchema
+  // A strength with nothing to apply it to is a caller bug, not a default to
+  // guess at: silently ignoring it renders at full denoise, which is the
+  // opposite of what a low strength asked for.
+  .refine((value) => value.initImageStrength === undefined || value.initImage !== undefined, {
+    message: 'initImageStrength requires an initImage',
+    path: ['initImageStrength'],
+  });
+
+// Same boundary as the image schema above — see the ADRs named there.
+//
+// Exported UN-REFINED as well: `negotiateVideoConstraints` re-validates a
+// partially-negotiated body against `.partial()`, and Zod refuses `.partial()`
+// on a schema carrying refinements. Splitting the object from its cross-field
+// rule keeps both callers honest instead of dropping the rule to keep the
+// partial working.
+export const federatedMediaVideoJobSubmissionBaseSchema = federatedMediaJobRoutingSchema.omit({
+  durationSec: true, durationMode: true,
+}).extend({
+  kind: z.literal('video'),
+  prompt: z.string().trim().min(1).max(4000),
+  negativePrompt: z.string().trim().max(4000).optional(),
+  width: z.number().int().min(64).max(2048).optional(),
+  height: z.number().int().min(64).max(2048).optional(),
+  numFrames: z.number().int().min(1).max(FEDERATED_MEDIA_MAX_VIDEO_FRAMES).optional(),
+  fps: z.number().int().min(1).max(60).optional(),
+  steps: z.number().int().min(1).max(150).optional(),
+  guidance: z.number().finite().min(0).max(30).optional(),
+  seed: z.number().int().min(0).optional(),
+  sourceImage: federatedMediaInputAssetRefSchema.optional(),
+  lastImage: federatedMediaInputAssetRefSchema.optional(),
+  sourceAudio: federatedMediaInputAssetRefSchema.optional(),
+  audioConditioning: federatedSourceAudioSchema.optional(),
+}).strict();
+
+export const federatedMediaVideoJobSubmissionSchema = federatedMediaVideoJobSubmissionBaseSchema
+  .refine((v) => Boolean(v.sourceAudio) === Boolean(v.audioConditioning), {
+    message: 'sourceAudio and audioConditioning must be supplied together',
+  })
+  .refine((v) => !v.audioConditioning || (v.fps !== undefined && v.numFrames !== undefined), {
+    message: 'Source audio requires explicit fps and numFrames for its exact window',
+  })
+  .refine((v) => !v.sourceAudio || (!v.lastImage && v.sourceAudio.assetId.endsWith(v.audioConditioning?.clipSha256 || '!')), {
+    message: 'Source audio must match its clip digest and cannot combine with an end frame',
+  })
+  // First-last-frame needs both ends. A lone end frame would render a plain
+  // text-to-video clip and quietly discard the frame the caller supplied.
+  .refine((value) => value.lastImage === undefined || value.sourceImage !== undefined, {
+    message: 'lastImage requires a sourceImage (first-last-frame needs both ends)',
+    path: ['lastImage'],
+  });
+
+// An already-shipped consumer's request body never carries `kind` — it only
+// knows the pre-existing audio-only shape. Defaulting the missing field to
+// 'audio' before the discriminated union runs keeps that body validating
+// exactly as before; a new consumer names its kind explicitly.
+export const federatedMediaJobSubmissionSchema = z.preprocess(
+  (value) => (isPlainObject(value) && value.kind === undefined ? { ...value, kind: 'audio' } : value),
+  z.discriminatedUnion('kind', [
+    federatedMediaAudioJobSubmissionSchema,
+    federatedMediaImageJobSubmissionSchema,
+    federatedMediaVideoJobSubmissionSchema,
+  ]),
+);
+
+export const federatedMediaIdempotencyKeySchema = z.string().trim().min(1).max(200)
+  .regex(/^[A-Za-z0-9._:-]+$/, 'Idempotency-Key contains unsupported characters');
+
+export const federatedMediaJobParamsSchema = z.object({
+  id: z.string().uuid(),
+}).strict();
+
+export const federatedMediaStatusQuerySchema = z.object({
+  kinds: z.string().trim().max(40).regex(/^[a-z]+(,[a-z]+)*$/).optional(),
+}).passthrough();
+
+// Creative Director settings slice. Each LLM-backed stage can pin its own
+// provider/model instead of inheriting the system default. `evaluation` is a
+// direct vision API call (blank = auto-pick a local vision model, else fall
+// back to the coding agent); treatment and plan run as CoS agent tasks.
+// Reuses the shared feature-provider shape so an empty-string picker value
+// normalizes to unset.
+export const creativeDirectorSettingsSchema = z.object({
+  treatment: featureProviderConfigSchema.partial().optional(),
+  plan: featureProviderConfigSchema.partial().optional(),
+  evaluation: featureProviderConfigSchema.partial().optional(),
+});
+
+/**
+ * Validate data against a schema
+ * Returns { success: true, data } or { success: false, errors }
+ */
+export function validate(schema, data) {
+  const result = schema.safeParse(data);
+  if (result.success) {
+    return { success: true, data: result.data };
+  }
+  return {
+    success: false,
+    errors: result.error.issues.map(e => ({
+      path: e.path.join('.'),
+      message: e.message
+    }))
+  };
+}
+
+// =============================================================================
+// SCAFFOLD (app generator)
+// =============================================================================
+
+// Known scaffold templates — the single source of truth for the enum the
+// scaffold route accepts. An unknown template MUST be rejected before any
+// filesystem write or subprocess spawn (issue #2390), so the route can no
+// longer create a target directory for a template it can't actually build.
+export const SCAFFOLD_TEMPLATES = [
+  'portos-stack',
+  'vite-express',
+  'vite-react',
+  'express-api',
+  'ios-native',
+  'xcode-multiplatform'
+];
+
+// Ports may arrive absent (auto-allocated by the route) or as an explicit
+// number. Tolerate the UI '' sentinel as "not provided"; anything else must be
+// a valid TCP port so an out-of-range value is rejected deterministically.
+const scaffoldPortSchema = z.preprocess(
+  emptyToUndefined,
+  z.number().int().min(1).max(65535).nullable().optional()
+);
+
+// Full request schema for POST /api/scaffold. Validated before the route
+// touches the filesystem — template enum, port range, and a name that yields a
+// usable directory slug are all enforced up front.
+export const scaffoldSchema = z.object({
+  name: z.string().trim().min(1).max(100)
+    // The route sanitizes name → [a-z0-9-]; a name with no alphanumerics
+    // slugifies to an all-dash/empty dirName. Reject it here rather than
+    // creating a garbage directory.
+    .refine(v => /[a-z0-9]/i.test(v), {
+      message: 'name must contain at least one letter or number'
+    }),
+  template: z.enum(SCAFFOLD_TEMPLATES),
+  parentDir: z.string().trim().min(1),
+  uiPort: scaffoldPortSchema,
+  apiPort: scaffoldPortSchema,
+  createGitHubRepo: z.boolean().optional().default(false),
+  githubOrg: z.preprocess(emptyToNull, z.string().min(1).nullable().optional())
+});
+
+// =============================================================================
+// USAGE (devtools usage reports)
+// =============================================================================
+
+// Shape AND calendar validity — the regex alone accepts impossible dates like
+// 2026-02-30, which would silently return an empty report instead of a 400.
+const isoDay = z.string()
+  .regex(/^\d{4}-\d{2}-\d{2}$/, 'Expected YYYY-MM-DD')
+  .refine((s) => {
+    const d = new Date(`${s}T00:00:00Z`);
+    return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s;
+  }, { message: 'Not a valid calendar date' });
+
+/**
+ * Query params for GET /api/usage — either a preset period or an explicit
+ * from/to date range (inclusive, YYYY-MM-DD). Explicit dates win over period.
+ */
+export const usageQuerySchema = z.object({
+  period: z.enum(['7d', '30d', '90d', 'all']).optional(),
+  from: isoDay.optional(),
+  to: isoDay.optional()
+}).refine((q) => !(q.from && q.to) || q.from <= q.to, { message: 'from must be on or before to' });
+
+/** Query for GET /api/usage/providers. `family` narrows the read to a single
+ * quota card (the per-card Refresh on the usage page) so one slow TUI scrape
+ * isn't paid for every provider at once. */
+export const providerUsageQuerySchema = z.object({
+  refresh: z.enum(['0', '1', 'true', 'false']).optional(),
+  family: z.string().regex(/^[a-z0-9-]{1,32}$/, 'family must be a provider family id').optional()
+});
+
+/** Body for POST /api/usage/messages — token counts persist forever, so
+ * reject non-integer/negative garbage instead of coercing it into counters. */
+export const usageMessagesSchema = z.object({
+  providerId: z.string().min(1),
+  model: z.string().nullish(),
+  messageCount: z.number().int().nonnegative(),
+  tokenCount: z.number().int().nonnegative().optional().default(0),
+  inputTokenCount: z.number().int().nonnegative().optional().default(0)
+});
+
+/** Body for POST /api/usage/tokens — same guard as messages: no string or negative totals. */
+export const usageTokensSchema = z.object({
+  inputTokens: z.number().int().nonnegative().optional().default(0),
+  outputTokens: z.number().int().nonnegative().optional().default(0)
+});
+
+/** Body for POST /api/usage/session — model/providerName become persisted keys/values. */
+export const usageSessionSchema = z.object({
+  providerId: z.string().min(1),
+  providerName: z.string().max(200).optional(),
+  model: z.string().max(200).nullish()
+});
+
+/**
+ * What the user pays monthly for each provider family's quota plan, keyed by
+ * family id. Used by BOTH write paths — `PUT /api/usage/subscriptions` (wrapped
+ * below) and the `subscriptionCosts` slice of `PUT /api/settings` — so a price
+ * can't be written past validation through the generic settings endpoint.
+ *
+ * Keys are the real family ids, not a loose id pattern: this gates a PERSISTED
+ * write, and an arbitrary key would accumulate in settings.json with no editor
+ * row that could ever clear it. `null` is accepted and meaningful — it CLEARS a
+ * plan's price (the user cancelled it), which an omitted key must not do, since
+ * the editor submits only the rows it knows about. Prices are plain USD dollars
+ * (cents allowed), capped at `MAX_MONTHLY_COST` so a mistyped extra digit can't
+ * swamp every savings figure on the page.
+ */
+// `partialRecord`, not `record`: with an enum key schema Zod 4's `record` is
+// EXHAUSTIVE — it would demand a price for every family on every save, which is
+// the opposite of the patch semantics the editor relies on.
+export const subscriptionCostsMapSchema = z.partialRecord(
+  z.enum(PROVIDER_FAMILY_IDS),
+  z.number().min(0).max(MAX_MONTHLY_COST).nullable()
+);
+
+/**
+ * Which TIER of each family's plan the user is on, keyed by family id. Same
+ * key rule and same patch semantics as the price map above — an omitted family
+ * keeps its stored tier, `null` (or an empty string, which normalizes to null)
+ * CLEARS it. Free text rather than an enum because these are vendor marketing
+ * names ("Max 20x", "Pro") that change on the vendor's schedule, not on the
+ * PortOS release cycle; the length cap is what keeps settings.json from
+ * collecting notes.
+ *
+ * Used by BOTH write paths — `PUT /api/usage/subscriptions` and the
+ * `subscriptionPlanTiers` slice of `PUT /api/settings`.
+ */
+export const subscriptionPlanTiersMapSchema = z.partialRecord(
+  z.enum(PROVIDER_FAMILY_IDS),
+  z.string().max(MAX_PLAN_TIER_LENGTH).nullable()
+);
+
+/**
+ * Body for PUT /api/usage/subscriptions. Both slices are OPTIONAL and
+ * independent: the price editor sends only `costs`, the plan editor only
+ * `tiers`, and neither save may disturb the other's stored map.
+ */
+export const subscriptionsUpdateSchema = z.object({
+  costs: subscriptionCostsMapSchema.optional(),
+  tiers: subscriptionPlanTiersMapSchema.optional(),
+});
+
+/**
+ * Body for PUT /api/usage/subscriptions/enabled — switch one subscription on or
+ * off. `family` is enumerated, not free text, because the handler fans the flag
+ * out across every provider record that family owns.
+ */
+export const subscriptionEnabledSchema = z.object({
+  family: z.enum(PROVIDER_FAMILY_IDS),
+  enabled: z.boolean(),
+});
+
+/**
+ * Instances that pay API rates rather than the viewer's subscriptions, so the
+ * Across Instances combined total can leave them out. Used by BOTH write
+ * paths — `PUT /api/usage/fleet-billing` (the per-row toggle) and the
+ * `usageApiBilledInstanceIds` slice of `PUT /api/settings` — so a restore
+ * dump can't write an unbounded or non-string list through the generic
+ * settings endpoint. Cap matches the stored peer-digest cap (64).
+ */
+export const usageApiBilledInstanceIdsSchema = z.array(z.string().min(1).max(200)).max(64);
+
+/** Body for PUT /api/usage/fleet-billing. */
+export const usageFleetBillingSchema = z.object({
+  instanceId: z.string().min(1).max(200),
+  usesSubscriptions: z.boolean(),
+});
+
+
+// =============================================================================
+// PORTS
+// =============================================================================
+
+// POST /api/ports/check — probe a set of ports for availability.
+export const portsCheckSchema = z.object({
+  ports: z.array(z.number().int().min(1).max(65535)).min(1)
+});
+
+// POST /api/ports/allocate — reserve N free ports. `count` accepts a number or
+// a numeric string (the UI may send either) and defaults to 1 when absent,
+// matching the prior `parseInt(count) || 1` behavior — but non-numeric garbage
+// now 400s instead of silently collapsing to 1. The preprocess only forwards
+// number|string so `z.coerce` can't quietly turn a boolean (`true → 1`) or an
+// array (`[5] → 5`) into a valid count.
+export const portsAllocateSchema = z.object({
+  count: z.preprocess(
+    (v) => {
+      if (v === undefined) return 1;
+      return (typeof v === 'number' || typeof v === 'string') ? v : NaN;
+    },
+    z.coerce.number().int().min(1).max(10)
+  )
+});
+
+// =============================================================================
+// DATA MANAGER
+// =============================================================================
+
+// DELETE /api/data/:category — purge a category, or one entry inside it.
+// `subPath` names a single top-level entry of the category directory; omitting
+// it asks for the whole-directory wipe, which `purgeCategory` only honors for
+// `purgeScope: 'category'` entries (#3327). `isTopLevelEntryName` in
+// `fileUtils.js` is the authoritative gate — it runs in `purgeCategory`, which
+// is the boundary a non-HTTP caller crosses too. The separator check is spelled
+// out here rather than imported so this module keeps its narrow import surface
+// (a partial mock of fileUtils in an unrelated suite would break schema
+// construction at module load).
+export const dataPurgeSchema = z.object({
+  subPath: z.string().min(1).max(255)
+    .refine(
+      (v) => !v.includes('/') && !v.includes('\\') && v !== '.' && v !== '..',
+      'subPath must name a single entry in the category'
+    )
+    .optional()
+});
+
+// =============================================================================
+// DATABASE
+// =============================================================================
+
+const DB_BACKENDS = ['docker', 'native'];
+
+// POST /api/database/switch — switch active backend, optionally migrating data.
+export const databaseSwitchSchema = z.object({
+  target: z.enum(DB_BACKENDS),
+  migrate: z.boolean().optional()
+});
+
+// POST /api/database/maintenance/preflight — advisory only; never accepts a cutover.
+export const databaseMaintenancePreflightSchema = z.object({
+  source: z.enum(DB_BACKENDS),
+  target: z.enum(DB_BACKENDS)
+}).strict().refine(value => value.source !== value.target, { message: 'Source and target must differ' });
+
+// POST /api/database/maintenance/cutover — accepts the offline cutover (202).
+export const databaseMaintenanceCutoverSchema = databaseMaintenancePreflightSchema;
+
+// POST /api/database/maintenance/recover — same-operation recovery only.
+export const databaseMaintenanceRecoverSchema = z.object({ id: z.string().uuid() }).strict();
+
+// POST /api/database/{start,stop,destroy} — operate on a named backend.
+export const databaseBackendSchema = z.object({
+  backend: z.enum(DB_BACKENDS)
+});
+
+// POST /api/database/export — export from a specific backend, or (when omitted)
+// the active backend.
+export const databaseExportSchema = z.object({
+  backend: z.enum(DB_BACKENDS).optional()
+});
+
+// Dismissible system health warnings — see server/routes/systemHealth.js.
+// Probe failures are intentionally excluded: a missing measurement cannot be dismissed.
+export const SYSTEM_HEALTH_WARNING_TYPES = ['memory', 'cpu', 'disk', 'data-disk', 'process', 'restarts', 'apps', 'database', 'forge', 'code-review', 'health-settings'];
+export const systemHealthWarningParamsSchema = z.object({ type: z.enum(SYSTEM_HEALTH_WARNING_TYPES) });
+export const systemHealthWarningDismissSchema = z.object({ message: z.string().trim().min(1).max(500) });
+
+export const appIconQuerySchema = z.object({
+  size: z.enum(['64', '128', '256']).default('128').transform(Number),
+});
+
+/**
+ * Validate data against a Zod schema, throwing on failure.
+ * Returns parsed data on success, throws ServerError on failure.
+ */
+export function validateRequest(schema, data) {
+  const result = schema.safeParse(data);
+  if (result.success) return result.data;
+  const errors = result.error.issues.map(e => ({
+    path: e.path.join('.'),
+    message: e.message
+  }));
+  throw new ServerError('Validation failed', {
+    status: 400,
+    code: 'VALIDATION_ERROR',
+    context: { details: errors }
+  });
+}
+
+// Media cancellation bodies (#9932). An OMITTED jobId keeps the legacy
+// "newest/running job" selection; a SUPPLIED jobId must be a usable id — a
+// malformed one (array, object, null, blank) is a 400, never silently treated
+// as absent, because absent selects a different live render to cancel.
+export const mediaCancelJobIdSchema = z.string().trim().min(1).max(200);
+export const imageCancelBodySchema = z.object({
+  jobId: mediaCancelJobIdSchema.optional(),
+  all: z.boolean().optional(),
+});
+export const videoCancelBodySchema = z.object({
+  jobId: mediaCancelJobIdSchema.optional(),
+});
+
+export const rapidReaderLibraryParamsSchema = z.object({ id: z.string().min(1).max(128).regex(/^[A-Za-z0-9_-]+$/) });
+export const rapidReaderLibraryCreateSchema = z.object({ title: z.string().trim().min(1).max(200), author: z.string().trim().max(200).optional(), text: z.string().trim().min(1).max(2 * 1024 * 1024) });
+export const rapidReaderLibraryFetchSchema = z.object({ url: z.string().trim().url().max(2000).refine((value) => /^https?:\/\//i.test(value), 'url must be http(s)'), title: z.string().trim().min(1).max(200).optional() });
+
+// =============================================================================
+// SHELL
+// =============================================================================
+
+// POST /api/shell/sessions/:sessionId/image — hand a photo to whatever is running
+// in a shell session. `data` is base64 image bytes; the real ceiling is enforced
+// by `saveImageUpload` (MAX_SCREENSHOT_BYTES) against the DECODED buffer, so the
+// cap here only refuses a payload too large to be worth decoding. The message cap
+// matches the BTW route's — both end up bracket-pasted into the same TUI prompt.
+export const shellImageDropSchema = z.object({
+  data: z.string().min(1, 'data is required (base64)').max(64 * 1024 * 1024),
+  filename: z.string().min(1, 'filename is required').max(255),
+  message: z.string().max(5000).optional()
+});
+
+// =============================================================================
+// USER ACTION LEDGER
+// =============================================================================
+
+// GET /api/user-actions — read the machine-local operator-action ledger (#5594).
+// Every value arrives as a query string, so numbers are coerced and `success` is
+// the string form of the boolean. Range checking is deliberately loose here and
+// the CLAMP lives in `userActions.normalizeListOptions`: a caller asking for 5000
+// rows wants "as many as you will give me", not a 400.
+const isParseableDate = (value) => !Number.isNaN(new Date(value).getTime());
+const userActionDateFilter = z.string().trim().min(1).max(64)
+  .refine(isParseableDate, 'must be a parseable date');
+const userActionType = z.enum([...USER_ACTION_TYPES]);
+
+export const userActionsListQuerySchema = z.object({
+  type: userActionType.optional(),
+  // Repeated `?types=a&types=b` arrives as an array; a single one as a string.
+  types: z.union([userActionType, z.array(userActionType)]).optional(),
+  actor: z.enum([...USER_ACTION_ACTORS]).optional(),
+  target: z.string().trim().min(1).max(200).optional(),
+  success: z.enum(['true', 'false']).optional(),
+  from: userActionDateFilter.optional(),
+  to: userActionDateFilter.optional(),
+  limit: z.coerce.number().int().optional(),
+  offset: z.coerce.number().int().optional(),
+});
+
+// =============================================================================
+// AGENT ACTIVITY LOG (server/routes/agentActivity.js)
+// =============================================================================
+
+// The activity log is a per-agent, per-day tree of JSON files under
+// `data/agents/activity/<agentId>/<YYYY-MM-DD>.json`. Two things follow:
+// `agentId` is interpolated into a filesystem path, so it is held to a bare
+// filename segment (`isSafeRecordId` on top of the charset, so `..` can't turn
+// a read into a traversal); and the read limits are CLAMPED here rather than in
+// the service, because every handler slices an already-loaded array — an
+// unbounded `limit` is a memory/response-size problem, not a query cost.
+const AGENT_ACTIVITY_MAX_LIMIT = 500;
+const agentActivityLimit = (defaultLimit) =>
+  z.coerce.number().int().min(1).max(AGENT_ACTIVITY_MAX_LIMIT).default(defaultLimit);
+// A blank query value (`?action=` from an unset form field) reads as absent
+// rather than as a 400 — it was `action || null` before this schema existed.
+const agentActivityAction = z.preprocess(emptyToUndefined, z.string().trim().min(1).max(64).optional());
+const agentActivityIds = csvIdsParam({ max: 50, maxIdLength: 128 });
+
+// GET /api/agents/activity
+export const agentActivityQuerySchema = z.object({
+  limit: agentActivityLimit(50),
+  agentIds: agentActivityIds,
+  action: agentActivityAction,
+}).strict();
+
+// GET /api/agents/activity/timeline — `before` is an infinite-scroll cursor the
+// client echoes back from a row's `timestamp`, so it is a full ISO instant.
+export const agentActivityTimelineQuerySchema = z.object({
+  limit: agentActivityLimit(50),
+  agentIds: agentActivityIds,
+  before: z.preprocess(emptyToUndefined, z.string().datetime().optional()),
+}).strict();
+
+export const agentActivityAgentParamsSchema = z.object({
+  agentId: z.string().trim().min(1).max(128)
+    .regex(/^[A-Za-z0-9._-]+$/, 'agentId must be alphanumeric with . _ -')
+    .refine(isSafeRecordId, 'agentId must be a bare filename segment'),
+}).strict();
+
+// GET /api/agents/activity/agent/:agentId — `date` stays a `YYYY-MM-DD` STRING
+// all the way to `getActivityFilePath`, which takes that form directly. Parsing
+// it to a Date first would re-derive the day in local time from a UTC midnight
+// and read the neighbouring file for anyone west of UTC.
+export const agentActivityAgentQuerySchema = z.object({
+  date: z.preprocess(emptyToUndefined, z.string().date().optional()),
+  limit: agentActivityLimit(100),
+  offset: z.coerce.number().int().min(0).default(0),
+  action: agentActivityAction,
+}).strict();
+
+// GET /api/agents/activity/agent/:agentId/stats — one file read per day, so the
+// window is capped at a year rather than left open.
+export const agentActivityStatsQuerySchema = z.object({
+  days: z.coerce.number().int().min(1).max(365).default(7),
+}).strict();
+
+// POST /api/agents/activity/cleanup — unlinks every activity file older than the
+// window. The floor is 1 day, NOT 0: `daysToKeep: 0` puts the cutoff at now and
+// deletes the whole archive, and a negative value reaches into future-dated
+// files. "Delete everything" is not a retention window; if it is ever wanted it
+// gets its own explicitly-named endpoint rather than riding this number.
+export const agentActivityCleanupSchema = z.object({
+  daysToKeep: z.coerce.number().int().min(1).max(3650).default(30),
+}).strict();
+
+// GET /api/review/queue — pagination is opt-in so existing Review Hub clients
+// keep receiving the legacy full-list envelope. Cursors are opaque and bounded
+// before they reach the queue snapshot decoder.
+export const reviewQueueQuerySchema = z.object({
+  limit: z.preprocess(emptyToUndefined, z.coerce.number().int().min(1).max(100).optional()),
+  cursor: z.preprocess(emptyToUndefined, z.string().trim().min(1).max(4096).optional()),
+  view: z.preprocess(emptyToUndefined, z.enum(['today', 'all', 'waiting', 'someday', 'history', 'snoozed']).optional()),
+}).strict();
+
+// =============================================================================
+// CLIENT ERROR REPORT
+// =============================================================================
+
+// Browser-emitted error reports (window.onerror + unhandledrejection).
+// The field caps here are outer bounds — anything bigger is a runaway producer
+// and is refused before validation; the storage-size caps live in
+// services/clientErrors.js and are intentionally lower (the Review Hub entry
+// is a UI surface, not a forensic log).
+export const CLIENT_ERROR_TYPES = ['error', 'unhandledrejection'];
+export const clientErrorReportSchema = z.object({
+  type: z.enum(CLIENT_ERROR_TYPES),
+  message: z.string().min(1).max(2000),
+  stack: z.string().max(20000).optional(),
+  source: z.string().max(2000).optional(),
+  line: z.number().int().nonnegative().optional(),
+  column: z.number().int().nonnegative().optional(),
+  url: z.string().max(2000).optional(),
+  userAgent: z.string().max(1000).optional(),
+});
+
+// =============================================================================
+// PAGINATION HELPERS
+// =============================================================================
+
+/**
+ * Parse a zero-based array index from an Express route parameter.
+ * @param {unknown} raw - Route parameter value
+ * @returns {number}
+ */
+export function parseIndexParam(raw) {
+  const index = Number(raw);
+  if (typeof raw !== 'string' || !/^\d+$/.test(raw) || !Number.isSafeInteger(index)) {
+    throw new ServerError('Invalid index', { status: 400, code: 'INVALID_INDEX' });
+  }
+  return index;
+}
+
+/**
+ * Parse limit/offset pagination from query params with defaults and clamping.
+ * @param {object} query - req.query object
+ * @param {object} options - { defaultLimit, maxLimit }
+ * @returns {{ limit: number, offset: number }}
+ */
+export function parsePagination(query, { defaultLimit = 50, maxLimit = 200 } = {}) {
+  const rawLimit = parseInt(query?.limit, 10);
+  const rawOffset = parseInt(query?.offset, 10);
+  const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, maxLimit) : defaultLimit;
+  const offset = Number.isFinite(rawOffset) && rawOffset >= 0 ? rawOffset : 0;
+  return { limit, offset };
+}
+
+/**
+ * Did the caller explicitly ask for pagination? True when either `limit` or
+ * `offset` is present in the query string. Lets a list endpoint stay
+ * backward-compatible (return the full array when neither is set) while opting
+ * into a bounded `{ items, total, limit, offset }` envelope the moment a client
+ * passes a pagination param.
+ * @param {object} query - req.query object
+ * @returns {boolean}
+ */
+export function isPaginationRequested(query) {
+  return query?.limit !== undefined || query?.offset !== undefined;
+}
+
+/**
+ * Slice an array into a bounded page using the same limit/offset parsing as
+ * `parsePagination`. Returns the page plus the metadata needed to render the
+ * envelope every paginated PortOS list endpoint shares.
+ * @param {Array} items - the full list (already filtered/sorted by the caller)
+ * @param {object} query - req.query object
+ * @param {object} options - { defaultLimit, maxLimit }
+ * @returns {{ items: Array, total: number, limit: number, offset: number }}
+ */
+export function paginateArray(items, query, options = {}) {
+  const list = Array.isArray(items) ? items : [];
+  const { limit, offset } = parsePagination(query, options);
+  return { items: list.slice(offset, offset + limit), total: list.length, limit, offset };
+}
+
+// =============================================================================
+// SHARING (cross-network share buckets via cloud-synced folders)
+// =============================================================================
+
+export const bucketModeSchema = z.enum(['auto-merge', 'inbox']);
+
+export const bucketCreateSchema = z.object({
+  name: z.string().trim().min(1).max(120),
+  path: z.string().trim().min(1).max(2000),
+  mode: bucketModeSchema.optional().default('inbox'),
+  displayNameOverride: z.string().trim().max(120).optional().nullable(),
+  bioOverride: z.string().trim().max(2000).optional().nullable(),
+}).strict();
+
+export const bucketUpdateSchema = z.object({
+  name: z.string().trim().min(1).max(120).optional(),
+  mode: bucketModeSchema.optional(),
+  displayNameOverride: z.string().trim().max(120).nullable().optional(),
+  bioOverride: z.string().trim().max(2000).nullable().optional(),
+}).strict();
+
+// Items shape for kind:'media'. Mirrors mediaCollections item key
+// — { kind: 'image'|'video', ref: '<filename>' }.
+const sharingMediaItemSchema = z.object({
+  kind: z.enum(['image', 'video']),
+  ref: z.string().min(1).max(500),
+}).strict();
+
+export const sharingExportSchema = z.object({
+  kind: z.enum(['series', 'universe', 'media']),
+  ids: z.array(z.string().min(1).max(120)).max(50).optional(),
+  items: z.array(sharingMediaItemSchema).max(200).optional(),
+}).strict().refine(
+  (data) => {
+    if (data.kind === 'media') return Array.isArray(data.items) && data.items.length > 0;
+    return Array.isArray(data.ids) && data.ids.length > 0;
+  },
+  { message: "Provide 'ids' for kind=series|universe, or 'items' for kind=media" },
+);
+
+// User-level sharing config — extends settings.json.
+export const sharingSettingsPatchSchema = z.object({
+  sharingDisplayName: z.string().trim().max(120).optional(),
+  sharingBio: z.string().trim().max(2000).optional(),
+}).strict();
+
+// Geographic home location for location-aware features — the `weather_now`
+// voice tool today, any future location-dependent surface tomorrow. Stored on
+// `settings.location`. lat/lon are nullable so the user can clear a saved
+// location and fall the consuming tool back to its default. The refine enforces
+// both-or-neither so a half-set pair can't pin a nonsensical coordinate
+// (e.g. a custom latitude with a default longitude).
+export const locationSettingsSchema = z.object({
+  lat: z.number().min(-90).max(90).nullable().optional(),
+  lon: z.number().min(-180).max(180).nullable().optional(),
+}).strict().refine(
+  (d) => (d.lat == null) === (d.lon == null),
+  { message: 'Provide both lat and lon, or neither.' },
+);
+
+// Durable "don't show this again" for the dashboard first-run card (#5640).
+// Top-level general-settings boolean — same record as timezone/location, never
+// localStorage. Absent means show; only an explicit true suppresses.
+export const networkSetupPreferenceSchema = z.enum(['tailscale', 'tailcat', 'none']);
+
+export const hideFirstRunCardSchema = z.boolean();
+
+// Grok Imagegen settings slice (`imageGen.grok`) — the Grok Build CLI backend
+// (#2859). No model/effort knobs: grok's image tools run on xAI's fixed image
+// backend, so only the enable gate, binary path, default aspect ratio, and
+// per-mode cleaner flags are stored. `''` sentinels from the UI preprocess to
+// undefined (same convention as other CLI provider slices); aspectRatio is
+// constrained to the `N:M` shape the grok tool accepts so a hand-edited
+// settings.json can't inject arbitrary prompt text.
+export const imageGenGrokSettingsSchema = z.object({
+  enabled: z.boolean().optional(),
+  grokPath: z.preprocess((v) => (v === '' ? undefined : v), z.string().trim().max(500).optional()),
+  aspectRatio: z.preprocess((v) => (v === '' ? undefined : v), z.string().trim().regex(/^\d{1,2}:\d{1,2}$/, 'aspect ratio must look like 16:9').optional()),
+  cleanC2PA: z.boolean().optional(),
+  denoise: z.boolean().optional(),
+});
+
+const agyImageModelSchema = z.preprocess(
+  (v) => (v === '' ? undefined : v),
+  cloudModelIdString('model must be a valid Agy model id').optional(),
+);
+
+// Per-surface render defaults (`settings.renderDefaults`, #3231 Phase 2) —
+// one optional entry per render target, each pinning a backend and/or a cloud
+// model for that surface. `'auto'`, `''`, and null all mean "no pin — fall
+// through to the install default" (renderTargetDefaults normalizes them).
+// Deliberately TOLERANT of unknown keys at both levels (no `.strict()`): the
+// Settings UI round-trips the WHOLE stored object on every save, so after a
+// version rollback (or a newer client against an older server) a target/field
+// this build doesn't know would otherwise 400 every Image Gen save until the
+// user hand-edits settings.json — the same forward-compat call the settings
+// route makes for catalogUserTypes. The route persists the raw body, so a
+// newer build's pins survive the round-trip intact rather than being dropped.
+// Known fields keep full enum/charset enforcement (that's what stops a bad
+// model id reaching a CLI argv); the known-key alphabet is RENDER_TARGETS from
+// lib/renderTargets.js, which the client re-exports rather than mirrors.
+const renderTargetModelSchema = z.preprocess(
+  (v) => (v === '' ? null : v),
+  cloudModelIdString('model must be a valid model id').nullable().optional(),
+);
+// Shared by the per-target entries and `videoGenSettingsSchema.mode` below —
+// one copy of the video-backend pin alphabet.
+const videoModePinSchema = z.enum([RENDER_TARGET_BACKEND_AUTO, ...VIDEO_GEN_MODES]).nullable().optional();
+const renderTargetEntrySchema = z.object({
+  imageMode: z.enum([RENDER_TARGET_BACKEND_AUTO, ...QUEUEABLE_IMAGE_MODES]).nullable().optional(),
+  imageModel: renderTargetModelSchema,
+  videoMode: videoModePinSchema,
+  videoModel: renderTargetModelSchema,
+});
+export const renderDefaultsSettingsSchema = z.object(
+  Object.fromEntries(RENDER_TARGETS.map((t) => [t, renderTargetEntrySchema.optional()])),
+);
+
+// Install-wide video render pin (`settings.videoGen`, #3231 Phase 4) — the
+// third rung in resolveVideoMode's ladder (request → target pin → THIS →
+// local). `'auto'`/`''`/null all mean "no pin — local". Tolerant of unknown
+// keys for the same rollback/forward-compat reason as renderDefaults above.
+// `defaultModelId` is the install-wide local video model choice used by the
+// Video Gen form and pipeline video stages — typed here so a Settings save
+// can't write junk to it.
+export const videoGenSettingsSchema = z.object({
+  mode: videoModePinSchema,
+  defaultModelId: z.preprocess(emptyToNull, z.string().trim().max(64).nullable().optional()),
+  // Opt-in macOS GPU-watchdog mitigation for local MLX video renders (mlx
+  // #3267) — OFF by default, since a render is a short, attended action and
+  // sleeping the screen unasked reads as a crash. Set true to have PortOS
+  // sleep the display for the duration of a render; also settable per-render
+  // (see the `displaySleep` field on POST /api/video-gen).
+  displaySleep: z.boolean().optional(),
+  // Install-wide acknowledgement of restricted-model license gates, stored as
+  // the exact reviewed-license ids (`termsGate.id`). Written through
+  // POST /api/video-gen/model-terms; typed here so a Settings save can't put
+  // junk where the render gate reads authorization from.
+  acceptedModelTerms: z.array(z.string().trim().min(1).max(128)).max(50).optional(),
+  // fal.ai queue REST provider (#6213) — settings-stored key wins over the
+  // FAL_KEY env var (same precedence as loras.js's Civitai key).
+  fal: z.object({
+    apiKey: z.preprocess((v) => (v === '' ? undefined : v), z.string().trim().max(200).optional()),
+  }).optional(),
+  // reactor.inc fast-h3 provider (#6214) — same settings-wins-over-env
+  // precedence as `fal` above.
+  reactor: z.object({
+    apiKey: z.preprocess((v) => (v === '' ? undefined : v), z.string().trim().max(200).optional()),
+  }).optional(),
+});
+
+// POST /api/video-gen/model-terms — record (or withdraw) the acknowledgement of
+// one restricted model's reviewed license. `termsId` is the exact versioned
+// gate id; the route rejects ids no shipped model declares.
+export const videoModelTermsSchema = z.object({
+  termsId: z.string().trim().min(1).max(128),
+  accepted: z.boolean(),
+});
+
+// fal.ai Imagegen settings slice (`imageGen.fal`). The API key is NOT here —
+// it is the fal.ai credential the video backend already owns (write-only via
+// PUT /api/settings/credentials/fal). `model` must name a catalog endpoint
+// (lib/falImageModels.js): each id is a different price, so free text is
+// refused rather than persisted and discovered at render time.
+export const imageGenFalSettingsSchema = z.object({
+  enabled: z.boolean().optional(),
+  model: z.preprocess((v) => (v === '' ? undefined : v), z.enum(FAL_IMAGE_MODEL_IDS).optional()),
+  cleanC2PA: z.boolean().optional(),
+  denoise: z.boolean().optional(),
+});
+
+export const imageGenAgySettingsSchema = z.object({
+  enabled: z.boolean().optional(),
+  agyPath: z.preprocess((v) => (v === '' ? undefined : v), z.string().trim().max(500).optional()),
+  model: agyImageModelSchema,
+  cleanC2PA: z.boolean().optional(),
+  denoise: z.boolean().optional(),
+});
+
+// Provider-agnostic embeddings settings. `provider: 'none'` is the default and
+// makes embedText() a no-op — rows persist without an embedding and a future
+// admin "Re-embed missing" action backfills. Model is optional so the user can
+// pick provider first and choose a model from the live list in the UI.
+export const settingsEmbeddingsSchema = z.object({
+  provider: z.enum(['ollama', 'lmstudio', 'none']),
+  model: z.string().trim().max(200).optional().nullable(),
+}).strict();
+
+// Local backend availability is machine-local configuration. Disabled means
+// the user intentionally does not run that backend; it does not remove any
+// installed models or prevent an explicit model-management action.
+export const localLlmSettingsSchema = z.object({
+  ollama: z.object({ disabled: z.boolean().optional() }).strict().optional(),
+  lmstudio: z.object({ disabled: z.boolean().optional() }).strict().optional(),
+  // Idle windows for the two PM2-managed model servers, in minutes. `0` = never
+  // release the model, which is what every install did before this setting
+  // existed and stays the default. Capped at a day: a longer window is
+  // indistinguishable from "never" and is far likelier a units mix-up.
+  llama: z.object({
+    idleMinutes: z.number().int().min(0).max(1440).optional(),
+    keepLoaded: z.boolean().optional(),
+    pinned: z.boolean().optional(),
+  }).strict().optional(),
+  mtplx: z.object({
+    idleMinutes: z.number().int().min(0).max(1440).optional(),
+    keepLoaded: z.boolean().optional(),
+    pinned: z.boolean().optional(),
+    // The launch line a lazy start replays. MTPLX has no Start button any more —
+    // the first request that needs it brings it up — so the checkpoint and port
+    // the user chose have to outlive the process, or an on-demand start would
+    // fall back to "first verified checkpoint in the cache" and quietly serve
+    // something they didn't pick.
+    launch: z.object({
+      model: z.string().trim().max(300).nullable().optional(),
+      port: z.number().int().min(1).max(65535).optional(),
+    }).strict().optional(),
+  }).strict().optional(),
+  slotstream: z.object({
+    idleMinutes: z.number().int().min(0).max(1440).optional(),
+    keepLoaded: z.boolean().optional(),
+    pinned: z.boolean().optional(),
+    launch: z.object({
+      model: z.string().trim().max(300).nullable().optional(),
+      port: z.number().int().min(1).max(65535).optional(),
+      memoryGb: z.number().min(6).max(512).nullable().optional(),
+    }).strict().optional(),
+  }).strict().optional(),
+}).strict();
+
+// =============================================================================
+// LM STUDIO (server/routes/lmstudio.js)
+// =============================================================================
+
+// PUT /api/lmstudio/config — persisted straight into module-level state
+// (lmStudioManager's `config`) that every other LM Studio call site reads via
+// getBaseUrl(). A malformed baseUrl must be rejected up front rather than
+// degrading local-LLM connectivity until the process restarts.
+export const lmStudioConfigSchema = z.object({
+  baseUrl: z.string().trim().url().optional(),
+  timeout: z.number().int().positive().optional(),
+  defaultThinkingModel: z.string().trim().min(1).optional(),
+});
+
+// Shared by /download, /load, /unload — each acts on a single model id.
+export const lmStudioModelIdSchema = z.object({
+  modelId: z.string().trim().min(1),
+});
+
+// POST /api/lmstudio/completion
+export const lmStudioCompletionSchema = z.object({
+  prompt: z.string().min(1),
+  model: z.string().trim().min(1).optional(),
+  maxTokens: z.number().int().positive().optional(),
+  temperature: z.number().min(0).max(2).optional(),
+  systemPrompt: z.string().optional(),
+});
+
+// POST /api/lmstudio/analyze-task
+export const lmStudioAnalyzeTaskSchema = z.object({
+  description: z.string().min(1),
+  id: z.string().optional(),
+  metadata: z.record(z.any()).optional(),
+});
+
+// POST /api/lmstudio/classify-memory
+export const lmStudioClassifyMemorySchema = z.object({
+  content: z.string().min(1),
+});
+
+// POST /api/lmstudio/embeddings
+export const lmStudioEmbeddingsSchema = z.object({
+  text: z.string().min(1),
+  model: z.string().trim().min(1).optional(),
+});
+
+// Subscription creation: persistent (bucket, record) tuple. Series + universe
+// are the subscribable kinds (records that change over time and benefit from
+// auto-re-export). Media is one-shot via /buckets/:id/export.
+export const subscriptionCreateSchema = z.object({
+  bucketId: z.string().trim().min(1).max(120),
+  recordKind: z.enum(['series', 'universe']),
+  recordId: z.string().trim().min(1).max(120),
+}).strict();
+
+// Per-request LLM provider/model override. Shared by universe-builder expand
+// routes and pipeline arc-planning routes. Optional so callers that omit the
+// llm field fall back to the server's active provider.
+export const llmSchema = z.object({
+  provider: providerRefSchema.nullable().optional(),
+  model: z.string().trim().max(200).nullable().optional(),
+}).optional();
+
+// =============================================================================
+// DOCUMENT EDITING SCHEMAS  (shared by apps.js and gsd.js document routes)
+// =============================================================================
+
+/**
+ * Body schema for PUT /api/apps/:id/documents/*docPath and
+ * PUT /api/cos/gsd/projects/:appId/documents/:docName.
+ * Both routes accept a content string plus an optional commit message.
+ */
+export const documentUpdateSchema = z.object({
+  content: z.string().max(500000),
+  commitMessage: z.string().max(200).optional()
+});
+
+// Legacy Export (issue #901) — portable identity bundle. `sections` optionally
+// narrows the bundle to a subset of domains; omitted/empty means "all present
+// sections". The enum is kept in sync with `legacyExport.js#getSectionKeys()`
+// (asserted in legacyExport's tests) — validation.js must not import from
+// services (cycle), so the keys are inlined here.
+export const LEGACY_EXPORT_SECTIONS = ['identity', 'autobiography', 'brain', 'goals', 'decisions', 'health'];
+export const legacyExportSchema = z.object({
+  sections: z.array(z.enum(LEGACY_EXPORT_SECTIONS)).optional(),
+  // Phase 2: render a `legacy-portrait.pdf` from the section Markdown. Default
+  // false — the Markdown/JSON bundle is the primary artifact.
+  includePdf: z.boolean().optional()
+});
+
+// Video downloader (#1946) — paste a YouTube/x.com URL, download the full
+// video. The host allowlist is enforced in the service (assertSupportedVideoUrl)
+// so the error names the supported hosts; the schema just guards the shape.
+export const videoDownloadSchema = z.object({
+  url: z.string().url().max(2048)
+});
+
+// Git submodules. `repoPath` is the repo ROOT (omitted = the PortOS checkout,
+// and it is separately checked against the workspace allowlist); `path` is the
+// repo-relative submodule path, matching `git submodule status` output.
+const optionalRepoPath = z.string().trim().min(1).max(4096).nullish();
+
+export const submoduleStatusQuerySchema = z.object({
+  repoPath: optionalRepoPath
+});
+
+export const submoduleUpdateSchema = z.object({
+  path: z.string().trim().min(1).max(4096),
+  repoPath: optionalRepoPath,
+  commit: z.boolean().optional().default(false)
+});
+
+// =============================================================================
+// TRANSITIONAL RE-EXPORTS (issue #1151 split)
+// =============================================================================
+// These domain schema groups moved to their own per-domain files (the
+// brainValidation.js pattern); the re-exports keep every existing deep
+// `import { x } from '../lib/validation.js'` working. New code should import
+// from the domain file (or the barrel's namespace export) directly.
+//
+// Cycle note: the domain files must NOT import from this module — ESM hoists
+// `export * from`, so they evaluate before this module's body runs and any
+// value read back from here hits the TDZ. Shared zod primitives they need
+// (e.g. `emptyToUndefined`) live in zodCompat.js.
+export * from './peerSyncValidation.js';
+export * from './creativeDirectorValidation.js';
+export * from './creativeCommissionValidation.js';
+export * from './musicVideoValidation.js';
+export * from './storyBuilderValidation.js';
+export * from './moodBoardValidation.js';
+export * from './privacyValidation.js';
+export * from './agentValidation.js';
+export * from './cosValidation.js';
+export * from './mediaValidation.js';
+export * from './pipelineValidation.js';
+import { stageConfigUpdateSchema } from './pipelineValidation.js';
+export * from './quotaBurnValidation.js';
+export * from './spriteValidation.js';
+export * from './agentContextValidation.js';
+export * from './eidoverseValidation.js';
+
+// Reference prices and PortOS-run benchmark observations. A source is attached
+// to each metric because prices, scores and runtime measurements differ.
+const isAllowedComparisonSourceUrl = value => {
+  if (/^portos:\/\/model-comparison\/[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(value)) return true;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && Boolean(url.hostname);
+  } catch {
+    return false;
+  }
+};
+const comparisonSourceSchema = z.object({
+  url: z.string().min(1).max(2000).refine(
+    isAllowedComparisonSourceUrl,
+    'Source must use HTTPS or identify a PortOS benchmark run',
+  ),
+  retrievedAt: z.string().datetime().refine(value => Date.parse(value) <= Date.now(), 'Source date cannot be in the future'),
+  methodology: z.string().min(1).max(1000),
+}).strict();
+const comparisonMetricSchema = z.object({ value: z.number().finite().nonnegative(), source: comparisonSourceSchema }).strict();
+export const modelComparisonObservationSchema = z.object({
+  id: z.string().min(1).max(200),
+  provider: z.string().min(1).max(160),
+  model: z.string().min(1).max(200),
+  effort: z.string().min(1).max(80),
+  configuration: z.string().min(1).max(500),
+  billing: z.enum(['api', 'subscription', 'local', 'free', 'unknown']),
+  benchmark: z.string().min(1).max(160),
+  quality: comparisonMetricSchema.nullable(),
+  costPerTask: comparisonMetricSchema.nullable(),
+  inputPerMillion: comparisonMetricSchema.nullable(),
+  outputPerMillion: comparisonMetricSchema.nullable(),
+  reasoningPerMillion: comparisonMetricSchema.nullable(),
+  responseSeconds: comparisonMetricSchema.nullable(),
+  tokensPerSecond: comparisonMetricSchema.nullable(),
+  tokensPerRun: comparisonMetricSchema.nullable().optional(),
+  inputTokens: comparisonMetricSchema.nullable().optional(),
+  outputTokens: comparisonMetricSchema.nullable().optional(),
+  apiEquivalentCost: comparisonMetricSchema.nullable().optional(),
+  tokenBasis: z.enum(['measured', 'estimated', 'mixed']).nullable().optional(),
+  completedTasks: z.number().int().nonnegative().max(1000).nullable().optional(),
+  totalTasks: z.number().int().positive().max(1000).nullable().optional(),
+  quota: z.object({ unitsPerTask: z.number().finite().nonnegative(), unit: z.string().min(1).max(80), source: comparisonSourceSchema }).strict().nullable(),
+  notes: z.string().max(2000),
+}).strict().superRefine((row, ctx) => {
+  if (row.benchmark === 'PortOS Research Index v1 (AA v4.3.2 scale)' && row.quality) {
+    if (row.quality.value > 100) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['quality', 'value'], message: 'PortOS research index must be between 0 and 100' });
+    if (!row.quality.source.methodology.startsWith('PortOS estimate:')) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['quality', 'source', 'methodology'], message: 'Research estimates must disclose their derivation with PortOS estimate:' });
+  }
+});
+const modelComparisonCatalogBaseSchema = z.object({
+  schemaVersion: z.literal(1),
+  // Source imports can contain thousands of independently attributed rows and
+  // are applied as one atomic catalog merge.
+  observations: z.array(modelComparisonObservationSchema).max(12000),
+}).strict().superRefine((value, ctx) => {
+  const ids = new Set();
+  value.observations.forEach((row, index) => {
+    if (ids.has(row.id)) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['observations', index, 'id'], message: 'Duplicate observation id' });
+    ids.add(row.id);
+    if (!row.quality && !row.costPerTask && !row.inputPerMillion && !row.outputPerMillion && !row.reasoningPerMillion && !row.responseSeconds && !row.tokensPerSecond && !row.quota && !row.tokensPerRun && !row.inputTokens && !row.outputTokens && !row.apiEquivalentCost) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['observations', index], message: 'At least one sourced metric is required' });
+    }
+  });
+});
+// A migration may legitimately retire the last legacy observation. The stored
+// catalog can then be empty, but client imports still need at least one row.
+export const modelComparisonCatalogSchema = modelComparisonCatalogBaseSchema;
+export const modelComparisonImportSchema = modelComparisonCatalogBaseSchema.refine(
+  value => value.observations.length > 0,
+  { message: 'At least one observation is required', path: ['observations'] },
+);
+
+export const modelComparisonDiscoverySchema = z.object({ providerId: z.string().min(1).max(200) }).strict();
+export const privateCredentialParamsSchema = z.object({ id: z.enum(CREDENTIALS.filter(entry => entry.privateStore).map(entry => entry.id)) });
+export const privateCredentialInputSchema = z.object({ value: z.string().trim().max(2000) }).strict();
+
+export const modelComparisonBenchmarkRunSchema = z.object({
+  providerId: z.string().min(1).max(200),
+  model: z.string().min(1).max(200),
+  effort: z.string().min(1).max(80).nullable().optional(),
+}).strict();
+
+// =============================================================================
+// HARNESS ENABLEMENT + CREDENTIAL BOOTSTRAP APPS (#7564)
+// =============================================================================
+
+/**
+ * `settings.harnesses` — per-harness enablement: `{ [harnessId]: { enabled } }`.
+ * Keyed by a registry id only, so a typo cannot store a rule nothing reads. A
+ * harness with no entry is enabled when its binary is detected on PATH
+ * (`services/harnessEnablement.js`); `direct` is always enabled.
+ */
+// `partialRecord`: a Zod 4 `record` over an enum key is EXHAUSTIVE and would
+// demand an entry for every harness.
+export const harnessSettingsSchema = z.partialRecord(
+  z.enum(PROVIDER_HARNESS_IDS),
+  z.object({ enabled: z.boolean() }).strict(),
+);
+
+/**
+ * One credential-bootstrap APP (#7564): the wrapper CLI that mints a harness's
+ * credential at spawn (`<command> <args...> <harnessName> [<separator>] <harness args>`).
+ * Same field limits as the inline `credentialBootstrap` a record carries
+ * (`aiToolkit/validation.js`); `harnessNames` maps a harness id to the name the
+ * wrapper knows it by when that differs from the binary (`claude` → `claude-code`).
+ * `setupCommand` is advisory text — PortOS never runs it.
+ */
+export const credentialBootstrapSchema = z.object({
+  label: z.string().trim().min(1).max(100),
+  command: z.string().trim().min(1).max(200),
+  args: z.array(z.string().max(200)).max(20).optional(),
+  envCommand: z.array(z.string().min(1).max(500)).min(1).max(21).optional(),
+  argsSeparator: z.string().trim().max(20).optional(),
+  setupCommand: z.string().trim().max(500).optional(),
+  harnessNames: z.partialRecord(z.enum(PROVIDER_HARNESS_IDS), z.string().trim().min(1).max(100)).optional(),
+}).strict();
+
+/** `settings.credentialBootstraps` — apps keyed by the slug a composite id's `+<slug>` suffix names. */
+export const credentialBootstrapsSettingsSchema = z.record(
+  z.string().regex(SERVICE_SLUG_RE, 'bootstrap slug must be lowercase alphanumeric with hyphens').max(64),
+  credentialBootstrapSchema,
+);
+
+/**
+ * `POST /api/providers/presets` (#7565) — "Save as preset": a composite id
+ * becomes a stored, derived preset. The composite's own grammar is checked
+ * here; whether it is RUNNABLE (harness enabled, service known, compatible) is
+ * the resolver's verdict, published as a 400 with its code. `effort` is
+ * validated against the harness's ladder in the service, not against a flat
+ * enum: which rungs exist is a per-harness (and per-model) fact.
+ */
+export const providerPresetCreateSchema = z.object({
+  compositeId: providerRefSchema.refine((value) => parseProviderRef(value)?.kind === 'composite', {
+    message: 'compositeId must be a composite <harness>.<cli|tui|api>@<service-slug>[+<bootstrap-slug>]',
+  }),
+  id: presetProviderIdSchema.optional(),
+  name: z.string().trim().min(1).max(100).optional(),
+  model: z.string().trim().min(1).max(512).nullable().optional(),
+  effort: z.string().trim().min(1).max(20).nullable().optional(),
+}).strict();
+
+/** `PUT /api/providers/harnesses/:id` — flip one harness's enablement. */
+export const harnessEnablementUpdateSchema = z.object({ enabled: z.boolean() }).strict();
+export const harnessIdParamSchema = z.enum(PROVIDER_HARNESS_IDS);
+
+// =============================================================================
+// PERSISTENT MIND BUNDLE (server/routes/cosMindRoutes.js)
+// =============================================================================
+
+/**
+ * `POST /api/cos/mind/bundle/export` (#7621) — seal the Mind into a downloadable,
+ * passphrase-encrypted bundle.
+ *
+ * The scope vocabulary and passphrase floor come from `mindBundleCrypto.js`, the
+ * module that owns the container contract, so the route, the sealer, and the UI
+ * cannot drift apart on what a bundle may declare. The passphrase is bounded but
+ * deliberately unconstrained in composition: it is a user-chosen secret, and a
+ * validation failure here must never echo it (`validateRequest` reports paths
+ * and messages, never values).
+ */
+export const mindBundleExportSchema = z.object({
+  scopes: z.array(z.enum(PERSISTENT_MIND_BUNDLE_SCOPES))
+    .min(1)
+    .max(PERSISTENT_MIND_BUNDLE_SCOPES.length)
+    .refine((scopes) => new Set(scopes).size === scopes.length, 'bundle scopes must be unique'),
+  passphrase: z.string()
+    .min(MIND_BUNDLE_PASSPHRASE_MIN_CHARS, `Passphrase must be at least ${MIND_BUNDLE_PASSPHRASE_MIN_CHARS} characters`)
+    .max(MIND_BUNDLE_PASSPHRASE_MAX_CHARS),
+}).strict();
+
+const mindBundlePassphrase = z.string()
+  .min(MIND_BUNDLE_PASSPHRASE_MIN_CHARS, `Passphrase must be at least ${MIND_BUNDLE_PASSPHRASE_MIN_CHARS} characters`)
+  .max(MIND_BUNDLE_PASSPHRASE_MAX_CHARS);
+
+// The uploaded file, as text. Bounded here as well as in the container reader
+// so an oversized upload is refused before a key derivation runs over it.
+const mindBundleText = z.string().min(1).max(MIND_BUNDLE_MAX_CHARS);
+
+/** Open a bundle and report what it carries. Read-only — no choices, no writes (#7622). */
+export const mindBundlePreviewSchema = z.object({
+  bundle: mindBundleText,
+  passphrase: mindBundlePassphrase,
+}).strict();
+
+/**
+ * Apply a bundle under one whole-group choice per group. A group the caller
+ * omits keeps this install's value, so a partial payload can never overwrite a
+ * personality by accident; `.strict()` on the choice map means a group name
+ * this build does not know is a 400, not a silently ignored key.
+ */
+export const mindBundleApplySchema = z.object({
+  bundle: mindBundleText,
+  passphrase: mindBundlePassphrase,
+  choices: z.object(Object.fromEntries(
+    PERSISTENT_MIND_BUNDLE_GROUPS.map((group) => [group, z.enum(MIND_BUNDLE_GROUP_CHOICES).optional()]),
+  )).strict(),
+}).strict();
+
+export const appLaunchVideoPublishSchema = z.object({
+  format: z.enum(['mp4', 'gif']).default('gif'),
+  videoId: z.string().min(1).max(200).regex(/^[a-zA-Z0-9_-]+$/),
+}).strict();
+
+export const LAUNCH_VIDEO_MOTION_STYLES = Object.freeze(['walkthrough', 'showreel', 'ui-morph']);
+
+// One launch timeline can render several frames (#8960). Each name maps to the
+// exact size a composition declares in portosComposition.formats; the order is
+// the canonical render/delivery order.
+export const LAUNCH_VIDEO_FORMAT_SIZES = Object.freeze({ landscape: '1920x1080', vertical: '1080x1920', square: '1080x1080' });
+export const LAUNCH_VIDEO_FORMATS = Object.freeze(Object.keys(LAUNCH_VIDEO_FORMAT_SIZES));
+const launchVideoFormatSchema = z.enum(LAUNCH_VIDEO_FORMATS);
+const launchVideoFormatListSchema = z.array(launchVideoFormatSchema).min(1).max(LAUNCH_VIDEO_FORMATS.length)
+  .refine(list => new Set(list).size === list.length, 'formats must not repeat');
+
+// A style reference (#8961): a frame, a short clip, or a Media History image
+// or video. `source` picks the bucket the filename is resolved against —
+// `gallery` (Media History's own images/videos folders) or `upload` (the
+// generic /api/uploads scratch dir) — so the route can contain the read to
+// exactly one directory per kind, never a client-supplied path.
+export const launchVideoStyleReferenceSchema = z.object({
+  kind: z.enum(['image', 'video']),
+  source: z.enum(['gallery', 'upload']),
+  filename: z.string().min(1).max(255).regex(/^[^/\\]+$/, 'filename must not contain a path separator'),
+}).strict();
+
+// Off / Light / Film shutter presets; the mapping lives in services/htmlComposition.
+export const htmlCompositionMotionBlurChoiceSchema = z.enum(['off', 'light', 'film']);
+
+export const appLaunchVideoRequestSchema = z.object({
+  sourceVideoId: z.string().min(1).max(200).regex(/^[a-zA-Z0-9_-]+$/).optional(),
+  feedback: z.string().trim().min(1).max(4000).optional(),
+  tone: z.enum(['default', 'polished', 'deadpan', 'cinematic', 'parody']).default('default'),
+  direction: z.string().trim().max(2000).default(''),
+  // `format` is the single-frame form older callers send; `formats` asks one
+  // run for several aspect ratios of the same film. The route normalizes both.
+  format: launchVideoFormatSchema.optional(),
+  formats: launchVideoFormatListSchema.optional(),
+  targetDurationSec: z.number().int().min(15).max(120).default(20),
+  generateMusic: z.boolean().default(false),
+  musicMethod: z.enum(['agent', 'service']).default('agent'),
+  // Legacy boolean for older callers; true means motionStyle "showreel".
+  motionGraphics: z.boolean().optional(),
+  motionStyle: z.enum(LAUNCH_VIDEO_MOTION_STYLES).optional(),
+  // Contact-sheet proof → critique → fix passes before the final render.
+  critiqueRounds: z.number().int().min(0).max(4).default(2),
+  // Render-time motion blur (#9080); omitted, the composition's own setting stands.
+  motionBlur: htmlCompositionMotionBlurChoiceSchema.optional(),
+  // Ask the agent to consult installed motion-design skills (npm run setup:motion).
+  motionSkills: z.boolean().default(false),
+  musicTrack: z.string().min(1).max(255).regex(/^[^/\\]+$/).optional(),
+  styleReference: launchVideoStyleReferenceSchema.optional(),
+  // Curated medium rulebook (#10254); only its motion/camera/sound/native-move parts reach the prompt.
+  styleGrammarId: knownFilmStyleIdSchema.optional(),
+}).strict();
+
+export const launchVideoOptionsSchema = z.object({
+  sourceVideoId: z.string().min(1).max(200).regex(/^[a-zA-Z0-9_-]+$/).optional(),
+  targetDurationSec: z.number().min(15).max(120),
+  appId: z.string().regex(/^[a-zA-Z0-9_-]+$/).max(128).optional(),
+  runId: z.string().regex(/^[a-zA-Z0-9_-]+$/).max(128).optional(),
+}).strict().refine(value => Boolean(value.appId) === Boolean(value.runId), 'appId and runId must be supplied together');
+
+export const launchVideoStoryboardSchema = z.object({
+  posterSec: z.number().nonnegative(),
+  scenes: z.array(z.object({
+    durationSec: z.number().positive(),
+    lines: z.array(z.object({
+      text: z.string().trim().min(1).max(10000),
+      wordCount: z.number().int().positive(),
+      holdSec: z.number().positive(),
+    }).strict()).max(100),
+  }).strict()).min(1).max(100),
+}).strict();
+
+// HTML composition inputs are local, editable assets, never provider prompts.
+export const htmlCompositionRenderSchema = z.object({
+  launchVideo: launchVideoOptionsSchema.optional(),
+  synthesizeMusic: z.boolean().optional(),
+  // Master synthesized and library music to -14 LUFS / -1.5 dBTP (#10249); false keeps the bed as supplied.
+  masterLoudness: z.boolean().optional(),
+  // Overrides the page's own portosComposition.motionBlur when present (#9080).
+  motionBlur: htmlCompositionMotionBlurChoiceSchema.optional(),
+  directory: z.string().min(1).max(1024).refine(value => !value.startsWith('/') && !value.includes('\\') && !value.includes(':') && !value.split('/').some(part => part === '..' || part === '.' || !part), 'directory must be a relative path inside data'),
+  musicTrack: z.string().min(1).max(255).regex(/^[^/\\]+$/, 'musicTrack must be a Music-library filename').optional(),
+  // Several aspect ratios of one timeline, rendered in sequence on one page.
+  // Omitted, the job renders the composition's own width/height as before.
+  formats: launchVideoFormatListSchema.optional(),
+  // A proof renders a silent contact sheet for review instead of the video;
+  // `format` checks one declared framing, defaulting to the composition's own.
+  proof: z.object({ everySec: z.number().min(0.25).max(10).default(1), format: launchVideoFormatSchema.optional() }).strict().optional(),
+}).refine(value => !(value.synthesizeMusic && value.musicTrack), 'Choose synthesized music or a library track, not both')
+  .refine(value => !(value.proof && (value.synthesizeMusic || value.musicTrack)), 'A proof is silent; omit synthesizeMusic and musicTrack')
+  .refine(value => !(value.proof && value.formats), 'A proof checks one framing; use proof.format instead of formats');
+
+// GET /api/html-composition/beats — a Music-library filename, same shape as
+// htmlCompositionRenderSchema's musicTrack but required (this endpoint exists
+// only to measure one).
+export const htmlCompositionBeatsQuerySchema = z.object({
+  musicTrack: z.string().min(1).max(255).regex(/^[^/\\]+$/, 'musicTrack must be a Music-library filename'),
+}).strict();
+
+// Public renders stay capped at 120s. A music-video owner passes a higher
+// ceiling (the song length, hard-capped by the caller at 900s) and gets the
+// same frame rules. superRefine lives on this factory because the exported
+// schema is a ZodEffects and cannot be extended in place.
+export function htmlCompositionContractSchemaFor(maxDurationSec = 120) {
+  return z.object({
+    durationSec: z.number().min(1).max(maxDurationSec),
+    fps: z.number().int().min(12).max(60),
+    width: z.number().int(),
+    height: z.number().int(),
+    // Subframes averaged per output frame to fake motion blur on fast moves.
+    // The integer form (1 default) keeps the existing tmix path byte for byte;
+    // the object form (#9077) samples a centred shutter in linear light, with a
+    // fixed count or 'auto' refinement that stops once the average converges.
+    motionBlur: z.union([
+      z.number().int().min(1).max(4),
+      z.object({
+        shutter: z.number().min(0.05).max(1).default(0.5),
+        samples: z.union([z.literal('auto'), z.number().int().min(4).max(64)]).default('auto'),
+        tolerance: z.number().min(1).max(8).default(2),
+      }).strict(),
+    ]).default(1),
+    // Extra sizes this one timeline can render (#8960), reframed by the optional
+    // layout({ width, height }) hook before each format's first seek.
+    formats: z.array(z.enum(Object.values(LAUNCH_VIDEO_FORMAT_SIZES))).min(1).max(LAUNCH_VIDEO_FORMATS.length).optional(),
+    layout: z.boolean().default(false),
+  }).superRefine((value, ctx) => {
+    if (!['1920x1080', '1080x1920', '1080x1080', '1280x720'].includes(`${value.width}x${value.height}`)) {
+      ctx.addIssue({ code: 'custom', path: ['width'], message: 'width/height must be 1920x1080, 1080x1920, 1080x1080 or 1280x720' });
+    }
+    if (Math.abs(value.durationSec * value.fps - Math.round(value.durationSec * value.fps)) > 1e-8) {
+      ctx.addIssue({ code: 'custom', path: ['durationSec'], message: 'durationSec × fps must be a whole number of frames' });
+    }
+  });
+}
+
+export const htmlCompositionContractSchema = htmlCompositionContractSchemaFor(120);
+
+// Jira issue key (ABC-123) or numeric id — the value is interpolated into upstream REST paths.
+export const jiraTicketKeySchema = z.string().max(64).regex(/^([A-Za-z][A-Za-z0-9_]*-\d+|\d+)$/, 'Invalid Jira ticket id');
+
+// Prompt stage names and variable keys become `stages/<name>.md` / a
+// variables.json key, so they must be a single safe path segment (#9152).
+export const promptStageNameSchema = z.string().regex(/^[a-z0-9][a-z0-9_-]*$/, 'invalid stage name').max(80);
+export const promptVariableKeySchema = z.string().regex(/^[A-Za-z0-9_-]+$/, 'invalid variable key').max(80);
+
+// =============================================================================
+// ROUTE BODY SCHEMAS (#9950) — handlers that used to read `req.body` by hand.
+// `routeValidationConventions.test.js` fails any body-bearing POST/PUT/PATCH
+// handler that skips `validateRequest`. A bodyless POST (a bare "run now"
+// button) still parses an optional-field object: pass `req.body ?? {}`.
+// =============================================================================
+
+const nonEmptyString = z.string().min(1);
+const optionalString = z.string().optional();
+const nullishString = z.string().nullish();
+
+// Project detection (routes/detect.js)
+export const detectRepoBodySchema = z.object({ path: nonEmptyString });
+export const detectPortBodySchema = z.object({ port: z.coerce.number().int().min(1).max(65535) });
+export const detectPm2BodySchema = z.object({ name: nonEmptyString });
+export const detectAiBodySchema = z.object({ path: nonEmptyString, providerId: nullishString });
+
+// Messages (routes/messages.js)
+export const MESSAGE_TOKEN_PROVIDERS = ['outlook', 'teams'];
+export const messageSyncBodySchema = z.object({ mode: z.enum(['unread', 'full']).optional() });
+export const messageFetchFullBodySchema = z.object({ force: z.boolean().default(false) });
+export const messageActionBodySchema = z.object({ action: z.enum(['archive', 'delete']) });
+export const messageTokenProviderBodySchema = z.object({ provider: z.enum(MESSAGE_TOKEN_PROVIDERS).optional() });
+
+// CoS agents / tasks / schedule
+export const cosAgentFeedbackBodySchema = z.object({
+  rating: z.enum(['positive', 'negative', 'neutral']),
+  comment: nullishString,
+});
+export const cosAgentBtwBodySchema = z.object({ message: z.string().trim().min(1).max(5000) });
+export const cosTaskReorderBodySchema = z.object({ taskIds: z.array(nonEmptyString) });
+export const cosScheduleTargetBodySchema = z.object({ taskType: nonEmptyString, appId: nullishString });
+
+// Per-app task-type overrides (routes/apps/taskTypes.js)
+export const appTaskTypeToggleBodySchema = z.object({ enabled: z.boolean() });
+export const appTaskTypeOverrideBodySchema = z.object({
+  enabled: z.boolean().optional(),
+  interval: nullishString,
+  intervalMs: z.number().positive().finite().nullish(),
+  providerId: nullishString,
+  model: nullishString,
+  taskMetadata: z.record(z.string(), z.unknown()).nullish(),
+}).refine((body) => Object.values(body).some((value) => value !== undefined), {
+  message: 'enabled (boolean), interval (string|null), intervalMs (number|null), providerId (string|null), model (string|null), or taskMetadata (object|null) required',
+});
+
+// Brain journal / inbox
+export const brainInboxRetryBodySchema = z.object({ providerOverride: nullishString, modelOverride: nullishString });
+export const brainJournalAppendBodySchema = z.object({
+  text: z.string().refine((text) => text.trim().length > 0, 'text is required'),
+  source: nullishString,
+});
+export const brainJournalReplaceBodySchema = z.object({ content: z.string(), ifMatchUpdatedAt: nullishString });
+
+// Prompts (routes/prompts.js)
+export const promptVariableUpdateBodySchema = z.object({ name: optionalString, category: optionalString, content: optionalString });
+export const promptVariableCreateBodySchema = z.object({ key: promptVariableKeySchema, name: optionalString, category: optionalString, content: nonEmptyString });
+export const promptStageCreateBodySchema = z.object({
+  stageName: promptStageNameSchema,
+  name: nonEmptyString,
+  description: optionalString,
+  model: z.string().default('default'),
+  returnsJson: z.boolean().default(false),
+  variables: z.array(z.string()).default([]),
+  template: z.string().default(''),
+});
+export const promptStageUpdateBodySchema = stageConfigUpdateSchema.extend({ template: z.string().optional() });
+export const promptJobSkillBodySchema = z.object({ content: nonEmptyString });
+export const promptPreviewBodySchema = z.object({ testData: z.record(z.string(), z.unknown()).default({}) });
+
+// Smaller single-purpose bodies
+export const calendarAutoConfigureBodySchema = z.object({ email: optionalString });
+export const commandExecuteBodySchema = z.object({ command: nonEmptyString, workspacePath: nullishString });
+export const dataArchiveBodySchema = z.object({
+  daysToKeep: z.preprocess((value) => (value == null ? undefined : value), z.coerce.number().finite().min(0).optional()),
+});
+export const imageVisibilityBodySchema = z.object({ hidden: z.boolean().default(false) });
+export const moltworldQueueFailBodySchema = z.object({ error: nullishString });
+export const referenceRepoReviewedBodySchema = z.object({ sha: z.string().trim().default('') });
+export const scaffoldTemplateCreateBodySchema = z.object({ templateId: nonEmptyString, name: nonEmptyString, targetPath: nonEmptyString });
+export const screenshotUploadBodySchema = z.object({ data: nonEmptyString, filename: nullishString });
+export const standardizeTargetBodySchema = z.object({ repoPath: nullishString, appId: nullishString, providerId: nullishString });
+export const systemHealthThresholdsBodySchema = z.object({
+  memoryWarn: z.coerce.number().finite(),
+  memoryCritical: z.coerce.number().finite(),
+  diskWarn: z.coerce.number().finite(),
+  diskCritical: z.coerce.number().finite(),
+});
+export const voicePiperFetchBodySchema = z.object({ voice: nonEmptyString });
+export const writersRoomSceneImageBodySchema = z.object({
+  sceneId: nullishString, filename: nullishString, jobId: nullishString, prompt: nullishString,
+});

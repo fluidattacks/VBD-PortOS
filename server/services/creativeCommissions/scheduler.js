@@ -1,0 +1,545 @@
+/**
+ * Creative Commission scheduler (#2657, Phase 1 — Autonomous Creation Engine).
+ *
+ * A per-commission cron that fires the Creative Director's directive pipeline on
+ * the user's cadence. Modeled directly on `seriesAutopilotScheduler.js`:
+ *   - one eventScheduler cron per enabled commission (id namespace below),
+ *   - a `registered` set + `lastSignature` guard so re-syncs are cheap no-ops,
+ *   - a fire handler that runs OUTSIDE the Express request lifecycle: the fire
+ *     core (`fireCommission`) never throws (whole body in try/catch), and the
+ *     one deliberate exception — a pre-fire read failure in
+ *     `runScheduledCommission` — is re-thrown to eventScheduler's own
+ *     contained `runEvent` boundary so the outage lands on that tick's run
+ *     history instead of reading as a silent no-op,
+ *   - re-reads the commission + autonomy config on every fire (only the cron is
+ *     captured at registration).
+ *
+ * Cold-bootstrap compliance (AGENTS.md AI Provider Usage Policy): a commission is
+ * a user-configured scheduled automation — the sanctioned exception. `start…()`
+ * only ARMS crons; nothing fires until the cadence elapses. The fire handler
+ * additionally gates on creative autonomy mode === 'execute' AND the daily cos
+ * budget, so an `off`/`dry-run` install (or an over-budget one) generates nothing
+ * and simply records a skipped run.
+ *
+ * Commissions are machine-local (not federated), so — unlike series autopilot —
+ * the scheduler re-syncs when the commission STORE changes (routes call
+ * `syncCommissionSchedules` after a mutation), not on settings:updated.
+ */
+
+import { schedule, cancel, isValidCron, isValidRecurrence } from '../eventScheduler.js';
+import { getUserTimezone } from '../userTimezone.js';
+import { getSettings, settingsEvents } from '../settings.js';
+import { RENDER_TARGET } from '../../lib/renderTargets.js';
+import { renderTargetDefaults } from '../imageGen/cloudProviderConfig.js';
+import { resolveVideoMode, VIDEO_GEN_MODE } from '../videoGen/modes.js';
+import { listCommissions, getCommission, recordCommissionRun, commissionEvents, ERR_NOT_FOUND } from './store.js';
+import { commissionToCron, commissionToRecurrence } from './directive.js';
+import { buildCommissionDirective, getAbilityAdapter } from './abilityAdapters.js';
+import { buildMusicTasteRecipe } from './musicTasteRecipe.js';
+import { surfaceCommissionRun, surfaceCommissionHistoryLoss } from './surface.js';
+import { registerCommissionProjectReconciler } from './projectControl.js';
+
+const eventId = (commissionId) => `creative-commission-${commissionId}`;
+const registered = new Set();
+let lastSignature = null;
+let syncTail = Promise.resolve(); // serializes concurrent re-syncs (see syncCommissionSchedules)
+
+// Bounded-backoff retry for a failed inventory read (#7526). A rejected
+// `listCommissions()` must not cancel every armed cron — see
+// `doSyncCommissionSchedules` — but the install still needs to notice once the
+// store recovers, without a settings/commission save to nudge it. One
+// coalesced timer only: a second failure while a retry is already pending
+// reuses it rather than stacking another, so a burst of `commission:changed`/
+// `settings:updated` events during an outage can't multiply timers or spam
+// logs faster than the backoff interval.
+const RECONCILE_RETRY_TIERS_MS = [5_000, 15_000, 60_000, 300_000]; // 5s, 15s, 1m, capped at 5m
+let reconcileRetryTimer = null;
+let reconcileRetryTier = 0;
+
+function scheduleReconcileRetry() {
+  if (reconcileRetryTimer) return; // already coalesced onto a pending retry
+  const delay = RECONCILE_RETRY_TIERS_MS[Math.min(reconcileRetryTier, RECONCILE_RETRY_TIERS_MS.length - 1)];
+  reconcileRetryTier = Math.min(reconcileRetryTier + 1, RECONCILE_RETRY_TIERS_MS.length - 1);
+  reconcileRetryTimer = setTimeout(() => {
+    reconcileRetryTimer = null;
+    // Registration only — never a catch-up fire/generation. `runScheduledCommission`
+    // re-checks enabled/schedule validity fresh on every tick regardless of when it
+    // was armed, so a retry that lands after a commission was paused or deleted
+    // cannot run it.
+    syncCommissionSchedules().catch((err) =>
+      console.error(`❌ Creative commission schedule reconciliation retry failed: ${err.message}`));
+  }, delay);
+  if (typeof reconcileRetryTimer.unref === 'function') reconcileRetryTimer.unref();
+}
+
+function clearReconcileRetry() {
+  if (reconcileRetryTimer) { clearTimeout(reconcileRetryTimer); reconcileRetryTimer = null; }
+  reconcileRetryTier = 0;
+}
+
+function triggerResync() {
+  syncCommissionSchedules().catch((err) =>
+    console.error(`❌ Creative commission schedule re-sync failed: ${err.message}`));
+}
+
+// Re-arm crons whenever a commission is created/updated/deleted through ANY
+// writer, not just the REST route — decoupled from the HTTP handler.
+commissionEvents.on('commission:changed', triggerResync);
+// Cancelling the cron only stops FUTURE fires. projectControl owns the other half
+// — reconciling the work a commission ALREADY spawned when it is paused, deleted,
+// or re-providered. Registered from here because this module is already the one
+// the boot sequence pulls in; the logic itself stays out of the cron concern.
+registerCommissionProjectReconciler();
+// Also re-sync on a settings save so a global timezone change re-registers the
+// crons of commissions that use the fallback tz (schedule.timezone == null) —
+// same reason seriesAutopilotScheduler subscribes here. The signature guard
+// makes an unrelated settings save a cheap no-op.
+settingsEvents.on('settings:updated', triggerResync);
+
+/**
+ * Enabled commissions whose schedule composes into a cron the scheduler honors.
+ * Pure over the passed-in list.
+ */
+export function activeCommissions(commissions) {
+  const out = [];
+  for (const c of commissions || []) {
+    if (!c || c.enabled === false || !c.id) continue;
+    const recurrence = commissionToRecurrence(c.schedule);
+    if (recurrence) {
+      if (!isValidRecurrence(recurrence)) continue;
+      out.push({ id: c.id, recurrence, timezone: c.schedule?.timezone || null });
+      continue;
+    }
+    const cron = commissionToCron(c.schedule);
+    if (!cron || !isValidCron(cron)) continue;
+    out.push({ id: c.id, cron, timezone: c.schedule?.timezone || null });
+  }
+  return out;
+}
+
+function signatureOf(active, fallbackTz) {
+  return JSON.stringify({
+    tz: fallbackTz || null,
+    s: active.map((e) => [e.id, e.cron || null, e.recurrence || null, e.timezone]),
+  });
+}
+
+function registerSchedule(entry, timezone) {
+  // Resilient: a bad stored cron/timezone (e.g. a hand-edited record) throws in
+  // eventScheduler.schedule → Intl.DateTimeFormat; swallow it per-entry so one
+  // bad commission can't abort the whole sync loop and strand the others.
+  try {
+    schedule({
+      id: eventId(entry.id),
+      type: entry.recurrence ? 'recurrence' : 'cron',
+      cron: entry.cron,
+      recurrence: entry.recurrence,
+      timezone: entry.timezone || timezone,
+      handler: () => runScheduledCommission(entry.id),
+      metadata: { source: 'creativeCommissionScheduler', commissionId: entry.id },
+    });
+    registered.add(entry.id);
+  } catch (err) {
+    console.error(`❌ Creative commission ${entry.id} cron registration failed: ${err.message}`);
+  }
+}
+
+/**
+ * (Re)sync the registered crons to the current commission set. Idempotent and
+ * safe at boot and after every store mutation. The signature guard makes an
+ * unrelated re-sync a cheap no-op.
+ *
+ * Serialized on a single tail promise: a settings save and a commission
+ * mutation can fire concurrently, and two syncs with different snapshots
+ * interleaving their mutations of `registered`/`lastSignature` could cancel a
+ * still-enabled commission's cron. Chaining guarantees each sync sees a
+ * consistent view (a re-entrancy guard, fine under the single-user model).
+ */
+export function syncCommissionSchedules(commissions) {
+  syncTail = syncTail.then(() => doSyncCommissionSchedules(commissions), () => doSyncCommissionSchedules(commissions));
+  return syncTail;
+}
+
+async function doSyncCommissionSchedules(commissions) {
+  let list;
+  if (commissions) {
+    list = commissions;
+  } else {
+    try {
+      list = await listCommissions();
+    } catch (err) {
+      // Sentinel + validate (AGENTS.md): a REJECTED inventory read is not the
+      // same value as a genuinely empty one, and must not collapse into it.
+      // The old `.catch(() => [])` here made a transient DB error look like
+      // "zero commissions" and cancelled every armed cron below — preserve
+      // `registered`/`lastSignature` instead and let the retry below notice
+      // when the store recovers.
+      console.error(`❌ Creative commission inventory read failed — preserving ${registered.size} armed cron(s): ${err.message}`);
+      scheduleReconcileRetry();
+      return registered.size;
+    }
+  }
+  clearReconcileRetry(); // a successful read is itself evidence of recovery
+  const active = activeCommissions(list);
+  const timezone = await getUserTimezone().catch(() => 'UTC');
+
+  const signature = signatureOf(active, timezone);
+  if (signature === lastSignature) return active.length;
+  lastSignature = signature;
+
+  const activeIds = new Set(active.map((e) => e.id));
+  for (const id of [...registered]) {
+    if (!activeIds.has(id)) { cancel(eventId(id)); registered.delete(id); }
+  }
+  for (const entry of active) registerSchedule(entry, timezone);
+  return active.length;
+}
+
+/** Boot entry point — arms crons for existing commissions. Fires nothing now. */
+export async function startCommissionScheduler() {
+  return syncCommissionSchedules();
+}
+
+/** Cancel every registered cron (test teardown / shutdown). */
+export function stopCommissionScheduler() {
+  for (const id of [...registered]) { cancel(eventId(id)); registered.delete(id); }
+  lastSignature = null;
+  clearReconcileRetry();
+}
+
+// Sentinel + validate (AGENTS.md): a storage failure must never persist with the
+// same shape as a legitimately-empty result. Never store the raw error message —
+// it can originate from a DB driver and, per #7529's acceptance criteria, run
+// history and any client-visible warning must exclude record contents, prompts
+// and private feedback. A short, bounded classification (an error `code` when the
+// failure supplies one, else its constructor name) is enough to distinguish
+// outage types without repeating this file's log.
+function classifyBoundedError(err, prefix) {
+  if (typeof err?.code === 'string' && err.code) return `${prefix}:${err.code}`;
+  if (typeof err?.name === 'string' && err.name) return `${prefix}:${err.name}`;
+  return prefix;
+}
+
+// The machine-readable code every degraded-history outcome carries. A caller
+// branches on this, never on prose.
+export const HISTORY_UNAVAILABLE = 'run-history-unavailable';
+
+/**
+ * Persist one run entry, separating three outcomes that a bare
+ * `.catch(() => null)` used to collapse into one (#7529, AGENTS.md's
+ * sentinel + validate rule):
+ *
+ *   - written          → { run }                                (no warning key)
+ *   - commission gone  → { run: null, historyWarning: null }  (honest absence)
+ *   - write FAILED     → { run: null, historyWarning: {...} }  (degradation)
+ *
+ * The third case is the one that used to disappear: generation had already
+ * started, the project existed, and the caller still got `run: null` — which
+ * reads exactly like "the commission was deleted mid-fire". The commission's
+ * gallery is derived from persisted run ids, so a lost write leaves a project
+ * running with no history row, no rating control, and no surfaced notification
+ * (surfacing is gated on a real run), with nothing anywhere saying so.
+ *
+ * Never throws: every caller is outside the Express request lifecycle. The
+ * console.error IS the scheduled path's diagnostic — it does not depend on the
+ * ledger that just failed. It carries only local ids and a bounded class, never
+ * names, prompts or feedback.
+ */
+async function persistRun(commissionId, entry) {
+  try {
+    return { run: await recordCommissionRun(commissionId, entry) };
+  } catch (err) {
+    const detail = classifyBoundedError(err, 'write-failed');
+    const projectNote = entry.projectId ? ` — project ${entry.projectId} is running unrecorded` : '';
+    console.error(`❌ Creative commission ${commissionId} ${entry.trigger} ${entry.status} run history write failed (${detail})${projectNote}`);
+    return {
+      run: null,
+      historyWarning: {
+        code: HISTORY_UNAVAILABLE,
+        outcome: entry.status,
+        trigger: entry.trigger,
+        commissionId,
+        projectId: entry.projectId || null,
+        detail,
+      },
+    };
+  }
+}
+
+/**
+ * A scheduled cron tick. Runs outside the Express request lifecycle. A
+ * confirmed deletion (ERR_NOT_FOUND), a paused commission, or a schedule that
+ * became invalid since registration are honest no-ops and skip silently.
+ *
+ * Any OTHER pre-fire read failure — a storage timeout on the commission row
+ * itself, or on its federated feedback (store.js's getCommission deliberately
+ * lets that propagate rather than substitute "no feedback", so generation
+ * never ignores ratings) — must not read as a quiet success. It is recorded
+ * as a failed run against the commission (id + a safe classification only),
+ * then RE-THROWN: eventScheduler's own contained boundary (`runEvent`) is
+ * where this fire is caught, marked failed on the schedule's own history, and
+ * the recurring event is rearmed for the next tick either way.
+ */
+export async function runScheduledCommission(commissionId) {
+  let commission;
+  try {
+    commission = await getCommission(commissionId);
+  } catch (err) {
+    if (err?.code === ERR_NOT_FOUND) return; // confirmed deletion — quiet no-op
+    console.error(`❌ Creative commission ${commissionId} pre-fire read failed: ${err?.message || err}`);
+    const { historyWarning } = await persistRun(commissionId, {
+      status: 'failed',
+      trigger: 'schedule',
+      error: classifyBoundedError(err, 'read-failed'),
+    });
+    if (historyWarning) {
+      // The failed-run write above ITSELF failed — nothing landed on the
+      // commission's history, so these two lines are the only surviving record
+      // of the outage. The joint one names the compound failure that neither
+      // half states on its own; the notification is what actually reaches a
+      // user who was not watching the logs at 02:00.
+      console.error(`❌ Creative commission ${commissionId} pre-fire read failed AND its failure could not be recorded: ${historyWarning.detail}`);
+      await surfaceCommissionHistoryLoss({ id: commissionId }, historyWarning).catch(() => {});
+    }
+    throw err; // propagate to eventScheduler's runEvent, which contains it
+  }
+  if (commission.enabled === false) return; // paused — quiet no-op
+
+  const recurrence = commissionToRecurrence(commission.schedule);
+  const cron = commissionToCron(commission.schedule);
+  if (recurrence ? !isValidRecurrence(recurrence) : (!cron || !isValidCron(cron))) return; // schedule became invalid since registration
+
+  await fireCommission(commission, 'schedule');
+}
+
+/**
+ * A user-initiated "Run Now" fire (the route's test button). Runs the SAME
+ * gated fire path as a cron tick — so it's an end-to-end test of exactly what
+ * the schedule will do — but deliberately skips the `enabled` and cron-validity
+ * guards: a paused or half-configured commission is still testable. The
+ * autonomy/budget gates stay: the downstream plan steps are gated on them in
+ * `dispatchCreativeTool` anyway, so bypassing them here would only strand a
+ * dead project — a skipped outcome with the reason is the honest test result.
+ *
+ * Throws ERR_NOT_FOUND (→404 via the route's error mapper) for an unknown id;
+ * every other failure is recorded on the run history and returned as an outcome.
+ */
+export async function runCommissionNow(commissionId) {
+  const commission = await getCommission(commissionId);
+  return fireCommission(commission, 'manual');
+}
+
+// Source reads are intentionally lazy and machine-local. The recipe receives
+// only the bounded stated summary and observed rollup; raw Digital Twin answers,
+// Spotify caches, and activity events never enter a commission record or CD
+// project. A source read failure is treated exactly like absent taste data so an
+// opted-in commission records an explicit skip instead of generating generically.
+async function resolveMusicTasteRecipe(commission) {
+  const config = commission?.targetAbility === 'music' ? commission?.brief?.musicTaste : null;
+  if (!config) return null;
+  const [profile, observed] = await Promise.all([
+    import('../taste-questionnaire.js')
+      .then(({ getTasteProfile }) => getTasteProfile())
+      .catch(() => null),
+    import('../twinEnrichment.js')
+      .then(({ getTasteEvidence }) => getTasteEvidence())
+      .catch(() => null),
+  ]);
+  const musicSection = profile?.sections?.find((section) => section?.id === 'music');
+  return buildMusicTasteRecipe({
+    commissionId: commission.id,
+    config,
+    stated: {
+      summary: musicSection?.summary || null,
+      lastSessionAt: profile?.lastSessionAt || null,
+    },
+    observed,
+    feedback: commission.feedback,
+    recentRuns: commission.runs,
+  });
+}
+
+/**
+ * The shared fire core. Never throws (callers may be outside the Express
+ * request lifecycle — a throw would crash Node). Re-reads the creative autonomy
+ * config every fire; gates on execute-mode + budget; then mints a
+ * directive-driven CD project and nudges the advance loop (which runs each plan
+ * step through the gated `dispatchCreativeTool`). Every path records a run
+ * (tagged with its trigger) and returns an outcome:
+ *   { status: 'started', projectId, run }
+ *   { status: 'skipped', reason, run }
+ *   { status: 'failed',  error, run }
+ */
+async function fireCommission(commission, trigger) {
+  const commissionId = commission.id;
+  // Hoisted so a throw AFTER createProject succeeded (e.g. the advance kick)
+  // still reports the minted project on the failed run/outcome — otherwise a
+  // manual caller sees a bare failure, can't find the orphaned CD project, and
+  // a retry mints a duplicate.
+  let startedProjectId = null;
+  let startedTasteRecipe = null;
+  let startedMusicGeneration = null;
+  // Every degraded ledger write raises the SAME persisted notification, whatever
+  // the trigger. A cron tick has no HTTP response to carry `historyWarning` home
+  // in, so without this the unattended case — the one this fix is actually about
+  // — would be a console line nobody reads. Manual callers get both.
+  const outcome = async (base, persisted) => {
+    // .catch like the surfaceCommissionRun call below: fireCommission promises
+    // its callers an outcome and never a throw, and one of them is a cron tick
+    // outside the request lifecycle where an escaping rejection kills the process.
+    if (persisted.historyWarning) await surfaceCommissionHistoryLoss(commission, persisted.historyWarning).catch(() => {});
+    return { ...base, ...persisted };
+  };
+  const skip = async (reason) =>
+    outcome({ status: 'skipped', reason }, await persistRun(commissionId, { status: 'skipped', reason, trigger }));
+  try {
+    // Gate on creative autonomy mode + daily cos budget BEFORE spawning anything
+    // (the planner is itself an LLM call) — honors "off ⇒ no generation" and the
+    // no-cold-LLM policy. Both reads FAIL CLOSED: if governance state can't be
+    // verified we skip rather than launch a paid planner on a permissive default.
+    const [{ loadState }, { getCreativeAutonomyMode }, { getDomainBudgetStatus }] = await Promise.all([
+      import('../cosState.js'),
+      import('../../lib/domainAutonomy.js'),
+      import('../domainUsage.js'),
+    ]);
+    const state = await loadState().catch(() => null);
+    if (!state) return skip('governance-unavailable');
+    const mode = getCreativeAutonomyMode(state.config);
+    if (mode !== 'execute') return skip(`autonomy-${mode}`);
+    const budget = await getDomainBudgetStatus('cos').catch(() => null);
+    if (!budget) return skip('budget-unavailable');
+    if (!budget.withinBudget) return skip('budget');
+
+    // Resolve the output-type adapter (#2769). Every supported type (video,
+    // image, music, music-video, series) has one; an unknown ability (a
+    // hand-edited or forward-version record the store sanitizer couldn't clamp)
+    // is skipped rather than mis-generated as a video.
+    const abilityAdapter = getAbilityAdapter(commission.targetAbility);
+    if (!abilityAdapter) return skip('unknown-ability');
+
+    const tasteResult = await resolveMusicTasteRecipe(commission);
+    if (tasteResult?.status === 'unavailable') return skip(tasteResult.reason);
+    startedTasteRecipe = tasteResult?.recipe || null;
+    if (startedTasteRecipe) {
+      const { resolveMusicEngineSelection } = await import('../musicEngineCatalog.js');
+      const engineResult = await resolveMusicEngineSelection({
+        engineId: commission.brief.musicTaste.musicEngineId,
+        modelId: commission.brief.musicTaste.musicModelId,
+      }).catch(() => ({ status: 'unavailable', reason: 'music-engine-unavailable' }));
+      if (engineResult.status !== 'ready') return skip(engineResult.reason);
+      startedMusicGeneration = {
+        ...engineResult.selection,
+        durationSec: commission.generation.lengthSeconds,
+      };
+    }
+
+    // NOTE: we deliberately do NOT pre-charge the cos budget here. The planner
+    // spawns as a normal CoS agent (a `cd-` task) and is accounted by
+    // `completeAgent` → `recordDomainUsage('cos', { actions: 1 })` on completion,
+    // so a pre-charge would double-count. A hard concurrency/budget admission for
+    // the planner (routing it through dequeueNextTask instead of the direct
+    // task:ready emit shared with the CD directive flow) is the deeper CoS-queue
+    // gap tracked on #2657.
+    const [
+      { createProject }, { advanceAfterPlanStepSettled }, { defaultVideoModelId },
+      { composeCommissionStyleSpec, resolveCommissionStyleSource },
+    ] = await Promise.all([
+      import('../creativeDirector/local.js'),
+      import('../creativeDirector/planAdvance.js'),
+      import('../videoGen/local.js'),
+      import('./styleSource.js'),
+    ]);
+
+    const settings = (commission.targetAbility === 'video' || commission.targetAbility === 'music-video')
+      ? await getSettings().catch(() => ({}))
+      : {};
+    const requestedVideoMode = commission.generation?.videoMode === 'auto'
+      ? null : commission.generation?.videoMode;
+    const effectiveVideoMode = (commission.targetAbility === 'video' || commission.targetAbility === 'music-video')
+      ? resolveVideoMode(requestedVideoMode, settings, { target: RENDER_TARGET.CREATIVE_AGENT })
+      : VIDEO_GEN_MODE.LOCAL;
+    const effectiveVideoModelId = effectiveVideoMode === VIDEO_GEN_MODE.LOCAL
+      ? renderTargetDefaults(settings, RENDER_TARGET.CREATIVE_AGENT).videoModel
+      : null;
+    // The configured universe / mood board is the art-direction base for both
+    // the planner (via the goal) and the treatment/evaluation stages (via the
+    // project styleSpec). Resolved per fire so edits to the universe or board
+    // reach the next run.
+    const styleSource = await resolveCommissionStyleSource(commission);
+    const directive = buildCommissionDirective(commission, {
+      styleSource,
+      tasteRecipe: startedTasteRecipe,
+      defaultVideoModelId,
+      effectiveVideoMode,
+      effectiveVideoModelId,
+    });
+    // createProject prefixes "Creative Director: " (19 chars) before a
+    // mediaCollections name capped at 80, so cap our derived name at 61 — a long
+    // commission name would otherwise fail the collection create on every run.
+    const dateSuffix = ` — ${new Date().toISOString().slice(0, 10)}`; // 13 chars
+    const maxBase = 61 - dateSuffix.length;
+    const baseName = commission.name.length > maxBase
+      ? `${commission.name.slice(0, maxBase - 1)}…`
+      : commission.name;
+    // Per-ability project params (#2769): each output type maps its generation
+    // knobs onto createProject's render settings. Non-video types pass harmless
+    // geometry defaults (the planner only forces that geometry onto video render
+    // steps) and let their directive drive the non-video tools.
+    const projectParams = abilityAdapter.buildProjectParams(commission, { defaultVideoModelId });
+    const project = await createProject({
+      name: `${baseName}${dateSuffix}`,
+      ...projectParams,
+      styleSpec: composeCommissionStyleSpec(commission.brief?.styleSpec, styleSource),
+      // The style source's reference images as data, not just served paths in
+      // the styleSpec text: scene evaluation attaches them to its vision call
+      // and local image renders condition on them (#8724).
+      styleReferenceImages: styleSource?.images,
+      directive,
+      // The back-pointer, NOT a copy of the commission's provider pin. agentBridge
+      // resolves that pin live from this id at every dispatch, so an edit to the
+      // commission reaches a project already in flight; a snapshot written here
+      // would freeze the provider for the life of the project. It is also how
+      // pause/delete finds this project in order to stop it.
+      commissionId,
+    });
+
+    startedProjectId = project.id;
+    const persisted = await persistRun(commissionId, {
+      status: 'started',
+      trigger,
+      projectId: project.id,
+      promptUsed: directive.goal,
+      ...(startedTasteRecipe ? { tasteRecipe: startedTasteRecipe } : {}),
+      ...(startedMusicGeneration ? { musicGeneration: startedMusicGeneration } : {}),
+    });
+    const { run } = persisted;
+    // A taste-aware audio enqueue resolves its authoritative prompt/renderer
+    // from this local run. If the write failed, advancing would make that lookup
+    // look legitimately absent and silently release planner defaults instead.
+    if (startedTasteRecipe && !run) throw new Error('taste-run-persistence-unavailable');
+
+    // Surface the fire (notification + brain inbox) so the user can rate the
+    // result once it lands — the reaction feeds the next run via
+    // buildCommissionDirective. Best-effort; surface.js swallows its own errors,
+    // and the outer catch backstops anything unexpected (we're outside the
+    // request lifecycle). Only surface real runs (a run row was persisted).
+    if (run) await surfaceCommissionRun(commission, run).catch(() => {});
+
+    // Kick the planner → plan → execute loop. Fire-and-forget within this
+    // try/catch (already outside the request lifecycle).
+    await advanceAfterPlanStepSettled(project.id);
+    // The project IS running and its id is authoritative — the warning says only
+    // that this fire's bookkeeping was lost, so a caller reports degraded history
+    // instead of promising the render will appear in the commission's gallery.
+    return outcome({ status: 'started', projectId: project.id }, persisted);
+  } catch (err) {
+    console.error(`❌ Creative commission ${commissionId} ${trigger} fire failed: ${err?.message || err}`);
+    const error = err?.message || String(err);
+    const persisted = await persistRun(commissionId, {
+      status: 'failed', error, trigger, projectId: startedProjectId,
+      ...(startedTasteRecipe ? { tasteRecipe: startedTasteRecipe } : {}),
+      ...(startedMusicGeneration ? { musicGeneration: startedMusicGeneration } : {}),
+    });
+    return outcome({ status: 'failed', error, projectId: startedProjectId }, persisted);
+  }
+}

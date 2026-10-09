@@ -1,0 +1,247 @@
+import { it, expect, vi } from 'vitest';
+import { mockNoPeers } from '../lib/mockPathsDataRoot.js';
+import { exportPortosQuality, collectPortosQuality, collectAppQuality, buildQualitySnapshot, readReleaseQuality, FEDERATION_LEGACY_CATEGORIES } from './appQualityFederation.js';
+import { enrichAppsWithQuality, getAppQualityHistory } from './appQuality.js';
+import { PORTOS_SCHEMA_VERSIONS } from '../lib/schemaVersions.js';
+import { qualityFileFromWireSnapshot } from './appQualitySnapshotFormat.js';
+vi.mock('./instances.js', () => mockNoPeers());
+const now = Date.parse('2026-09-10T12:00:00Z');
+const peer = { id: 'peer-a', instanceId: 'instance-a', enabled: true, address: '192.0.2.1', port: 5555 };
+const getOriginInfo = async () => ({ host: 'github.com', fullName: 'atomantic/PortOS' });
+const row = (category, score, assessed_at = '2026-09-10T10:00:00Z', extra = {}) => ({
+  app_id: 'portos-default', category, agent_id: `agent-${category}`, assessed_at,
+  report: { version: 1, category, score, worstSeverity: 5, coverage: 'broad', confidence: 'high',
+    summary: 'Private paths /Users/person/project and audit narrative', scannedFiles: 12, totalFiles: 12 }, ...extra,
+});
+const deps = rows => ({ now, getOriginInfo, readFile: async () => null, getPeers: async () => [peer], query: vi.fn(async () => ({ rows })) });
+const response = payload => new Response(JSON.stringify(payload), { status: 200 });
+
+// Uniquely pins numeric-only privacy, peer consent and cross-install score convergence.
+it('exports only validated local numeric evidence to approved sync peers', async () => {
+  const local = deps([row('security', 40)]);
+  const payload = await exportPortosQuality(peer.instanceId, 30, local);
+  expect(PORTOS_SCHEMA_VERSIONS.appQuality).toBe(1);
+  expect(payload).toMatchObject({ schemaVersion: 1, measurements: [{ report: { category: 'security', score: 40 } }] });
+  expect(JSON.stringify(payload)).not.toMatch(/Private|Users|agent-security|summary|app_id|github/);
+  expect(local.query.mock.calls[0][1][0]).toBe('portos-default');
+  expect(local.query.mock.calls[0][1][1].toISOString()).toBe('2026-07-13T00:00:00.000Z');
+  for (const caller of [undefined, 'unknown']) expect(await exportPortosQuality(caller, 30, local)).toBeNull();
+  for (const disabled of [{ enabled: false }, { syncEnabled: false }, { directions: ['inbound'] }]) {
+    const blocked = { ...local, getPeers: async () => [{ ...peer, ...disabled }] };
+    expect(await exportPortosQuality(peer.instanceId, 30, blocked)).toBeNull();
+    expect(await collectPortosQuality(30, blocked)).toMatchObject({ records: [], federation: { peers: 0 } });
+  }
+  expect(await exportPortosQuality(peer.instanceId, 30, { ...local, getOriginInfo: async () => ({}) })).toBeNull();
+});
+
+it('combines newest categories in app view and UTC history without changing other apps or forwarding evidence', async () => {
+  const remote = await exportPortosQuality(peer.instanceId, 30, deps([row('security', 80), row('performance', 60)]));
+  const local = { ...deps([row('security', 20, '2026-09-09T10:00:00Z')]), peerFetch: vi.fn(async () => response(remote)) };
+  const apps = await enrichAppsWithQuality([{ id: 'portos-default' }, { id: 'other' }], local);
+  expect(apps[0].quality).toMatchObject({ score: 70, ratedCategories: 2, federation: { peers: 1, available: 1, unavailable: 0 } });
+  expect(apps[0].quality.categories.find(c => c.id === 'security')).toMatchObject({ sourcePeerId: 'peer-a', agentId: null });
+  expect(apps[1].quality.score).toBeNull();
+  expect(local.peerFetch.mock.calls[0]).toEqual([expect.stringMatching(/^http:\/\/192\.0\.2\.1:5555\/api\/apps\/quality-federation\?days=30&categories=security%2C/),
+    expect.objectContaining({ signal: expect.any(AbortSignal), redirect: 'error', maxBytes: 4194304 }), peer]);
+  const history = await getAppQualityHistory({ id: 'portos-default' }, 30, local);
+  expect(history.points.find(p => p.date === '2026-09-09').score).toBe(20);
+  expect(history.points.at(-1)).toMatchObject({ score: 70, ratedCategories: 2 });
+  expect((await enrichAppsWithQuality([{ id: 'portos-default' }], local))[0].quality.score).toBe(70);
+  expect((await exportPortosQuality(peer.instanceId, 30, local)).measurements.map(m => m.report.score)).toEqual([20]);
+});
+
+// A peer on an older catalog validates the whole payload strictly: one row in a
+// category it does not know would make it drop every measurement from us.
+it('sends a requester only the categories it can parse, and the pre-expansion set to one that does not say', async () => {
+  const source = deps([row('security', 80), row('privacy', 60)]);
+  const legacy = await exportPortosQuality(peer.instanceId, 30, source);
+  expect(legacy.measurements.map(m => m.report.category)).toEqual(['security']);
+  const current = await exportPortosQuality(peer.instanceId, 30, source, undefined, ['security', 'privacy']);
+  expect(current.measurements.map(m => m.report.category).sort()).toEqual(['privacy', 'security']);
+  expect(FEDERATION_LEGACY_CATEGORIES).toHaveLength(25);
+});
+
+it('keeps a newer peer\'s known categories when it also sends one this install cannot parse', async () => {
+  const remote = await exportPortosQuality(peer.instanceId, 30, deps([row('security', 80)]));
+  const withUnknown = { ...remote, measurements: [...remote.measurements,
+    { ...remote.measurements[0], measurementId: 'c'.repeat(64), report: { ...remote.measurements[0].report, category: 'example-future-lens' } }] };
+  const { records, federation } = await collectPortosQuality(30, { ...deps([]), peerFetch: async () => response(withUnknown) });
+  expect(records.map(record => record.category)).toEqual(['security']);
+  expect(federation).toMatchObject({ available: 1, unavailable: 0 });
+});
+
+it('reads stored lifecycle measurements under the renamed category', async () => {
+  const [app] = await enrichAppsWithQuality(
+    [{ id: 'portos-default' }],
+    deps([row('react-lifecycle', 73)]),
+  );
+  expect(app.quality.categories.find(category => category.id === 'ui-lifecycle'))
+    .toMatchObject({ score: 73, coverage: 'broad', stale: false });
+});
+
+it('keeps local scores on old, offline, malformed, oversize or mismatched peers and rejects future evidence', async () => {
+  const payload = await exportPortosQuality(peer.instanceId, 30, deps([row('security', 90)]));
+  const local = deps([row('security', 20)]);
+  for (const fetch of [
+    async () => new Response('', { status: 404 }),
+    async () => { throw new Error('offline'); },
+    async () => response({ ...payload, schemaVersion: 2 }),
+    async () => response({ ...payload, repository: '0'.repeat(64) }),
+    async () => new Response('too large', { headers: { 'content-length': '4194305' } }),
+  ]) {
+    const [app] = await enrichAppsWithQuality([{ id: 'portos-default' }], { ...local, peerFetch: fetch });
+    expect(app.quality).toMatchObject({ score: 20, federation: { available: 0, unavailable: 1 } });
+  }
+  // A malformed ROW costs that row, not the peer: the rest of its evidence counts.
+  const oneBad = { ...payload, measurements: [{ ...payload.measurements[0], report: { ...payload.measurements[0].report, score: 101 } }] };
+  const [partial] = await enrichAppsWithQuality([{ id: 'portos-default' }], { ...local, peerFetch: async () => response(oneBad) });
+  expect(partial.quality).toMatchObject({ score: 20, federation: { available: 1, unavailable: 0 } });
+  const future = { ...payload, measurements: [{ ...payload.measurements[0], assessedAt: '2026-09-11T00:00:00Z' }] };
+  expect((await collectPortosQuality(30, { ...local, peerFetch: async () => response(future) })).records).toEqual([]);
+});
+
+it('lets newer partial evidence supersede older broad scores and breaks ties consistently', async () => {
+  const partial = row('security', 80);
+  partial.report.coverage = 'partial';
+  partial.report.scannedFiles = 1;
+  const payload = await exportPortosQuality(peer.instanceId, 30, deps([partial]));
+  const partialDeps = { ...deps([row('security', 20, '2026-09-09T10:00:00Z')]), peerFetch: async () => response(payload) };
+  expect((await enrichAppsWithQuality([{ id: 'portos-default' }], partialDeps))[0].quality.score).toBeNull();
+  expect((await getAppQualityHistory({ id: 'portos-default' }, 30, partialDeps)).points.at(-1).score).toBeNull();
+  const a = row('security', 25, undefined, { agent_id: 'run-a' });
+  const b = row('security', 75, undefined, { agent_id: 'run-b' });
+  const scores = [];
+  for (const [here, there] of [[a, b], [b, a]]) {
+    const shared = await exportPortosQuality(peer.instanceId, 30, deps([there]));
+    const combined = { ...deps([here]), peerFetch: async () => response(shared) };
+    scores.push((await enrichAppsWithQuality([{ id: 'portos-default' }], combined))[0].quality.score);
+    scores.push((await getAppQualityHistory({ id: 'portos-default' }, 30, combined)).points.at(-1).score);
+  }
+  expect(new Set(scores).size).toBe(1);
+});
+
+it('matches managed repositories with different local ids and excludes other origins', async () => {
+  const getOriginInfo = async path => ({ host: 'github.com', fullName: path === '/unrelated' ? 'owner/other' : 'owner/app' });
+  const source = { ...deps([row('security', 88)]), getOriginInfo };
+  const payload = await buildQualitySnapshot({ id: 'remote-id', repoPath: '/remote/app' }, 30, source);
+  const local = { ...deps([]), getOriginInfo, peerFetch: vi.fn(async () => response(payload)),
+    getAppById: async id => ({ id, repoPath: '/local/app' }) };
+  const [app] = await enrichAppsWithQuality([{ id: 'local-id', repoPath: '/local/app' }], local);
+  expect(app.quality).toMatchObject({ score: 88, federation: { available: 1 } });
+  expect(local.peerFetch.mock.calls[0][0]).toContain(`&repository=${payload.repository}`);
+  expect((await getAppQualityHistory({ id: 'local-id', repoPath: '/local/app' }, 30, local)).points.at(-1).score).toBe(88);
+  expect((await collectAppQuality({ id: 'other', repoPath: '/unrelated' }, 30, local)).records).toEqual([]);
+  source.getAllApps = async () => [{ id: 'remote-id', repoPath: '/remote/app' }];
+  expect(await exportPortosQuality(peer.instanceId, 30, source, payload.repository)).toEqual(payload);
+  expect(source.query.mock.calls.at(-1)[1][0]).toBe('remote-id');
+  expect(await exportPortosQuality(peer.instanceId, 30, source, '0'.repeat(64))).toBeNull();
+});
+
+// PortOS's own release evidence goes through the same `.quality.json` path as
+// every managed app: same filename, same reader, same guards.
+it('loads release evidence without peers and never re-exports it', async () => {
+  const payload = await buildQualitySnapshot(undefined, 30, deps([row('security', 82)]));
+  const readPaths = [];
+  const local = { ...deps([]), getPeers: async () => [],
+    readFile: async path => { readPaths.push(path); return JSON.stringify(payload); } };
+  expect((await enrichAppsWithQuality([{ id: 'portos-default' }], local))[0].quality.score).toBe(82);
+  expect(readPaths.length).toBeGreaterThan(0);
+  expect(readPaths.every(path => path.endsWith('.quality.json'))).toBe(true);
+  expect((await getAppQualityHistory({ id: 'portos-default' }, 30, local)).points.at(-1).score).toBe(82);
+  expect((await buildQualitySnapshot(undefined, 30, local)).measurements).toEqual([]);
+  expect(await readReleaseQuality({ ...local, getOriginInfo: async () => ({ host: 'github.com', fullName: 'fork/PortOS' }) })).toEqual([]);
+  expect(await readReleaseQuality({ ...local, readFile: async () => 'broken' })).toEqual([]);
+});
+
+
+const newerInstallSnapshot = (repository, assessedAt) => JSON.stringify({
+  schemaVersion: 2, repository, reportVersion: 1,
+  categories: ['security', 'example-future-lens'],
+  coverage: ['broad', 'partial', 'unavailable', 'not-applicable'], confidence: ['low', 'medium', 'high'],
+  measurements: [[assessedAt, 0, 76, 3, 0, 2, 10, 10], [assessedAt, 1, 50, 3, 0, 2, 10, 10]],
+});
+
+it('reads the known rows of a snapshot a newer install wrote with categories this one lacks', async () => {
+  const getOriginInfo = async () => ({ host: 'github.com', fullName: 'owner/app' });
+  const managed = { id: 'local-id', repoPath: '/repo/example-app' };
+  const { repository } = await buildQualitySnapshot(managed, 30, { ...deps([row('security', 76)]), getOriginInfo });
+  const body = newerInstallSnapshot(repository, '2026-09-10T10:00:00.000Z');
+  const records = await readReleaseQuality({ ...deps([]), getOriginInfo, getPeers: async () => [], readFile: async () => body }, managed);
+  expect(records.map(record => record.category)).toEqual(['security']);
+});
+
+it('reads a managed app\'s committed .quality.json as release evidence and rejects a foreign or broken one', async () => {
+  const getOriginInfo = async () => ({ host: 'github.com', fullName: 'owner/app' });
+  const managed = { id: 'local-id', repoPath: '/repo/example-app' };
+  const published = await buildQualitySnapshot(managed, 30, { ...deps([row('security', 76)]), getOriginInfo });
+  const file = body => ({ ...deps([]), getOriginInfo, getPeers: async () => [], readFile: async () => body });
+
+  const local = file(JSON.stringify(published));
+  const records = await readReleaseQuality(local, managed);
+  expect(records).toMatchObject([{ category: 'security', sourcePeerName: 'Release snapshot', report: { score: 76 } }]);
+  expect(JSON.stringify(records)).not.toMatch(/Users|agent-security|app_id|github/);
+  expect((await enrichAppsWithQuality([managed], local))[0].quality.score).toBe(76);
+  expect((await getAppQualityHistory(managed, 30, local)).points.at(-1).score).toBe(76);
+
+  // A different fork's snapshot is never mixed in.
+  expect(await readReleaseQuality({ ...local, getOriginInfo: async () => ({ host: 'github.com', fullName: 'owner/other' }) }, managed)).toEqual([]);
+  expect(await readReleaseQuality(file('not json'), managed)).toEqual([]);
+  expect(await readReleaseQuality(file(JSON.stringify({ ...published, schemaVersion: 2 })), managed)).toEqual([]);
+  expect(await readReleaseQuality(file(JSON.stringify({ quality: published })), managed)).toEqual([]);
+  expect(await readReleaseQuality(local, { id: 'local-id' })).toEqual([]);
+});
+
+it('reads v2 and legacy snapshot files without writing, and drops future dates', async () => {
+  const getOriginInfo = async () => ({ host: 'github.com', fullName: 'owner/app' });
+  const managed = { id: 'local-id', repoPath: '/repo/example-app' };
+  const published = await buildQualitySnapshot(managed, 30, { ...deps([row('security', 76)]), getOriginInfo });
+  const v2 = qualityFileFromWireSnapshot(published);
+  const writes = [];
+  const file = bodyFor => ({
+    ...deps([]), getOriginInfo, getPeers: async () => [],
+    writeFile: async () => { writes.push('write'); },
+    readFile: async path => bodyFor(path),
+  });
+
+  const records = await readReleaseQuality(file(() => v2), managed);
+  expect(records).toMatchObject([{ category: 'security', sourcePeerName: 'Release snapshot', report: { score: 76 } }]);
+  expect(writes).toEqual([]);
+  expect(v2).not.toContain('measurementId');
+  expect(v2).not.toContain(published.measurements[0].measurementId);
+  expect(JSON.stringify(records)).not.toMatch(/Users|agent-security|app_id|github/);
+
+  const legacy = await readReleaseQuality(file(path => {
+    if (path.endsWith('.quality.json')) throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+    return JSON.stringify(published);
+  }), managed);
+  expect(legacy).toMatchObject([{ report: { score: 76 } }]);
+
+  const occupied = await readReleaseQuality(file(path => {
+    if (path.endsWith('.quality.json')) return JSON.stringify({ schemaVersion: 3 });
+    return JSON.stringify(published);
+  }), managed);
+  expect(occupied).toEqual([]);
+
+  const future = JSON.parse(v2);
+  future.measurements.push(['2026-09-11T00:00:00.000Z', 0, 10, 1, 0, 2, 12, 12]);
+  expect(await readReleaseQuality(file(() => JSON.stringify(future)), managed)).toMatchObject([{ report: { score: 76 } }]);
+});
+
+it('keeps one broken checkout from failing the whole list or its own history read', async () => {
+  // execGit rejecting inside repositoryKey (spawn failure, timeout) used to
+  // escape both release reads and 500 GET /api/apps?includeQuality=true.
+  const getOriginInfo = async path => {
+    if (path === '/repo/broken') throw new Error('git spawn failed');
+    return { host: 'github.com', fullName: 'owner/app' };
+  };
+  const healthy = { id: 'healthy-id', repoPath: '/repo/example-app' };
+  const broken = { id: 'broken-id', repoPath: '/repo/broken' };
+  const published = await buildQualitySnapshot(healthy, 30, { ...deps([row('security', 64)]), getOriginInfo });
+  const local = { ...deps([]), getOriginInfo, getPeers: async () => [], readFile: async () => JSON.stringify(published) };
+
+  const apps = await enrichAppsWithQuality([healthy, broken], local);
+  expect(apps.map(entry => entry.id)).toEqual(['healthy-id', 'broken-id']);
+  expect(apps[0].quality.score).toBe(64);
+  expect(apps[1].quality.score).toBeNull();
+  expect((await getAppQualityHistory(broken, 30, local)).points.at(-1).score).toBeNull();
+});

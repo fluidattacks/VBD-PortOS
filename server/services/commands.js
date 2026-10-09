@@ -1,0 +1,123 @@
+import { spawn } from '../lib/childProcess.js';
+import { logAction } from './history.js';
+import { ALLOWED_COMMANDS, validateCommand } from '../lib/commandSecurity.js';
+import { safeChildProcessEnv } from '../lib/processEnv.js';
+import { withSpawnCwdEnv } from '../lib/spawnCwd.js';
+
+// Track active commands
+const activeCommands = new Map();
+
+/**
+ * Execute a shell command with safety checks
+ *
+ * Security measures:
+ * 1. Base command must be in allowlist
+ * 2. Command cannot contain shell metacharacters that enable injection
+ * 3. Command executed via spawn with shell:false where possible
+ */
+export function executeCommand(command, workspacePath, onData, onComplete) {
+  const commandId = Date.now().toString(36) + Math.random().toString(36).substr(2);
+
+  const validation = validateCommand(command);
+  if (!validation.valid) {
+    const trimmedForLog = (command || '').trim();
+    onComplete?.({ success: false, error: validation.error, exitCode: 1 });
+    if (trimmedForLog) {
+      logAction('command', null, trimmedForLog.substring(0, 50), { command: trimmedForLog, workspacePath }, false, validation.error);
+    }
+    return null;
+  }
+
+  const { baseCommand, args } = validation;
+  const startTime = Date.now();
+  let output = '';
+  let settled = false;
+
+  // Security: Use spawn with array of args (shell:false) to prevent shell injection.
+  // validateCommand has already rejected shell metacharacters AND parsed quoted args
+  // correctly (e.g. 'git commit -m "msg with spaces"' becomes 4 args, not 5).
+  // safeChildProcessEnv matches the other spawn sites (ffmpeg, python, media):
+  // it strips macOS Malloc* debug noise but intentionally inherits the rest of
+  // the parent env — allowlisted commands like gh/git/npm legitimately need
+  // PATH/HOME and their auth tokens.
+  // Pin PWD to the spawn cwd — see withSpawnCwdEnv (#3193). The allowlist
+  // includes AI CLIs, so a command run against an app workspace must not be told
+  // it lives in the PortOS checkout.
+  const commandCwd = workspacePath || process.cwd();
+  const child = spawn(baseCommand, args, {
+    cwd: commandCwd,
+    env: withSpawnCwdEnv(safeChildProcessEnv({ FORCE_COLOR: '1' }), commandCwd),
+    shell: false
+  });
+
+  activeCommands.set(commandId, child);
+
+  child.stdout.on('data', (data) => {
+    const text = data.toString();
+    output += text;
+    onData?.(text, 'stdout');
+  });
+
+  child.stderr.on('data', (data) => {
+    const text = data.toString();
+    output += text;
+    onData?.(text, 'stderr');
+  });
+
+  child.on('close', (code) => {
+    if (settled) return;
+    settled = true;
+    activeCommands.delete(commandId);
+    const runtime = Date.now() - startTime;
+    const success = code === 0;
+
+    logAction('command', null, command.substring(0, 50), {
+      command,
+      workspacePath,
+      exitCode: code,
+      runtime,
+      output: output.substring(0, 10000) // Truncate to prevent huge history
+    }, success, success ? null : `Exit code ${code}`);
+
+    onComplete?.({
+      success,
+      exitCode: code,
+      runtime,
+      output
+    });
+  });
+
+  child.on('error', (err) => {
+    if (settled) return;
+    settled = true;
+    activeCommands.delete(commandId);
+    logAction('command', null, command.substring(0, 50), { command, workspacePath }, false, err.message);
+    onComplete?.({
+      success: false,
+      error: err.message,
+      exitCode: 1
+    });
+  });
+
+  return commandId;
+}
+
+/**
+ * Stop a running command
+ */
+export function stopCommand(commandId) {
+  const child = activeCommands.get(commandId);
+  if (child) {
+    child.kill('SIGTERM');
+    activeCommands.delete(commandId);
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Get list of allowed commands
+ */
+export function getAllowedCommands() {
+  return Array.from(ALLOWED_COMMANDS).sort();
+}

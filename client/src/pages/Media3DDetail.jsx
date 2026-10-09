@@ -1,0 +1,304 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { Link, useNavigate, useParams } from 'react-router';
+import { ArrowLeft, Boxes, AlertTriangle, Loader2, RefreshCw, Trash2 } from 'lucide-react';
+import { getImageTo3dModel, generateImageTo3dModel, deleteImageTo3dModel, imageTo3dAssetUrl, imageTo3dFullMeshUrl } from '../services/api';
+import useMounted from '../hooks/useMounted';
+import { useModelLifecycle } from '../hooks/useModelLifecycle';
+import { timeAgo } from '../utils/formatters';
+import GlbViewer from '../components/media/GlbViewer';
+import MediaImage from '../components/MediaImage';
+import InlineConfirmRow from '../components/ui/InlineConfirmRow';
+import ImageTo3dRenderOptions from '../components/media/ImageTo3dRenderOptions';
+import RigPanel from '../components/media/RigPanel';
+import ArExportPanel from '../components/media/ArExportPanel';
+import {
+  fieldsFromRun, renderOptionsBody, runWantsTransparency, SUBJECT_SCALE_DEFAULT,
+} from '../lib/imageTo3dRenderOptions';
+import { imageTo3dStatusMeta } from '../components/media/imageTo3dStatus';
+import toast from '../components/ui/Toast';
+import PageSkeleton from '../components/ui/PageSkeleton';
+
+// Per-record detail view for an image-to-3D model (`/3d/:id`). The record
+// id is the URL, so a finished mesh is a shareable, reload-safe deep link. Mounts
+// the reusable GlbViewer once the render lands (status `ready` + `assetPath`),
+// with a Download .glb, and offers re-render / delete. Refreshes on model events.
+export default function Media3DDetail() {
+  const { id } = useParams();
+  const navigate = useNavigate();
+  const mountedRef = useMounted();
+  const { data: record, updateData: setRecord, refetch, loading, error } = useModelLifecycle(id, getImageTo3dModel);
+  const notFound = !loading && !error && !record;
+  useEffect(() => {
+    if (error) toast.error(error.message || 'Could not refresh the model');
+  }, [error]);
+  const [busy, setBusy] = useState(false);
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  // The three.js graph GlbViewer has loaded, handed up so the AR panel can
+  // re-serialize the very scene on screen to USDZ. `null` until the GLB parses
+  // (and again when it unloads) — the export button stays disabled until then.
+  const [loadedScene, setLoadedScene] = useState(null);
+  // Per-run knobs, seeded from the latest run once per id (NOT on every poll
+  // tick — that would clobber in-progress edits). Seed stays blank by design:
+  // see fieldsFromRun.
+  const [steps, setSteps] = useState('');
+  const [seed, setSeed] = useState('');
+  const [keyBackground, setKeyBackground] = useState(false);
+  const [detail, setDetail] = useState('auto');
+  const [alphaMode, setAlphaMode] = useState('');
+  const [normalMap, setNormalMap] = useState(false);
+  const [subjectScale, setSubjectScale] = useState(SUBJECT_SCALE_DEFAULT);
+  const optionsSeededFor = useRef(null);
+  const routeIdRef = useRef(id);
+  const routeGenerationRef = useRef(0);
+  // Invalidate an older request during render so it cannot win between the
+  // route commit and the passive effect that starts the replacement request.
+  if (routeIdRef.current !== id) {
+    routeIdRef.current = id;
+    routeGenerationRef.current += 1;
+  }
+  const routeGeneration = routeGenerationRef.current;
+  const updateRecordForRoute = useCallback((next) => {
+    if (!next || !mountedRef.current || routeIdRef.current !== id
+      || routeGenerationRef.current !== routeGeneration || String(next.id) !== id) return;
+    setRecord(next);
+  }, [id, mountedRef, routeGeneration, setRecord]);
+
+  // Reset edit state only on route entry; progress must not clobber drafts.
+  useEffect(() => {
+    setBusy(false); setConfirmingDelete(false);
+    optionsSeededFor.current = null;
+    setSteps(''); setSeed(''); setKeyBackground(false); setDetail('auto');
+    setAlphaMode(''); setNormalMap(false); setSubjectScale(SUBJECT_SCALE_DEFAULT);
+    setLoadedScene(null);
+  }, [id]);
+
+  // Seed the option fields from the latest run once per id.
+  useEffect(() => {
+    if (!record || String(record.id) !== id || optionsSeededFor.current === id) return;
+    optionsSeededFor.current = id;
+    const fields = fieldsFromRun(record.runs?.at?.(-1));
+    setSteps(fields.steps);
+    setSeed(fields.seed);
+    setKeyBackground(fields.keyBackground);
+    setDetail(fields.detail);
+    setAlphaMode(fields.alphaMode);
+    setNormalMap(fields.normalMap);
+    setSubjectScale(fields.subjectScale);
+  }, [id, record]);
+
+  const handleRegenerate = useCallback(async () => {
+    if (busy || record?.status === 'generating') return;
+    const requestedId = id;
+    const requestedGeneration = routeGenerationRef.current;
+    const isCurrentRoute = () => mountedRef.current
+      && routeIdRef.current === requestedId
+      && routeGenerationRef.current === requestedGeneration;
+    setBusy(true);
+    const next = await generateImageTo3dModel(
+      requestedId,
+      renderOptionsBody({ steps, seed, keyBackground, detail, alphaMode, normalMap, subjectScale }),
+      { silent: true },
+    ).catch((err) => {
+      if (isCurrentRoute()) toast.error(err?.message || 'Could not start the render.');
+      return null;
+    });
+    if (isCurrentRoute()) {
+      setBusy(false);
+      if (next && String(next.id) === requestedId) {
+        setRecord(next);
+        // Completion can beat the POST response; reconcile after applying it.
+        refetch();
+      }
+    }
+  }, [busy, record?.status, id, steps, seed, keyBackground, detail, alphaMode, normalMap,
+    subjectScale, mountedRef, setRecord, refetch]);
+
+  const handleDelete = useCallback(async () => {
+    const requestedId = id;
+    const requestedGeneration = routeGenerationRef.current;
+    const isCurrentRoute = () => mountedRef.current
+      && routeIdRef.current === requestedId
+      && routeGenerationRef.current === requestedGeneration;
+    const ok = await deleteImageTo3dModel(requestedId, { silent: true }).then(() => true).catch((err) => {
+      if (isCurrentRoute()) toast.error(err?.message || 'Delete failed');
+      return false;
+    });
+    if (ok && isCurrentRoute()) navigate('/3d');
+  }, [id, navigate, mountedRef]);
+
+  const recordMatchesRoute = record && String(record.id) === id;
+  if (loading || (record && !recordMatchesRoute)) {
+    return (
+      <div className="mx-auto max-w-4xl">
+        <PageSkeleton
+          label="Loading 3D model"
+          headerRowClass="flex flex-wrap items-center justify-between gap-3"
+          titleWidthClass="w-56"
+          cards={2}
+          sidebar={false}
+        />
+      </div>
+    );
+  }
+
+  if (notFound || !record) {
+    return (
+      <div className="mx-auto max-w-4xl py-16 text-center">
+        <p className="text-sm text-gray-400">{error ? 'Could not load this 3D model. Return to this tab or reconnect to retry.' : 'This 3D model no longer exists.'}</p>
+        <Link to="/3d" className="mt-3 inline-flex items-center gap-1.5 text-sm text-port-accent hover:underline">
+          <ArrowLeft className="h-4 w-4" /> Back to 3D
+        </Link>
+      </div>
+    );
+  }
+
+  const isGenerating = record.status === 'generating';
+  const latestRun = Array.isArray(record.runs) && record.runs.length ? record.runs[record.runs.length - 1] : null;
+  const percent = Number.isFinite(latestRun?.percent) ? Math.round(latestRun.percent) : null;
+  // Re-renders overwrite the same model.glb path. Key the fetch to the completed
+  // generation so drei's URL cache loads the new bytes when this record is rendered
+  // again, while old records without generatedAt retain their historical URL.
+  // Read from the last run rather than the live form: the form is what the NEXT
+  // render will use, while the mesh on screen came from the last one.
+  const renderedTransparent = runWantsTransparency(record?.runs?.at?.(-1));
+  const meshSrc = record.generatedAt
+    ? `${record.assetPath}?v=${encodeURIComponent(record.generatedAt)}`
+    : record.assetPath;
+
+  return (
+    <div className="mx-auto max-w-4xl">
+      <header className="mb-4">
+        <Link to="/3d" className="inline-flex items-center gap-1.5 text-xs text-gray-400 hover:text-white">
+          <ArrowLeft className="h-3.5 w-3.5" /> Back to 3D
+        </Link>
+        <div className="mt-2 flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <Boxes className="h-5 w-5 text-port-accent" />
+            <h1 className="text-lg font-semibold text-white">{record.name || 'Untitled 3D model'}</h1>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={handleRegenerate}
+              disabled={busy || isGenerating}
+              className="inline-flex items-center gap-1.5 rounded-md border border-port-border px-3 py-1.5 text-xs text-gray-300 hover:border-port-accent hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <RefreshCw className={`h-3.5 w-3.5 ${busy ? 'animate-spin' : ''}`} /> {record.status === 'ready' ? 'Re-render' : 'Retry'}
+            </button>
+            <button
+              type="button"
+              onClick={() => setConfirmingDelete(true)}
+              className="inline-flex items-center gap-1.5 rounded-md border border-port-error/40 px-3 py-1.5 text-xs text-port-error hover:bg-port-error/10"
+            >
+              <Trash2 className="h-3.5 w-3.5" /> Delete
+            </button>
+          </div>
+        </div>
+        <p className="mt-1 text-xs text-gray-500">
+          {imageTo3dStatusMeta(record.status).label}
+          {isGenerating && percent !== null ? ` · ${percent}%` : ''}
+          {Number.isInteger(latestRun?.seed) ? ` · seed ${latestRun.seed}` : ''}
+          {Number.isInteger(latestRun?.steps) ? ` · ${latestRun.steps} steps` : ''}
+          {latestRun?.sourceKeyed ? ' · background keyed' : ''}
+          {latestRun?.sourceFramed && Number.isFinite(latestRun?.subjectScale)
+            ? ` · framed at ${Math.round(latestRun.subjectScale * 100)}%`
+            : ''}
+          {' '}· updated {timeAgo(record.updatedAt)}
+        </p>
+      </header>
+
+      <div className="mb-4 rounded-lg border border-port-border bg-port-card p-3">
+        <ImageTo3dRenderOptions
+          stepsSupported={record.supportsRenderOptions?.steps !== false}
+          detailSupported={record.supportsRenderOptions?.detail !== false}
+          alphaModeSupported={record.supportsRenderOptions?.alphaMode !== false}
+          steps={steps}
+          onStepsChange={setSteps}
+          seed={seed}
+          onSeedChange={setSeed}
+          keyBackground={keyBackground}
+          onKeyBackgroundChange={setKeyBackground}
+          detail={detail}
+          onDetailChange={setDetail}
+          alphaMode={alphaMode}
+          onAlphaModeChange={setAlphaMode}
+          normalMapSupported={record.supportsRenderOptions?.normalMap !== false}
+          normalMap={normalMap}
+          onNormalMapChange={setNormalMap}
+          subjectScale={subjectScale}
+          onSubjectScaleChange={setSubjectScale}
+          sourcePreviewUrl={record.sourceImage?.path || null}
+          disabled={busy || isGenerating}
+        />
+      </div>
+
+      {confirmingDelete && (
+        <InlineConfirmRow
+          className="mb-4"
+          question={`Delete "${record.name || 'this model'}"?`}
+          onConfirm={handleDelete}
+          onCancel={() => setConfirmingDelete(false)}
+        />
+      )}
+
+      {record.status === 'failed' && record.error && (
+        <div role="status" className="mb-4 flex items-start gap-1.5 rounded-lg border border-port-error/30 bg-port-error/10 px-3 py-2 text-sm text-port-error">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" /> {record.error}
+        </div>
+      )}
+
+      <section className="grid gap-4 sm:grid-cols-[200px_1fr]">
+        <div>
+          <span className="mb-1 block text-xs text-gray-400">Source image</span>
+          <div className="aspect-square overflow-hidden rounded-lg border border-port-border bg-port-bg">
+            {record.sourceImage?.path && (
+              <MediaImage src={record.sourceImage.path} alt="Source image" className="h-full w-full object-cover" />
+            )}
+          </div>
+        </div>
+
+        <div>
+          <span className="mb-1 block text-xs text-gray-400">Mesh</span>
+          {record.status === 'ready' && record.assetPath ? (
+            <>
+              {/* The viewer is the THIRD layer that can flatten alpha, after the
+                  exporter's own alpha_mode and PortOS's GLB rewrite. It has to agree
+                  with the run's request, or a mesh exported as BLEND still renders
+                  solid here and reads as a broken exporter. */}
+              <GlbViewer
+                src={meshSrc}
+                downloadHref={imageTo3dAssetUrl(record.id)}
+                forceOpaque={!renderedTransparent}
+                onSceneLoaded={setLoadedScene}
+              />
+              {/* The viewer loads the decimated GLB because that is what a browser
+                  can render; the decoder's full mesh is an order of magnitude
+                  larger. Offer it, but say what it actually is so nobody downloads
+                  several hundred MB expecting a textured model. */}
+              <a
+                href={imageTo3dFullMeshUrl(record.id)}
+                className="mt-2 inline-block text-xs text-gray-400 underline decoration-dotted hover:text-gray-200"
+              >
+                Download full-resolution mesh (.obj — geometry only, no textures)
+              </a>
+            </>
+          ) : (
+            <div className="flex aspect-square items-center justify-center rounded-xl border border-dashed border-port-border bg-port-bg text-center text-sm text-gray-500">
+              {isGenerating ? (
+                <span className="inline-flex items-center gap-2 text-port-accent">
+                  <Loader2 className="h-4 w-4 animate-spin" /> Rendering{percent !== null ? ` ${percent}%` : '…'}
+                </span>
+              ) : (
+                'No mesh yet — run a render to generate one.'
+              )}
+            </div>
+          )}
+        </div>
+      </section>
+
+      <ArExportPanel record={record} scene={loadedScene} onRecordChange={updateRecordForRoute} />
+
+      <RigPanel record={record} onRecordChange={updateRecordForRoute} />
+    </div>
+  );
+}

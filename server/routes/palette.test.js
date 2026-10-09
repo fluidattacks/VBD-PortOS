@@ -1,0 +1,237 @@
+import { describe, it, expect, vi } from 'vitest';
+import express from 'express';
+import { request } from '../lib/testHelper.js';
+import { errorMiddleware } from '../lib/errorHandler.js';
+
+// Stub voice tool side-effects — the palette dispatches them, but we only
+// want to verify routing and whitelisting here.
+vi.mock('../services/brain.js', () => ({
+  captureThought: vi.fn(async () => ({ inboxLog: { id: 'inbox-1' }, message: 'ok' })),
+  getInboxLog: vi.fn(async () => []),
+}));
+vi.mock('../services/meatspaceAlcohol.js', () => ({
+  logDrink: vi.fn(async () => ({ standardDrinks: 1, dayTotal: 1 })),
+  getAlcoholSummary: vi.fn(async () => ({ today: 0 })),
+}));
+vi.mock('../services/meatspaceNicotine.js', () => ({
+  logNicotine: vi.fn(async () => ({ totalMg: 1, dayTotal: 1 })),
+  getNicotineSummary: vi.fn(async () => ({ today: 0 })),
+}));
+vi.mock('../services/meatspaceHealth.js', () => ({
+  addBodyEntry: vi.fn(async () => ({ date: '2026-04-24' })),
+}));
+vi.mock('../services/identity.js', () => ({
+  getGoals: vi.fn(async () => ({ goals: [] })),
+  updateGoalProgress: vi.fn(async () => {}),
+  addProgressEntry: vi.fn(async () => {}),
+}));
+vi.mock('../services/pm2.js', () => ({
+  listProcesses: vi.fn(async () => [{ name: 'api', status: 'online', restarts: 0 }]),
+  restartApp: vi.fn(async () => {}),
+}));
+vi.mock('../services/feeds.js', () => ({
+  getItems: vi.fn(async () => []),
+  getFeeds: vi.fn(async () => []),
+}));
+vi.mock('../services/catalogDB.js', () => ({
+  listIngredients: vi.fn(async () => ({
+    items: [
+      { id: 'character-1', type: 'character', name: 'Mira', payload: { physicalDescription: 'A tall stoic ranger.' }, tags: [] },
+    ],
+    nextOffset: 1,
+  })),
+  listRefsForIngredient: vi.fn(async () => [{ ingredientId: 'character-1', refKind: 'universe', refId: 'u1', role: 'cast' }]),
+}));
+vi.mock('../services/apps.js', () => ({
+  getActiveApps: vi.fn(async () => [{ id: 'bookloom', name: 'BookLoom' }]),
+  PORTOS_APP_ID: 'portos-default',
+}));
+vi.mock('../lib/appResolver.js', () => ({
+  resolveAppByPhrase: vi.fn((phrase, apps) =>
+    (apps || []).find((a) => a.name.toLowerCase().includes(String(phrase).toLowerCase())) || null,
+  ),
+}));
+vi.mock('../services/workspaceContext.js', () => ({
+  snapshotOnRepoSwitch: vi.fn(async () => ({ appId: 'portos-default' })),
+  restoreContext: vi.fn(async () => ({
+    saved: { branch: 'main' },
+    restorable: { shellSessions: [{ sessionId: 's1' }, { sessionId: 's2' }], missingShellSessionIds: [], branchMatches: true },
+  })),
+}));
+vi.mock('../services/askService.js', () => ({
+  VALID_MODES: new Set(['ask', 'advise', 'draft']),
+  runAsk: vi.fn(async function* () {
+    yield { type: 'sources', sources: [{ kind: 'memory', title: 'A note' }] };
+    yield {
+      type: 'done',
+      answer: 'Here is the answer.',
+      sources: [{ kind: 'memory', title: 'A note' }],
+      providerId: 'p1',
+      model: 'm1',
+    };
+  }),
+}));
+
+const { default: paletteRoutes } = await import('./palette.js');
+
+const makeApp = () => {
+  const app = express();
+  app.use(express.json());
+  app.use('/api/palette', paletteRoutes);
+  app.use(errorMiddleware);
+  return app;
+};
+
+describe('GET /api/palette/manifest', () => {
+  it('returns nav commands and palette-safe actions', async () => {
+    const res = await request(makeApp()).get('/api/palette/manifest');
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.nav)).toBe(true);
+    expect(Array.isArray(res.body.actions)).toBe(true);
+    expect(res.body.nav.length).toBeGreaterThan(50);
+
+    // Every nav entry is fully formed — the client fuzzy-matches on these.
+    for (const cmd of res.body.nav) {
+      expect(cmd.id).toBeTruthy();
+      expect(cmd.path).toMatch(/^\//);
+      expect(cmd.label).toBeTruthy();
+      expect(cmd.section).toBeTruthy();
+    }
+
+    // Action descriptions hydrate from the voice tool registry, proving the
+    // DRY link between voice schema and palette metadata.
+    const brainCapture = res.body.actions.find((a) => a.id === 'brain_capture');
+    expect(brainCapture).toBeTruthy();
+    expect(brainCapture.description).toMatch(/capture/i);
+    expect(brainCapture.parameters?.properties?.text).toBeTruthy();
+  });
+
+  it('excludes DOM-driving ui_* tools (ui_click / ui_fill / ui_navigate need a live voice DOM); ui_ask is the explicit exception', async () => {
+    const res = await request(makeApp()).get('/api/palette/manifest');
+    const ids = res.body.actions.map((a) => a.id);
+    expect(ids).not.toContain('ui_click');
+    expect(ids).not.toContain('ui_fill');
+    expect(ids).not.toContain('ui_navigate');
+    expect(ids).toContain('ui_ask');
+  });
+
+  it('exposes the new user-invocable actions (calendar/weather/timer/workout)', async () => {
+    const res = await request(makeApp()).get('/api/palette/manifest');
+    const ids = res.body.actions.map((a) => a.id);
+    expect(ids).toContain('calendar_today');
+    expect(ids).toContain('calendar_next');
+    expect(ids).toContain('weather_now');
+    expect(ids).toContain('timer_set');
+    expect(ids).toContain('meatspace_log_workout');
+  });
+
+  it('exposes workspace_switch with its description + workspace param hydrated from the voice tool', async () => {
+    const res = await request(makeApp()).get('/api/palette/manifest');
+    const action = res.body.actions.find((a) => a.id === 'workspace_switch');
+    expect(action).toBeTruthy();
+    expect(action.section).toBe('Workspace');
+    expect(action.label).toMatch(/switch workspace/i);
+    // Description/params hydrate from the voice tool registry (DRY link).
+    expect(action.description).toMatch(/workspace|project/i);
+    expect(action.parameters?.properties?.workspace).toBeTruthy();
+  });
+
+  it('keeps ui_describe_visually OFF the palette (no screenshot context)', async () => {
+    const res = await request(makeApp()).get('/api/palette/manifest');
+    const ids = res.body.actions.map((a) => a.id);
+    expect(ids).not.toContain('ui_describe_visually');
+  });
+
+  it('exposes catalog_lookup with type+query parameters hydrated from the voice tool', async () => {
+    const res = await request(makeApp()).get('/api/palette/manifest');
+    const action = res.body.actions.find((a) => a.id === 'catalog_lookup');
+    expect(action).toBeTruthy();
+    expect(action.section).toBe('Catalog');
+    expect(action.label).toMatch(/look up/i);
+    expect(action.parameters?.properties?.query).toBeTruthy();
+    expect(action.parameters?.properties?.type?.enum).toEqual(
+      expect.arrayContaining(['character', 'place', 'object', 'idea', 'scene', 'concept']),
+    );
+  });
+
+  it('exposes ui_ask in the manifest with description hydrated from voice tools', async () => {
+    const res = await request(makeApp()).get('/api/palette/manifest');
+    const askAction = res.body.actions.find((a) => a.id === 'ui_ask');
+    expect(askAction).toBeTruthy();
+    expect(askAction.label).toBe('Ask Yourself');
+    expect(askAction.section).toBe('Ask');
+    expect(askAction.description).toMatch(/digital twin|retrieval/i);
+    expect(askAction.parameters?.properties?.question).toBeTruthy();
+  });
+});
+
+describe('POST /api/palette/action/:id', () => {
+  it('dispatches a whitelisted action and returns its result', async () => {
+    const res = await request(makeApp())
+      .post('/api/palette/action/brain_capture')
+      .send({ args: { text: 'remember to drink water' } });
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(true);
+    expect(res.body.result.id).toBe('inbox-1');
+    expect(res.body.result.summary).toMatch(/Captured/);
+  });
+
+  it('rejects unknown action ids', async () => {
+    const res = await request(makeApp())
+      .post('/api/palette/action/unknown_tool')
+      .send({ args: {} });
+    expect(res.status).toBe(404);
+  });
+
+  it('rejects non-whitelisted voice tools even if they exist', async () => {
+    // ui_click is a real voice tool but intentionally not in the palette
+    // whitelist — the palette has no DOM context to drive.
+    const res = await request(makeApp())
+      .post('/api/palette/action/ui_click')
+      .send({ args: { label: 'Save' } });
+    expect(res.status).toBe(404);
+  });
+
+  it('dispatches catalog_lookup and returns shaped results with snippet + refsCount', async () => {
+    const res = await request(makeApp())
+      .post('/api/palette/action/catalog_lookup')
+      .send({ args: { query: 'Mira' } });
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(true);
+    expect(res.body.result.count).toBe(1);
+    const hit = res.body.result.results[0];
+    expect(hit).toMatchObject({ id: 'character-1', type: 'character', name: 'Mira', refsCount: 1 });
+    expect(hit.snippet).toMatch(/tall stoic ranger/);
+  });
+
+  it('dispatches workspace_switch — snapshots the leaving workspace then restores the target', async () => {
+    const res = await request(makeApp())
+      .post('/api/palette/action/workspace_switch')
+      .send({ args: { workspace: 'BookLoom' } });
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(true);
+    expect(res.body.result.workspace).toBe('bookloom');
+    expect(res.body.result.reattachable).toBe(2);
+    expect(res.body.result.snapshotted).toBe('portos-default');
+    expect(res.body.result.summary).toMatch(/Switched to BookLoom/);
+  });
+
+  it('workspace_switch reports an unknown workspace instead of throwing', async () => {
+    const res = await request(makeApp())
+      .post('/api/palette/action/workspace_switch')
+      .send({ args: { workspace: 'nonexistent-app' } });
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(false);
+    expect(res.body.result.summary).toMatch(/don't see a project/i);
+  });
+
+  it('dispatches ui_ask through the palette and returns the answer + sources', async () => {
+    const res = await request(makeApp())
+      .post('/api/palette/action/ui_ask')
+      .send({ args: { question: 'what did I decide about exercise?' } });
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(true);
+    expect(res.body.result.content).toBe('Here is the answer.');
+    expect(res.body.result.sourceCount).toBe(1);
+  });
+});

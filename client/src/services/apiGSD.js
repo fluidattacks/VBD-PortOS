@@ -1,0 +1,20 @@
+import { request } from './apiCore.js';
+
+// GSD (Get Stuff Done) Integration
+export const getGsdProjects = () => request('/cos/gsd/projects');
+export const getGsdProject = (appId, options = {}) => request(`/cos/gsd/projects/${appId}`, options);
+export const getGsdPhases = (appId, options) => request(`/cos/gsd/projects/${appId}/phases`, options);
+export const createGsdConcernTasks = (appId, data, options = {}) => request(`/cos/gsd/projects/${appId}/concerns/tasks`, {
+  method: 'POST',
+  body: JSON.stringify(data),
+  ...options
+});
+export const triggerGsdPhaseAction = (appId, phaseId, action) => request(`/cos/gsd/projects/${appId}/phases/${phaseId}/action`, {
+  method: 'POST',
+  body: JSON.stringify({ action })
+});
+export const getGsdDocument = (appId, docName) => request(`/cos/gsd/projects/${appId}/documents/${docName}`);
+export const saveGsdDocument = (appId, docName, content, commitMessage) => request(`/cos/gsd/projects/${appId}/documents/${docName}`, {
+  method: 'PUT',
+  body: JSON.stringify({ content, ...(commitMessage && { commitMessage }) })
+});

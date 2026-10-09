@@ -1,0 +1,2443 @@
+-- PortOS Memory System Schema
+-- PostgreSQL + pgvector
+
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+-- Core memories table
+CREATE TABLE IF NOT EXISTS memories (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  type VARCHAR(20) NOT NULL,
+  content TEXT NOT NULL,
+  summary TEXT,
+  category VARCHAR(100) DEFAULT 'other',
+  tags TEXT[] DEFAULT '{}',
+  embedding vector(768),
+  embedding_model VARCHAR(100),
+  confidence FLOAT DEFAULT 0.8,
+  importance FLOAT DEFAULT 0.5,
+  access_count INT DEFAULT 0,
+  last_accessed TIMESTAMPTZ,
+  status VARCHAR(20) DEFAULT 'active',
+  source_task_id VARCHAR(100),
+  source_agent_id VARCHAR(100),
+  source_app_id VARCHAR(100),
+  expires_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  -- Federation sync sequence (auto-incrementing on insert/update)
+  sync_sequence BIGSERIAL
+);
+
+-- Schema upgrades: add columns that may not exist on older installs
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS sync_sequence BIGSERIAL;
+
+-- Machine-local memory history (#10494)
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS version INT NOT NULL DEFAULT 1;
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS archive_reason TEXT;
+CREATE TABLE IF NOT EXISTS memory_versions (
+  memory_id UUID NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+  version INT NOT NULL,
+  content TEXT NOT NULL,
+  summary TEXT,
+  type VARCHAR(20) NOT NULL,
+  category VARCHAR(100),
+  tags TEXT[],
+  changed_by VARCHAR(100),
+  change_reason TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (memory_id, version)
+);
+CREATE OR REPLACE FUNCTION record_memory_version() RETURNS TRIGGER AS $$
+BEGIN
+  IF ROW(OLD.content, OLD.summary, OLD.type, OLD.category, OLD.tags)
+     IS DISTINCT FROM ROW(NEW.content, NEW.summary, NEW.type, NEW.category, NEW.tags) THEN
+    INSERT INTO memory_versions
+      (memory_id, version, content, summary, type, category, tags, changed_by, change_reason)
+    VALUES (OLD.id, OLD.version, OLD.content, OLD.summary, OLD.type, OLD.category, OLD.tags,
+      NULLIF(current_setting('portos.memory_changed_by', true), ''),
+      NULLIF(current_setting('portos.memory_change_reason', true), ''));
+    NEW.version := OLD.version + 1;
+  ELSE
+    NEW.version := OLD.version;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = 'memories'::regclass AND tgname = 'memory_version_history') THEN
+    CREATE TRIGGER memory_version_history BEFORE UPDATE ON memories
+    FOR EACH ROW EXECUTE FUNCTION record_memory_version();
+  END IF;
+END$$;
+
+-- Origin instance tracking for federation
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS origin_instance_id VARCHAR(36);
+CREATE INDEX IF NOT EXISTS idx_memories_origin_instance ON memories (origin_instance_id);
+
+-- HNSW index for fast vector similarity search (O(log n) instead of O(n))
+CREATE INDEX IF NOT EXISTS idx_memories_embedding
+  ON memories USING hnsw (embedding vector_cosine_ops)
+  WITH (m = 16, ef_construction = 64);
+
+-- Full-text search index (replaces BM25)
+CREATE INDEX IF NOT EXISTS idx_memories_fts
+  ON memories USING gin (
+    to_tsvector('english', coalesce(content, '') || ' ' || coalesce(summary, ''))
+  );
+
+-- Filtered queries
+CREATE INDEX IF NOT EXISTS idx_memories_status ON memories (status);
+CREATE INDEX IF NOT EXISTS idx_memories_type ON memories (type);
+CREATE INDEX IF NOT EXISTS idx_memories_category ON memories (category);
+CREATE INDEX IF NOT EXISTS idx_memories_source_app ON memories (source_app_id);
+CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories (created_at);
+CREATE INDEX IF NOT EXISTS idx_memories_importance ON memories (importance);
+CREATE INDEX IF NOT EXISTS idx_memories_tags ON memories USING gin (tags);
+
+-- Sync sequence index for federation
+CREATE INDEX IF NOT EXISTS idx_memories_sync_sequence ON memories (sync_sequence);
+
+-- Versioned DB-migration tracker (#1029). Records which ordered migration files
+-- in server/scripts/db-migrations/ have been applied on THIS install. Part of
+-- the base schema (mirrored in db.js ensureSchema, parity-locked by
+-- db.ddlParity.test.js) so the boot-time runner can always read it.
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  id TEXT PRIMARY KEY,
+  applied_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Machine-local replay receipts for snapshot database restores (#9725): one row
+-- per committed restore operation, written inside the replay transaction.
+-- Mirrors restoreReceiptsDdl in server/lib/db/schema/core.js.
+CREATE TABLE IF NOT EXISTS restore_receipts (
+  operation_id UUID PRIMARY KEY,
+  dump_sha256 TEXT NOT NULL,
+  applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- MeatSpace POST normalized run/attempt history. Machine-local: personal
+-- performance evidence never rides federation.
+CREATE TABLE IF NOT EXISTS post_runs (
+  id TEXT PRIMARY KEY,
+  mode TEXT NOT NULL CHECK (mode IN ('benchmark', 'test', 'training')),
+  local_day DATE NOT NULL,
+  started_at TIMESTAMPTZ NOT NULL,
+  completed_at TIMESTAMPTZ,
+  status TEXT NOT NULL DEFAULT 'completed' CHECK (status IN ('planned', 'in_progress', 'completed')),
+  planned JSONB NOT NULL DEFAULT '{}'::jsonb,
+  data JSONB NOT NULL DEFAULT '{}'::jsonb,
+  legacy BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_post_runs_mode_day ON post_runs (mode, local_day DESC);
+CREATE INDEX IF NOT EXISTS idx_post_runs_started ON post_runs (started_at DESC);
+
+CREATE TABLE IF NOT EXISTS post_attempts (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES post_runs(id) ON DELETE CASCADE,
+  position INTEGER NOT NULL CHECK (position >= 0),
+  module TEXT NOT NULL,
+  drill_type TEXT NOT NULL,
+  difficulty JSONB,
+  config_version TEXT,
+  correct BOOLEAN,
+  score DOUBLE PRECISION CHECK (score IS NULL OR (score >= 0 AND score <= 100)),
+  latency_ms BIGINT NOT NULL DEFAULT 0 CHECK (latency_ms >= 0),
+  completion DOUBLE PRECISION CHECK (completion IS NULL OR (completion >= 0 AND completion <= 1)),
+  hint_used BOOLEAN NOT NULL DEFAULT FALSE,
+  confidence DOUBLE PRECISION CHECK (confidence IS NULL OR (confidence >= 0 AND confidence <= 1)),
+  input_mode TEXT NOT NULL DEFAULT 'unknown',
+  scorer_provenance TEXT NOT NULL DEFAULT 'unknown',
+  data JSONB NOT NULL DEFAULT '{}'::jsonb,
+  legacy BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (run_id, position)
+);
+CREATE INDEX IF NOT EXISTS idx_post_attempts_run ON post_attempts (run_id, position);
+CREATE INDEX IF NOT EXISTS idx_post_attempts_skill ON post_attempts (module, drill_type);
+
+-- Memory relationships. Typed (#10493): 'related' is symmetric and stored as a
+-- reverse pair; every other link_type is directed and stored as one row.
+CREATE TABLE IF NOT EXISTS memory_links (
+  source_id UUID REFERENCES memories(id) ON DELETE CASCADE,
+  target_id UUID REFERENCES memories(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  id UUID NOT NULL DEFAULT gen_random_uuid(),
+  link_type VARCHAR(32) NOT NULL DEFAULT 'related',
+  note TEXT,
+  created_by VARCHAR(100),
+  PRIMARY KEY (source_id, target_id, link_type)
+);
+-- Upgrade path for installs whose table predates typed links: existing rows take
+-- the 'related' default (and a fresh id), so nothing is lost.
+ALTER TABLE memory_links ADD COLUMN IF NOT EXISTS id UUID NOT NULL DEFAULT gen_random_uuid();
+ALTER TABLE memory_links ADD COLUMN IF NOT EXISTS link_type VARCHAR(32) NOT NULL DEFAULT 'related';
+ALTER TABLE memory_links ADD COLUMN IF NOT EXISTS note TEXT;
+ALTER TABLE memory_links ADD COLUMN IF NOT EXISTS created_by VARCHAR(100);
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint c
+      JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY (c.conkey)
+     WHERE c.conrelid = 'memory_links'::regclass AND c.contype = 'p' AND a.attname = 'link_type'
+  ) THEN
+    ALTER TABLE memory_links DROP CONSTRAINT memory_links_pkey;
+    ALTER TABLE memory_links ADD PRIMARY KEY (source_id, target_id, link_type);
+  END IF;
+END$$;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_links_id ON memory_links (id);
+CREATE INDEX IF NOT EXISTS idx_memory_links_target ON memory_links (target_id);
+
+-- Relationship / Tribe graph. People live in Postgres so they can be joined to
+-- Brain memories, touchpoint history, and calendar event references.
+CREATE TABLE IF NOT EXISTS tribe_people (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name TEXT NOT NULL,
+  relationship TEXT DEFAULT '',
+  ring VARCHAR(32) NOT NULL DEFAULT 'tribe',
+  cadence_days INTEGER NOT NULL DEFAULT 45,
+  last_contact_on DATE,
+  channel TEXT DEFAULT '',
+  energy VARCHAR(32) NOT NULL DEFAULT 'steady',
+  tags TEXT[] DEFAULT '{}',
+  next_move TEXT DEFAULT '',
+  notes TEXT DEFAULT '',
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  deleted BOOLEAN DEFAULT FALSE,
+  deleted_at TIMESTAMPTZ
+);
+-- Known emails/handles for a person — the deterministic key that maps a calendar
+-- attendee / message counterpart back to this tracked person (#2033).
+ALTER TABLE tribe_people ADD COLUMN IF NOT EXISTS emails TEXT[] DEFAULT '{}';
+-- Known phone handles for a person — the deterministic key that maps an
+-- iMessage/Signal handle (E.164, e.g. +15551234567) back to this tracked
+-- person so touchpoints can be auto-logged (#2151). Mirrors emails[].
+ALTER TABLE tribe_people ADD COLUMN IF NOT EXISTS phones TEXT[] DEFAULT '{}';
+CREATE INDEX IF NOT EXISTS idx_tribe_people_live ON tribe_people (deleted, ring, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tribe_people_tags ON tribe_people USING gin (tags);
+CREATE INDEX IF NOT EXISTS idx_tribe_people_emails ON tribe_people USING gin (emails);
+CREATE INDEX IF NOT EXISTS idx_tribe_people_phones ON tribe_people USING gin (phones);
+
+CREATE TABLE IF NOT EXISTS tribe_touchpoints (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  person_id UUID NOT NULL REFERENCES tribe_people(id) ON DELETE CASCADE,
+  happened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  channel TEXT DEFAULT '',
+  summary TEXT DEFAULT '',
+  source VARCHAR(32) NOT NULL DEFAULT 'user',
+  calendar_account_id TEXT,
+  calendar_event_id TEXT,
+  dedupe_key TEXT,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+-- Idempotency key for auto-logged touchpoints (calendar event id / message
+-- thread+day); NULL for hand-logged user touchpoints.
+ALTER TABLE tribe_touchpoints ADD COLUMN IF NOT EXISTS dedupe_key TEXT;
+CREATE INDEX IF NOT EXISTS idx_tribe_touchpoints_person ON tribe_touchpoints (person_id, happened_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tribe_touchpoints_calendar ON tribe_touchpoints (calendar_account_id, calendar_event_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tribe_touchpoints_dedupe ON tribe_touchpoints (person_id, dedupe_key) WHERE dedupe_key IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS tribe_memory_links (
+  person_id UUID NOT NULL REFERENCES tribe_people(id) ON DELETE CASCADE,
+  memory_id UUID NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+  note TEXT DEFAULT '',
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  PRIMARY KEY (person_id, memory_id)
+);
+CREATE INDEX IF NOT EXISTS idx_tribe_memory_links_memory ON tribe_memory_links (memory_id);
+
+-- Network-scoped identity claims (#34, decided on #10). Mirrors the block in
+-- server/lib/db/schema/tribe.js — see there for the `kind` rationale.
+CREATE TABLE IF NOT EXISTS tribe_identities (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  person_id UUID NOT NULL REFERENCES tribe_people(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  network TEXT NOT NULL DEFAULT '',
+  handle TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT '',
+  linked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE (kind, network, handle)
+);
+CREATE INDEX IF NOT EXISTS idx_tribe_identities_person ON tribe_identities (person_id);
+
+-- Human activity timeline (#2150) — unified, machine-local event store fed by
+-- message/calendar syncs (later: iMessage, Spotify, YouTube, Signal). Metadata +
+-- short summary only; full bodies stay in per-source caches. Idempotent via the
+-- unique (source, dedupe_key) index + ON CONFLICT DO NOTHING. Machine-local like
+-- Tribe (ADR 2026-06-26-tribe-and-universe-runs-local.md) — excluded from peer sync.
+CREATE TABLE IF NOT EXISTS human_activity_events (
+  id TEXT PRIMARY KEY,
+  source TEXT NOT NULL,
+  account_id TEXT,
+  kind TEXT NOT NULL,
+  happened_at TIMESTAMPTZ NOT NULL,
+  duration_s INTEGER,
+  title TEXT,
+  summary TEXT,
+  url TEXT,
+  participants JSONB DEFAULT '[]'::jsonb,
+  metadata JSONB DEFAULT '{}'::jsonb,
+  dedupe_key TEXT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_human_activity_dedupe ON human_activity_events (source, dedupe_key);
+CREATE INDEX IF NOT EXISTS idx_human_activity_happened ON human_activity_events (happened_at);
+-- Source-scoped timeline reads (#5715) — see db/schema/humanActivity.js for why
+-- there are two composites and why neither uses CONCURRENTLY.
+CREATE INDEX IF NOT EXISTS idx_human_activity_source_happened ON human_activity_events (source, happened_at DESC);
+CREATE INDEX IF NOT EXISTS idx_human_activity_source_kind_happened ON human_activity_events (source, kind, happened_at DESC);
+
+-- Operator-action ledger (#5594) — the durable, filterable record of what the
+-- human actually did in PortOS. Machine-local like human_activity_events:
+-- excluded from peer sync, guarded in sharing/peerSync.test.js. Idempotent via
+-- the unique (type, dedupe_key) index + ON CONFLICT DO NOTHING. Deliberately
+-- NOT audited (no trg_user_action_events_audit) — a personal operator log, same
+-- rationale as post_runs.
+CREATE TABLE IF NOT EXISTS user_action_events (
+  id TEXT PRIMARY KEY,
+  type TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  happened_at TIMESTAMPTZ NOT NULL,
+  target TEXT,
+  target_name TEXT,
+  success BOOLEAN NOT NULL DEFAULT TRUE,
+  summary TEXT NOT NULL,
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  source JSONB NOT NULL DEFAULT '{}'::jsonb,
+  dedupe_key TEXT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_user_action_dedupe ON user_action_events (type, dedupe_key);
+CREATE INDEX IF NOT EXISTS idx_user_action_happened ON user_action_events (happened_at DESC);
+CREATE INDEX IF NOT EXISTS idx_user_action_type_time ON user_action_events (type, happened_at DESC);
+CREATE INDEX IF NOT EXISTS idx_user_action_actor_time ON user_action_events (actor, happened_at DESC);
+
+-- Machine-local Review Hub presentation markers. Queue payloads remain owned by
+-- their source records; this table stores only keyed snooze/dismissal state and
+-- a delivery-generation marker reserved for the delivery layer.
+CREATE TABLE IF NOT EXISTS review_queue_triage (
+  action_key TEXT NOT NULL,
+  occurrence TEXT NOT NULL DEFAULT '',
+  revision TEXT NOT NULL DEFAULT '',
+  snoozed_until TIMESTAMPTZ,
+  dismissed BOOLEAN NOT NULL DEFAULT FALSE,
+  delivery_generation INTEGER NOT NULL DEFAULT 0 CHECK (delivery_generation >= 0),
+  delivery JSONB,
+  PRIMARY KEY (action_key, occurrence, revision)
+);
+
+-- Machine-local CoS feedback obligations. Only the completed agent id and its
+-- archive date-bucket locator are retained here; prose and ratings stay with
+-- the source agent record and this table never enters federation payloads.
+CREATE TABLE IF NOT EXISTS cos_pending_agent_feedback (
+  agent_id TEXT PRIMARY KEY,
+  archive_date TEXT
+);
+
+-- Auto-update updated_at and sync_sequence on content/metadata changes.
+-- Skips bump for access-stat-only updates (access_count, last_accessed)
+-- to avoid sync noise from read operations.
+-- Respects explicitly provided updated_at (e.g., from sync service).
+CREATE OR REPLACE FUNCTION update_memory_timestamp()
+RETURNS TRIGGER AS $$
+DECLARE
+  content_changed BOOLEAN;
+BEGIN
+  content_changed := (
+    NEW.type IS DISTINCT FROM OLD.type OR
+    NEW.content IS DISTINCT FROM OLD.content OR
+    NEW.summary IS DISTINCT FROM OLD.summary OR
+    NEW.category IS DISTINCT FROM OLD.category OR
+    NEW.tags IS DISTINCT FROM OLD.tags OR
+    NEW.embedding IS DISTINCT FROM OLD.embedding OR
+    NEW.embedding_model IS DISTINCT FROM OLD.embedding_model OR
+    NEW.confidence IS DISTINCT FROM OLD.confidence OR
+    NEW.importance IS DISTINCT FROM OLD.importance OR
+    NEW.status IS DISTINCT FROM OLD.status OR
+    NEW.expires_at IS DISTINCT FROM OLD.expires_at OR
+    NEW.source_task_id IS DISTINCT FROM OLD.source_task_id OR
+    NEW.source_agent_id IS DISTINCT FROM OLD.source_agent_id OR
+    NEW.source_app_id IS DISTINCT FROM OLD.source_app_id OR
+    NEW.updated_at IS DISTINCT FROM OLD.updated_at
+  );
+
+  -- Access-stat-only update: skip sync_sequence and updated_at bump
+  IF NOT content_changed THEN
+    RETURN NEW;
+  END IF;
+
+  IF NEW.updated_at IS NULL OR NEW.updated_at = OLD.updated_at THEN
+    NEW.updated_at := NOW();
+  END IF;
+  NEW.sync_sequence := nextval(pg_get_serial_sequence('memories', 'sync_sequence'));
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_memory_updated_at ON memories;
+CREATE TRIGGER trg_memory_updated_at
+  BEFORE UPDATE ON memories
+  FOR EACH ROW
+  EXECUTE FUNCTION update_memory_timestamp();
+
+-- ============================================================================
+-- Creative Ingredients Catalog
+-- ============================================================================
+-- Typed, tagged, embeddable store for creative "ingredients" (characters,
+-- places, objects, ideas, scenes, concepts) extracted from user-pasted scraps.
+-- Cross-references universes/series/issues/works via catalog_ingredient_refs.
+-- Federates via sync_sequence BIGSERIAL + LWW on updated_at (same pattern as
+-- the memories table above).
+
+-- Machine-local retry receipts: retained with the database backup, never federated.
+CREATE TABLE IF NOT EXISTS catalog_commit_receipts (
+  operation_key UUID PRIMARY KEY,
+  fingerprint TEXT NOT NULL,
+  ingredients JSONB,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Raw user input preserved verbatim. One scrap can spawn many ingredients.
+CREATE TABLE IF NOT EXISTS catalog_scraps (
+  id TEXT PRIMARY KEY,                         -- 'cat-scrap-<uuid>'
+  title TEXT,
+  raw_text TEXT NOT NULL,
+  source_kind VARCHAR(32) DEFAULT 'paste',     -- paste|brain-bridge|importer-handoff
+  metadata JSONB DEFAULT '{}'::jsonb,
+  embedding vector(768),
+  embedding_model VARCHAR(100),
+  origin_instance_id VARCHAR(36),
+  -- Scrap chunking (catalog v7): a long paste splits into a parent (chunk_index
+  -- 0, parent_scrap_id NULL, raw_text = FULL original) plus N child rows
+  -- (chunk_index 1..N, parent_scrap_id → parent, raw_text = chunk slice). A
+  -- plain scrap is just a parent with no children. ensureSchema in
+  -- server/lib/db.js mirrors these as ADD COLUMN IF NOT EXISTS for existing installs.
+  chunk_index INT NOT NULL DEFAULT 0,
+  parent_scrap_id TEXT REFERENCES catalog_scraps(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  deleted BOOLEAN DEFAULT FALSE,
+  deleted_at TIMESTAMPTZ,
+  sync_sequence BIGSERIAL
+);
+CREATE INDEX IF NOT EXISTS idx_catalog_scraps_embedding
+  ON catalog_scraps USING hnsw (embedding vector_cosine_ops)
+  WITH (m = 16, ef_construction = 64);
+CREATE INDEX IF NOT EXISTS idx_catalog_scraps_fts
+  ON catalog_scraps USING gin (
+    to_tsvector('english', coalesce(title, '') || ' ' || coalesce(raw_text, ''))
+  );
+CREATE INDEX IF NOT EXISTS idx_catalog_scraps_sync_seq ON catalog_scraps (sync_sequence);
+CREATE INDEX IF NOT EXISTS idx_catalog_scraps_created_at ON catalog_scraps (created_at);
+CREATE INDEX IF NOT EXISTS idx_catalog_scraps_origin_instance ON catalog_scraps (origin_instance_id);
+CREATE INDEX IF NOT EXISTS idx_catalog_scraps_parent ON catalog_scraps (parent_scrap_id);
+
+-- Extracted, structured ingredients. Char/place/object payloads follow the
+-- shape sanitized by server/lib/storyBible.js so backfill and fresh ingest
+-- produce identical records. Idea/scene/concept payloads are lighter shapes.
+CREATE TABLE IF NOT EXISTS catalog_ingredients (
+  id TEXT PRIMARY KEY,                         -- 'cat-chr-<uuid>', 'cat-plc-<uuid>', etc.
+  -- No DB CHECK on `type`: valid types are gated at the app layer via the
+  -- INGREDIENT_TYPES registry (server/lib/catalogTypes.js), enforced by the Zod
+  -- enum in catalogValidation.js. Adding a new system (or future user-defined)
+  -- type is then a registry entry, NOT a DROP/RE-ADD constraint migration in two
+  -- files. VARCHAR(32) leaves headroom for longer type ids.
+  type VARCHAR(32) NOT NULL,
+  name TEXT NOT NULL,
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  tags TEXT[] DEFAULT '{}',
+  embedding vector(768),
+  embedding_model VARCHAR(100),
+  origin_instance_id VARCHAR(36),
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  deleted BOOLEAN DEFAULT FALSE,
+  deleted_at TIMESTAMPTZ,
+  sync_sequence BIGSERIAL
+);
+-- Weighted FTS column. Name carries the most weight (A); the character canon
+-- fields (description, physicalDescription, personality, background, summary,
+-- notes) plus the role/motivations/significance type-specific fields fall under
+-- B. Generated/stored so the GIN index stays fresh without trigger code.
+-- Postgres can't ALTER the expression of a STORED generated column, so when
+-- the v2 expansion needs to land we DROP and re-ADD the column. The DO block
+-- below inspects pg_attrdef and only drops when the existing expression is
+-- missing a v2-only field (`physicalDescription`) — fresh runs of this script
+-- skip the drop entirely (column absent), already-v2 installs skip it too, and
+-- only an upgrading v1 install pays the table-rewrite cost. That rewrite takes
+-- an ACCESS EXCLUSIVE lock for its duration; this is deliberately accepted at
+-- boot because Postgres cannot alter a STORED generation expression in place
+-- and the catalog schema must be complete before the server becomes ready.
+-- Operators with unusually large catalogs should schedule the upgrade as
+-- maintenance; docs/STORAGE.md carries the decision and runbook. ensureSchema in
+-- server/lib/db.js mirrors the same gate. PORTOS_SCHEMA_VERSIONS.catalog is
+-- bumped to 2 in lockstep so older peers can't push pre-expansion-shape rows
+-- that would mismatch the indexed expression.
+DO $$
+  DECLARE
+    expr TEXT;
+  BEGIN
+    SELECT pg_get_expr(d.adbin, d.adrelid)
+      INTO expr
+      FROM pg_attribute a
+      JOIN pg_attrdef  d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+     WHERE a.attrelid = 'catalog_ingredients'::regclass
+       AND a.attname  = 'search_tsv'
+       AND a.attgenerated = 's';
+    IF expr IS NOT NULL AND position('physicalDescription' in expr) = 0 THEN
+      EXECUTE 'ALTER TABLE catalog_ingredients DROP COLUMN search_tsv';
+    END IF;
+  END$$;
+ALTER TABLE catalog_ingredients ADD COLUMN IF NOT EXISTS search_tsv tsvector
+  GENERATED ALWAYS AS (
+    setweight(to_tsvector('english', coalesce(name, '')), 'A') ||
+    setweight(to_tsvector('english',
+      coalesce(payload->>'description', '') || ' ' ||
+      coalesce(payload->>'physicalDescription', '') || ' ' ||
+      coalesce(payload->>'personality', '') || ' ' ||
+      coalesce(payload->>'background', '') || ' ' ||
+      coalesce(payload->>'summary', '') || ' ' ||
+      coalesce(payload->>'notes', '') || ' ' ||
+      coalesce(payload->>'role', '') || ' ' ||
+      coalesce(payload->>'motivations', '') || ' ' ||
+      coalesce(payload->>'significance', '')
+    ), 'B')
+  ) STORED;
+CREATE INDEX IF NOT EXISTS idx_catalog_ing_embedding
+  ON catalog_ingredients USING hnsw (embedding vector_cosine_ops)
+  WITH (m = 16, ef_construction = 64);
+CREATE INDEX IF NOT EXISTS idx_catalog_ing_fts ON catalog_ingredients USING gin (search_tsv);
+CREATE INDEX IF NOT EXISTS idx_catalog_ing_type ON catalog_ingredients (type);
+CREATE INDEX IF NOT EXISTS idx_catalog_ing_tags ON catalog_ingredients USING gin (tags);
+CREATE INDEX IF NOT EXISTS idx_catalog_ing_sync_seq ON catalog_ingredients (sync_sequence);
+CREATE INDEX IF NOT EXISTS idx_catalog_ing_created_at ON catalog_ingredients (created_at);
+CREATE INDEX IF NOT EXISTS idx_catalog_ing_origin_instance ON catalog_ingredients (origin_instance_id);
+
+-- Provenance: which scrap(s) an ingredient was extracted from.
+-- A single ingredient may be reinforced by multiple scraps over time.
+CREATE TABLE IF NOT EXISTS catalog_ingredient_sources (
+  ingredient_id TEXT NOT NULL REFERENCES catalog_ingredients(id) ON DELETE CASCADE,
+  scrap_id TEXT NOT NULL REFERENCES catalog_scraps(id) ON DELETE CASCADE,
+  span JSONB,                                  -- optional { start, end } char range in raw_text
+  extracted_at TIMESTAMPTZ DEFAULT NOW(),
+  sync_sequence BIGSERIAL,
+  PRIMARY KEY (ingredient_id, scrap_id)
+);
+CREATE INDEX IF NOT EXISTS idx_catalog_ing_sources_scrap ON catalog_ingredient_sources (scrap_id);
+CREATE INDEX IF NOT EXISTS idx_catalog_ing_sources_sync_seq ON catalog_ingredient_sources (sync_sequence);
+
+-- Consumption: which universe/series/issue/work/etc references this ingredient.
+-- Drives the "Appears in" panel on the ingredient detail page and the
+-- back-reference count on the catalog list.
+CREATE TABLE IF NOT EXISTS catalog_ingredient_refs (
+  ingredient_id TEXT NOT NULL REFERENCES catalog_ingredients(id) ON DELETE CASCADE,
+  ref_kind VARCHAR(32) NOT NULL,               -- 'universe'|'series'|'issue'|'work'|'creative-director'
+  ref_id TEXT NOT NULL,
+  role VARCHAR(64) NOT NULL,                   -- 'canon-character'|'canon-place'|'canon-object'|'cast'|'mentioned'
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  deleted BOOLEAN DEFAULT FALSE,               -- soft-delete tombstone so unlinks propagate to peers
+  deleted_at TIMESTAMPTZ,
+  updated_at TIMESTAMPTZ DEFAULT NOW(),        -- #8347: tombstone/revival change-clock (deleted_at resets to NULL on revival)
+  sync_sequence BIGSERIAL,
+  PRIMARY KEY (ingredient_id, ref_kind, ref_id, role)
+);
+CREATE INDEX IF NOT EXISTS idx_catalog_ing_refs_target ON catalog_ingredient_refs (ref_kind, ref_id);
+CREATE INDEX IF NOT EXISTS idx_catalog_ing_refs_sync_seq ON catalog_ingredient_refs (sync_sequence);
+
+-- Ingredient↔ingredient edges — the seam that makes the catalog a graph
+-- instead of a flat list. `kind` is an app-layer enum (RELATION_KINDS in
+-- server/lib/catalogTypes.js): 'appears-in'|'lives-in'|'created-by'|
+-- 'parent-of'|'variant-of'|'references'|'related-to'. Both ids FK to
+-- catalog_ingredients(id) ON DELETE CASCADE so deleting an ingredient
+-- (hard-delete) cleans up its edges. Soft-delete (deleted/deleted_at) from day
+-- one so unlinks propagate to peers as tombstones — same lesson as the refs
+-- table. Directed edge: from_id → to_id (the inverse direction is rendered in
+-- the UI from the same row, not stored twice).
+CREATE TABLE IF NOT EXISTS catalog_ingredient_relations (
+  from_id TEXT NOT NULL REFERENCES catalog_ingredients(id) ON DELETE CASCADE,
+  to_id TEXT NOT NULL REFERENCES catalog_ingredients(id) ON DELETE CASCADE,
+  kind VARCHAR(32) NOT NULL,                   -- relation kind from RELATION_KINDS
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  deleted BOOLEAN DEFAULT FALSE,               -- soft-delete tombstone so unlinks propagate to peers
+  deleted_at TIMESTAMPTZ,
+  updated_at TIMESTAMPTZ DEFAULT NOW(),        -- #8347: tombstone/revival change-clock (deleted_at resets to NULL on revival)
+  sync_sequence BIGSERIAL,
+  PRIMARY KEY (from_id, to_id, kind)
+);
+CREATE INDEX IF NOT EXISTS idx_catalog_ing_relations_to ON catalog_ingredient_relations (to_id);
+CREATE INDEX IF NOT EXISTS idx_catalog_ing_relations_sync_seq ON catalog_ingredient_relations (sync_sequence);
+
+-- First-class canonical tag table. The freeform `catalog_ingredients.tags
+-- TEXT[]` column stays as-is for write-path simplicity; this table is an
+-- additive index that the normalizer (catalogDB.normalizeTags) populates on
+-- first use of a tag. `id` is deterministic (`cat-tag-<canonical-key>`) so the
+-- same logical tag has the same id on every install. `parent_id` is an optional
+-- self-FK enabling tag hierarchies (genre/tone vs structural). Federates via
+-- sync_sequence BIGSERIAL + LWW on created_at (tags are append-mostly; the
+-- mutable fields — label/description/color/parent_id — round-trip through the
+-- trigger below). `ON DELETE SET NULL` on the parent self-FK keeps orphaned
+-- children rather than cascading a whole subtree away.
+CREATE TABLE IF NOT EXISTS catalog_tags (
+  id TEXT PRIMARY KEY,
+  label TEXT NOT NULL,                         -- canonical display label (first-seen casing)
+  description TEXT,
+  color VARCHAR(32),
+  parent_id TEXT REFERENCES catalog_tags(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  sync_sequence BIGSERIAL
+);
+CREATE INDEX IF NOT EXISTS idx_catalog_tags_label ON catalog_tags (label);
+CREATE INDEX IF NOT EXISTS idx_catalog_tags_parent ON catalog_tags (parent_id);
+CREATE INDEX IF NOT EXISTS idx_catalog_tags_sync_seq ON catalog_tags (sync_sequence);
+
+-- Append-only revision history for catalog_ingredients. A row is written by
+-- catalogDB.updateIngredient whenever name/payload/tags actually change (and a
+-- seed row on create), so the detail page can show "what changed" and offer a
+-- Restore button. `source` records WHO/WHAT drove the change ('user' edit,
+-- 'extract' ingest commit, 'refine' AI pass, 'sync' peer apply); `actor` is an
+-- optional free label (agent run id, provider name). Keyed (ingredient_id,
+-- created_at) for the per-ingredient timeline query. Retention is capped at the
+-- last N per ingredient by the app layer (CATALOG_REVISION_RETENTION, default
+-- 50) -- older rows are pruned on each write to bound growth.
+--
+-- LOCAL audit history: revisions do NOT carry a sync_sequence and are NOT
+-- federated. Each install records its own edit timeline; the synced
+-- catalog_ingredients row already LWW-merges the latest state across peers, so
+-- replicating per-edit history would multiply rows without a restore use case
+-- on the receiving peer. (If revisions ever need to federate, add a
+-- sync_sequence BIGSERIAL + a getChangesSince path and bump
+-- PORTOS_SCHEMA_VERSIONS.catalog.)
+CREATE TABLE IF NOT EXISTS catalog_ingredient_revisions (
+  id TEXT PRIMARY KEY,
+  ingredient_id TEXT NOT NULL REFERENCES catalog_ingredients(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  tags TEXT[] DEFAULT '{}',
+  source VARCHAR(16) NOT NULL DEFAULT 'user'
+    CHECK (source IN ('user', 'extract', 'refine', 'sync')),
+  actor VARCHAR(120),
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_catalog_ing_revisions_ingredient
+  ON catalog_ingredient_revisions (ingredient_id, created_at DESC);
+
+-- Typed media attachments for an ingredient (a generated portrait, a mood /
+-- reference image, a recorded voice memo, …). `media_key` is a REFERENCE into
+-- this install's media library (data/images + the history.jsonl sidecar /
+-- generated assets) — the bytes are NEVER duplicated here, so federation ships
+-- the key and the receiver matches it against its OWN library (a missing match
+-- surfaces via the metadata-missing integrity endpoint rather than failing the
+-- sync). `kind` is an app-layer enum (MEDIA_KINDS in catalogTypes.js), not a DB
+-- CHECK, so a newer peer's extra kind stores harmlessly. Soft-delete
+-- (deleted/deleted_at) from day one so detaches tombstone + propagate to peers
+-- — same lesson as the refs/relations tables. PK is (ingredient_id, media_key,
+-- kind): the same asset can ride as both a portrait and a reference, but not
+-- twice as the same kind.
+CREATE TABLE IF NOT EXISTS catalog_ingredient_media (
+  ingredient_id TEXT NOT NULL REFERENCES catalog_ingredients(id) ON DELETE CASCADE,
+  media_key TEXT NOT NULL,                     -- filename/key into the media library; not an FK
+  kind VARCHAR(32) NOT NULL,                   -- portrait|reference|audio|video|document (MEDIA_KINDS)
+  role VARCHAR(64),                            -- optional free label (e.g. 'hero-shot', 'angry')
+  caption TEXT,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb, -- bounded generation provenance when present
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  deleted BOOLEAN DEFAULT FALSE,               -- soft-delete tombstone so detaches propagate to peers
+  deleted_at TIMESTAMPTZ,
+  updated_at TIMESTAMPTZ DEFAULT NOW(),        -- #8347: tombstone/revival change-clock (deleted_at resets to NULL on revival)
+  sync_sequence BIGSERIAL,
+  PRIMARY KEY (ingredient_id, media_key, kind)
+);
+CREATE INDEX IF NOT EXISTS idx_catalog_ing_media_ingredient ON catalog_ingredient_media (ingredient_id);
+CREATE INDEX IF NOT EXISTS idx_catalog_ing_media_key ON catalog_ingredient_media (media_key);
+CREATE INDEX IF NOT EXISTS idx_catalog_ing_media_sync_seq ON catalog_ingredient_media (sync_sequence);
+
+-- Auto-update updated_at and bump sync_sequence on content/metadata changes.
+-- Mirrors update_memory_timestamp's pattern: skip the bump on no-content-change
+-- so cosmetic touches don't trigger sync. Respects explicit updated_at (used by
+-- the sync apply path to preserve the originating timestamp during LWW merges).
+CREATE OR REPLACE FUNCTION update_catalog_ingredient_timestamp()
+RETURNS TRIGGER AS $$
+DECLARE
+  content_changed BOOLEAN;
+BEGIN
+  content_changed := (
+    NEW.type IS DISTINCT FROM OLD.type OR
+    NEW.name IS DISTINCT FROM OLD.name OR
+    NEW.payload IS DISTINCT FROM OLD.payload OR
+    NEW.tags IS DISTINCT FROM OLD.tags OR
+    NEW.embedding IS DISTINCT FROM OLD.embedding OR
+    NEW.embedding_model IS DISTINCT FROM OLD.embedding_model OR
+    NEW.deleted IS DISTINCT FROM OLD.deleted OR
+    NEW.updated_at IS DISTINCT FROM OLD.updated_at
+  );
+
+  IF NOT content_changed THEN
+    RETURN NEW;
+  END IF;
+
+  IF NEW.updated_at IS NULL OR NEW.updated_at = OLD.updated_at THEN
+    NEW.updated_at := NOW();
+  END IF;
+  NEW.sync_sequence := nextval(pg_get_serial_sequence('catalog_ingredients', 'sync_sequence'));
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_catalog_ingredient_updated_at ON catalog_ingredients;
+CREATE TRIGGER trg_catalog_ingredient_updated_at
+  BEFORE UPDATE ON catalog_ingredients
+  FOR EACH ROW
+  EXECUTE FUNCTION update_catalog_ingredient_timestamp();
+
+CREATE OR REPLACE FUNCTION update_catalog_scrap_timestamp()
+RETURNS TRIGGER AS $$
+DECLARE
+  content_changed BOOLEAN;
+BEGIN
+  content_changed := (
+    NEW.title IS DISTINCT FROM OLD.title OR
+    NEW.raw_text IS DISTINCT FROM OLD.raw_text OR
+    NEW.source_kind IS DISTINCT FROM OLD.source_kind OR
+    NEW.metadata IS DISTINCT FROM OLD.metadata OR
+    NEW.embedding IS DISTINCT FROM OLD.embedding OR
+    NEW.embedding_model IS DISTINCT FROM OLD.embedding_model OR
+    NEW.deleted IS DISTINCT FROM OLD.deleted OR
+    NEW.updated_at IS DISTINCT FROM OLD.updated_at
+  );
+
+  IF NOT content_changed THEN
+    RETURN NEW;
+  END IF;
+
+  IF NEW.updated_at IS NULL OR NEW.updated_at = OLD.updated_at THEN
+    NEW.updated_at := NOW();
+  END IF;
+  NEW.sync_sequence := nextval(pg_get_serial_sequence('catalog_scraps', 'sync_sequence'));
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_catalog_scrap_updated_at ON catalog_scraps;
+CREATE TRIGGER trg_catalog_scrap_updated_at
+  BEFORE UPDATE ON catalog_scraps
+  FOR EACH ROW
+  EXECUTE FUNCTION update_catalog_scrap_timestamp();
+
+-- Source-link UPDATE bumps sync_sequence so a span change (via
+-- `upsertSourceFromPeer` → ON CONFLICT DO UPDATE SET span = ...) doesn't
+-- stay invisible to peers whose cursor would skip past the unchanged seq.
+CREATE OR REPLACE FUNCTION update_catalog_source_sync_seq()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF NEW.span IS DISTINCT FROM OLD.span THEN
+    NEW.sync_sequence := nextval(pg_get_serial_sequence('catalog_ingredient_sources', 'sync_sequence'));
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_catalog_source_sync_seq ON catalog_ingredient_sources;
+CREATE TRIGGER trg_catalog_source_sync_seq
+  BEFORE UPDATE ON catalog_ingredient_sources
+  FOR EACH ROW
+  EXECUTE FUNCTION update_catalog_source_sync_seq();
+
+-- Ref-link UPDATE bumps sync_sequence on soft-delete or revival so peers
+-- receive the tombstone as a normal sync event. Without this, the soft-delete
+-- path would update `deleted`/`deleted_at` but leave sync_sequence at the
+-- original INSERT value — peers past that cursor would never see the change
+-- and their "Appears in" panels would stay stale forever.
+-- #8347: also stamps `updated_at` (unless the caller already set an explicit
+-- value — a peer apply carrying the sender's own clock) so the revival guard
+-- in `upsertRefFromPeer` has a change-clock that moves on BOTH a delete and a
+-- revival, unlike `deleted_at` which resets to NULL.
+CREATE OR REPLACE FUNCTION update_catalog_ref_sync_seq()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF NEW.deleted IS DISTINCT FROM OLD.deleted
+     OR NEW.deleted_at IS DISTINCT FROM OLD.deleted_at THEN
+    IF NEW.updated_at IS NULL OR NEW.updated_at = OLD.updated_at THEN
+      NEW.updated_at := NOW();
+    END IF;
+    NEW.sync_sequence := nextval(pg_get_serial_sequence('catalog_ingredient_refs', 'sync_sequence'));
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_catalog_ref_sync_seq ON catalog_ingredient_refs;
+CREATE TRIGGER trg_catalog_ref_sync_seq
+  BEFORE UPDATE ON catalog_ingredient_refs
+  FOR EACH ROW
+  EXECUTE FUNCTION update_catalog_ref_sync_seq();
+
+-- Relation UPDATE bumps sync_sequence on soft-delete or revival so peers pick
+-- up the tombstone (or the un-delete) on their next pull — same rationale as
+-- the ref trigger above.
+-- #8347: same `updated_at` change-clock stamp as the ref trigger above.
+CREATE OR REPLACE FUNCTION update_catalog_relation_sync_seq()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF NEW.deleted IS DISTINCT FROM OLD.deleted
+     OR NEW.deleted_at IS DISTINCT FROM OLD.deleted_at THEN
+    IF NEW.updated_at IS NULL OR NEW.updated_at = OLD.updated_at THEN
+      NEW.updated_at := NOW();
+    END IF;
+    NEW.sync_sequence := nextval(pg_get_serial_sequence('catalog_ingredient_relations', 'sync_sequence'));
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_catalog_relation_sync_seq ON catalog_ingredient_relations;
+CREATE TRIGGER trg_catalog_relation_sync_seq
+  BEFORE UPDATE ON catalog_ingredient_relations
+  FOR EACH ROW
+  EXECUTE FUNCTION update_catalog_relation_sync_seq();
+
+-- Media UPDATE bumps sync_sequence when a soft-delete/revival OR a mutable
+-- field (role/caption) changes, so peers receive the edit (or the tombstone)
+-- on their next pull. Unlike refs/relations, media rows carry editable
+-- metadata, so the change-detector also watches role + caption + provenance.
+-- #8347: same `updated_at` change-clock stamp as the ref/relation triggers.
+CREATE OR REPLACE FUNCTION update_catalog_media_sync_seq()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF NEW.deleted IS DISTINCT FROM OLD.deleted
+     OR NEW.deleted_at IS DISTINCT FROM OLD.deleted_at
+     OR NEW.role IS DISTINCT FROM OLD.role
+     OR NEW.caption IS DISTINCT FROM OLD.caption
+     OR NEW.metadata IS DISTINCT FROM OLD.metadata THEN
+    IF NEW.updated_at IS NULL OR NEW.updated_at = OLD.updated_at THEN
+      NEW.updated_at := NOW();
+    END IF;
+    NEW.sync_sequence := nextval(pg_get_serial_sequence('catalog_ingredient_media', 'sync_sequence'));
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_catalog_media_sync_seq ON catalog_ingredient_media;
+CREATE TRIGGER trg_catalog_media_sync_seq
+  BEFORE UPDATE ON catalog_ingredient_media
+  FOR EACH ROW
+  EXECUTE FUNCTION update_catalog_media_sync_seq();
+
+-- Tag UPDATE bumps sync_sequence + updated_at when a mutable field changes
+-- (label/description/color/parent_id) so peers receive the edit on their next
+-- pull. Respects an explicit updated_at (the sync apply path preserves the
+-- originating timestamp during LWW merges). Mirrors the scrap timestamp trigger.
+CREATE OR REPLACE FUNCTION update_catalog_tag_timestamp()
+RETURNS TRIGGER AS $$
+DECLARE
+  content_changed BOOLEAN;
+BEGIN
+  content_changed := (
+    NEW.label IS DISTINCT FROM OLD.label OR
+    NEW.description IS DISTINCT FROM OLD.description OR
+    NEW.color IS DISTINCT FROM OLD.color OR
+    NEW.parent_id IS DISTINCT FROM OLD.parent_id OR
+    NEW.updated_at IS DISTINCT FROM OLD.updated_at
+  );
+
+  IF NOT content_changed THEN
+    RETURN NEW;
+  END IF;
+
+  IF NEW.updated_at IS NULL OR NEW.updated_at = OLD.updated_at THEN
+    NEW.updated_at := NOW();
+  END IF;
+  NEW.sync_sequence := nextval(pg_get_serial_sequence('catalog_tags', 'sync_sequence'));
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_catalog_tag_updated_at ON catalog_tags;
+CREATE TRIGGER trg_catalog_tag_updated_at
+  BEFORE UPDATE ON catalog_tags
+  FOR EACH ROW
+  EXECUTE FUNCTION update_catalog_tag_timestamp();
+
+-- ===========================================================================
+-- Creative Director projects (Phase 3, issue #997)
+-- ===========================================================================
+-- One row per project. The full project record — treatment, scenes, runs[],
+-- and the misc back-pointers (collectionId / timelineProjectId / finalVideoId
+-- / sourceIssueId) — lives in `data` JSONB. `status` / `created_at` /
+-- `updated_at` are mirrored into columns (kept in lockstep with the JSONB on
+-- every write) so future queries CAN filter/sort on them without a JSONB
+-- expression; `listProjects` sorts by `created_at`. No index on status/
+-- updated_at yet — nothing queries them today (the recovery scan filters
+-- p.status in JS over the loaded record), and an unused index is just write
+-- amplification. Add one alongside the query that needs it.
+--
+-- Why JSONB and not normalized scene/run tables: no code queries INTO scenes
+-- or runs relationally (the orchestrator loads the whole project, mutates a
+-- scene or appends a run, writes it back), and scenes carry ad-hoc fields
+-- outside the Zod schema (evaluationFrames). Per-PROJECT rows already remove
+-- the monolithic-file write contention + O(N²) reserialize the old single
+-- creative-director-projects.json caused. Normalizing scenes/runs is deferred
+-- to a later phase if a cross-project scene/run query ever materializes.
+--
+-- As of #1564 CD projects FEDERATE across peers via the per-record peer-sync
+-- push pipeline (record kind `creativeDirectorProject`, sync category
+-- `creativeDirectorProjects`), so the soft-delete tombstone trio
+-- (deleted/deleted_at + LWW updated_at) mirrors the authors table — a delete is a
+-- tombstone the merge keeps an out-of-date peer from resurrecting (NOT a hard
+-- DELETE). `status` has no DB CHECK; valid values are gated at the app layer via
+-- PROJECT_STATUSES (creativeDirectorPresets.js), matching the catalog
+-- ingredients convention so a new status needs no constraint migration.
+CREATE TABLE IF NOT EXISTS creative_director_projects (
+  id TEXT PRIMARY KEY,
+  status VARCHAR(32) NOT NULL DEFAULT 'draft',
+  data JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  deleted BOOLEAN DEFAULT FALSE,               -- soft-delete tombstone so deletes propagate to peers
+  deleted_at TIMESTAMPTZ
+);
+-- Partial index for the live-list filter (deleted = FALSE).
+CREATE INDEX IF NOT EXISTS idx_creative_director_projects_live ON creative_director_projects (deleted) WHERE deleted = FALSE;
+
+-- Three.js procedural models. Image bytes stay in data/images; each row owns
+-- the validated declarative scene spec, provider/model attribution, generation
+-- state, and refinement history.
+CREATE TABLE IF NOT EXISTS threejs_models (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  status VARCHAR(32) NOT NULL DEFAULT 'draft',
+  data JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  deleted BOOLEAN DEFAULT FALSE,
+  deleted_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_threejs_models_live_updated ON threejs_models (updated_at DESC) WHERE deleted = FALSE;
+
+-- Image-to-3D models (issue #2952). Neural image→GLB records — distinct from
+-- threejs_models above (procedural JS source vs. a real .glb mesh). The GLB
+-- binary stays on disk at data/image-to-3d/<id>/model.glb; each row owns the
+-- source gallery image reference, selected target, generation state, run
+-- history, and the exported GLB's served path. Not federated in this phase.
+CREATE TABLE IF NOT EXISTS image_to_3d_models (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  status VARCHAR(32) NOT NULL DEFAULT 'draft',
+  data JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  deleted BOOLEAN DEFAULT FALSE,
+  deleted_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_image_to_3d_models_live_updated ON image_to_3d_models (updated_at DESC) WHERE deleted = FALSE;
+
+-- Music Video projects (issue #1760). The director scene board's db-primary
+-- record: id/status/created_at/updated_at mirrored as columns, the full project
+-- (track link, cached audioAnalysis, scenes[]) in `data` JSONB — same shape as
+-- creative_director_projects. The soft-delete tombstone trio is present so
+-- peer-sync federation (a follow-up) is additive. Mirrors the music_video_projects
+-- block in db.js ensureSchema().
+CREATE TABLE IF NOT EXISTS music_video_projects (
+  id TEXT PRIMARY KEY,
+  status VARCHAR(32) NOT NULL DEFAULT 'draft',
+  data JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  deleted BOOLEAN DEFAULT FALSE,               -- soft-delete tombstone so deletes propagate to peers
+  deleted_at TIMESTAMPTZ
+);
+-- Partial index for the live-list filter (deleted = FALSE).
+CREATE INDEX IF NOT EXISTS idx_music_video_projects_live ON music_video_projects (deleted) WHERE deleted = FALSE;
+
+-- Sprite records (issue #2895, phase 1). One row per sprite subject — a
+-- character or a props atlas family; the full record (spec, chromaKey,
+-- publishBinding, importedFrom) in `data` JSONB with kind/status mirrored for
+-- queries. Binary assets live under data/sprites/<id>/. Not federated in
+-- phase 1; the tombstone trio keeps peer-sync additive later. Mirrors the
+-- sprite_records block in db/schema/media.js.
+CREATE TABLE IF NOT EXISTS sprite_records (
+  id TEXT PRIMARY KEY,
+  kind VARCHAR(16) NOT NULL DEFAULT 'character',
+  status VARCHAR(32) NOT NULL DEFAULT 'draft',
+  data JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  deleted BOOLEAN DEFAULT FALSE,
+  deleted_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_sprite_records_live ON sprite_records (deleted) WHERE deleted = FALSE;
+
+-- Game studio (#3177). One row per managed-app asset plan; reusable sprite and
+-- music bindings, compile pointers/history, and user-requested AI feedback live
+-- in `data` JSONB. Compiled bundle manifests stay under
+-- data/games/<id>/manifests. Machine-local because the app registry and bound
+-- asset bytes are machine-local; no peer-sync tombstones.
+CREATE TABLE IF NOT EXISTS games (
+  id TEXT PRIMARY KEY,
+  app_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  data JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_games_app_updated ON games (app_id, updated_at DESC);
+
+-- Mood boards (issue #911). A dedicated inspiration/mood-board canvas, distinct
+-- from raw Media History, for collecting visual + textual references that feed
+-- the Create suite. One row per board, the full record (name/description/items[])
+-- in `data` JSONB. Each item carries an image (media-key or external URL) or a
+-- text note, optional caption, and an optional source backref — kept inline in
+-- the board's JSONB rather than a child table because a board is read/written
+-- whole (a small bounded item list, no cross-board item queries). `name` mirrors
+-- a column for the live-list sort. As of #1564 mood boards FEDERATE across peers
+-- via the per-record peer-sync push pipeline (record kind `moodBoard`, sync
+-- category `moodBoards`), so the soft-delete tombstone trio (deleted/deleted_at +
+-- LWW updated_at) mirrors creative_director_projects — a delete is a tombstone the
+-- merge keeps an out-of-date peer from resurrecting (NOT a hard DELETE). Mirrors
+-- the mood_boards block in db.js ensureSchema().
+CREATE TABLE IF NOT EXISTS mood_boards (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  data JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  deleted BOOLEAN DEFAULT FALSE,               -- soft-delete tombstone so deletes propagate to peers
+  deleted_at TIMESTAMPTZ
+);
+-- Backfill the tombstone columns on installs created before #1564 (the CREATE
+-- above is a no-op once the table exists), so re-applying this schema to an
+-- existing DB stays idempotent and the partial index below can reference `deleted`.
+ALTER TABLE mood_boards ADD COLUMN IF NOT EXISTS deleted BOOLEAN DEFAULT FALSE;
+ALTER TABLE mood_boards ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+-- updated_at DESC is the board-list "recently touched" sort.
+CREATE INDEX IF NOT EXISTS idx_mood_boards_updated ON mood_boards (updated_at DESC);
+-- Partial index for the live-list filter (deleted = FALSE).
+CREATE INDEX IF NOT EXISTS idx_mood_boards_live ON mood_boards (deleted) WHERE deleted = FALSE;
+
+-- Media asset index (Phase 3.2, issue #1000). One row per generated image or
+-- video. The bytes stay on disk (data/images, data/videos) and the image
+-- sidecars + data/video-history.json remain authoritative — this table is a
+-- DERIVED, queryable index, reconciled from disk at boot and kept warm by a
+-- generation-completed hook. `media_key` is the shared `<kind>:<ref>` key
+-- (mediaItemKey.js); `kind`/`ref` mirror into columns for queries while the
+-- full metadata record lives in `data` JSONB. created_at is the asset's own
+-- timestamp; indexed_at is when this index row was written. No
+-- sync_sequence/tombstone: the index is local-only (rebuilt from disk), not
+-- federated — a row vanishes when its file does (prune on reconcile). Mirrors
+-- the media_assets block in db.js ensureSchema().
+CREATE TABLE IF NOT EXISTS media_assets (
+  media_key TEXT PRIMARY KEY,
+  kind VARCHAR(16) NOT NULL,
+  ref TEXT NOT NULL,
+  data JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  indexed_at TIMESTAMPTZ DEFAULT NOW()
+);
+-- created_at DESC is the gallery/history sort order; kind narrows
+-- images-vs-videos. A composite (kind, created_at DESC) serves both.
+CREATE INDEX IF NOT EXISTS idx_media_assets_kind_created ON media_assets (kind, created_at DESC);
+
+-- Code Animation jobs. Gallery status/title and the full brief/provider record
+-- live in PostgreSQL; generated HTML stays in data/code-animations/<id>.html.
+-- Machine-local generated work with no peer-sync cursor or tombstone.
+CREATE TABLE IF NOT EXISTS code_animation_jobs (
+  id TEXT PRIMARY KEY,
+  status VARCHAR(16) NOT NULL,
+  title TEXT NOT NULL DEFAULT '',
+  concept TEXT NOT NULL DEFAULT '',
+  provider_id TEXT,
+  model TEXT,
+  data JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_code_animation_jobs_created ON code_animation_jobs (created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_code_animation_jobs_status_created ON code_animation_jobs (status, created_at DESC);
+
+-- Code Animation Production projects, immutable source revisions and run history.
+CREATE TABLE IF NOT EXISTS code_animation_projects (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL DEFAULT '',
+  data JSONB NOT NULL,
+  accepted_revision_id TEXT,
+  candidate_revision_id TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_code_animation_projects_created ON code_animation_projects (created_at DESC, id DESC);
+
+CREATE TABLE IF NOT EXISTS code_animation_project_revisions (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES code_animation_projects(id) ON DELETE CASCADE,
+  package_hash TEXT NOT NULL,
+  source_hash TEXT NOT NULL,
+  total_bytes BIGINT NOT NULL,
+  data JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (project_id, id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_code_animation_project_revisions_project ON code_animation_project_revisions (project_id, created_at DESC, id DESC);
+
+CREATE TABLE IF NOT EXISTS code_animation_project_runs (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES code_animation_projects(id) ON DELETE CASCADE,
+  revision_id TEXT,
+  status VARCHAR(16) NOT NULL,
+  data JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  completed_at TIMESTAMPTZ,
+  FOREIGN KEY (project_id, revision_id) REFERENCES code_animation_project_revisions(project_id, id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_code_animation_project_runs_project ON code_animation_project_runs (project_id, created_at DESC, id DESC);
+
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'code_animation_projects_accepted_fk' AND conrelid = 'code_animation_projects'::regclass) THEN
+    ALTER TABLE code_animation_projects ADD CONSTRAINT code_animation_projects_accepted_fk
+      FOREIGN KEY (id, accepted_revision_id) REFERENCES code_animation_project_revisions(project_id, id) DEFERRABLE INITIALLY DEFERRED;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'code_animation_projects_candidate_fk' AND conrelid = 'code_animation_projects'::regclass) THEN
+    ALTER TABLE code_animation_projects ADD CONSTRAINT code_animation_projects_candidate_fk
+      FOREIGN KEY (id, candidate_revision_id) REFERENCES code_animation_project_revisions(project_id, id) DEFERRABLE INITIALLY DEFERRED;
+  END IF;
+END $$;
+
+-- Catalog user-defined types (Phase 4 lead-in, issue #1001). One row per
+-- user-defined ingredient type — the registry that defines catalog row
+-- semantics, moved out of data/settings.json (`catalogUserTypes`) so type
+-- evolution versions/syncs alongside the catalog data it governs. `id` is the
+-- type discriminator (the `type` column on catalog_ingredients + the
+-- `cat-<prefix>-<uuid>` mint seed); the full definition lives in `data` JSONB.
+-- updated_at / deleted_at mirror the federation LWW clock + tombstone (a
+-- soft-deleted type is KEPT as a tombstone row so the deletion federates —
+-- setUserCatalogTypes filters tombstones out of the active registry). ≤64 rows,
+-- read whole on every warm/sync, so no secondary index. Mirrors the
+-- catalog_user_types block in db.js ensureSchema().
+CREATE TABLE IF NOT EXISTS catalog_user_types (
+  id TEXT PRIMARY KEY,
+  data JSONB NOT NULL DEFAULT '{}'::jsonb,
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  deleted_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Universe Builder records (Phase 3 Create migration, issue #1014). One row per
+-- universe, the full sanitized record (canon bibles, categories, compositeSheets,
+-- locks, influences) in `data` JSONB, moved out of data/universes/{id}/index.json
+-- (collectionStore). Only the fields the service/federation query, join, or sort
+-- on are mirrored into columns: `name` (rename-cascade + delete-guard + list
+-- sort), `schema_version` (the RECORD-shape version sanitizeTemplate stamps — a
+-- column so a future migration can find unmigrated rows without parsing JSONB),
+-- `ephemeral` (the snapshot loop filters local-only records), and the
+-- LWW/tombstone trio (updated_at/deleted/deleted_at). NO sync_sequence: universes
+-- federate via the EXISTING dataSync snapshot/push model (LWW on the body's
+-- updatedAt), NOT catalog-style pull cursors — the storage swap is invisible to
+-- peers (no schema-version bump). The mirror columns are populated FROM the
+-- record body, not a DB trigger. Mirrors the universes block in db.js
+-- ensureSchema().
+CREATE TABLE IF NOT EXISTS universes (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  data JSONB NOT NULL DEFAULT '{}'::jsonb,
+  schema_version INTEGER NOT NULL DEFAULT 4,
+  ephemeral BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  deleted BOOLEAN DEFAULT FALSE,
+  deleted_at TIMESTAMPTZ
+);
+-- Partial index on the live set — the common list/scan path is "non-deleted
+-- universes". updated_at supports LWW-staleness scans.
+CREATE INDEX IF NOT EXISTS idx_universes_live ON universes (deleted) WHERE deleted = FALSE;
+CREATE INDEX IF NOT EXISTS idx_universes_updated ON universes (updated_at);
+
+-- Machine-local character voice profiles (#5380). Portable character voice
+-- direction stays in the federated universe record; profile bindings, local
+-- preset/artifact metadata, and rendered benchmark provenance stay here.
+CREATE TABLE IF NOT EXISTS voice_profiles (
+  id TEXT PRIMARY KEY,
+  universe_id TEXT NOT NULL,
+  character_id TEXT NOT NULL,
+  approval_status TEXT NOT NULL DEFAULT 'draft' CHECK (approval_status IN ('draft', 'approved', 'retired')),
+  data JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+ALTER TABLE voice_profiles ALTER COLUMN universe_id DROP NOT NULL;
+ALTER TABLE voice_profiles ALTER COLUMN character_id DROP NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_voice_profiles_binding ON voice_profiles (universe_id, character_id, updated_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_voice_profiles_approved_binding ON voice_profiles (universe_id, character_id) WHERE approval_status = 'approved';
+
+-- Machine-local dialogue render provenance. Pipeline issues federate, so their
+-- audio lines keep only a portable filename while profile identity and delivery
+-- details remain in this local table.
+CREATE TABLE IF NOT EXISTS voice_profile_renders (
+  issue_id TEXT NOT NULL,
+  line_id TEXT NOT NULL,
+  profile_id TEXT NOT NULL,
+  profile_revision INTEGER NOT NULL,
+  data JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  PRIMARY KEY (issue_id, line_id)
+);
+CREATE INDEX IF NOT EXISTS idx_voice_profile_renders_profile ON voice_profile_renders (profile_id, profile_revision, updated_at DESC);
+
+-- Universe render-history log (issue #1014). The type-level `config.runs[]` array
+-- collectionStore kept in data/universes/index.json (capped 200, NEVER federated
+-- — per-peer local) becomes its own table. `universe_id` is a soft ref (no FK):
+-- the cascade-clean on universe delete is handled in the service exactly as the
+-- file backend did, and a soft ref keeps the table independent of universe-row
+-- insert ordering during the one-time import. `data` holds
+-- jobIds[]/promptCount/collectionId. Mirrors db.js ensureSchema().
+CREATE TABLE IF NOT EXISTS universe_runs (
+  id TEXT PRIMARY KEY,
+  universe_id TEXT NOT NULL,
+  collection_id TEXT,
+  data JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_universe_runs_universe ON universe_runs (universe_id, created_at DESC);
+
+-- Author personas. One row per reusable author/byline persona, the full
+-- sanitized record (name, writingStyle, bio, physicalDescription, headshotStyle,
+-- headshotImageUrl) in `data` JSONB. `name` mirrors a column for the live-list
+-- sort; the LWW/tombstone trio (updated_at/deleted/deleted_at) is populated FROM
+-- the record body. Authors are db-primary AND federated via the per-record
+-- peer-sync push pipeline (record kind `author`, sync category `authors`); a
+-- federated series also keeps its denormalized `author` byline so a peer that
+-- hasn't synced the persona still renders the cover correctly. Mirrors the
+-- authors block in db.js ensureSchema().
+CREATE TABLE IF NOT EXISTS authors (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  data JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  deleted BOOLEAN DEFAULT FALSE,
+  deleted_at TIMESTAMPTZ
+);
+-- The common path is "live authors sorted by name".
+CREATE INDEX IF NOT EXISTS idx_authors_live ON authors (deleted) WHERE deleted = FALSE;
+
+-- Music artists (the Music studio's persona store — analogue of authors). One
+-- row per artist, the full sanitized record (name, genre, bio, musicalStyle,
+-- physicalDescription, portraitStyle, portraitImageUrl) in `data` JSONB. `name`
+-- mirrors a column for the live-list sort; the LWW/tombstone trio is populated
+-- FROM the record body. Artists are db-primary and federation-ready (LWW merge
+-- mirrors authors), but the artist record kind is not yet registered in peerSync
+-- — local-only for now (see issue #1502). Mirrors the artists block in db.js.
+CREATE TABLE IF NOT EXISTS artists (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  data JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  deleted BOOLEAN DEFAULT FALSE,
+  deleted_at TIMESTAMPTZ
+);
+-- The common path is "live artists sorted by name".
+CREATE INDEX IF NOT EXISTS idx_artists_live ON artists (deleted) WHERE deleted = FALSE;
+
+-- Music albums (the Music studio). One row per album, the full sanitized record
+-- (title, artistId + denormalized artist, description, genre, releaseYear,
+-- coverImageUrl, ordered trackIds) in `data` JSONB. `title` mirrors a column for
+-- the live-list sort. db-primary + federation-ready (LWW merge mirrors artists),
+-- not yet registered in peerSync — local-only for now (see issue #1502). Mirrors
+-- the albums block in db.js.
+CREATE TABLE IF NOT EXISTS albums (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  data JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  deleted BOOLEAN DEFAULT FALSE,
+  deleted_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_albums_live ON albums (deleted) WHERE deleted = FALSE;
+
+-- Music tracks (the Music studio). One row per track, the full sanitized record
+-- (title, albumId/artistId FKs + denormalized artist, lyrics, prompt, engine/
+-- modelId/durationSec gen metadata, audioFilename pointing into the shared music
+-- library at data/music/) in `data` JSONB. `title` mirrors a column for queries.
+-- db-primary + federation-ready, not yet registered in peerSync — local-only for
+-- now (see issue #1502). Mirrors the tracks block in db.js.
+CREATE TABLE IF NOT EXISTS tracks (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  data JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  deleted BOOLEAN DEFAULT FALSE,
+  deleted_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_tracks_live ON tracks (deleted) WHERE deleted = FALSE;
+
+-- Pipeline series (Phase 3 Create migration, issue #1015). One row per series,
+-- the full sanitized record (arc/seasons/locks/covers/style) in `data` JSONB,
+-- moved out of data/pipeline-series/{id}/index.json (collectionStore). Only the
+-- fields the service/federation query, join, or sort on are mirrored into
+-- columns: `name` (rename-cascade + list sort), `universe_id` (the hot
+-- relationship — delete-guard + "series in this universe" lists; soft ref, no
+-- FK — a series can sync before its universe arrives), and the promote
+-- back-link `writers_room_work_id`. `ephemeral` + the LWW/tombstone trio
+-- (updated_at/deleted/deleted_at) populated FROM the record body, not a DB
+-- trigger. NO sync_sequence: pipeline records federate via the EXISTING
+-- dataSync snapshot/push model — the storage swap is invisible to peers (no
+-- schema-version bump). Mirrors the pipeline_series block in db.js ensureSchema().
+CREATE TABLE IF NOT EXISTS pipeline_series (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  universe_id TEXT,
+  writers_room_work_id TEXT,
+  data JSONB NOT NULL DEFAULT '{}'::jsonb,
+  ephemeral BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  deleted BOOLEAN DEFAULT FALSE,
+  deleted_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_series_universe ON pipeline_series (universe_id) WHERE deleted = FALSE;
+CREATE INDEX IF NOT EXISTS idx_series_wr_work ON pipeline_series (writers_room_work_id);
+CREATE INDEX IF NOT EXISTS idx_series_updated ON pipeline_series (updated_at);
+
+-- Pipeline issues (issue #1015). One row per issue; the 8-stage `stages` map
+-- (text/visual/audio, runHistory, canonExtraction, covers) + lastRunId pointers
+-- stay entirely in `data` JSONB (document-shaped, sanitizer-owned). `series_id`
+-- (parent, soft ref), `season_id` (arc grouping), and `number`
+-- (renumber-recomputed ordinal) are promoted — the renumber pass reads all
+-- issues of a series ordered by number, the single most common cross-record
+-- pipeline query, served directly by idx_issues_series (series_id, number).
+-- `status` promoted for "issues needing review" dashboards. `ephemeral` +
+-- LWW/tombstone trio mirror the body. NO sync_sequence (see pipeline_series).
+-- Mirrors the pipeline_issues block in db.js ensureSchema().
+CREATE TABLE IF NOT EXISTS pipeline_issues (
+  id TEXT PRIMARY KEY,
+  series_id TEXT NOT NULL,
+  season_id TEXT,
+  number INTEGER,
+  status VARCHAR(32),
+  data JSONB NOT NULL DEFAULT '{}'::jsonb,
+  ephemeral BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  deleted BOOLEAN DEFAULT FALSE,
+  deleted_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_issues_series ON pipeline_issues (series_id, number) WHERE deleted = FALSE;
+CREATE INDEX IF NOT EXISTS idx_issues_season ON pipeline_issues (season_id) WHERE season_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_issues_updated ON pipeline_issues (updated_at);
+
+-- Story Builder sessions (issue #1016). One row per session; the conductor
+-- bookkeeping (`steps` lock/integrity map, `syncedHashes` baseline,
+-- `currentStep`, `llm` picker choice) stays entirely in `data` JSONB. The two
+-- FKs `universe_id` / `series_id` are promoted for "sessions linked to this
+-- record" lookups. `sync` is promoted because Story Builder is the one store
+-- whose federation is OPT-IN — the snapshot loop filters WHERE sync = TRUE to
+-- decide what to even consider pushing, so promoting it avoids deserializing
+-- every session's `data` per snapshot tick. `ephemeral` + the LWW/tombstone
+-- trio mirror the body. NO sync_sequence (sessions ride the existing dataSync
+-- snapshot/LWW model, not the per-record push pipeline).
+-- Mirrors the story_builder_sessions block in db.js ensureSchema().
+CREATE TABLE IF NOT EXISTS story_builder_sessions (
+  id TEXT PRIMARY KEY,
+  universe_id TEXT,
+  series_id TEXT,
+  sync BOOLEAN DEFAULT FALSE,
+  data JSONB NOT NULL DEFAULT '{}'::jsonb,
+  ephemeral BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  deleted BOOLEAN DEFAULT FALSE,
+  deleted_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_stb_universe ON story_builder_sessions (universe_id);
+CREATE INDEX IF NOT EXISTS idx_stb_series ON story_builder_sessions (series_id);
+CREATE INDEX IF NOT EXISTS idx_stb_updated ON story_builder_sessions (updated_at);
+
+-- Writers Room (Phase 3 Create migration, issue #1017). FOUR tables replace the
+-- bespoke file layout (folders.json, exercises.json, per-work manifest.json).
+-- Writers Room is NOT federated (no dataSync category, no schema-version gate),
+-- so unlike the universe/pipeline/story-builder tables these carry NO
+-- `ephemeral`/`sync`/sync_sequence columns. The only thing that stays on disk is
+-- the draft prose body (drafts/<draftId>.md, file-primary); its metadata is the
+-- draft_versions row.
+-- Mirrors the writers_room_* blocks in db.js ensureSchema().
+CREATE TABLE IF NOT EXISTS writers_room_folders (
+  id TEXT PRIMARY KEY,
+  parent_id TEXT,
+  name TEXT NOT NULL,
+  sort_order INTEGER DEFAULT 0,
+  data JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  deleted BOOLEAN DEFAULT FALSE,
+  deleted_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_wr_folders_parent ON writers_room_folders (parent_id, sort_order);
+
+CREATE TABLE IF NOT EXISTS writers_room_works (
+  id TEXT PRIMARY KEY,
+  folder_id TEXT,
+  title TEXT NOT NULL,
+  kind VARCHAR(32),
+  status VARCHAR(32),
+  active_draft_version_id TEXT,
+  pipeline_series_id TEXT,
+  pipeline_issue_id TEXT,
+  cd_project_id TEXT,
+  media_collection_id TEXT,
+  data JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  deleted BOOLEAN DEFAULT FALSE,
+  deleted_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_wr_works_folder ON writers_room_works (folder_id) WHERE deleted = FALSE;
+CREATE INDEX IF NOT EXISTS idx_wr_works_series ON writers_room_works (pipeline_series_id) WHERE pipeline_series_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS writers_room_draft_versions (
+  id TEXT PRIMARY KEY,
+  work_id TEXT NOT NULL,
+  label TEXT,
+  content_file TEXT NOT NULL,
+  content_hash TEXT,
+  word_count INTEGER DEFAULT 0,
+  segment_index JSONB NOT NULL DEFAULT '[]'::jsonb,
+  created_from_version_id TEXT,
+  data JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_wr_drafts_work ON writers_room_draft_versions (work_id, created_at);
+
+CREATE TABLE IF NOT EXISTS writers_room_exercises (
+  id TEXT PRIMARY KEY,
+  work_id TEXT,
+  status VARCHAR(16),
+  data JSONB NOT NULL DEFAULT '{}'::jsonb,
+  started_at TIMESTAMPTZ,
+  finished_at TIMESTAMPTZ,
+  deleted BOOLEAN DEFAULT FALSE,
+  deleted_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_wr_exercises_work ON writers_room_exercises (work_id, started_at DESC);
+
+-- FableLoom branching narratives. One row per loom (a branching-narrative
+-- story), the full sanitized record (episodes, scene-node graphs, intent
+-- transitions) in `data` JSONB. `universe_id`/`series_id` are soft refs
+-- mirrored for relationship queries only. FableLoom federates through the
+-- per-record peer-sync pipeline (record kind/category `fableLoom`), so deletes
+-- are LWW tombstones. No sync_sequence: recordEvents subscriptions drive pushes.
+-- Mirrors the fableloom_stories block in db/schema/pipeline.js.
+CREATE TABLE IF NOT EXISTS fableloom_stories (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  universe_id TEXT,
+  series_id TEXT,
+  data JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  deleted BOOLEAN DEFAULT FALSE,
+  deleted_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_fableloom_universe ON fableloom_stories (universe_id);
+CREATE INDEX IF NOT EXISTS idx_fableloom_updated ON fableloom_stories (updated_at);
+CREATE INDEX IF NOT EXISTS idx_fableloom_live ON fableloom_stories (deleted) WHERE deleted = FALSE;
+
+-- LoRA training runs (character LoRA training, /api/lora-training). One row
+-- per run: id/status/character_id mirrored as columns for filtering, the
+-- full record in `data` JSONB. Machine-local — no sync cursor/tombstones
+-- (training artifacts live on this machine's disk under data/training-runs/).
+CREATE TABLE IF NOT EXISTS lora_training_runs (
+  id TEXT PRIMARY KEY,
+  status TEXT NOT NULL,
+  character_id TEXT,
+  data JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_lora_training_runs_status ON lora_training_runs (status);
+CREATE INDEX IF NOT EXISTS idx_lora_training_runs_character ON lora_training_runs (character_id);
+
+-- Privacy Center: household subjects (issue #3658). Every person the Privacy
+-- Center works on behalf of — `self` plus any consenting household member
+-- (partner, child, parent). A TABLE rather than a free-text `subject` string so
+-- renames aren't lossy and scoping stays typed. Machine-local like the rest of
+-- the suite: no federation, no tombstones, hard deletes (which CASCADE the
+-- subject's vault/org/holding/change/case/consent rows). Created FIRST so the
+-- `subject_id` FKs below resolve. Mirrors the privacy blocks in
+-- server/lib/db/schema/privacy.js.
+CREATE TABLE IF NOT EXISTS privacy_subjects (
+  id UUID PRIMARY KEY,
+  display_name TEXT NOT NULL,
+  relationship TEXT NOT NULL DEFAULT 'other',
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+-- Seed the `self` row at a FIXED id (mirrored by SELF_SUBJECT_ID in
+-- server/lib/db/schema/privacy.js and PRIVACY_SELF_SUBJECT_ID in
+-- server/lib/privacyValidation.js) so every install names the same row without
+-- a lookup. Idempotent — an install that renamed it keeps its display_name.
+INSERT INTO privacy_subjects (id, display_name, relationship, created_at, updated_at)
+VALUES ('00000000-0000-4000-8000-000000000001', 'Me', 'self', NOW(), NOW())
+ON CONFLICT (id) DO NOTHING;
+
+-- Privacy Center: PII Vault (issue #2140, epic #2138). Encrypted-at-rest
+-- identity facts — `value_enc` is AES-256-GCM ciphertext (`v1:<iv>:<tag>:<ct>`,
+-- key from PRIVACY_VAULT_KEY; see server/lib/vaultCrypto.js). Plaintext is
+-- NEVER stored; `masked_value` is the display form. Machine-local — no
+-- federation, no tombstones. NEVER federated by decision, not deferral (ADR
+-- docs/decisions/2026-08-08-privacy-records-machine-local.md, #2148); adding a
+-- sync cursor trips services/sharing/privacyNeverFederates.test.js.
+-- A delete is a hard DELETE.
+-- `use_for_scans` gates which facts the broker scan engine may disclose
+-- (hard-false for ssn/passport/drivers_license/financial_account — enforced
+-- app-side). Mirrors the privacy blocks in server/lib/db.js ensureSchema().
+CREATE TABLE IF NOT EXISTS privacy_vault_records (
+  id UUID PRIMARY KEY,
+  subject_id UUID NOT NULL DEFAULT '00000000-0000-4000-8000-000000000001' REFERENCES privacy_subjects (id) ON DELETE CASCADE,
+  type TEXT NOT NULL,
+  label TEXT NOT NULL DEFAULT '',
+  value_enc TEXT NOT NULL,
+  masked_value TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'current',
+  valid_from DATE,
+  valid_to DATE,
+  share_with_twin BOOLEAN NOT NULL DEFAULT FALSE,
+  use_for_scans BOOLEAN NOT NULL DEFAULT FALSE,
+  notes TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+-- Type is the primary list filter (all addresses, all emails, ...).
+CREATE INDEX IF NOT EXISTS idx_privacy_vault_records_type ON privacy_vault_records (type);
+-- Explicit consent audit rows, one per (subject, purpose) grant. The scan and
+-- opt-out engines require an ACTIVE row of the exact purpose scope; revoking a
+-- broker purpose stamps revoked_at instead of deleting the row (#8332).
+CREATE TABLE IF NOT EXISTS privacy_consents (
+  id UUID PRIMARY KEY,
+  subject TEXT NOT NULL DEFAULT 'self',
+  subject_id UUID NOT NULL DEFAULT '00000000-0000-4000-8000-000000000001' REFERENCES privacy_subjects (id) ON DELETE CASCADE,
+  scope TEXT NOT NULL,
+  method TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  granted_at TIMESTAMPTZ DEFAULT NOW(),
+  revoked_at TIMESTAMPTZ
+);
+
+-- Privacy Center: Trusted Organizations registry (issue #2141, epic #2138).
+-- Every organization that has (or had) the user's PII, with a trust stance
+-- and per-org holdings linking to the exact vault records each org holds.
+-- Data backbone for the change-of-address inventory (Phase 4) and the "who
+-- has my PII" view. Machine-local — no federation, no tombstones (same
+-- guarantee as the vault — NEVER federated; ADR
+-- docs/decisions/2026-08-08-privacy-records-machine-local.md, #2148). Mirrors
+-- the privacy blocks in server/lib/db.js ensureSchema().
+CREATE TABLE IF NOT EXISTS privacy_orgs (
+  id UUID PRIMARY KEY,
+  subject_id UUID NOT NULL DEFAULT '00000000-0000-4000-8000-000000000001' REFERENCES privacy_subjects (id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  category TEXT NOT NULL DEFAULT 'other',
+  website TEXT NOT NULL DEFAULT '',
+  trust TEXT NOT NULL DEFAULT 'trusted',
+  status TEXT NOT NULL DEFAULT 'active',
+  contact JSONB NOT NULL DEFAULT '{}'::jsonb,
+  social_account_id TEXT,
+  notes TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_privacy_orgs_trust ON privacy_orgs (trust);
+CREATE INDEX IF NOT EXISTS idx_privacy_orgs_status ON privacy_orgs (status);
+-- Which vault records each org holds. Composite PK (no surrogate id) — an org
+-- either holds a given vault record or it doesn't, so the pair IS the
+-- identity. Cascade both ways: deleting the org or the vault record drops its
+-- holdings rows.
+CREATE TABLE IF NOT EXISTS privacy_org_holdings (
+  org_id UUID NOT NULL REFERENCES privacy_orgs (id) ON DELETE CASCADE,
+  subject_id UUID NOT NULL DEFAULT '00000000-0000-4000-8000-000000000001' REFERENCES privacy_subjects (id) ON DELETE CASCADE,
+  vault_record_id UUID NOT NULL REFERENCES privacy_vault_records (id) ON DELETE CASCADE,
+  status TEXT NOT NULL DEFAULT 'current',
+  noted_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  PRIMARY KEY (org_id, vault_record_id)
+);
+-- Reverse lookup: "which orgs hold vault record X" (getOrgsHoldingRecord).
+CREATE INDEX IF NOT EXISTS idx_privacy_org_holdings_vault_record ON privacy_org_holdings (vault_record_id);
+
+-- Privacy Center: data-broker database + case ledger (issue #2144, epic #2138).
+-- `privacy_brokers` is the curated (+ later BADBOOL / CA-registry) database of
+-- people-search brokers the exposure-scan/opt-out engine works. Seeded
+-- idempotently from data.reference/privacy/brokers.json on first use (NO network
+-- at boot). `source`/`confidence` gate the refresh: curated rows are never
+-- clobbered by an auto refresh. `cluster_parent` groups sibling brands under one
+-- suppression; `disclosure_fields` caps what the engine may submit. Machine-local
+-- — no federation, no tombstones; NEVER federated (ADR
+-- docs/decisions/2026-08-08-privacy-records-machine-local.md, #2148). Mirrors
+-- the privacy blocks in server/lib/db.js ensureSchema().
+CREATE TABLE IF NOT EXISTS privacy_brokers (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  urls JSONB NOT NULL DEFAULT '{}'::jsonb,
+  optout JSONB NOT NULL DEFAULT '{}'::jsonb,
+  tier SMALLINT NOT NULL DEFAULT 2,
+  disclosure_fields TEXT[] NOT NULL DEFAULT '{}',
+  cluster_parent TEXT REFERENCES privacy_brokers (id) ON DELETE SET NULL,
+  prefer_suppression BOOLEAN NOT NULL DEFAULT FALSE,
+  antibot BOOLEAN NOT NULL DEFAULT FALSE,
+  source TEXT NOT NULL DEFAULT 'curated',
+  confidence TEXT NOT NULL DEFAULT 'documented',
+  last_verified DATE,
+  enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+-- Planner walks enabled brokers, cluster-parents first.
+CREATE INDEX IF NOT EXISTS idx_privacy_brokers_enabled ON privacy_brokers (enabled);
+CREATE INDEX IF NOT EXISTS idx_privacy_brokers_cluster_parent ON privacy_brokers (cluster_parent);
+-- Per-broker exposure/opt-out case ledger with a service-enforced state machine.
+-- `state` is validated app-side (privacyBrokers.js); every write stamps
+-- `next_recheck_at` (state-dependent backoff). `evidence` holds match basis /
+-- lane / screenshot refs in the clear; the identity-bearing fields (matched
+-- name + location, search/listing URLs) are sealed under
+-- `evidence.sealed_identity` with the vault key (#8333). A broker delete
+-- cascades its cases.
+CREATE TABLE IF NOT EXISTS privacy_broker_cases (
+  id UUID PRIMARY KEY,
+  subject_id UUID NOT NULL DEFAULT '00000000-0000-4000-8000-000000000001' REFERENCES privacy_subjects (id) ON DELETE CASCADE,
+  broker_id TEXT NOT NULL REFERENCES privacy_brokers (id) ON DELETE CASCADE,
+  state TEXT NOT NULL DEFAULT 'unscanned',
+  found BOOLEAN,
+  evidence JSONB NOT NULL DEFAULT '{}'::jsonb,
+  disclosed_fields TEXT[] NOT NULL DEFAULT '{}',
+  channel TEXT,
+  reason TEXT,
+  next_recheck_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+-- One live case per (broker, subject) — two household members are worked
+-- through the same broker independently (#3658).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_privacy_broker_cases_broker_subject ON privacy_broker_cases (broker_id, subject_id);
+-- "Which cases are due for a recheck" — the run-loop's primary query.
+CREATE INDEX IF NOT EXISTS idx_privacy_broker_cases_recheck ON privacy_broker_cases (next_recheck_at);
+
+-- Privacy Center: change-of-address events (issue #2143, epic #2138). One row
+-- per "field X changed from A to B" declaration. `vault_record_id` is the OLD
+-- record (marked `previous` on declare); `replacement_record_id` is the NEW one
+-- (nullable for a removal-only change). Declaring an event flips every `current`
+-- holding of the old record to `update_pending` (see privacyChanges.js). Both
+-- FKs cascade-delete so removing a vault record cleans up its change events.
+-- Machine-local — no federation, no tombstones; NEVER federated, same
+-- guarantee as the vault (ADR
+-- docs/decisions/2026-08-08-privacy-records-machine-local.md, #2148). Mirrors
+-- the block in server/lib/db.js ensureSchema().
+CREATE TABLE IF NOT EXISTS privacy_change_events (
+  id UUID PRIMARY KEY,
+  subject_id UUID NOT NULL DEFAULT '00000000-0000-4000-8000-000000000001' REFERENCES privacy_subjects (id) ON DELETE CASCADE,
+  vault_record_id UUID NOT NULL REFERENCES privacy_vault_records (id) ON DELETE CASCADE,
+  replacement_record_id UUID REFERENCES privacy_vault_records (id) ON DELETE SET NULL,
+  kind TEXT NOT NULL DEFAULT 'other',
+  declared_at TIMESTAMPTZ DEFAULT NOW(),
+  note TEXT NOT NULL DEFAULT ''
+);
+-- "Changes touching this record" — the inventory view groups by the old record.
+CREATE INDEX IF NOT EXISTS idx_privacy_change_events_vault_record ON privacy_change_events (vault_record_id);
+-- "Every record for subject X" — the primary list filter once a second
+-- household member exists (#3658).
+CREATE INDEX IF NOT EXISTS idx_privacy_vault_records_subject ON privacy_vault_records (subject_id);
+CREATE INDEX IF NOT EXISTS idx_privacy_orgs_subject ON privacy_orgs (subject_id);
+CREATE INDEX IF NOT EXISTS idx_privacy_change_events_subject ON privacy_change_events (subject_id);
+CREATE INDEX IF NOT EXISTS idx_privacy_consents_subject ON privacy_consents (subject_id);
+-- `self` always holds local-vault consent — the install owner IS the self
+-- subject (#3658). Broker purposes are never seeded, even for `self` (#8332).
+INSERT INTO privacy_consents (id, subject_id, scope, method, note, granted_at)
+SELECT gen_random_uuid(), '00000000-0000-4000-8000-000000000001', 'pii_vault', 'self',
+       'seeded: the install owner is the self subject', NOW()
+WHERE NOT EXISTS (SELECT 1 FROM privacy_consents WHERE subject_id = '00000000-0000-4000-8000-000000000001');
+
+-- Stacker News community stewardship. Credentials are isolated from account
+-- configuration; untrusted snapshots and all review transitions are auditable.
+CREATE TABLE IF NOT EXISTS stacker_news_accounts (
+  id UUID PRIMARY KEY,
+  label TEXT NOT NULL,
+  username TEXT NOT NULL,
+  enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  monitoring_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+  monitoring_interval_minutes INTEGER NOT NULL DEFAULT 30 CHECK (monitoring_interval_minutes BETWEEN 5 AND 1440),
+  sync_item_limit INTEGER NOT NULL DEFAULT 30 CHECK (sync_item_limit BETWEEN 1 AND 100),
+  analysis_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+  text_model TEXT NOT NULL DEFAULT '',
+  vision_model TEXT NOT NULL DEFAULT '',
+  rules JSONB NOT NULL DEFAULT '{}'::jsonb,
+  policy_version TEXT NOT NULL DEFAULT 'v1',
+  read_transport TEXT NOT NULL DEFAULT 'browser' CHECK (read_transport IN ('browser','api')),
+  last_sync_at TIMESTAMPTZ,
+  last_error TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE (username)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_stacker_news_accounts_username_ci ON stacker_news_accounts (LOWER(username));
+CREATE TABLE IF NOT EXISTS stacker_news_credentials (
+  account_id UUID PRIMARY KEY REFERENCES stacker_news_accounts (id) ON DELETE CASCADE,
+  api_key_enc TEXT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS stacker_news_territories (
+  id UUID PRIMARY KEY,
+  account_id UUID NOT NULL REFERENCES stacker_news_accounts (id) ON DELETE CASCADE,
+  slug TEXT NOT NULL,
+  label TEXT NOT NULL DEFAULT '',
+  is_owned BOOLEAN NOT NULL DEFAULT FALSE,
+  monitoring_enabled BOOLEAN,
+  inherit_account_rules BOOLEAN NOT NULL DEFAULT TRUE,
+  rules JSONB NOT NULL DEFAULT '{}'::jsonb,
+  remote_settings JSONB NOT NULL DEFAULT '{}'::jsonb,
+  remote_refreshed_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE (account_id, slug)
+);
+CREATE INDEX IF NOT EXISTS idx_stacker_news_territories_account ON stacker_news_territories (account_id);
+CREATE TABLE IF NOT EXISTS stacker_news_items (
+  id UUID PRIMARY KEY,
+  account_id UUID NOT NULL REFERENCES stacker_news_accounts (id) ON DELETE CASCADE,
+  territory_id UUID REFERENCES stacker_news_territories (id) ON DELETE SET NULL,
+  remote_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  author_name TEXT NOT NULL DEFAULT '',
+  title TEXT NOT NULL DEFAULT '',
+  body TEXT NOT NULL DEFAULT '',
+  source_url TEXT NOT NULL DEFAULT '',
+  image_urls JSONB NOT NULL DEFAULT '[]'::jsonb,
+  content_hash TEXT NOT NULL,
+  remote_created_at TIMESTAMPTZ,
+  remote_updated_at TIMESTAMPTZ,
+  received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE (account_id, remote_id)
+);
+CREATE INDEX IF NOT EXISTS idx_stacker_news_items_account_received ON stacker_news_items (account_id, received_at DESC);
+CREATE INDEX IF NOT EXISTS idx_stacker_news_items_account_remote_created ON stacker_news_items (account_id, remote_created_at DESC NULLS LAST, received_at DESC);
+CREATE TABLE IF NOT EXISTS stacker_news_media (
+  id UUID PRIMARY KEY,
+  item_id UUID NOT NULL REFERENCES stacker_news_items (id) ON DELETE CASCADE,
+  source_url_hash TEXT NOT NULL,
+  content_hash TEXT NOT NULL DEFAULT '',
+  mime_type TEXT NOT NULL DEFAULT '',
+  width INTEGER,
+  height INTEGER,
+  byte_length INTEGER,
+  status TEXT NOT NULL DEFAULT 'pending',
+  error TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE (item_id, source_url_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_stacker_news_media_item ON stacker_news_media (item_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS stacker_news_analyses (
+  id UUID PRIMARY KEY,
+  item_id UUID NOT NULL REFERENCES stacker_news_items (id) ON DELETE CASCADE,
+  stage TEXT NOT NULL,
+  provider TEXT NOT NULL DEFAULT 'deterministic',
+  model TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'completed',
+  source_content_hash TEXT NOT NULL,
+  rules_hash TEXT NOT NULL DEFAULT '',
+  policy_version TEXT NOT NULL DEFAULT 'v1',
+  result JSONB NOT NULL DEFAULT '{}'::jsonb,
+  moderator_feedback TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_stacker_news_analyses_item ON stacker_news_analyses (item_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS stacker_news_actions (
+  id UUID PRIMARY KEY,
+  account_id UUID NOT NULL REFERENCES stacker_news_accounts (id) ON DELETE CASCADE,
+  item_id UUID REFERENCES stacker_news_items (id) ON DELETE SET NULL,
+  territory_id UUID REFERENCES stacker_news_territories (id) ON DELETE SET NULL,
+  kind TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'draft',
+  destination TEXT NOT NULL DEFAULT '',
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  source_content_hash TEXT NOT NULL DEFAULT '',
+  rules_hash TEXT NOT NULL DEFAULT '',
+  policy_version TEXT NOT NULL DEFAULT 'v1',
+  idempotency_key TEXT NOT NULL,
+  reviewed_target JSONB NOT NULL DEFAULT '{}'::jsonb,
+  review_note TEXT NOT NULL DEFAULT '',
+  result JSONB NOT NULL DEFAULT '{}'::jsonb,
+  error TEXT NOT NULL DEFAULT '',
+  approved_at TIMESTAMPTZ,
+  executed_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+DROP INDEX IF EXISTS idx_stacker_news_actions_idempotency_key;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_stacker_news_actions_active_idempotency_key ON stacker_news_actions (idempotency_key) WHERE state IN ('pending_review','approved','executing');
+CREATE INDEX IF NOT EXISTS idx_stacker_news_actions_account_state ON stacker_news_actions (account_id, state, created_at DESC);
+CREATE TABLE IF NOT EXISTS stacker_news_action_events (
+  id UUID PRIMARY KEY,
+  action_id UUID NOT NULL REFERENCES stacker_news_actions (id) ON DELETE CASCADE,
+  from_state TEXT,
+  to_state TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_stacker_news_action_events_action ON stacker_news_action_events (action_id, created_at ASC);
+
+-- X account diagnostics and review-gated drafts. Reads use the managed browser;
+-- no X password or publishing credential is stored here.
+CREATE TABLE IF NOT EXISTS x_accounts (
+  id UUID PRIMARY KEY,
+  label TEXT NOT NULL,
+  username TEXT NOT NULL,
+  enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  notes TEXT NOT NULL DEFAULT '',
+  profile_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+  last_sync_at TIMESTAMPTZ,
+  last_error TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE (username)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_x_accounts_username_ci ON x_accounts (LOWER(username));
+CREATE TABLE IF NOT EXISTS x_posts (
+  id UUID PRIMARY KEY,
+  account_id UUID NOT NULL REFERENCES x_accounts (id) ON DELETE CASCADE,
+  remote_id TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'post' CHECK (kind IN ('post','reply')),
+  body TEXT NOT NULL DEFAULT '',
+  source_url TEXT NOT NULL DEFAULT '',
+  remote_created_at TIMESTAMPTZ,
+  impressions INTEGER,
+  engagements INTEGER,
+  replies INTEGER NOT NULL DEFAULT 0,
+  reposts INTEGER NOT NULL DEFAULT 0,
+  likes INTEGER NOT NULL DEFAULT 0,
+  bookmarks INTEGER NOT NULL DEFAULT 0,
+  content_hash TEXT NOT NULL,
+  received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE (account_id, remote_id)
+);
+CREATE INDEX IF NOT EXISTS idx_x_posts_account_received ON x_posts (account_id, received_at DESC);
+CREATE TABLE IF NOT EXISTS x_drafts (
+  id UUID PRIMARY KEY,
+  account_id UUID NOT NULL REFERENCES x_accounts (id) ON DELETE CASCADE,
+  body TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'draft' CHECK (state IN ('draft','pending_review','approved','rejected','opened')),
+  review_note TEXT NOT NULL DEFAULT '',
+  result JSONB NOT NULL DEFAULT '{}'::jsonb,
+  approved_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_x_drafts_account_state ON x_drafts (account_id, state, created_at DESC);
+
+-- Beeper conversation mirror (#27). Machine-local mirror of the Beeper Desktop
+-- API — accounts, conversations, messages, participants, attachment metadata,
+-- and per-chat sync cursors. NEVER FEDERATED: no sync_sequence column, no
+-- PEER_SUBSCRIBABLE_KINDS entry, no dataSync category, no PORTOS_SCHEMA_VERSIONS
+-- entry (guarded by server/services/sharing/beeperNeverFederates.test.js).
+-- Deletions from the source are tombstones, not removals — a message the
+-- source unsends keeps its row/body/attachments and gains `unsent_at` (never
+-- `deleted_at`, which collides with the federation guard's column list).
+-- Mirrors the beeper.js block in server/lib/db/schema/.
+CREATE TABLE IF NOT EXISTS beeper_accounts (
+  account_id TEXT PRIMARY KEY,
+  network TEXT NOT NULL DEFAULT '',
+  display_name TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT '',
+  bridge_id TEXT NOT NULL DEFAULT '',
+  last_seen_at TIMESTAMPTZ,
+  chat_cursor TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+-- The ONE Beeper credential this install holds (#31), AES-256-GCM encrypted by
+-- server/lib/vaultCrypto.js. Single-row by construction (id = 'default'): PortOS
+-- models one Beeper account per install. token_expires_at NULL = never expires
+-- (only Beeper's own UI can mint that); there is no refresh grant, so an expired
+-- token is re-connected, never refreshed. scopes/client_id exist for the
+-- disconnect-time revocation call and never reach a client payload.
+CREATE TABLE IF NOT EXISTS beeper_credentials (
+  id TEXT PRIMARY KEY,
+  token_enc TEXT NOT NULL,
+  token_expires_at TIMESTAMPTZ,
+  scopes TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL DEFAULT 'pasted' CHECK (source IN ('oauth','pasted')),
+  client_id TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS beeper_conversations (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  account_id TEXT NOT NULL REFERENCES beeper_accounts (account_id) ON DELETE CASCADE,
+  network TEXT NOT NULL DEFAULT '',
+  source_chat_id TEXT NOT NULL,
+  title TEXT NOT NULL DEFAULT '',
+  type TEXT NOT NULL DEFAULT 'single',
+  is_group BOOLEAN NOT NULL DEFAULT FALSE,
+  is_pinned BOOLEAN NOT NULL DEFAULT FALSE,
+  is_archived BOOLEAN NOT NULL DEFAULT FALSE,
+  is_low_priority BOOLEAN NOT NULL DEFAULT FALSE,
+  is_muted BOOLEAN NOT NULL DEFAULT FALSE,
+  last_activity TIMESTAMPTZ,
+  unread_count INTEGER NOT NULL DEFAULT 0,
+  -- LOCAL "seen in PortOS" watermark (#83). Never mirrored from Beeper and
+  -- never written by the sweep — opening a thread stamps it with NOW(), and
+  -- the read model compares it against COALESCE(last_activity, created_at)
+  -- to decide whether the unread badge still shows. Mirrors the ALTER in
+  -- server/lib/db/schema/beeper.js (for existing installs).
+  seen_at TIMESTAMPTZ,
+  -- Beeper-owned snooze deadline; NULL on older Desktop API versions.
+  snooze_until TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE (account_id, source_chat_id)
+);
+-- Repointed at the ordering expression the keyset walk actually uses — no
+-- query filters on account_id. #81: the ORDER BY / cursor predicate sort on
+-- COALESCE(last_activity, 'epoch'::timestamptz), never the raw column and
+-- never a created_at fallback — created_at is the MIRROR ROW's mint time,
+-- not chat activity, so falling back to it sorted a batch of activity-less
+-- chats swept in the same pass at the top of the Inbox by their shared,
+-- recent creation time. The epoch sentinel keeps the row-value keyset tuple
+-- shape (a real NULLS LAST cannot) while sorting every activity-less chat
+-- LAST under DESC instead. Mirrors the block in server/lib/db/schema/beeper.js.
+CREATE INDEX IF NOT EXISTS idx_beeper_conversations_activity_epoch_keyset ON beeper_conversations ((COALESCE(last_activity, 'epoch'::timestamptz)) DESC, id DESC);
+CREATE TABLE IF NOT EXISTS beeper_messages (
+  id TEXT PRIMARY KEY,
+  conversation_id UUID NOT NULL REFERENCES beeper_conversations (id) ON DELETE CASCADE,
+  sender_id TEXT NOT NULL DEFAULT '',
+  body TEXT NOT NULL DEFAULT '',
+  sent_at TIMESTAMPTZ,
+  edited_at TIMESTAMPTZ,
+  unsent_at TIMESTAMPTZ,
+  sort_key TEXT NOT NULL DEFAULT '',
+  -- Mirrors the API's own Message.isSender. senderID cannot be compared
+  -- against the local user (accounts[].user.id differs from senderID on every
+  -- network), so this is the only reliable inbound/outbound signal.
+  is_sender BOOLEAN NOT NULL DEFAULT FALSE,
+  observed_at TIMESTAMPTZ NOT NULL DEFAULT 'epoch',
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+-- Repointed: sort_key is written on ingest and never read back. A thread page
+-- and the "latest message" preview LATERAL both order on
+-- COALESCE(sent_at, created_at) DESC, id DESC within one conversation_id, so
+-- one index serves both (audit cluster 06). Mirrors beeper.js.
+CREATE INDEX IF NOT EXISTS idx_beeper_messages_conversation_order ON beeper_messages (conversation_id, (COALESCE(sent_at, created_at)) DESC, id DESC);
+CREATE TABLE IF NOT EXISTS beeper_participants (
+  conversation_id UUID NOT NULL REFERENCES beeper_conversations (id) ON DELETE CASCADE,
+  source_user_id TEXT NOT NULL,
+  display_name TEXT NOT NULL DEFAULT '',
+  handle TEXT NOT NULL DEFAULT '',
+  tribe_person_id UUID REFERENCES tribe_people (id) ON DELETE SET NULL,
+  observed_via TEXT NOT NULL CHECK (observed_via IN ('participant-list','message-sender')),
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  PRIMARY KEY (conversation_id, source_user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_beeper_participants_tribe_person ON beeper_participants (tribe_person_id) WHERE tribe_person_id IS NOT NULL;
+CREATE TABLE IF NOT EXISTS beeper_attachments (
+  conversation_id UUID NOT NULL REFERENCES beeper_conversations (id) ON DELETE CASCADE,
+  message_id TEXT NOT NULL REFERENCES beeper_messages (id) ON DELETE CASCADE,
+  idx INTEGER NOT NULL,
+  mxc_id TEXT,
+  mime_type TEXT NOT NULL DEFAULT '',
+  byte_length BIGINT,
+  file_name TEXT NOT NULL DEFAULT '',
+  width INTEGER,
+  height INTEGER,
+  last_viewed_at TIMESTAMPTZ,
+  keep BOOLEAN NOT NULL DEFAULT FALSE,
+  -- Byte-mirror columns (#37). `local_path` is the store-relative path of the
+  -- mirrored bytes (`<sha256 prefix>/<sha256>.<ext>`), NULL while only the
+  -- reference is held — that NULL is the lazy mirror's state machine, never ''.
+  -- `unavailable_at`/`fetch_error` record a TERMINAL refusal from the source,
+  -- which both stops a re-fetch loop and exempts the row from eviction.
+  local_path TEXT,
+  fetched_at TIMESTAMPTZ,
+  unavailable_at TIMESTAMPTZ,
+  fetch_error TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  PRIMARY KEY (conversation_id, message_id, idx)
+);
+-- Every attachment route addresses one row by (message_id, idx) — the PK
+-- above leads with conversation_id, which none of those callers have on
+-- hand, so every lookup scanned the table (audit cluster 06).
+CREATE INDEX IF NOT EXISTS idx_beeper_attachments_message ON beeper_attachments (message_id, idx);
+CREATE INDEX IF NOT EXISTS idx_beeper_attachments_local ON beeper_attachments (local_path) WHERE local_path IS NOT NULL;
+-- evictToBudget's candidate query filters local_path IS NOT NULL AND
+-- keep = FALSE AND unavailable_at IS NULL AND mxc_id IS NOT NULL, and orders
+-- by last_viewed_at ASC NULLS FIRST, fetched_at ASC NULLS FIRST (a
+-- never-viewed row is the BEST eviction candidate, ordered first on purpose).
+-- Predicate and NULLS placement match that query exactly (audit cluster 06).
+-- `sha256` (and its index) is dropped, not shipped fresh: it was written on
+-- every fetch but never read back — the content-addressed path is built from
+-- the freshly computed hash, not from this column (decision 3).
+CREATE INDEX IF NOT EXISTS idx_beeper_attachments_eviction_candidates ON beeper_attachments (last_viewed_at ASC NULLS FIRST, fetched_at ASC NULLS FIRST) WHERE keep = FALSE AND local_path IS NOT NULL;
+CREATE TABLE IF NOT EXISTS beeper_sync_cursors (
+  account_id TEXT NOT NULL REFERENCES beeper_accounts (account_id) ON DELETE CASCADE,
+  chat_id TEXT NOT NULL,
+  cursor TEXT,
+  last_activity TIMESTAMPTZ,
+  last_swept_at TIMESTAMPTZ,
+  PRIMARY KEY (account_id, chat_id)
+);
+
+-- Outbound outbox (#36). A row is written BEFORE the send POST, so intent
+-- survives a crash between the click and the POST and one row is the
+-- serialization point that stops a double-click double-posting. `state` is
+-- PortOS's own machine (not a Beeper vocabulary), so the CHECK is deliberate;
+-- a failed row is never retried in place — a re-send is a NEW row, because
+-- Beeper has no idempotency key on send. Mirrors the beeper.js block in
+-- server/lib/db/schema/.
+CREATE TABLE IF NOT EXISTS beeper_reconcile_cursors (
+  account_id TEXT PRIMARY KEY REFERENCES beeper_accounts (account_id) ON DELETE CASCADE,
+  message_id TEXT NOT NULL,
+  upper_bound TEXT
+);
+
+CREATE TABLE IF NOT EXISTS beeper_outbox (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  conversation_id UUID NOT NULL REFERENCES beeper_conversations (id) ON DELETE CASCADE,
+  chat_id TEXT NOT NULL,
+  body TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'draft' CHECK (state IN ('draft','approved','sending','awaiting-confirmation','sent','failed')),
+  pending_message_id TEXT,
+  message_id TEXT,
+  error_code TEXT,
+  error_message TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  approved_at TIMESTAMPTZ,
+  send_requested_at TIMESTAMPTZ,
+  sent_at TIMESTAMPTZ,
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_beeper_outbox_conversation_state ON beeper_outbox (conversation_id, state, created_at DESC);
+
+-- Deletion audit log (incident #1248-follow-up). Append-only forensic trail of
+-- every tombstone / un-tombstone / hard-delete of user-authored records, written
+-- by a DB trigger so it captures deletions from ANY source (app, a test suite's
+-- raw DELETE, a manual psql session). row_snapshot keeps the OLD row JSON so a
+-- wrongful delete is recoverable from the log alone. Local-only (not federated).
+-- Mirrors the record_audit block in server/lib/db.js (parity-locked by
+-- db.ddlParity.test.js).
+CREATE TABLE IF NOT EXISTS record_audit (
+  id BIGSERIAL PRIMARY KEY,
+  table_name TEXT NOT NULL,
+  record_id TEXT,
+  record_name TEXT,
+  action VARCHAR(16) NOT NULL,
+  actor TEXT,
+  source_query TEXT,
+  application_name TEXT,
+  backend_pid INTEGER,
+  row_snapshot JSONB,
+  occurred_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_record_audit_record ON record_audit (table_name, record_id, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_record_audit_occurred ON record_audit (occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_record_audit_action ON record_audit (action, occurred_at DESC);
+
+-- Generic audit trigger function — reads id/name/title/deleted/deleted_at out of
+-- to_jsonb(OLD/NEW) so it needs no per-table column knowledge. A row is "deleted"
+-- when `deleted` is true OR `deleted_at` is non-null. See server/lib/db.js for
+-- the authoritative copy + commentary.
+CREATE OR REPLACE FUNCTION record_audit_log()
+RETURNS TRIGGER AS $$
+DECLARE
+  oldj JSONB := to_jsonb(OLD);
+  newj JSONB;
+  was_deleted BOOLEAN;
+  now_deleted BOOLEAN;
+  v_action TEXT;
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    v_action := 'hard_delete';
+    INSERT INTO record_audit
+      (table_name, record_id, record_name, action, actor, source_query, application_name, backend_pid, row_snapshot)
+    VALUES
+      (TG_TABLE_NAME, oldj->>'id', COALESCE(oldj->>'name', oldj->>'title'), v_action,
+       current_setting('portos.actor', true), current_query(),
+       current_setting('application_name', true), pg_backend_pid(), oldj);
+    RETURN OLD;
+  END IF;
+
+  newj := to_jsonb(NEW);
+  was_deleted := COALESCE((oldj->>'deleted')::boolean, false) OR oldj->>'deleted_at' IS NOT NULL;
+  now_deleted := COALESCE((newj->>'deleted')::boolean, false) OR newj->>'deleted_at' IS NOT NULL;
+  IF now_deleted AND NOT was_deleted THEN
+    v_action := 'tombstone';
+  ELSIF was_deleted AND NOT now_deleted THEN
+    v_action := 'untombstone';
+  ELSE
+    RETURN NEW;
+  END IF;
+  INSERT INTO record_audit
+    (table_name, record_id, record_name, action, actor, source_query, application_name, backend_pid, row_snapshot)
+  VALUES
+    (TG_TABLE_NAME, newj->>'id', COALESCE(newj->>'name', newj->>'title'), v_action,
+     current_setting('portos.actor', true), current_query(),
+     current_setting('application_name', true), pg_backend_pid(), newj);
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Audit trigger on every user-authored-content table. AUDITED_RECORD_TABLES —
+-- keep in sync with auditedTables in server/lib/db/schema/audit.js.
+DROP TRIGGER IF EXISTS trg_universes_audit ON universes;
+CREATE TRIGGER trg_universes_audit AFTER UPDATE OR DELETE ON universes FOR EACH ROW EXECUTE FUNCTION record_audit_log();
+DROP TRIGGER IF EXISTS trg_universe_runs_audit ON universe_runs;
+CREATE TRIGGER trg_universe_runs_audit AFTER UPDATE OR DELETE ON universe_runs FOR EACH ROW EXECUTE FUNCTION record_audit_log();
+DROP TRIGGER IF EXISTS trg_pipeline_series_audit ON pipeline_series;
+CREATE TRIGGER trg_pipeline_series_audit AFTER UPDATE OR DELETE ON pipeline_series FOR EACH ROW EXECUTE FUNCTION record_audit_log();
+DROP TRIGGER IF EXISTS trg_pipeline_issues_audit ON pipeline_issues;
+CREATE TRIGGER trg_pipeline_issues_audit AFTER UPDATE OR DELETE ON pipeline_issues FOR EACH ROW EXECUTE FUNCTION record_audit_log();
+DROP TRIGGER IF EXISTS trg_story_builder_sessions_audit ON story_builder_sessions;
+CREATE TRIGGER trg_story_builder_sessions_audit AFTER UPDATE OR DELETE ON story_builder_sessions FOR EACH ROW EXECUTE FUNCTION record_audit_log();
+DROP TRIGGER IF EXISTS trg_writers_room_works_audit ON writers_room_works;
+CREATE TRIGGER trg_writers_room_works_audit AFTER UPDATE OR DELETE ON writers_room_works FOR EACH ROW EXECUTE FUNCTION record_audit_log();
+DROP TRIGGER IF EXISTS trg_writers_room_folders_audit ON writers_room_folders;
+CREATE TRIGGER trg_writers_room_folders_audit AFTER UPDATE OR DELETE ON writers_room_folders FOR EACH ROW EXECUTE FUNCTION record_audit_log();
+DROP TRIGGER IF EXISTS trg_writers_room_draft_versions_audit ON writers_room_draft_versions;
+CREATE TRIGGER trg_writers_room_draft_versions_audit AFTER UPDATE OR DELETE ON writers_room_draft_versions FOR EACH ROW EXECUTE FUNCTION record_audit_log();
+DROP TRIGGER IF EXISTS trg_catalog_ingredients_audit ON catalog_ingredients;
+CREATE TRIGGER trg_catalog_ingredients_audit AFTER UPDATE OR DELETE ON catalog_ingredients FOR EACH ROW EXECUTE FUNCTION record_audit_log();
+DROP TRIGGER IF EXISTS trg_catalog_scraps_audit ON catalog_scraps;
+CREATE TRIGGER trg_catalog_scraps_audit AFTER UPDATE OR DELETE ON catalog_scraps FOR EACH ROW EXECUTE FUNCTION record_audit_log();
+DROP TRIGGER IF EXISTS trg_catalog_user_types_audit ON catalog_user_types;
+CREATE TRIGGER trg_catalog_user_types_audit AFTER UPDATE OR DELETE ON catalog_user_types FOR EACH ROW EXECUTE FUNCTION record_audit_log();
+DROP TRIGGER IF EXISTS trg_creative_director_projects_audit ON creative_director_projects;
+CREATE TRIGGER trg_creative_director_projects_audit AFTER UPDATE OR DELETE ON creative_director_projects FOR EACH ROW EXECUTE FUNCTION record_audit_log();
+DROP TRIGGER IF EXISTS trg_threejs_models_audit ON threejs_models;
+CREATE TRIGGER trg_threejs_models_audit AFTER UPDATE OR DELETE ON threejs_models FOR EACH ROW EXECUTE FUNCTION record_audit_log();
+DROP TRIGGER IF EXISTS trg_image_to_3d_models_audit ON image_to_3d_models;
+CREATE TRIGGER trg_image_to_3d_models_audit AFTER UPDATE OR DELETE ON image_to_3d_models FOR EACH ROW EXECUTE FUNCTION record_audit_log();
+DROP TRIGGER IF EXISTS trg_sprite_records_audit ON sprite_records;
+CREATE TRIGGER trg_sprite_records_audit AFTER UPDATE OR DELETE ON sprite_records FOR EACH ROW EXECUTE FUNCTION record_audit_log();
+DROP TRIGGER IF EXISTS trg_games_audit ON games;
+CREATE TRIGGER trg_games_audit AFTER UPDATE OR DELETE ON games FOR EACH ROW EXECUTE FUNCTION record_audit_log();
+DROP TRIGGER IF EXISTS trg_code_animation_jobs_audit ON code_animation_jobs;
+CREATE TRIGGER trg_code_animation_jobs_audit AFTER UPDATE OR DELETE ON code_animation_jobs FOR EACH ROW EXECUTE FUNCTION record_audit_log();
+DROP TRIGGER IF EXISTS trg_fableloom_stories_audit ON fableloom_stories;
+CREATE TRIGGER trg_fableloom_stories_audit AFTER UPDATE OR DELETE ON fableloom_stories FOR EACH ROW EXECUTE FUNCTION record_audit_log();
+DROP TRIGGER IF EXISTS trg_mood_boards_audit ON mood_boards;
+CREATE TRIGGER trg_mood_boards_audit AFTER UPDATE OR DELETE ON mood_boards FOR EACH ROW EXECUTE FUNCTION record_audit_log();
+DROP TRIGGER IF EXISTS trg_lora_training_runs_audit ON lora_training_runs;
+CREATE TRIGGER trg_lora_training_runs_audit AFTER UPDATE OR DELETE ON lora_training_runs FOR EACH ROW EXECUTE FUNCTION record_audit_log();
+DROP TRIGGER IF EXISTS trg_authors_audit ON authors;
+CREATE TRIGGER trg_authors_audit AFTER UPDATE OR DELETE ON authors FOR EACH ROW EXECUTE FUNCTION record_audit_log();
+DROP TRIGGER IF EXISTS trg_artists_audit ON artists;
+CREATE TRIGGER trg_artists_audit AFTER UPDATE OR DELETE ON artists FOR EACH ROW EXECUTE FUNCTION record_audit_log();
+DROP TRIGGER IF EXISTS trg_albums_audit ON albums;
+CREATE TRIGGER trg_albums_audit AFTER UPDATE OR DELETE ON albums FOR EACH ROW EXECUTE FUNCTION record_audit_log();
+DROP TRIGGER IF EXISTS trg_tracks_audit ON tracks;
+CREATE TRIGGER trg_tracks_audit AFTER UPDATE OR DELETE ON tracks FOR EACH ROW EXECUTE FUNCTION record_audit_log();
+DROP TRIGGER IF EXISTS trg_tribe_people_audit ON tribe_people;
+CREATE TRIGGER trg_tribe_people_audit AFTER UPDATE OR DELETE ON tribe_people FOR EACH ROW EXECUTE FUNCTION record_audit_log();
+DROP TRIGGER IF EXISTS trg_tribe_touchpoints_audit ON tribe_touchpoints;
+CREATE TRIGGER trg_tribe_touchpoints_audit AFTER UPDATE OR DELETE ON tribe_touchpoints FOR EACH ROW EXECUTE FUNCTION record_audit_log();
+DROP TRIGGER IF EXISTS trg_tribe_identities_audit ON tribe_identities;
+CREATE TRIGGER trg_tribe_identities_audit AFTER UPDATE OR DELETE ON tribe_identities FOR EACH ROW EXECUTE FUNCTION record_audit_log();
+
+-- AI provider connection graph DDL — `ai_connections`, `ai_harness_bindings`
+-- and `ai_route_bindings` (#6367, design record
+-- docs/plans/2026-09-06-provider-connections-and-harnesses.md). Machine-local
+-- by construction and never federated — rows carry endpoints, credential
+-- material and this host's execution environment.
+CREATE TABLE IF NOT EXISTS ai_connections (
+  id UUID PRIMARY KEY,
+  revision INTEGER NOT NULL DEFAULT 1,
+  kind TEXT NOT NULL,
+  label TEXT NOT NULL DEFAULT '',
+  transports JSONB NOT NULL DEFAULT '{}'::jsonb,
+  credentials JSONB NOT NULL DEFAULT '{}'::jsonb,
+  catalog JSONB NOT NULL DEFAULT '{"state":"unknown","models":[]}'::jsonb,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+-- Service-instance columns (#7563): a connection is one instance of a
+-- SERVICE_DEFINITIONS row, addressed by slug, under a declared plan.
+ALTER TABLE ai_connections ADD COLUMN IF NOT EXISTS slug TEXT;
+ALTER TABLE ai_connections ADD COLUMN IF NOT EXISTS definition_id TEXT;
+ALTER TABLE ai_connections ADD COLUMN IF NOT EXISTS plan TEXT NOT NULL DEFAULT 'paid';
+ALTER TABLE ai_connections ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT true;
+ALTER TABLE ai_connections ADD COLUMN IF NOT EXISTS credential_via TEXT NOT NULL DEFAULT 'stored';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_ai_connections_slug
+  ON ai_connections (slug)
+  WHERE slug IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS ai_harness_bindings (
+  id UUID PRIMARY KEY,
+  revision INTEGER NOT NULL DEFAULT 1,
+  connection_id UUID NOT NULL REFERENCES ai_connections (id),
+  harness_id TEXT,
+  variant_key TEXT NOT NULL DEFAULT 'default',
+  label TEXT NOT NULL DEFAULT '',
+  enabled BOOLEAN NOT NULL DEFAULT false,
+  selected_models JSONB NOT NULL DEFAULT '[]'::jsonb,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_ai_harness_bindings_variant
+  ON ai_harness_bindings (connection_id, harness_id, variant_key)
+  WHERE harness_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_ai_harness_bindings_api_variant
+  ON ai_harness_bindings (connection_id, variant_key)
+  WHERE harness_id IS NULL;
+CREATE INDEX IF NOT EXISTS idx_ai_harness_bindings_connection
+  ON ai_harness_bindings (connection_id);
+
+CREATE TABLE IF NOT EXISTS ai_route_bindings (
+  provider_id TEXT PRIMARY KEY,
+  binding_id UUID NOT NULL REFERENCES ai_harness_bindings (id),
+  mode TEXT NOT NULL CHECK (mode IN ('cli', 'tui', 'api')),
+  model_map JSONB NOT NULL DEFAULT '{}'::jsonb,
+  projected JSONB NOT NULL DEFAULT '{}'::jsonb,
+  pending JSONB,
+  pending_revision INTEGER,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+ALTER TABLE ai_route_bindings ADD COLUMN IF NOT EXISTS model_alias_overrides JSONB NOT NULL DEFAULT '{}'::jsonb;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_ai_route_bindings_binding_mode
+  ON ai_route_bindings (binding_id, mode);
+CREATE INDEX IF NOT EXISTS idx_ai_route_bindings_binding
+  ON ai_route_bindings (binding_id);
+
+-- Creative Commissions (#2657) — standing, recurring creative brief that fires
+-- on a schedule and drives the Creative Director directive pipeline unattended.
+-- Machine-local: never federated (a synced schedule would double-run on every peer).
+-- The commission BRIEF federates as of #2686; the schedule/runs stay machine-local.
+CREATE TABLE IF NOT EXISTS creative_commissions (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL DEFAULT '',
+  enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  data JSONB NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  deleted BOOLEAN DEFAULT FALSE,
+  deleted_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_creative_commissions_enabled ON creative_commissions (enabled);
+
+-- Creative Commission FEEDBACK — the split-record federation half (#2686).
+-- Taste reactions federate so a 👍/👎 rated on one machine conditions the same
+-- commission's next run on another. One row per reaction; the full sanitized
+-- record in `data` JSONB, with commission_id / run_id / created_at / updated_at
+-- mirrored for the per-commission hydration query, plus the soft-delete tombstone
+-- columns the LWW merge needs (a hard delete never propagates).
+CREATE TABLE IF NOT EXISTS commission_feedback (
+  id TEXT PRIMARY KEY,
+  commission_id TEXT,
+  run_id TEXT,
+  data JSONB NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  deleted BOOLEAN DEFAULT FALSE,
+  deleted_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_commission_feedback_commission ON commission_feedback (commission_id, created_at);
+
+-- Immutable machine-local scheduled audit measurements per app/category/run.
+CREATE TABLE IF NOT EXISTS app_quality_measurements (
+      app_id TEXT NOT NULL,
+      category TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      assessed_at TIMESTAMPTZ NOT NULL,
+      report JSONB NOT NULL,
+      PRIMARY KEY (app_id, category, agent_id)
+    );
+
+CREATE INDEX IF NOT EXISTS idx_app_quality_history ON app_quality_measurements (app_id, assessed_at DESC);
+
+-- Machine-local Mind recipe library (#7194).
+CREATE TABLE IF NOT EXISTS mind_tool_recipes (
+    id UUID PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    active_revision INTEGER NOT NULL CHECK (active_revision > 0),
+    archived BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+CREATE TABLE IF NOT EXISTS mind_tool_recipe_versions (
+    recipe_id UUID NOT NULL REFERENCES mind_tool_recipes (id) ON DELETE CASCADE,
+    revision INTEGER NOT NULL CHECK (revision > 0),
+    definition JSONB NOT NULL,
+    author TEXT NOT NULL CHECK (author IN ('user', 'mind')),
+    archived BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (recipe_id, revision)
+  );
+
+-- Decks: playing-card / tarot design projects. Cards are per-row so a render
+-- attaches to one card; image bytes stay in data/images and are referenced by name.
+CREATE TABLE IF NOT EXISTS decks (
+    id UUID PRIMARY KEY,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('playing', 'tarot')),
+    universe_id TEXT,
+    definition JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    deleted BOOLEAN NOT NULL DEFAULT FALSE,
+    deleted_at TIMESTAMPTZ
+  );
+CREATE TABLE IF NOT EXISTS deck_cards (
+    id UUID PRIMARY KEY,
+    deck_id UUID NOT NULL REFERENCES decks (id) ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    key TEXT NOT NULL,
+    definition JSONB NOT NULL DEFAULT '{}'::jsonb,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (deck_id, key)
+  );
+CREATE INDEX IF NOT EXISTS idx_deck_cards_deck ON deck_cards (deck_id, position);
+CREATE INDEX IF NOT EXISTS idx_decks_deleted ON decks (deleted, updated_at DESC);
+
+-- ============================================================================
+-- Commit-ordered federation change feed (#8315)
+-- ============================================================================
+-- Peers page memories and the catalog tables by a feed POSITION drawn at
+-- COMMIT (deferred constraint triggers serialized by a transaction-scoped
+-- advisory lock), not by the row-write-time sync_sequence, so a transaction
+-- that commits late can never land below a cursor a peer already advanced
+-- past. Positions start at 1e15 so a legacy sync_sequence cursor replays the
+-- whole feed once. Rationale: server/lib/db/schema/syncFeed.js (mirrored there
+-- for existing installs; parity-locked by db.ddlParity.test.js).
+CREATE TABLE IF NOT EXISTS sync_feed (
+  stream TEXT NOT NULL,
+  row_sequence BIGINT NOT NULL,
+  position BIGINT NOT NULL,
+  PRIMARY KEY (stream, row_sequence)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_feed_position ON sync_feed (stream, position);
+CREATE SEQUENCE IF NOT EXISTS memories_sync_feed_seq START WITH 1000000000000000 MINVALUE 1000000000000000;
+CREATE SEQUENCE IF NOT EXISTS catalog_scraps_sync_feed_seq START WITH 1000000000000000 MINVALUE 1000000000000000;
+CREATE SEQUENCE IF NOT EXISTS catalog_ingredients_sync_feed_seq START WITH 1000000000000000 MINVALUE 1000000000000000;
+CREATE SEQUENCE IF NOT EXISTS catalog_ingredient_sources_sync_feed_seq START WITH 1000000000000000 MINVALUE 1000000000000000;
+CREATE SEQUENCE IF NOT EXISTS catalog_ingredient_refs_sync_feed_seq START WITH 1000000000000000 MINVALUE 1000000000000000;
+CREATE SEQUENCE IF NOT EXISTS catalog_ingredient_relations_sync_feed_seq START WITH 1000000000000000 MINVALUE 1000000000000000;
+CREATE SEQUENCE IF NOT EXISTS catalog_tags_sync_feed_seq START WITH 1000000000000000 MINVALUE 1000000000000000;
+CREATE SEQUENCE IF NOT EXISTS catalog_ingredient_media_sync_feed_seq START WITH 1000000000000000 MINVALUE 1000000000000000;
+CREATE OR REPLACE FUNCTION sync_feed_capture()
+RETURNS TRIGGER AS $$
+BEGIN
+  PERFORM pg_advisory_xact_lock(8315001);
+  IF TG_OP <> 'INSERT' THEN
+    DELETE FROM sync_feed WHERE stream = TG_TABLE_NAME AND row_sequence = OLD.sync_sequence;
+  END IF;
+  IF TG_OP <> 'DELETE' THEN
+    INSERT INTO sync_feed (stream, row_sequence, position)
+    VALUES (TG_TABLE_NAME, NEW.sync_sequence, nextval(format('%I', TG_TABLE_NAME || '_sync_feed_seq')::regclass))
+    ON CONFLICT (stream, row_sequence) DO UPDATE SET position = EXCLUDED.position;
+  END IF;
+  RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS trg_memories_sync_feed ON memories;
+CREATE CONSTRAINT TRIGGER trg_memories_sync_feed AFTER INSERT OR DELETE ON memories DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION sync_feed_capture();
+DROP TRIGGER IF EXISTS trg_memories_sync_feed_update ON memories;
+CREATE CONSTRAINT TRIGGER trg_memories_sync_feed_update AFTER UPDATE ON memories DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN (OLD.sync_sequence IS DISTINCT FROM NEW.sync_sequence) EXECUTE FUNCTION sync_feed_capture();
+DROP TRIGGER IF EXISTS trg_catalog_scraps_sync_feed ON catalog_scraps;
+CREATE CONSTRAINT TRIGGER trg_catalog_scraps_sync_feed AFTER INSERT OR DELETE ON catalog_scraps DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION sync_feed_capture();
+DROP TRIGGER IF EXISTS trg_catalog_scraps_sync_feed_update ON catalog_scraps;
+CREATE CONSTRAINT TRIGGER trg_catalog_scraps_sync_feed_update AFTER UPDATE ON catalog_scraps DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN (OLD.sync_sequence IS DISTINCT FROM NEW.sync_sequence) EXECUTE FUNCTION sync_feed_capture();
+DROP TRIGGER IF EXISTS trg_catalog_ingredients_sync_feed ON catalog_ingredients;
+CREATE CONSTRAINT TRIGGER trg_catalog_ingredients_sync_feed AFTER INSERT OR DELETE ON catalog_ingredients DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION sync_feed_capture();
+DROP TRIGGER IF EXISTS trg_catalog_ingredients_sync_feed_update ON catalog_ingredients;
+CREATE CONSTRAINT TRIGGER trg_catalog_ingredients_sync_feed_update AFTER UPDATE ON catalog_ingredients DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN (OLD.sync_sequence IS DISTINCT FROM NEW.sync_sequence) EXECUTE FUNCTION sync_feed_capture();
+DROP TRIGGER IF EXISTS trg_catalog_ingredient_sources_sync_feed ON catalog_ingredient_sources;
+CREATE CONSTRAINT TRIGGER trg_catalog_ingredient_sources_sync_feed AFTER INSERT OR DELETE ON catalog_ingredient_sources DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION sync_feed_capture();
+DROP TRIGGER IF EXISTS trg_catalog_ingredient_sources_sync_feed_update ON catalog_ingredient_sources;
+CREATE CONSTRAINT TRIGGER trg_catalog_ingredient_sources_sync_feed_update AFTER UPDATE ON catalog_ingredient_sources DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN (OLD.sync_sequence IS DISTINCT FROM NEW.sync_sequence) EXECUTE FUNCTION sync_feed_capture();
+DROP TRIGGER IF EXISTS trg_catalog_ingredient_refs_sync_feed ON catalog_ingredient_refs;
+CREATE CONSTRAINT TRIGGER trg_catalog_ingredient_refs_sync_feed AFTER INSERT OR DELETE ON catalog_ingredient_refs DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION sync_feed_capture();
+DROP TRIGGER IF EXISTS trg_catalog_ingredient_refs_sync_feed_update ON catalog_ingredient_refs;
+CREATE CONSTRAINT TRIGGER trg_catalog_ingredient_refs_sync_feed_update AFTER UPDATE ON catalog_ingredient_refs DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN (OLD.sync_sequence IS DISTINCT FROM NEW.sync_sequence) EXECUTE FUNCTION sync_feed_capture();
+DROP TRIGGER IF EXISTS trg_catalog_ingredient_relations_sync_feed ON catalog_ingredient_relations;
+CREATE CONSTRAINT TRIGGER trg_catalog_ingredient_relations_sync_feed AFTER INSERT OR DELETE ON catalog_ingredient_relations DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION sync_feed_capture();
+DROP TRIGGER IF EXISTS trg_catalog_ingredient_relations_sync_feed_update ON catalog_ingredient_relations;
+CREATE CONSTRAINT TRIGGER trg_catalog_ingredient_relations_sync_feed_update AFTER UPDATE ON catalog_ingredient_relations DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN (OLD.sync_sequence IS DISTINCT FROM NEW.sync_sequence) EXECUTE FUNCTION sync_feed_capture();
+DROP TRIGGER IF EXISTS trg_catalog_tags_sync_feed ON catalog_tags;
+CREATE CONSTRAINT TRIGGER trg_catalog_tags_sync_feed AFTER INSERT OR DELETE ON catalog_tags DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION sync_feed_capture();
+DROP TRIGGER IF EXISTS trg_catalog_tags_sync_feed_update ON catalog_tags;
+CREATE CONSTRAINT TRIGGER trg_catalog_tags_sync_feed_update AFTER UPDATE ON catalog_tags DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN (OLD.sync_sequence IS DISTINCT FROM NEW.sync_sequence) EXECUTE FUNCTION sync_feed_capture();
+DROP TRIGGER IF EXISTS trg_catalog_ingredient_media_sync_feed ON catalog_ingredient_media;
+CREATE CONSTRAINT TRIGGER trg_catalog_ingredient_media_sync_feed AFTER INSERT OR DELETE ON catalog_ingredient_media DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION sync_feed_capture();
+DROP TRIGGER IF EXISTS trg_catalog_ingredient_media_sync_feed_update ON catalog_ingredient_media;
+CREATE CONSTRAINT TRIGGER trg_catalog_ingredient_media_sync_feed_update AFTER UPDATE ON catalog_ingredient_media DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN (OLD.sync_sequence IS DISTINCT FROM NEW.sync_sequence) EXECUTE FUNCTION sync_feed_capture();
+
+-- Durable receiver-local Catalog dependency inbox (#8683).
+CREATE TABLE IF NOT EXISTS catalog_pending_applies (
+      kind TEXT NOT NULL CHECK (kind IN ('tags', 'scraps')),
+      id TEXT NOT NULL,
+      parent_id TEXT NOT NULL,
+      source_updated_at TIMESTAMPTZ NOT NULL,
+      payload JSONB NOT NULL,
+      PRIMARY KEY (kind, id)
+    );
+
+CREATE TABLE IF NOT EXISTS media_prompt_examinations (
+      id TEXT PRIMARY KEY,
+      source_key TEXT NOT NULL,
+      data JSONB NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+CREATE INDEX IF NOT EXISTS idx_media_prompt_examinations_created ON media_prompt_examinations (created_at DESC, id DESC);
+
+-- Receiver-local peer execution consumption (#10127); never federated.
+CREATE TABLE IF NOT EXISTS peer_execution_operations (
+    operation_id UUID PRIMARY KEY,
+    host_instance_id UUID NOT NULL,
+    peer_instance_id UUID NOT NULL,
+    request_id UUID NOT NULL,
+    fingerprint TEXT NOT NULL CHECK (fingerprint ~ '^[a-f0-9]{64}$'),
+    binding JSONB NOT NULL,
+    execution_epoch UUID NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('queued', 'draining', 'in-flight', 'awaiting-reconnect', 'succeeded', 'failed', 'uncertain')),
+    revision BIGINT NOT NULL DEFAULT 1 CHECK (revision > 0),
+    claim JSONB,
+    receipt JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (host_instance_id, peer_instance_id, request_id),
+    CHECK (host_instance_id <> peer_instance_id)
+  );
+CREATE INDEX IF NOT EXISTS idx_peer_execution_operations_state ON peer_execution_operations (state, operation_id);
+CREATE TABLE IF NOT EXISTS peer_execution_generation_floors (
+    host_instance_id UUID NOT NULL,
+    peer_instance_id UUID NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('portos.update', 'portos.restart', 'catalog.install')),
+    generation BIGINT NOT NULL CHECK (generation >= 0),
+    PRIMARY KEY (host_instance_id, peer_instance_id, action),
+    CHECK (host_instance_id <> peer_instance_id)
+  );
+
+-- Machine-local Deep audit checkpoints and immutable evidence history.
+CREATE TABLE IF NOT EXISTS deep_audit_ledgers (
+      id TEXT PRIMARY KEY,
+      app_id TEXT NOT NULL,
+      category TEXT NOT NULL,
+      ledger JSONB NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );

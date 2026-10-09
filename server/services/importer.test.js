@@ -1,0 +1,2410 @@
+import { describe, it, expect, beforeEach, afterAll, vi } from 'vitest';
+import { mkdtempSync, rmSync, readdirSync, unlinkSync, existsSync, statSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { mockNoPeerSync, mockNoPeers } from '../lib/mockPathsDataRoot.js';
+
+// Create the tempRoot at top-level so PATHS.data resolves before any
+// service module runs its `const STATE_PATH = join(PATHS.data, ...)` at
+// import time. universeBuilder.js reads PATHS.data eagerly at module init,
+// so a per-test `let tempRoot = mkdtempSync()` would land too late.
+//
+// Vitest module-scoping caveat: this mock is sticky for the entire worker
+// — every service this file imports (universeBuilder, series, issues)
+// captures the redirected PATHS at THEIR module init. Any other test file
+// loaded by the same Vitest worker that imports those same services will
+// inherit our redirected PATHS through the shared module cache. Vitest's
+// default `pool: 'forks'` isolates by-file so this is safe today; if the
+// project ever switches to `pool: 'threads'` with shared module caches,
+// this file should be wrapped in `vi.isolate()` or moved into its own
+// project to avoid cross-test PATHS leakage.
+const tempRoot = mkdtempSync(join(tmpdir(), 'importer-test-'));
+
+// Mock fileUtils.js so every PATHS member points under tempRoot — not
+// just `data`. The importer's transitive imports (universeBuilder,
+// series, issues, runner) only touch PATHS.data today, but if a future
+// change starts writing under PATHS.logs / PATHS.runs / PATHS.cache,
+// those writes would leak into the developer's working tree under the
+// previous "override data only" pattern. Redirecting every key keeps
+// tests hermetic regardless of which PATHS member the SUT picks up.
+//
+// Spread the actual exports into a plain object — matches the pattern
+// used by bibleExtractor.test.js + sceneExtractor.test.js. A Proxy over
+// the ESM namespace exotic object that `vi.importActual` returns is
+// brittle: it intercepts only `get`, can bypass `[[Module]]` invariants
+// Vitest's transform expects, and behaves unpredictably for
+// `Symbol.toStringTag` / re-exports.
+vi.mock('../lib/fileUtils.js', async () => {
+  const actual = await vi.importActual('../lib/fileUtils.js');
+  const redirectedPaths = Object.fromEntries(
+    Object.keys(actual.PATHS).map((k) => [k, join(tempRoot, k)]),
+  );
+  return {
+    ...actual,
+    PATHS: redirectedPaths,
+  };
+});
+
+// Stub instances.js so non-ephemeral createSeries/createUniverse paths
+// don't fan out to real peers via peerSync's autoSubscribeRecordToAllPeers
+// (instances.js uses `dataPath` whose closure points at the REAL PATHS,
+// bypassing our PATHS mock above). Defense-in-depth: even with explicit
+// ephemeral:true on the direct fixtures, downstream production code may
+// still create non-ephemeral records.
+vi.mock('./instances.js', () => mockNoPeers());
+vi.mock('./sharing/peerSync.js', () => mockNoPeerSync());
+
+// Mock runStagedLLM so tests never hit a real provider — every importer
+// LLM call resolves to a canned JSON shape we control per-test.
+const mockRunStagedLLM = vi.fn();
+vi.mock('./stageRunner.js', () => ({
+tryReadFile: vi.fn().mockResolvedValue(null),
+  runStagedLLM: (...args) => mockRunStagedLLM(...args),
+}));
+
+// Mock `./pipeline/issues.js` so a single test can force `ensureIssueWithId`
+// (the importer's create boundary) to throw mid-loop and exercise the
+// ERR_PARTIAL_COMMIT_ISSUES rollback path.
+// `vi.hoisted` keeps the mock fn ref reachable from both the mock factory
+// (hoisted before imports) and the beforeEach reset (runs later). Default
+// behavior passes through to the real module so the dozen other tests that
+// expect real create behavior keep working unchanged.
+// `mockDeleteIssue` follows the same pattern so the replaceMode-abort test
+// can force a delete failure mid-wipe.
+const { mockEnsureIssue, mockDeleteIssue, realIssuesRef, sessionFaults } = vi.hoisted(() => ({
+  mockEnsureIssue: vi.fn(),
+  mockDeleteIssue: vi.fn(),
+  realIssuesRef: { current: null },
+  // Status values whose `recordImportProgress` write rejects — lets a test lose
+  // one specific session write (e.g. the final `committed` receipt, #10762).
+  sessionFaults: { failStatuses: new Set() },
+}));
+vi.mock('./pipeline/issues.js', async () => {
+  const actual = await vi.importActual('./pipeline/issues.js');
+  realIssuesRef.current = actual;
+  return {
+    ...actual,
+    ensureIssueWithId: (...args) => mockEnsureIssue(...args),
+    deleteIssue: (...args) => mockDeleteIssue(...args),
+  };
+});
+vi.mock('./importerSessions.js', async () => {
+  const actual = await vi.importActual('./importerSessions.js');
+  return {
+    ...actual,
+    recordImportProgress: (importId, patch) => (sessionFaults.failStatuses.has(patch?.status)
+      ? Promise.reject(new Error(`simulated ${patch.status} session write failure`))
+      : actual.recordImportProgress(importId, patch)),
+  };
+});
+
+const importerSvc = await import('./importer.js');
+const universeSvc = await import('./universeBuilder.js');
+const seriesSvc = await import('./pipeline/series.js');
+const issuesSvc = await import('./pipeline/issues.js');
+const sessionsSvc = await import('./importerSessions.js');
+
+// Per-test: wipe every file under tempRoot so each test starts with a clean
+// data dir. We can't rmSync the dir itself because the universeBuilder
+// state path is captured at module init.
+function wipeTempRoot() {
+  for (const entry of readdirSync(tempRoot)) {
+    const full = join(tempRoot, entry);
+    const stat = statSync(full);
+    if (stat.isFile()) unlinkSync(full);
+    else rmSync(full, { recursive: true, force: true });
+  }
+}
+
+beforeEach(() => {
+  wipeTempRoot();
+  mockRunStagedLLM.mockReset();
+  // Default ensureIssueWithId + deleteIssue to pass-through to the real module —
+  // only the rollback and replace-abort tests override these to inject
+  // failures.
+  mockEnsureIssue.mockReset();
+  mockEnsureIssue.mockImplementation((...args) => realIssuesRef.current.ensureIssueWithId(...args));
+  sessionFaults.failStatuses.clear();
+  mockDeleteIssue.mockReset();
+  mockDeleteIssue.mockImplementation((...args) => realIssuesRef.current.deleteIssue(...args));
+});
+
+afterAll(() => {
+  if (existsSync(tempRoot)) rmSync(tempRoot, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------------------
+// findOrCreate helpers
+// ---------------------------------------------------------------------------
+
+describe('findUniverseByName', () => {
+  it('returns null when no universe matches', async () => {
+    expect(await importerSvc.findUniverseByName('Unknown')).toBeNull();
+  });
+
+  it('matches case-insensitively', async () => {
+    const made = await universeSvc.createUniverse({ name: 'Cyberpunk 2099' });
+    const found = await importerSvc.findUniverseByName('CYBERPUNK 2099');
+    expect(found).not.toBeNull();
+    expect(found.id).toBe(made.id);
+  });
+});
+
+describe('findSeriesByName', () => {
+  it('scopes the match to a universe', async () => {
+    const uniA = await universeSvc.createUniverse({ name: 'Universe A' });
+    const uniB = await universeSvc.createUniverse({ name: 'Universe B' });
+    await seriesSvc.createSeries({ name: 'Same Title', universeId: uniA.id });
+
+    // Match in universe A works.
+    const foundInA = await importerSvc.findSeriesByName('SAME TITLE', uniA.id);
+    expect(foundInA).not.toBeNull();
+    expect(foundInA.universeId).toBe(uniA.id);
+
+    // Same name in a different universe is NOT a match.
+    const foundInB = await importerSvc.findSeriesByName('Same Title', uniB.id);
+    expect(foundInB).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// analyzeImport
+// ---------------------------------------------------------------------------
+
+const canonRunResponse = {
+  characters: [
+    { name: 'Aria', role: 'protagonist', physicalDescription: 'tall, freckles' },
+  ],
+  places: [
+    { name: 'The Foundry', slugline: 'INT. FOUNDRY — NIGHT', description: 'molten light' },
+  ],
+  objects: [
+    { name: 'The Locket', description: 'silver, dented', significance: "mother's keepsake" },
+  ],
+};
+
+const arcRunResponse = {
+  logline: 'A blacksmith chases a hidden inheritance.',
+  summary: 'Aria leaves the foundry to find her mother\'s past.',
+  protagonistArc: 'Reluctant heir grows into reluctant leader.',
+  themes: ['legacy', 'craft'],
+  shape: 'man-in-hole',
+  seasons: [
+    { number: 1, title: 'Foundry', logline: 'Aria leaves home.', synopsis: 'opening', endingHook: '' },
+  ],
+};
+
+const issuesRunResponse = {
+  issues: [
+    {
+      title: 'Cold Iron',
+      arcPosition: 1,
+      arcRole: 'pilot',
+      logline: 'The forge dies.',
+      synopsis: 'Aria finds the letter.',
+      proseExcerpt: 'The vault loomed in the dark.',
+    },
+  ],
+};
+
+function wireDefaultLLMResponses() {
+  // Mock per-stage so the call order doesn't matter — important because
+  // analyze fires canon + arc in parallel.
+  mockRunStagedLLM.mockImplementation(async (stageName) => {
+    if (stageName === 'importer-canon-extract') {
+      return { content: canonRunResponse, model: 'mock', providerId: 'mock', runId: 'run-canon' };
+    }
+    if (stageName === 'importer-arc-extract') {
+      return { content: arcRunResponse, model: 'mock', providerId: 'mock', runId: 'run-arc' };
+    }
+    if (stageName === 'importer-issue-proposal') {
+      return { content: issuesRunResponse, model: 'mock', providerId: 'mock', runId: 'run-issues' };
+    }
+    throw new Error(`Unexpected stage: ${stageName}`);
+  });
+}
+
+describe('splitComicScriptIssues (mechanical comic split)', () => {
+  it('splits on ISSUE headers — one verbatim issue each, sequential positions', () => {
+    const src = [
+      'ISSUE #1: THE FOUNDRY',
+      'PAGE 1',
+      'Panel 1. Aria forges a blade.',
+      'ISSUE #2: THE LOCKET',
+      'PAGE 1',
+      'Panel 1. The vault loomed.',
+    ].join('\n');
+    const out = importerSvc.splitComicScriptIssues(src);
+    expect(out).toHaveLength(2);
+    expect(out[0].arcPosition).toBe(1);
+    expect(out[1].arcPosition).toBe(2);
+    // Title preserved verbatim from the header; prose is verbatim + bounded.
+    expect(out[0].title).toBe('THE FOUNDRY');
+    expect(out[0].proseExcerpt).toContain('Aria forges a blade');
+    expect(out[0].proseExcerpt).toContain('ISSUE #1');
+    expect(out[0].proseExcerpt).not.toContain('The vault'); // boundary holds
+    expect(out[1].title).toBe('THE LOCKET');
+    expect(out[1].proseExcerpt).toContain('The vault loomed');
+    // No interpretation — mechanical split sets no logline/synopsis.
+    expect(out[0].logline).toBeUndefined();
+    expect(out[0].synopsis).toBeUndefined();
+  });
+
+  it('labels sequentially when an ISSUE header carries no title', () => {
+    const out = importerSvc.splitComicScriptIssues('ISSUE ONE\nstuff\nISSUE TWO\nmore');
+    expect(out.map((i) => i.title)).toEqual(['Issue 1', 'Issue 2']);
+  });
+
+  it('bundles PAGE markers into ~22-page issues when there are no ISSUE headers', () => {
+    const lines = [];
+    for (let p = 1; p <= 25; p++) { lines.push(`PAGE ${p}`); lines.push(`content ${p}`); }
+    const out = importerSvc.splitComicScriptIssues(lines.join('\n'));
+    expect(out).toHaveLength(2); // ceil(25 / 22)
+    expect(out[0].proseExcerpt).toContain('content 1');
+    expect(out[1].proseExcerpt).toContain('content 25');
+    // every page lands somewhere (no drops)
+    const joined = out.map((i) => i.proseExcerpt).join('\n');
+    for (let p = 1; p <= 25; p++) expect(joined).toContain(`content ${p}`);
+  });
+
+  it('honors an explicit targetIssueCount in the PAGE-bundle path', () => {
+    const lines = [];
+    for (let p = 1; p <= 6; p++) { lines.push(`PAGE ${p}`); lines.push(`c${p}`); }
+    const out = importerSvc.splitComicScriptIssues(lines.join('\n'), { targetIssueCount: 3 });
+    expect(out).toHaveLength(3);
+  });
+
+  it('returns null for a header-less script so the caller falls back to the LLM', () => {
+    expect(importerSvc.splitComicScriptIssues('Just prose, no markers anywhere here.')).toBeNull();
+  });
+
+  it('does not mistake a long prose sentence opening with "Page" for a header', () => {
+    const src = 'Page after page of the manuscript blurred together as she read on into the small hours.';
+    expect(importerSvc.splitComicScriptIssues(src)).toBeNull();
+  });
+
+  it('does not match a plural-keyword prose line ("ISSUES …") as an ISSUE header', () => {
+    // Word boundary after the keyword: "ISSUES" must not read as "ISSUE".
+    expect(importerSvc.splitComicScriptIssues('ISSUES with the forge piled up fast.')).toBeNull();
+  });
+
+  it('does not treat a prose line "Issue <word>" / "Pages <word>" as a header (number-token gate)', () => {
+    // The header number token is digits or spelled numbers — NOT any word —
+    // so ordinary prose that opens with the keyword no longer mis-splits.
+    expect(importerSvc.splitComicScriptIssues('Issue resolved by the council that night.')).toBeNull();
+    expect(importerSvc.splitComicScriptIssues('Pages turned slowly as the night wore on.')).toBeNull();
+    // A genuine spelled-number header still splits.
+    const out = importerSvc.splitComicScriptIssues('ISSUE ONE\nstuff\nISSUE TWO\nmore');
+    expect(out).toHaveLength(2);
+  });
+
+  it('does not mis-split a content line that starts with "Page N …" / "Issue N …" (standalone-header anchor)', () => {
+    // The number-token gate alone passed these (they DO contain a number); the
+    // standalone-header anchor (number then EOL/punct only) rejects the trailing
+    // prose so the mechanical path falls back to the LLM split.
+    expect(importerSvc.splitComicScriptIssues('Page 1 of the ancient book lies open and the dust settles.')).toBeNull();
+    expect(importerSvc.splitComicScriptIssues('Issue 1 of the saga had long been forgotten by the elders.')).toBeNull();
+    // Real standalone headers (incl. a parenthetical suffix) still split.
+    expect(importerSvc.splitComicScriptIssues('PAGE 1 (FIVE PANELS)\nart\nPAGE 2\nmore')).toHaveLength(1);
+  });
+});
+
+describe('importer cap invariants', () => {
+  it('IMPORTER_PROSE_EXCERPT_MAX stays ≤ STAGE_OUTPUT_MAX (no silent truncation on commit)', () => {
+    // createIssue trims stage output to STAGE_OUTPUT_MAX; if the importer's
+    // per-issue ceiling were larger, a verbatim excerpt between the two would
+    // pass analyze then be silently truncated on commit. lib/validation can't
+    // import the services-side constant, so pin the invariant here.
+    expect(importerSvc.IMPORTER_PROSE_EXCERPT_MAX).toBeLessThanOrEqual(issuesSvc.STAGE_OUTPUT_MAX);
+  });
+});
+
+describe('analyzeImport', () => {
+  it('creates universe + series on first run and returns preview shape', async () => {
+    wireDefaultLLMResponses();
+
+    const result = await importerSvc.analyzeImport({
+      universeName: 'Test Universe',
+      seriesName: 'Test Series',
+      contentType: 'short-story',
+      source: 'The vault loomed in the dark.',
+    });
+
+    expect(result.isExistingUniverse).toBe(false);
+    expect(result.isExistingSeries).toBe(false);
+    expect(result.universe.id).toBeDefined();
+    expect(result.series.id).toMatch(/^ser-/);
+    expect(result.series.universeId).toBe(result.universe.id);
+    // New shells are created as import drafts (issue #727): `ephemeral` keeps
+    // them out of sync, `importDraft` is the marker the orphan-shell GC keys on
+    // so an abandoned analyze self-cleans (without touching a user's private
+    // `ephemeral`-only records).
+    expect(result.universe.ephemeral).toBe(true);
+    expect(result.series.ephemeral).toBe(true);
+    expect(result.universe.importDraft).toBe(true);
+    expect(result.series.importDraft).toBe(true);
+    expect(result.canonPreview.characters).toHaveLength(1);
+    expect(result.canonPreview.characters[0].name).toBe('Aria');
+    expect(result.canonPreview.places).toHaveLength(1);
+    expect(result.canonPreview.objects).toHaveLength(1);
+    expect(result.arcPreview.shape).toBe('man-in-hole');
+    expect(result.seasonsPreview).toHaveLength(1);
+    expect(result.issueProposals).toHaveLength(1);
+    expect(result.runIds).toEqual({ canon: 'run-canon', arc: 'run-arc', issues: 'run-issues' });
+  });
+
+  it('reuses existing universe + series on a second analyze with same names', async () => {
+    wireDefaultLLMResponses();
+    const first = await importerSvc.analyzeImport({
+      universeName: 'Test U',
+      seriesName: 'Test S',
+      contentType: 'short-story',
+      source: 'first',
+    });
+    const second = await importerSvc.analyzeImport({
+      universeName: 'TEST U',  // case-insensitive
+      seriesName: 'test s',
+      contentType: 'short-story',
+      source: 'second',
+    });
+    expect(second.isExistingUniverse).toBe(true);
+    expect(second.isExistingSeries).toBe(true);
+    expect(second.universe.id).toBe(first.universe.id);
+    expect(second.series.id).toBe(first.series.id);
+  });
+
+  it('rejects oversized source with ERR_VALIDATION before calling the LLM', async () => {
+    wireDefaultLLMResponses();
+    let caught;
+    try {
+      await importerSvc.analyzeImport({
+        universeName: 'U',
+        seriesName: 'S',
+        contentType: 'novel',
+        source: 'x'.repeat(importerSvc.IMPORTER_SOURCE_CHAR_LIMIT + 1),
+      });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeDefined();
+    expect(caught.code).toBe(importerSvc.ERR_VALIDATION);
+    expect(mockRunStagedLLM).not.toHaveBeenCalled();
+  });
+
+  it('passes returnsJson:true so the stage runner parses the LLM reply', async () => {
+    // Regression-pin: without `returnsJson: true`, runStagedLLM returns the
+    // raw text and the orchestrator's `Array.isArray(content?.field)` checks
+    // all silently fail (preview becomes empty). Lock the opt in by asserting
+    // every analyze stage call passes it.
+    wireDefaultLLMResponses();
+    await importerSvc.analyzeImport({
+      universeName: 'U', seriesName: 'S', contentType: 'short-story', source: 'x',
+    });
+    expect(mockRunStagedLLM).toHaveBeenCalled();
+    for (const call of mockRunStagedLLM.mock.calls) {
+      const opts = call[2];
+      expect(opts).toMatchObject({ returnsJson: true });
+    }
+  });
+
+  it('forwards providerOverride + modelOverride to every analyze stage call', async () => {
+    // Regression-pin: the importer UI lets the user pin a specific provider +
+    // model for extraction (mirrors universe/series). Both must reach every
+    // staged LLM call (canon, arc, issues) — a one-sided drop would silently
+    // ignore the user's model choice on one of the three extractions.
+    wireDefaultLLMResponses();
+    await importerSvc.analyzeImport({
+      universeName: 'U', seriesName: 'S', contentType: 'short-story', source: 'x',
+      providerOverride: 'anthropic', modelOverride: 'claude-opus-4-7',
+    });
+    expect(mockRunStagedLLM).toHaveBeenCalled();
+    for (const call of mockRunStagedLLM.mock.calls) {
+      expect(call[2]).toMatchObject({ providerOverride: 'anthropic', modelOverride: 'claude-opus-4-7' });
+    }
+  });
+
+  it('forwards Mustache section-guard flags so per-content-type prompt blocks render', async () => {
+    // Regression-pin: PortOS's template engine is Mustache-only — the prompts
+    // use `{{#isShortStory}}…{{/isShortStory}}` blocks, so the orchestrator
+    // must pass per-type booleans alongside the contentType string.
+    wireDefaultLLMResponses();
+    await importerSvc.analyzeImport({
+      universeName: 'U', seriesName: 'S', contentType: 'novel', source: 'x',
+    });
+    const firstVars = mockRunStagedLLM.mock.calls[0][1];
+    expect(firstVars).toMatchObject({
+      isNovel: true,
+      isShortStory: false,
+      isScreenplay: false,
+      isComicScript: false,
+    });
+  });
+
+  it('wires existingCanonBlock into the canon-extract prompt for dedup on a second-pass import', async () => {
+    // Regression-pin: a refactor that drops the `existingCanonBlock` arg
+    // (or wires it to `null` / `''`) leaves the canon-extract LLM blind to
+    // already-seeded canon and silently re-extracts duplicates on every
+    // subsequent import.
+    const uni = await universeSvc.createUniverse({ name: 'Seeded U' });
+    await universeSvc.updateUniverse(uni.id, {
+      characters: [{ name: 'Aria Existing' }],
+    });
+
+    wireDefaultLLMResponses();
+    await importerSvc.analyzeImport({
+      universeName: 'Seeded U',
+      seriesName: 'New Series',
+      contentType: 'short-story',
+      source: 'A new story arrives.',
+    });
+
+    // Lookup by stage name rather than calls[0] — analyzeImport fires
+    // canon + arc via Promise.all and any future scheduling change could
+    // swap the order without breaking the contract.
+    const canonCall = mockRunStagedLLM.mock.calls.find((c) => c[0] === 'importer-canon-extract');
+    expect(canonCall).toBeDefined();
+    expect(canonCall[1].existingCanonBlock).toContain('Aria Existing');
+  });
+
+  it('emits ordered stage-progress frames with a stable runId', async () => {
+    // Regression-pin: the Importer page renders a live checklist from these
+    // `progress` frames. A `start` opens the run (carrying the stage list);
+    // each pass then flips `running`→`done`, and every frame shares one runId
+    // so the client can ignore stragglers from a prior run.
+    wireDefaultLLMResponses();
+    const frames = [];
+    const onProgress = (f) => frames.push(f);
+    importerSvc.importerEvents.on('progress', onProgress);
+    try {
+      await importerSvc.analyzeImport({
+        universeName: 'Progress U', seriesName: 'Progress S', contentType: 'short-story', source: 'x',
+      });
+    } finally {
+      importerSvc.importerEvents.off('progress', onProgress);
+    }
+
+    const start = frames.find((f) => f.type === 'start');
+    expect(start).toBeDefined();
+    expect(start.stages.map((s) => s.id)).toEqual(['canon', 'arc', 'issues']);
+
+    // Every frame shares the start frame's runId.
+    const runId = start.runId;
+    expect(runId).toBeTruthy();
+    expect(frames.every((f) => f.runId === runId)).toBe(true);
+
+    // Each stage reaches both running and done.
+    for (const id of ['canon', 'arc', 'issues']) {
+      const statuses = frames.filter((f) => f.type === 'stage' && f.id === id).map((f) => f.status);
+      expect(statuses).toContain('running');
+      expect(statuses).toContain('done');
+    }
+
+    // issues can't start until arc resolves — its `running` follows arc `done`.
+    const arcDoneIdx = frames.findIndex((f) => f.type === 'stage' && f.id === 'arc' && f.status === 'done');
+    const issuesRunningIdx = frames.findIndex((f) => f.type === 'stage' && f.id === 'issues' && f.status === 'running');
+    expect(issuesRunningIdx).toBeGreaterThan(arcDoneIdx);
+  });
+
+  it('passes the extended analyze timeout to every staged LLM call', async () => {
+    // Regression-pin: each analyze pass feeds the whole corpus to a heavy
+    // model, so the importer overrides the toolkit's 5-min default. A dropped
+    // override would reintroduce false timeouts + expensive fallback re-runs.
+    wireDefaultLLMResponses();
+    await importerSvc.analyzeImport({
+      universeName: 'Timeout U', seriesName: 'Timeout S', contentType: 'short-story', source: 'x',
+    });
+    expect(mockRunStagedLLM).toHaveBeenCalled();
+    for (const call of mockRunStagedLLM.mock.calls) {
+      expect(call[2]).toMatchObject({ timeoutOverride: importerSvc.ANALYZE_STAGE_TIMEOUT_MS });
+    }
+  });
+
+  it('mechanically splits a comic script and skips the LLM issue-proposal call', async () => {
+    wireDefaultLLMResponses();
+    const src = 'ISSUE #1: ONE\nPage stuff here.\nISSUE #2: TWO\nMore page stuff.';
+    const result = await importerSvc.analyzeImport({
+      universeName: 'Comic U', seriesName: 'Comic S', contentType: 'comic-script', source: src,
+    });
+    expect(result.issueSplitFailed).toBe(false);
+    expect(result.issueProposals).toHaveLength(2);
+    expect(result.issueProposals[0].proseExcerpt).toContain('Page stuff here');
+    // The LLM split was NOT invoked — canon + arc still were.
+    const issueCall = mockRunStagedLLM.mock.calls.find((c) => c[0] === 'importer-issue-proposal');
+    expect(issueCall).toBeUndefined();
+    expect(mockRunStagedLLM.mock.calls.some((c) => c[0] === 'importer-canon-extract')).toBe(true);
+    // Mechanical path carries no run id.
+    expect(result.runIds.issues).toBeNull();
+  });
+
+  it('preserves canon+arc and flags issueSplitFailed when the issue split throws', async () => {
+    // canon + arc succeed; the issue-proposal pass throws (e.g. a timeout).
+    // The expensive passes must NOT be discarded — analyze returns the
+    // preview with issueSplitFailed=true and persisted universe/series shells.
+    mockRunStagedLLM.mockImplementation(async (stageName) => {
+      if (stageName === 'importer-canon-extract') return { content: canonRunResponse, model: 'mock', providerId: 'mock', runId: 'run-canon' };
+      if (stageName === 'importer-arc-extract') return { content: arcRunResponse, model: 'mock', providerId: 'mock', runId: 'run-arc' };
+      if (stageName === 'importer-issue-proposal') throw new Error('codex timed out after 1200000ms');
+      throw new Error(`Unexpected stage: ${stageName}`);
+    });
+    // Capture progress frames to assert the issues stage reaches 'error'.
+    const frames = [];
+    const onProgress = (f) => frames.push(f);
+    importerSvc.importerEvents.on('progress', onProgress);
+    let result;
+    try {
+      result = await importerSvc.analyzeImport({
+        universeName: 'Resilient U', seriesName: 'Resilient S', contentType: 'novel', source: 'x',
+      });
+    } finally {
+      importerSvc.importerEvents.off('progress', onProgress);
+    }
+    expect(result.issueSplitFailed).toBe(true);
+    expect(result.issueSplitError).toContain('codex timed out');
+    expect(result.issueProposals).toEqual([]);
+    // The checklist's issues stage must reach a terminal 'error' frame (drives
+    // the client's error icon + retry banner).
+    const issuesStatuses = frames.filter((f) => f.type === 'stage' && f.id === 'issues').map((f) => f.status);
+    expect(issuesStatuses).toContain('running');
+    expect(issuesStatuses).toContain('error');
+    // Canon + arc preserved.
+    expect(result.canonPreview.characters).toHaveLength(1);
+    expect(result.arcPreview.shape).toBe('man-in-hole');
+    // Universe + series are actually PERSISTED (not just in-memory shells) so
+    // the client has stable ids to retry/commit against — re-read from disk.
+    expect(result.universe.id).toBeDefined();
+    expect(result.series.id).toMatch(/^ser-/);
+    expect(await universeSvc.getUniverse(result.universe.id)).toBeTruthy();
+    expect(await seriesSvc.getSeries(result.series.id)).toBeTruthy();
+    expect(result.runIds.issues).toBeNull();
+  });
+
+  it('fails analyze with ERR_VALIDATION when a comic split would exceed the per-issue prose cap', async () => {
+    // One ISSUE header with a body over IMPORTER_PROSE_EXCERPT_MAX → the
+    // verbatim excerpt would be rejected at commit; surface it at analyze
+    // instead of letting it dead-end on a commit-time 400. The failure rides
+    // the non-fatal issue-split path, so canon+arc are still preserved.
+    mockRunStagedLLM.mockImplementation(async (stageName) => {
+      if (stageName === 'importer-canon-extract') return { content: canonRunResponse, model: 'mock', providerId: 'mock', runId: 'run-canon' };
+      if (stageName === 'importer-arc-extract') return { content: arcRunResponse, model: 'mock', providerId: 'mock', runId: 'run-arc' };
+      throw new Error(`Unexpected stage: ${stageName}`);
+    });
+    const huge = `ISSUE 1\n${'x'.repeat(importerSvc.IMPORTER_PROSE_EXCERPT_MAX + 10)}`;
+    const result = await importerSvc.analyzeImport({
+      universeName: 'Big Comic U', seriesName: 'Big Comic S', contentType: 'comic-script', source: huge,
+    });
+    expect(result.issueSplitFailed).toBe(true);
+    expect(result.issueSplitError).toMatch(/per-issue limit/);
+    // No LLM issue-proposal call happened (the cap check fired on the mechanical path).
+    expect(mockRunStagedLLM.mock.calls.some((c) => c[0] === 'importer-issue-proposal')).toBe(false);
+  });
+
+  it('rejects a locked-arc series with ERR_LOCKED before calling the LLM', async () => {
+    // Pre-seed a series with locked.arc, then re-analyze with its name.
+    const uni = await universeSvc.createUniverse({ name: 'Locked U' });
+    const seeded = await seriesSvc.createSeries({ name: 'Locked S', universeId: uni.id });
+    await seriesSvc.updateSeries(seeded.id, { locked: { arc: true } });
+
+    wireDefaultLLMResponses();
+    let caught;
+    try {
+      await importerSvc.analyzeImport({
+        universeName: 'Locked U',
+        seriesName: 'Locked S',
+        contentType: 'short-story',
+        source: 'anything',
+      });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeDefined();
+    expect(caught.code).toBe(importerSvc.ERR_LOCKED);
+    expect(mockRunStagedLLM).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// classifyImportContent — hallucination-guard coverage
+//
+// Copilot review: route tests mock classifyImportContent entirely, so the
+// service-level sanitization logic (dropping out-of-enum contentType /
+// confidence, truncating reasoning, handling non-object run.content) had
+// no test coverage. A regression that accidentally accepted `raw.contentType`
+// without enum-membership would not have been caught. These tests pin every
+// guard branch directly against the service.
+// ---------------------------------------------------------------------------
+
+describe('retryIssueSplit', () => {
+  it('mechanically splits a comic script with no LLM call', async () => {
+    wireDefaultLLMResponses();
+    const out = await importerSvc.retryIssueSplit({
+      contentType: 'comic-script',
+      source: 'ISSUE #1: A\nstuff\nISSUE #2: B\nmore',
+    });
+    expect(out.method).toBe('mechanical');
+    expect(out.issueProposals).toHaveLength(2);
+    expect(out.runId).toBeNull();
+    expect(mockRunStagedLLM).not.toHaveBeenCalled();
+  });
+
+  it('falls through to the LLM split for prose content types, with the extended timeout', async () => {
+    wireDefaultLLMResponses();
+    const out = await importerSvc.retryIssueSplit({
+      contentType: 'novel', source: 'a novel body', arcSummary: 'the arc summary',
+    });
+    expect(out.method).toBe('llm');
+    expect(out.issueProposals).toHaveLength(1);
+    const call = mockRunStagedLLM.mock.calls.find((c) => c[0] === 'importer-issue-proposal');
+    expect(call).toBeDefined();
+    expect(call[2]).toMatchObject({ timeoutOverride: importerSvc.ANALYZE_STAGE_TIMEOUT_MS });
+  });
+
+  it('rejects an oversized source before calling the LLM', async () => {
+    wireDefaultLLMResponses();
+    await expect(importerSvc.retryIssueSplit({
+      contentType: 'novel',
+      source: 'x'.repeat(importerSvc.IMPORTER_SOURCE_CHAR_LIMIT + 1),
+    })).rejects.toMatchObject({ code: importerSvc.ERR_VALIDATION });
+    expect(mockRunStagedLLM).not.toHaveBeenCalled();
+  });
+});
+
+describe('classifyImportContent', () => {
+  it('passes valid contentType + confidence + reasoning through verbatim', async () => {
+    mockRunStagedLLM.mockResolvedValueOnce({
+      content: { contentType: 'screenplay', confidence: 'high', reasoning: 'has FADE IN markers' },
+      model: 'mock',
+      providerId: 'mock',
+      runId: 'run-classify-1',
+    });
+    const result = await importerSvc.classifyImportContent({ source: 'INT. ROOM - DAY' });
+    expect(result.contentType).toBe('screenplay');
+    expect(result.confidence).toBe('high');
+    expect(result.reasoning).toBe('has FADE IN markers');
+    expect(result.runId).toBe('run-classify-1');
+  });
+
+  it('forwards providerOverride + modelOverride to the classify stage call', async () => {
+    mockRunStagedLLM.mockResolvedValueOnce({
+      content: { contentType: 'novel', confidence: 'high', reasoning: 'chapters' },
+      model: 'mock',
+      providerId: 'mock',
+      runId: 'run-classify-override',
+    });
+    await importerSvc.classifyImportContent({
+      source: 'some prose', providerOverride: 'anthropic', modelOverride: 'claude-opus-4-7',
+    });
+    expect(mockRunStagedLLM).toHaveBeenCalledWith(
+      'importer-classify',
+      expect.any(Object),
+      expect.objectContaining({ providerOverride: 'anthropic', modelOverride: 'claude-opus-4-7' }),
+    );
+  });
+
+  it('drops a hallucinated contentType not in IMPORTER_CONTENT_TYPES to null', async () => {
+    mockRunStagedLLM.mockResolvedValueOnce({
+      content: { contentType: 'manga', confidence: 'high', reasoning: 'panels' },
+      model: 'mock',
+      providerId: 'mock',
+      runId: 'run-x',
+    });
+    const result = await importerSvc.classifyImportContent({ source: 'some prose' });
+    expect(result.contentType).toBeNull();
+    // Confidence + reasoning are independent guards — they stay valid.
+    expect(result.confidence).toBe('high');
+    expect(result.reasoning).toBe('panels');
+  });
+
+  it('drops a hallucinated confidence not in {high|medium|low} to null', async () => {
+    mockRunStagedLLM.mockResolvedValueOnce({
+      content: { contentType: 'novel', confidence: 'extremely-high', reasoning: 'chapters' },
+      model: 'mock',
+      providerId: 'mock',
+      runId: 'run-x',
+    });
+    const result = await importerSvc.classifyImportContent({ source: 'some prose' });
+    expect(result.contentType).toBe('novel');
+    expect(result.confidence).toBeNull();
+    expect(result.reasoning).toBe('chapters');
+  });
+
+  it('truncates reasoning to 500 chars', async () => {
+    const longReasoning = 'a'.repeat(2_000);
+    mockRunStagedLLM.mockResolvedValueOnce({
+      content: { contentType: 'short-story', confidence: 'medium', reasoning: longReasoning },
+      model: 'mock',
+      providerId: 'mock',
+      runId: 'run-x',
+    });
+    const result = await importerSvc.classifyImportContent({ source: 'some prose' });
+    expect(result.reasoning).toHaveLength(500);
+    expect(result.reasoning).toBe('a'.repeat(500));
+  });
+
+  it('coerces non-string reasoning to null', async () => {
+    mockRunStagedLLM.mockResolvedValueOnce({
+      content: { contentType: 'comic-script', confidence: 'low', reasoning: 42 },
+      model: 'mock',
+      providerId: 'mock',
+      runId: 'run-x',
+    });
+    const result = await importerSvc.classifyImportContent({ source: 'some prose' });
+    expect(result.reasoning).toBeNull();
+    expect(result.contentType).toBe('comic-script');
+    expect(result.confidence).toBe('low');
+  });
+
+  it('treats a non-object run.content as empty — all fields land at null', async () => {
+    mockRunStagedLLM.mockResolvedValueOnce({
+      content: 'I am a plain string, not JSON',
+      model: 'mock',
+      providerId: 'mock',
+      runId: 'run-x',
+    });
+    const result = await importerSvc.classifyImportContent({ source: 'some prose' });
+    expect(result.contentType).toBeNull();
+    expect(result.confidence).toBeNull();
+    expect(result.reasoning).toBeNull();
+    expect(result.runId).toBe('run-x');
+  });
+
+  it('treats a null run.content as empty', async () => {
+    mockRunStagedLLM.mockResolvedValueOnce({
+      content: null,
+      model: 'mock',
+      providerId: 'mock',
+      runId: 'run-x',
+    });
+    const result = await importerSvc.classifyImportContent({ source: 'some prose' });
+    expect(result.contentType).toBeNull();
+    expect(result.confidence).toBeNull();
+    expect(result.reasoning).toBeNull();
+  });
+
+  it('rejects missing source with ERR_VALIDATION before calling the LLM', async () => {
+    let caught;
+    try {
+      await importerSvc.classifyImportContent({ source: '' });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeDefined();
+    expect(caught.code).toBe(importerSvc.ERR_VALIDATION);
+    expect(mockRunStagedLLM).not.toHaveBeenCalled();
+  });
+
+  it('rejects oversized source with ERR_VALIDATION before calling the LLM', async () => {
+    const oversized = 'x'.repeat(importerSvc.IMPORTER_SOURCE_CHAR_LIMIT + 1);
+    let caught;
+    try {
+      await importerSvc.classifyImportContent({ source: oversized });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeDefined();
+    expect(caught.code).toBe(importerSvc.ERR_VALIDATION);
+    expect(mockRunStagedLLM).not.toHaveBeenCalled();
+  });
+
+  it('only passes the first CLASSIFY_SOURCE_HEAD_CHARS to the LLM', async () => {
+    mockRunStagedLLM.mockResolvedValueOnce({
+      content: { contentType: 'novel', confidence: 'low', reasoning: 'r' },
+      model: 'mock',
+      providerId: 'mock',
+      runId: 'run-x',
+    });
+    const big = 'a'.repeat(importerSvc.CLASSIFY_SOURCE_HEAD_CHARS + 5_000);
+    await importerSvc.classifyImportContent({ source: big });
+    expect(mockRunStagedLLM).toHaveBeenCalled();
+    const vars = mockRunStagedLLM.mock.calls[0][1];
+    expect(vars.sourceHead).toHaveLength(importerSvc.CLASSIFY_SOURCE_HEAD_CHARS);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// reformatSeededExcerpts (importer AI cleanup — issue #1335)
+// ---------------------------------------------------------------------------
+
+describe('reformatSeededExcerpts', () => {
+  // Collect importer progress frames the helper emits so we can assert the
+  // per-issue checklist is broadcast.
+  function captureFrames() {
+    const frames = [];
+    const onFrame = (f) => frames.push(f);
+    importerSvc.importerEvents.on('progress', onFrame);
+    return { frames, stop: () => importerSvc.importerEvents.off('progress', onFrame) };
+  }
+
+  it('returns the input unchanged (no LLM call) when no issue has a proseExcerpt', async () => {
+    const issues = [{ title: 'A', arcPosition: 1 }, { title: 'B', arcPosition: 2 }];
+    const out = await importerSvc.reformatSeededExcerpts(issues, { contentType: 'short-story' });
+    expect(out).toBe(issues); // same reference — nothing to do
+    expect(mockRunStagedLLM).not.toHaveBeenCalled();
+  });
+
+  it('replaces each excerpt with the cleaned text and emits per-issue progress frames', async () => {
+    // Cleaned output must preserve the word skeleton or the integrity guard
+    // rejects it — collapse the doubled space, nothing else.
+    mockRunStagedLLM.mockResolvedValue({ content: 'The vault loomed in the dark.', runId: 'r1' });
+    const { frames, stop } = captureFrames();
+    const issues = [{ title: 'Cold Iron', arcPosition: 1, proseExcerpt: 'The vault  loomed in the\ndark.' }];
+    const out = await importerSvc.reformatSeededExcerpts(issues, { contentType: 'short-story' });
+    stop();
+
+    expect(out[0].proseExcerpt).toBe('The vault loomed in the dark.');
+    expect(out).not.toBe(issues); // fresh array, input untouched
+    expect(issues[0].proseExcerpt).toBe('The vault  loomed in the\ndark.');
+    // start + (running, done) + done
+    expect(frames.find((f) => f.type === 'start')?.stages).toHaveLength(1);
+    expect(frames.some((f) => f.type === 'stage' && f.status === 'running')).toBe(true);
+    expect(frames.some((f) => f.type === 'stage' && f.status === 'done')).toBe(true);
+    expect(frames.some((f) => f.type === 'done')).toBe(true);
+  });
+
+  it('routes a comic-script import through the comicScript reformat format', async () => {
+    mockRunStagedLLM.mockResolvedValue({ content: 'PAGE 1 PANEL 1 Giant descends.', runId: 'r1' });
+    await importerSvc.reformatSeededExcerpts(
+      [{ title: 'P', arcPosition: 1, proseExcerpt: 'PAGE 1\nPANEL 1\nGiant descends.' }],
+      { contentType: 'comic-script' },
+    );
+    const call = mockRunStagedLLM.mock.calls.find((c) => c[0] === 'manuscript-reformat');
+    expect(call).toBeDefined();
+    expect(call[1].format).toBe('Comic script');
+  });
+
+  it('falls back to the verbatim excerpt when the reformat fails (best-effort, never throws)', async () => {
+    // Default reset mock resolves undefined → reformatManuscriptText throws
+    // "model returned no text" → helper swallows and keeps the original.
+    const { frames, stop } = captureFrames();
+    const issues = [{ title: 'Cold Iron', arcPosition: 1, proseExcerpt: 'The vault loomed.' }];
+    const out = await importerSvc.reformatSeededExcerpts(issues, { contentType: 'short-story' });
+    stop();
+    expect(out[0].proseExcerpt).toBe('The vault loomed.');
+    // A failed pass surfaces as 'error' in the checklist (warning icon).
+    expect(frames.some((f) => f.type === 'stage' && f.status === 'error')).toBe(true);
+  });
+
+  it('falls back when the integrity guard rejects a word-altering reformat', async () => {
+    mockRunStagedLLM.mockResolvedValue({ content: 'The castle loomed.', runId: 'r1' });
+    const out = await importerSvc.reformatSeededExcerpts(
+      [{ title: 'Cold Iron', arcPosition: 1, proseExcerpt: 'The vault loomed.' }],
+      { contentType: 'short-story' },
+    );
+    expect(out[0].proseExcerpt).toBe('The vault loomed.'); // guard tripped → verbatim kept
+  });
+});
+
+// commitImport
+// ---------------------------------------------------------------------------
+
+async function setupForCommit() {
+  // Create the universe + series the analyze phase would have created, then
+  // exercise commitImport directly with a hand-shaped payload.
+  //
+  // ephemeral:true keeps the fixtures out of peer-sync. Without it, the
+  // create*-time `autoSubscribeRecordToAllPeers` reads the LIVE peer
+  // registry (instances.json is NOT mocked by PATHS — only fileUtils.js
+  // PATHS is, and instances.js resolves its own file paths) and fans the
+  // fixture out to every actual peer, leaving "Commit U" / "Commit S"
+  // records on the user's null sync machine after every test run.
+  //
+  // importDraft:true models what analyzeImport stamps on a brand-new shell, so
+  // commitImport's promotion (which gates strictly on importDraft) clears both
+  // flags — matching the real analyze→commit lifecycle.
+  const uni = await universeSvc.createUniverse({ name: 'Commit U', ephemeral: true, importDraft: true });
+  const ser = await seriesSvc.createSeries({ name: 'Commit S', universeId: uni.id, ephemeral: true, importDraft: true });
+  return { uni, ser };
+}
+
+describe('commitImport', () => {
+  it('happy path: merges canon, writes arc + seasons, creates issues with prose seeded', async () => {
+    const { uni, ser } = await setupForCommit();
+    const result = await importerSvc.commitImport({
+      universeId: uni.id,
+      seriesId: ser.id,
+      canonSelections: {
+        characters: [{ name: 'Aria', role: 'protagonist', physicalDescription: 'tall' }],
+        places: [{ name: 'The Foundry', slugline: 'INT. FOUNDRY — NIGHT', description: 'molten' }],
+        objects: [{ name: 'The Locket', significance: 'heirloom' }],
+      },
+      arc: {
+        logline: 'A reluctant heir.',
+        summary: 'Big story.',
+        protagonistArc: 'Growth.',
+        themes: ['legacy'],
+        shape: 'man-in-hole',
+      },
+      seasons: [
+        { number: 1, title: 'Foundry', logline: 'Open', synopsis: 'a', endingHook: '' },
+      ],
+      issues: [
+        {
+          title: 'Cold Iron',
+          arcPosition: 1,
+          arcRole: 'pilot',
+          logline: 'Forge dies.',
+          synopsis: 'Aria finds the letter.',
+          proseExcerpt: 'The vault loomed in the dark.',
+        },
+      ],
+    });
+
+    // Universe canon was merged.
+    expect(result.universe.characters.find((c) => c.name === 'Aria')).toBeDefined();
+    expect(result.universe.places.find((s) => s.name === 'The Foundry')).toBeDefined();
+    expect(result.universe.objects.find((o) => o.name === 'The Locket')).toBeDefined();
+    // Series got arc + seasons.
+    expect(result.series.arc.shape).toBe('man-in-hole');
+    expect(result.series.seasons).toHaveLength(1);
+    expect(result.series.seasons[0].title).toBe('Foundry');
+    // Bible top-level fields populated from the extracted arc + issue count
+    // (the sidebar used to stay blank after import).
+    expect(result.series.logline).toBe('A reluctant heir.');
+    expect(result.series.premise).toBe('Big story.');
+    expect(result.series.issueCountTarget).toBe(1);
+    // A successful commit promotes both shells out of draft state (issue #727):
+    // ephemeral cleared so they sync to peers, importDraft cleared so the
+    // orphan-shell GC never touches them.
+    expect(result.universe.ephemeral).not.toBe(true);
+    expect(result.series.ephemeral).not.toBe(true);
+    expect(result.universe.importDraft).not.toBe(true);
+    expect(result.series.importDraft).not.toBe(true);
+    // One issue created with prose + idea seeded.
+    expect(result.createdIssueIds).toHaveLength(1);
+    const issue = await issuesSvc.getIssue(result.createdIssueIds[0]);
+    expect(issue.title).toBe('Cold Iron');
+    expect(issue.seriesId).toBe(ser.id);
+    expect(issue.stages.prose.output).toBe('The vault loomed in the dark.');
+    expect(issue.stages.prose.status).toBe('ready');
+    expect(issue.stages.idea.input).toContain('Logline: Forge dies.');
+    expect(issue.stages.idea.input).toContain('Synopsis: Aria finds the letter.');
+    // Issue was wired to the first season.
+    expect(issue.seasonId).toBe(result.series.seasons[0].id);
+  });
+
+  it('cleanupFormatting:true seeds the AI-reformatted excerpt (issue #1335)', async () => {
+    mockRunStagedLLM.mockResolvedValue({ content: 'The vault loomed in the dark.', runId: 'r1' });
+    const { uni, ser } = await setupForCommit();
+    const result = await importerSvc.commitImport({
+      universeId: uni.id,
+      seriesId: ser.id,
+      contentType: 'short-story',
+      cleanupFormatting: true,
+      issues: [{ title: 'Cold Iron', arcPosition: 1, proseExcerpt: 'The vault  loomed in the\ndark.' }],
+    });
+    const issue = await issuesSvc.getIssue(result.createdIssueIds[0]);
+    expect(issue.stages.prose.output).toBe('The vault loomed in the dark.');
+    expect(issue.stages.prose.status).toBe('ready');
+    expect(mockRunStagedLLM.mock.calls.some((c) => c[0] === 'manuscript-reformat')).toBe(true);
+  });
+
+  it('cleanupFormatting:true is best-effort — a failed reformat seeds the verbatim excerpt', async () => {
+    // Reset mock resolves undefined → reformat throws → fall back to verbatim;
+    // the commit still succeeds and creates the issue.
+    const { uni, ser } = await setupForCommit();
+    const result = await importerSvc.commitImport({
+      universeId: uni.id,
+      seriesId: ser.id,
+      contentType: 'short-story',
+      cleanupFormatting: true,
+      issues: [{ title: 'Cold Iron', arcPosition: 1, proseExcerpt: 'The vault loomed in the dark.' }],
+    });
+    expect(result.createdIssueIds).toHaveLength(1);
+    const issue = await issuesSvc.getIssue(result.createdIssueIds[0]);
+    expect(issue.stages.prose.output).toBe('The vault loomed in the dark.');
+  });
+
+  // Race-safety regression coverage for issue #8453: commitImport reads the
+  // universe/series once, then (with cleanupFormatting on) can spend minutes
+  // in per-issue LLM calls before writing the merged canon/seasons. These
+  // tests simulate a concurrent edit landing DURING that window via the mock
+  // `runStagedLLM` — the one async gap the real reformat pass creates — and
+  // assert the concurrent edit survives the eventual merge instead of being
+  // silently overwritten by a merge against the stale up-front snapshot.
+  it('a universe canon edit made during cleanupFormatting survives the import merge (issue #8453)', async () => {
+    const { uni, ser } = await setupForCommit();
+    mockRunStagedLLM.mockImplementation(async () => {
+      // Simulates a user adding a character in another tab (or an Autopilot/
+      // Series job editing canon) while the AI cleanup pass is in flight.
+      await universeSvc.updateUniverse(uni.id, {
+        characters: [{ name: 'Concurrent Editor', role: 'supporting' }],
+      });
+      return { content: 'The vault loomed in the dark.', runId: 'r1' };
+    });
+    const result = await importerSvc.commitImport({
+      universeId: uni.id,
+      seriesId: ser.id,
+      contentType: 'short-story',
+      cleanupFormatting: true,
+      canonSelections: { characters: [{ name: 'Aria', role: 'protagonist' }] },
+      issues: [{ title: 'Cold Iron', arcPosition: 1, proseExcerpt: 'The vault  loomed in the\ndark.' }],
+    });
+    const names = result.universe.characters.map((c) => c.name);
+    expect(names).toContain('Aria');
+    expect(names).toContain('Concurrent Editor');
+  });
+
+  it('a season edit made during cleanupFormatting survives the import merge (issue #8453)', async () => {
+    const { uni, ser } = await setupForCommit();
+    mockRunStagedLLM.mockImplementation(async () => {
+      // Simulates a season edited on the series in another tab while the AI
+      // cleanup pass is in flight.
+      await seriesSvc.updateSeries(ser.id, {
+        seasons: [{ number: 5, title: 'Concurrent Season' }],
+      });
+      return { content: 'The vault loomed in the dark.', runId: 'r1' };
+    });
+    const result = await importerSvc.commitImport({
+      universeId: uni.id,
+      seriesId: ser.id,
+      contentType: 'short-story',
+      cleanupFormatting: true,
+      seasons: [{ number: 1, title: 'Foundry' }],
+      issues: [{ title: 'Cold Iron', arcPosition: 1, proseExcerpt: 'The vault  loomed in the\ndark.' }],
+    });
+    const numbers = result.series.seasons.map((s) => s.number);
+    expect(numbers).toContain(1);
+    expect(numbers).toContain(5);
+  });
+
+  it('an arc-only import (no canon selections) makes no universe write', async () => {
+    // importDraft:false so commitImport's own post-commit promotion (gated
+    // strictly on importDraft === true) doesn't also call updateUniverse —
+    // isolating the assertion to the canon-merge write this test targets.
+    const uni = await universeSvc.createUniverse({ name: 'Commit U', ephemeral: true, importDraft: false });
+    const ser = await seriesSvc.createSeries({
+      name: 'Commit S', universeId: uni.id, ephemeral: true, importDraft: false,
+    });
+    const updateUniverseSpy = vi.spyOn(universeSvc, 'updateUniverse');
+    const result = await importerSvc.commitImport({
+      universeId: uni.id,
+      seriesId: ser.id,
+      arc: { logline: 'A reluctant heir.', summary: 'Big story.' },
+      issues: [{ title: 'Cold Iron', arcPosition: 1, proseExcerpt: 'The vault loomed in the dark.' }],
+    });
+    expect(updateUniverseSpy).not.toHaveBeenCalled();
+    expect(result.universe.characters ?? []).toHaveLength(0);
+    updateUniverseSpy.mockRestore();
+  });
+
+  it('seeds stages.comicScript (not prose) for a comic-script import', async () => {
+    // A comic-script source is already script-form, so its verbatim excerpt
+    // must land in comicScript (ready) — seeding prose would make the
+    // pipeline regenerate (re-interpret) the script.
+    const { uni, ser } = await setupForCommit();
+    const script = 'PAGE 1\nPANEL 1\nGiant descends.\nCAPTION\nNot real.';
+    const result = await importerSvc.commitImport({
+      universeId: uni.id,
+      seriesId: ser.id,
+      contentType: 'comic-script',
+      canonSelections: { characters: [], places: [], objects: [] },
+      issues: [{ title: 'Issue 1', arcPosition: 1, proseExcerpt: script }],
+    });
+    const issue = await issuesSvc.getIssue(result.createdIssueIds[0]);
+    expect(issue.stages.comicScript.output).toBe(script);
+    expect(issue.stages.comicScript.status).toBe('ready');
+    // prose is NOT seeded — the script never round-trips through it.
+    expect(issue.stages.prose?.output).toBeFalsy();
+  });
+
+  it('seeds stages.teleplay (not prose) for a screenplay import', async () => {
+    // A screenplay source is already script-form, so its verbatim excerpt
+    // must land in teleplay (ready) — seeding prose would make the pipeline
+    // regenerate it. Downstream scene extraction already consumes teleplay.
+    const { uni, ser } = await setupForCommit();
+    const script = 'INT. VAULT - NIGHT\n\nARIA\nWho left this here?\n\nFADE OUT.';
+    const result = await importerSvc.commitImport({
+      universeId: uni.id,
+      seriesId: ser.id,
+      contentType: 'screenplay',
+      canonSelections: { characters: [], places: [], objects: [] },
+      issues: [{ title: 'Issue 1', arcPosition: 1, proseExcerpt: script }],
+    });
+    const issue = await issuesSvc.getIssue(result.createdIssueIds[0]);
+    expect(issue.stages.teleplay.output).toBe(script);
+    expect(issue.stages.teleplay.status).toBe('ready');
+    // prose is NOT seeded — the script never round-trips through it.
+    expect(issue.stages.prose?.output).toBeFalsy();
+  });
+
+  it('still seeds stages.prose when contentType is absent (older clients)', async () => {
+    const { uni, ser } = await setupForCommit();
+    const result = await importerSvc.commitImport({
+      universeId: uni.id,
+      seriesId: ser.id,
+      canonSelections: { characters: [], places: [], objects: [] },
+      issues: [{ title: 'Issue 1', arcPosition: 1, proseExcerpt: 'Plain prose.' }],
+    });
+    const issue = await issuesSvc.getIssue(result.createdIssueIds[0]);
+    expect(issue.stages.prose.output).toBe('Plain prose.');
+    expect(issue.stages.comicScript?.output).toBeFalsy();
+    expect(issue.stages.teleplay?.output).toBeFalsy();
+  });
+
+  it('replace mode overwrites the bible, clearing stale fields when the new arc lacks them', async () => {
+    const { uni, ser } = await setupForCommit();
+    // First (additive) import seeds a bible logline + premise.
+    await importerSvc.commitImport({
+      universeId: uni.id,
+      seriesId: ser.id,
+      canonSelections: { characters: [], places: [], objects: [] },
+      arc: { logline: 'Old logline', summary: 'Old premise' },
+      seasons: [],
+      issues: [{ title: 'I1', arcPosition: 1, proseExcerpt: 'p1' }],
+    });
+    expect((await seriesSvc.getSeries(ser.id)).logline).toBe('Old logline');
+
+    // Replace with an arc that has NO logline/summary — the bible must be
+    // cleared, not left showing the prior work's text beside a replaced arc.
+    const result = await importerSvc.commitImport({
+      universeId: uni.id,
+      seriesId: ser.id,
+      replaceMode: true,
+      canonSelections: { characters: [], places: [], objects: [] },
+      arc: { logline: '', summary: '', protagonistArc: '' },
+      seasons: [],
+      issues: [{ title: 'I2', arcPosition: 1, proseExcerpt: 'p2' }],
+    });
+    expect(result.series.logline).toBe('');
+    expect(result.series.premise).toBe('');
+    expect(result.series.issueCountTarget).toBe(1);
+  });
+
+  it('refuses to commit when the series arc is locked', async () => {
+    const { uni, ser } = await setupForCommit();
+    await seriesSvc.updateSeries(ser.id, { locked: { arc: true } });
+    let caught;
+    try {
+      await importerSvc.commitImport({
+        universeId: uni.id,
+        seriesId: ser.id,
+        canonSelections: { characters: [], places: [], objects: [] },
+        arc: { logline: 'x', summary: 'y' },
+        seasons: [],
+        issues: [{ title: 'I1', arcPosition: 1, proseExcerpt: 'p' }],
+      });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeDefined();
+    expect(caught.code).toBe(importerSvc.ERR_LOCKED);
+    // No issues were created.
+    const issuesAfter = await issuesSvc.listIssues({ seriesId: ser.id });
+    expect(issuesAfter).toHaveLength(0);
+  });
+
+  it('LWW-merges canon by name — second commit does not duplicate a known character', async () => {
+    const { uni, ser } = await setupForCommit();
+    // Seed Aria once.
+    await importerSvc.commitImport({
+      universeId: uni.id,
+      seriesId: ser.id,
+      canonSelections: {
+        characters: [{ name: 'Aria', role: 'protagonist', physicalDescription: 'tall' }],
+        places: [],
+        objects: [],
+      },
+      arc: null,
+      seasons: [],
+      issues: [{ title: 'I1', arcPosition: 1, proseExcerpt: 'p1' }],
+    });
+    // Commit a second pass with Aria again (different case + no description
+    // to exercise the userEditable-blank rule).
+    const second = await importerSvc.commitImport({
+      universeId: uni.id,
+      seriesId: ser.id,
+      canonSelections: {
+        characters: [{ name: 'ARIA', role: 'protagonist' }],
+        places: [],
+        objects: [],
+      },
+      arc: null,
+      seasons: [],
+      issues: [{ title: 'I2', arcPosition: 2, proseExcerpt: 'p2' }],
+    });
+    const ariaEntries = second.universe.characters.filter((c) => c.name.toLowerCase() === 'aria');
+    expect(ariaEntries).toHaveLength(1);
+    // Original physicalDescription preserved (mergeExtractedBible doesn't
+    // overwrite non-blank userEditable fields).
+    expect(ariaEntries[0].physicalDescription).toBe('tall');
+  });
+
+  it('refuses commit when the issues array is empty', async () => {
+    const { uni, ser } = await setupForCommit();
+    let caught;
+    try {
+      await importerSvc.commitImport({
+        universeId: uni.id,
+        seriesId: ser.id,
+        canonSelections: { characters: [], places: [], objects: [] },
+        arc: null,
+        seasons: [],
+        issues: [],
+      });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeDefined();
+    expect(caught.code).toBe(importerSvc.ERR_VALIDATION);
+  });
+
+  it('refuses commit when at least one issue in the array is missing a title', async () => {
+    // Exercises the per-entry title validation loop (importer.js lines 315-323).
+    // A non-empty issues array where one entry has no title must be rejected
+    // fail-fast, before any state is written to disk.
+    const { uni, ser } = await setupForCommit();
+    let caught;
+    try {
+      await importerSvc.commitImport({
+        universeId: uni.id,
+        seriesId: ser.id,
+        canonSelections: { characters: [], places: [], objects: [] },
+        arc: null,
+        seasons: [],
+        issues: [
+          { title: 'Valid Issue', arcPosition: 1, proseExcerpt: 'p1' },
+          { title: '', arcPosition: 2, proseExcerpt: 'p2' },
+        ],
+      });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeDefined();
+    expect(caught.code).toBe(importerSvc.ERR_VALIDATION);
+    expect(caught.message).toMatch(/position 2/i);
+    // Confirm no issues were created — the fail-fast guard prevented any write.
+    const issuesAfter = await issuesSvc.listIssues({ seriesId: ser.id });
+    expect(issuesAfter).toHaveLength(0);
+  });
+
+  it('second-pass seasons are MERGED into existing seasons, not replaced', async () => {
+    // Regression guard for importer.js:360 destructive-replace behavior.
+    // Both passes supply non-empty seasons arrays; after the second commit the
+    // series must contain seasons from BOTH calls (merge), not just the second.
+    //
+    // NOTE: this test asserts the intended post-fix MERGE behavior. If the
+    // parallel agent's merge fix in importer.js has not landed yet, this test
+    // will fail loudly — that is the correct signal.
+    const { uni, ser } = await setupForCommit();
+
+    // First pass: season 1.
+    const first = await importerSvc.commitImport({
+      universeId: uni.id,
+      seriesId: ser.id,
+      canonSelections: { characters: [], places: [], objects: [] },
+      arc: null,
+      seasons: [{ number: 1, title: 'Season One', logline: 'Beginning', synopsis: 'a', endingHook: '' }],
+      issues: [{ title: 'I1', arcPosition: 1, proseExcerpt: 'p1' }],
+    });
+    expect(first.series.seasons).toHaveLength(1);
+    expect(first.series.seasons[0].title).toBe('Season One');
+
+    // Second pass: season 2 — the importer must MERGE this with season 1.
+    const second = await importerSvc.commitImport({
+      universeId: uni.id,
+      seriesId: ser.id,
+      canonSelections: { characters: [], places: [], objects: [] },
+      arc: null,
+      seasons: [{ number: 2, title: 'Season Two', logline: 'Escalation', synopsis: 'b', endingHook: '' }],
+      issues: [{ title: 'I2', arcPosition: 2, proseExcerpt: 'p2' }],
+    });
+
+    // After merge: series must contain both seasons.
+    expect(second.series.seasons).toHaveLength(2);
+    const titles = second.series.seasons.map((s) => s.title);
+    expect(titles).toContain('Season One');
+    expect(titles).toContain('Season Two');
+    // Season numbers must also be preserved correctly.
+    const s1 = second.series.seasons.find((s) => s.number === 1);
+    const s2 = second.series.seasons.find((s) => s.number === 2);
+    expect(s1).toBeDefined();
+    expect(s2).toBeDefined();
+  });
+
+  // Round-12 review: cross-universe guard must refuse commit when the
+  // series has NO universeId (legacy / hand-edited data), not just when
+  // it differs. Previously a falsy universeId silently bypassed the
+  // guard and let the importer re-home the series.
+  it('refuses commit when the series has no universeId', async () => {
+    const uni = await universeSvc.createUniverse({ name: 'Linkless U' });
+    const ser = await seriesSvc.createSeries({ name: 'Linkless S' });
+    // sanitizeSeries normalizes a missing universeId to null. Confirm
+    // the precondition before exercising the guard.
+    expect(ser.universeId).toBeFalsy();
+    let caught;
+    try {
+      await importerSvc.commitImport({
+        universeId: uni.id, seriesId: ser.id,
+        canonSelections: { characters: [], places: [], objects: [] },
+        arc: null,
+        seasons: [],
+        issues: [{ title: 'I1', arcPosition: 1, proseExcerpt: 'p' }],
+      });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeDefined();
+    expect(caught.code).toBe(importerSvc.ERR_VALIDATION);
+    expect(caught.message).toMatch(/no universeId/i);
+  });
+
+  // Round-10 review: round-9's auto-assign fix only covered the omitted
+  // case. An incoming issue that EXPLICITLY sets `arcPosition: 1` while
+  // the series already holds an issue at position 1 must be rejected
+  // fail-fast, not silently land a duplicate.
+  it('refuses commit when an explicit arcPosition collides with an existing issue', async () => {
+    const { uni, ser } = await setupForCommit();
+    await importerSvc.commitImport({
+      universeId: uni.id, seriesId: ser.id,
+      canonSelections: { characters: [], places: [], objects: [] },
+      arc: null,
+      seasons: [],
+      issues: [{ title: 'I1', arcPosition: 1, proseExcerpt: 'p1' }],
+    });
+    let caught;
+    try {
+      await importerSvc.commitImport({
+        universeId: uni.id, seriesId: ser.id,
+        canonSelections: { characters: [], places: [], objects: [] },
+        arc: null,
+        seasons: [],
+        // Explicit arcPosition 1 — already used by I1 above.
+        issues: [{ title: 'Collision', arcPosition: 1, proseExcerpt: 'p2' }],
+      });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeDefined();
+    expect(caught.code).toBe(importerSvc.ERR_VALIDATION);
+    expect(caught.message).toMatch(/collides with an existing issue/i);
+    // No issue created — the gate fires before createIssue.
+    const all = await issuesSvc.listIssues({ seriesId: ser.id });
+    expect(all).toHaveLength(1);
+  });
+
+  // Round-9 review: arcPosition auto-assign must seed `nextFreeArcPos`
+  // from the union of explicit incoming positions AND pre-existing
+  // series.issues[].arcPosition — re-import on a series that already
+  // has issues at [1..3] would otherwise auto-assign starting at 1 again
+  // and create duplicate positions silently.
+  it('arcPosition auto-assign on re-import skips arcPositions already used by existing issues', async () => {
+    const { uni, ser } = await setupForCommit();
+    // First pass: seed three issues at arcPositions 1, 2, 3.
+    await importerSvc.commitImport({
+      universeId: uni.id, seriesId: ser.id,
+      canonSelections: { characters: [], places: [], objects: [] },
+      arc: null,
+      seasons: [],
+      issues: [
+        { title: 'I1', arcPosition: 1, proseExcerpt: 'p1' },
+        { title: 'I2', arcPosition: 2, proseExcerpt: 'p2' },
+        { title: 'I3', arcPosition: 3, proseExcerpt: 'p3' },
+      ],
+    });
+    // Second pass: two new issues with NO arcPosition. Must auto-assign
+    // to 4 and 5, not collide with 1 and 2.
+    const second = await importerSvc.commitImport({
+      universeId: uni.id, seriesId: ser.id,
+      canonSelections: { characters: [], places: [], objects: [] },
+      arc: null,
+      seasons: [],
+      issues: [
+        { title: 'I4 — auto', proseExcerpt: 'p4' },
+        { title: 'I5 — auto', proseExcerpt: 'p5' },
+      ],
+    });
+    expect(second.createdIssueIds).toHaveLength(2);
+    const i4 = await issuesSvc.getIssue(second.createdIssueIds[0]);
+    const i5 = await issuesSvc.getIssue(second.createdIssueIds[1]);
+    expect(i4.arcPosition).toBe(4);
+    expect(i5.arcPosition).toBe(5);
+    // And the full series now has 5 issues, no collisions on arcPosition.
+    const allIssues = await issuesSvc.listIssues({ seriesId: ser.id });
+    const positions = allIssues.map((i) => i.arcPosition).sort((a, b) => a - b);
+    expect(positions).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  // Round-8 review: fallbackSeasonId must pick the LOWEST-NUMBERED season,
+  // not array-position [0]. After mergeSeasons the array order is
+  // `[...retained, ...incomingBuilt]` — retained existing seasons come
+  // first regardless of number, so a series with [season 2, season 3] that
+  // receives a new season 1 would otherwise pick season 2 as "fallback".
+  it('fallbackSeasonId picks the lowest-numbered season, not array[0]', async () => {
+    const { uni, ser } = await setupForCommit();
+
+    // First pass: seed seasons 2 and 3 (skip 1).
+    await importerSvc.commitImport({
+      universeId: uni.id, seriesId: ser.id,
+      canonSelections: { characters: [], places: [], objects: [] },
+      arc: null,
+      seasons: [
+        { number: 2, title: 'Two', logline: 'a', synopsis: '', endingHook: '' },
+        { number: 3, title: 'Three', logline: 'b', synopsis: '', endingHook: '' },
+      ],
+      issues: [{ title: 'I1', arcPosition: 1, proseExcerpt: 'p1' }],
+    });
+
+    // Second pass: add season 1 + an issue with no seasonNumber. The
+    // fallback must land it in season 1 (the new lowest), even though
+    // mergeSeasons returns [retained_2, retained_3, new_1] in that order.
+    const second = await importerSvc.commitImport({
+      universeId: uni.id, seriesId: ser.id,
+      canonSelections: { characters: [], places: [], objects: [] },
+      arc: null,
+      seasons: [{ number: 1, title: 'One', logline: 'c', synopsis: '', endingHook: '' }],
+      issues: [{ title: 'I-no-season', arcPosition: 4, proseExcerpt: 'p4' }],
+    });
+
+    const created = await issuesSvc.getIssue(second.createdIssueIds[0]);
+    const seasonOne = second.series.seasons.find((s) => s.number === 1);
+    expect(seasonOne).toBeDefined();
+    expect(created.seasonId).toBe(seasonOne.id);
+  });
+
+  // Round-8 review: remappedIssues entries now carry actualSeasonNumber
+  // and actualSeasonTitle so the client toast can name the season
+  // precisely instead of saying a generic "first season".
+  it('remappedIssues entries carry actualSeasonNumber + actualSeasonTitle', async () => {
+    const { uni, ser } = await setupForCommit();
+    // Seed season 1 only; the next commit references a non-existent season 99
+    // — the issue must land in season 1 and the remap entry must surface it.
+    const result = await importerSvc.commitImport({
+      universeId: uni.id, seriesId: ser.id,
+      canonSelections: { characters: [], places: [], objects: [] },
+      arc: null,
+      seasons: [{ number: 1, title: 'Foundry', logline: 'open', synopsis: '', endingHook: '' }],
+      issues: [
+        { title: 'A', arcPosition: 1, seasonNumber: 99, proseExcerpt: 'pa' },
+      ],
+    });
+    expect(result.remappedIssues).toHaveLength(1);
+    const remap = result.remappedIssues[0];
+    expect(remap.requestedSeasonNumber).toBe(99);
+    expect(remap.actualSeasonNumber).toBe(1);
+    expect(remap.actualSeasonTitle).toBe('Foundry');
+    expect(remap.actualSeasonId).toBeDefined();
+  });
+
+  // Round-8 review: missing test for the ERR_PARTIAL_COMMIT_ISSUES rollback
+  // path. Inject a createIssue failure on the 2nd of 3 issues; assert that
+  // the rollback deletes the 1st (already created), surfaces the partial
+  // code, and leaves the universe + series writes intact (those are
+  // idempotent + user-confirmed, so we don't roll them back).
+  it('rolls back created issues + throws ERR_PARTIAL_COMMIT_ISSUES when createIssue fails mid-loop', async () => {
+    const { uni, ser } = await setupForCommit();
+    let call = 0;
+    mockEnsureIssue.mockImplementation(async (...args) => {
+      call++;
+      if (call === 2) throw new Error('simulated mid-loop FS error');
+      return realIssuesRef.current.ensureIssueWithId(...args);
+    });
+
+    let caught;
+    try {
+      await importerSvc.commitImport({
+        universeId: uni.id, seriesId: ser.id,
+        canonSelections: { characters: [{ name: 'Aria' }], places: [], objects: [] },
+        arc: { logline: 'A', summary: 'S', shape: 'man-in-hole' },
+        seasons: [{ number: 1, title: 'S1', logline: '', synopsis: '', endingHook: '' }],
+        issues: [
+          { title: 'I1', arcPosition: 1, proseExcerpt: 'p1' },
+          { title: 'I2', arcPosition: 2, proseExcerpt: 'p2' },
+          { title: 'I3', arcPosition: 3, proseExcerpt: 'p3' },
+        ],
+      });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeDefined();
+    expect(caught.code).toBe('IMPORTER_PARTIAL_COMMIT_ISSUES');
+    expect(caught.message).toMatch(/universe and series were updated/i);
+    expect(caught.message).toMatch(/simulated mid-loop FS error/);
+    // The error carries the structured context the client needs to shape
+    // its retry — universe + series ids (so a re-fetch isn't required) and
+    // `arcAlreadyPersisted` (so the retry drops arc + seasons + canon from
+    // the payload and lets the server-side state stand).
+    expect(caught.context).toBeDefined();
+    expect(caught.context.universeId).toBe(uni.id);
+    expect(caught.context.seriesId).toBe(ser.id);
+    expect(caught.context.arcAlreadyPersisted).toBe(true);
+    expect(caught.context.skipArcOnRetry).toBe(true);
+
+    // Universe + series writes survive (user-confirmed, idempotent).
+    const universeAfter = await universeSvc.getUniverse(uni.id);
+    expect(universeAfter.characters.some((c) => c.name === 'Aria')).toBe(true);
+    const seriesAfter = await seriesSvc.getSeries(ser.id);
+    expect(seriesAfter.arc?.shape).toBe('man-in-hole');
+    expect(seriesAfter.seasons).toHaveLength(1);
+
+    // No leftover issues from the partial loop.
+    const issuesAfter = await issuesSvc.listIssues({ seriesId: ser.id });
+    expect(issuesAfter).toHaveLength(0);
+  });
+
+  // Round-N: replaceMode behavior. Seed a series with one issue + one arc
+  // shape; re-commit with replaceMode=true and assert the existing issue
+  // is wiped, the new issue is created, and the arc was overwritten.
+  it('replaceMode=true wipes existing issues + overwrites arc + seasons', async () => {
+    const { uni, ser } = await setupForCommit();
+    // Seed pass — one issue, one season, "rags-to-riches" arc.
+    await importerSvc.commitImport({
+      universeId: uni.id,
+      seriesId: ser.id,
+      canonSelections: { characters: [], places: [], objects: [] },
+      arc: { logline: 'Old', summary: 'Old', shape: 'rags-to-riches' },
+      seasons: [{ number: 1, title: 'Old S1', logline: '', synopsis: '', endingHook: '' }],
+      issues: [{ title: 'Old Issue', arcPosition: 1, proseExcerpt: 'old prose' }],
+    });
+    const beforeIssues = await issuesSvc.listIssues({ seriesId: ser.id });
+    expect(beforeIssues).toHaveLength(1);
+
+    // Replace pass — different arc shape, different issue.
+    const result = await importerSvc.commitImport({
+      universeId: uni.id,
+      seriesId: ser.id,
+      canonSelections: { characters: [], places: [], objects: [] },
+      arc: { logline: 'New', summary: 'New', shape: 'tragedy' },
+      seasons: [{ number: 1, title: 'New S1', logline: '', synopsis: '', endingHook: '' }],
+      issues: [{ title: 'New Issue', arcPosition: 1, proseExcerpt: 'new prose' }],
+      replaceMode: true,
+    });
+
+    // Old issue gone, only new issue remains.
+    const afterIssues = await issuesSvc.listIssues({ seriesId: ser.id });
+    expect(afterIssues).toHaveLength(1);
+    expect(afterIssues[0].title).toBe('New Issue');
+    expect(result.createdIssueIds).toEqual([afterIssues[0].id]);
+    // Arc was overwritten — shape is now `tragedy`.
+    expect(result.series.arc.shape).toBe('tragedy');
+    expect(result.series.arc.logline).toBe('New');
+    // Season title was overwritten.
+    expect(result.series.seasons[0].title).toBe('New S1');
+  });
+
+  // Copilot review: in replaceMode, a swallowed per-issue delete failure
+  // would leave the old issue on disk AND create a new one with a reused
+  // arcPosition (additive-mode's collision check is skipped in replace),
+  // producing duplicates the additive path explicitly rejects. The fix is
+  // to abort the commit before any new state is written if any delete
+  // fails. This test pins that contract — single-issue case: nothing got
+  // deleted before the failure, so the abort is fully transactional.
+  it('replaceMode=true aborts the commit when a delete fails — no new issues, arc unchanged', async () => {
+    const { uni, ser } = await setupForCommit();
+    // Seed pass — one issue, arc shape `rags-to-riches`.
+    await importerSvc.commitImport({
+      universeId: uni.id,
+      seriesId: ser.id,
+      canonSelections: { characters: [], places: [], objects: [] },
+      arc: { logline: 'Old', summary: 'Old', shape: 'rags-to-riches' },
+      seasons: [],
+      issues: [{ title: 'Old Issue', arcPosition: 1, proseExcerpt: 'old prose' }],
+    });
+    const beforeIssues = await issuesSvc.listIssues({ seriesId: ser.id });
+    expect(beforeIssues).toHaveLength(1);
+    const seededIssueId = beforeIssues[0].id;
+
+    // Inject a delete failure for the seeded issue id.
+    mockDeleteIssue.mockImplementationOnce(async () => {
+      throw new Error('disk full');
+    });
+
+    // Replace pass — should abort before universe/series/issue writes.
+    await expect(importerSvc.commitImport({
+      universeId: uni.id,
+      seriesId: ser.id,
+      canonSelections: { characters: [], places: [], objects: [] },
+      arc: { logline: 'New', summary: 'New', shape: 'tragedy' },
+      seasons: [],
+      issues: [{ title: 'New Issue', arcPosition: 1, proseExcerpt: 'new prose' }],
+      replaceMode: true,
+    })).rejects.toThrowError(/Replace mode aborted on first delete failure/);
+
+    // Old issue still on disk, no new issue created.
+    const afterIssues = await issuesSvc.listIssues({ seriesId: ser.id });
+    expect(afterIssues).toHaveLength(1);
+    expect(afterIssues[0].id).toBe(seededIssueId);
+    expect(afterIssues[0].title).toBe('Old Issue');
+    // Arc shape was NOT overwritten — series write never happened.
+    const seriesAfter = await seriesSvc.getSeries(ser.id);
+    expect(seriesAfter.arc.shape).toBe('rags-to-riches');
+    expect(seriesAfter.arc.logline).toBe('Old');
+  });
+
+  // Second Copilot review iteration: aborting on the FIRST delete failure
+  // (not after looping through all of them) minimizes the destructive
+  // surface. With 3 seeded issues + a failure injected on the 2nd call,
+  // only 1 should be deleted before the abort fires — the 3rd issue's
+  // delete must NEVER be attempted.
+  it('replaceMode=true aborts on the FIRST delete failure, leaving subsequent issues untouched', async () => {
+    const { uni, ser } = await setupForCommit();
+    // Seed pass — three issues at arcPositions 1, 2, 3.
+    await importerSvc.commitImport({
+      universeId: uni.id,
+      seriesId: ser.id,
+      canonSelections: { characters: [], places: [], objects: [] },
+      arc: null,
+      seasons: [],
+      issues: [
+        { title: 'Old A', arcPosition: 1, proseExcerpt: 'a' },
+        { title: 'Old B', arcPosition: 2, proseExcerpt: 'b' },
+        { title: 'Old C', arcPosition: 3, proseExcerpt: 'c' },
+      ],
+    });
+    const seeded = await issuesSvc.listIssues({ seriesId: ser.id });
+    expect(seeded).toHaveLength(3);
+
+    // First call succeeds (real passthrough); second call throws; we must
+    // never reach a third call. Track call count + which id failed.
+    let deleteCallCount = 0;
+    let failedId = null;
+    mockDeleteIssue.mockImplementation(async (id) => {
+      deleteCallCount += 1;
+      if (deleteCallCount === 2) {
+        failedId = id;
+        throw new Error('disk full');
+      }
+      return realIssuesRef.current.deleteIssue(id);
+    });
+
+    await expect(importerSvc.commitImport({
+      universeId: uni.id,
+      seriesId: ser.id,
+      canonSelections: { characters: [], places: [], objects: [] },
+      arc: null,
+      seasons: [],
+      issues: [{ title: 'New', arcPosition: 1, proseExcerpt: 'new' }],
+      replaceMode: true,
+    })).rejects.toThrowError(/Replace mode aborted on first delete failure/);
+
+    // Exactly two delete calls happened (one success + one failure);
+    // the third issue was NEVER touched.
+    expect(deleteCallCount).toBe(2);
+
+    // Two issues remain on disk: the one that failed to delete, and the
+    // one that was never attempted. Exactly one issue was actually
+    // deleted before the abort.
+    const remaining = await issuesSvc.listIssues({ seriesId: ser.id });
+    expect(remaining).toHaveLength(2);
+    expect(remaining.map((i) => i.id)).toContain(failedId);
+    // No new issue was created — replace aborted before issue-loop.
+    expect(remaining.map((i) => i.title)).not.toContain('New');
+  });
+
+  // Same arcPosition between old + new issues — additive mode would reject
+  // with "explicit arcPosition collides", but replaceMode wipes the old
+  // first so the collision is gone by the time we write the new set.
+  it('replaceMode=true tolerates arcPosition reuse from the wiped set', async () => {
+    const { uni, ser } = await setupForCommit();
+    await importerSvc.commitImport({
+      universeId: uni.id,
+      seriesId: ser.id,
+      canonSelections: { characters: [], places: [], objects: [] },
+      arc: null,
+      seasons: [],
+      issues: [{ title: 'Old', arcPosition: 1, proseExcerpt: 'old' }],
+    });
+    // Same arcPosition=1 — additive would throw, replace accepts.
+    const result = await importerSvc.commitImport({
+      universeId: uni.id,
+      seriesId: ser.id,
+      canonSelections: { characters: [], places: [], objects: [] },
+      arc: null,
+      seasons: [],
+      issues: [{ title: 'New', arcPosition: 1, proseExcerpt: 'new' }],
+      replaceMode: true,
+    });
+    expect(result.createdIssueIds).toHaveLength(1);
+    const after = await issuesSvc.listIssues({ seriesId: ser.id });
+    expect(after).toHaveLength(1);
+    expect(after[0].title).toBe('New');
+    expect(after[0].arcPosition).toBe(1);
+  });
+});
+
+// Import sessions (#9943): the server, not the client's React state, remembers
+// how far an import got, so a repeat commit cannot duplicate the issue set.
+describe('commitImport import sessions (#9943)', () => {
+  const analyze = (source = 'The vault loomed in the dark.') => importerSvc.analyzeImport({
+    universeName: 'Session U', seriesName: 'Session S', contentType: 'short-story', source,
+  });
+  const payloadFor = (preview, extra = {}) => ({
+    universeId: preview.universe.id,
+    seriesId: preview.series.id,
+    importId: preview.importId,
+    arc: { logline: 'Original logline', summary: 'Original summary', shape: 'man-in-hole' },
+    seasons: [{ number: 1, title: 'S1', logline: '', synopsis: '', endingHook: '' }],
+    issues: [
+      { title: 'I1', arcPosition: 1, proseExcerpt: 'p1' },
+      { title: 'I2', arcPosition: 2, proseExcerpt: 'p2' },
+    ],
+    ...extra,
+  });
+  const issueCount = async (preview) => (await issuesSvc.listIssues({ seriesId: preview.series.id })).length;
+
+  it('replays a repeated commit: nothing new is created and the recorded ids come back', async () => {
+    wireDefaultLLMResponses();
+    const preview = await analyze();
+    const first = await importerSvc.commitImport(payloadFor(preview));
+    expect(first.createdIssueIds).toHaveLength(2);
+    expect(first.replayed).toBeUndefined();
+
+    // An edit made after the commit must survive a repeat: the replay writes nothing.
+    await seriesSvc.updateSeries(preview.series.id, { logline: 'Edited since' });
+    const again = await importerSvc.commitImport(payloadFor(preview));
+
+    expect(again.replayed).toBe(true);
+    expect(again.createdIssueIds).toEqual(first.createdIssueIds);
+    expect(await issueCount(preview)).toBe(2);
+    expect((await seriesSvc.getSeries(preview.series.id)).logline).toBe('Edited since');
+  });
+
+  it('survives a reload: re-analyzing the same text reads the committed session back', async () => {
+    wireDefaultLLMResponses();
+    const preview = await analyze();
+    expect(preview.importSession).toBeNull();
+    const first = await importerSvc.commitImport(payloadFor(preview));
+
+    // The reload dropped every client marker; analyze is all the client has.
+    const reanalyzed = await analyze('  The vault loomed in the dark.\r\n');
+    expect(reanalyzed.isExistingSeries).toBe(true);
+    expect(reanalyzed.importId).toBe(preview.importId);
+    expect(reanalyzed.importSession).toEqual({ status: 'committed', createdIssueIds: first.createdIssueIds });
+
+    const resumed = await importerSvc.commitImport(payloadFor(reanalyzed));
+    expect(resumed.replayed).toBe(true);
+    expect(await issueCount(preview)).toBe(2);
+  });
+
+  it('resumes after a rolled-back issue loop without resending canon or the arc', async () => {
+    wireDefaultLLMResponses();
+    const preview = await analyze();
+    let call = 0;
+    mockEnsureIssue.mockImplementation(async (...args) => {
+      call++;
+      if (call === 2) throw new Error('simulated mid-loop FS error');
+      return realIssuesRef.current.ensureIssueWithId(...args);
+    });
+    await expect(importerSvc.commitImport(payloadFor(preview))).rejects.toMatchObject({
+      code: importerSvc.ERR_PARTIAL_COMMIT_ISSUES,
+    });
+    expect(await issueCount(preview)).toBe(0);
+
+    const reanalyzed = await analyze();
+    expect(reanalyzed.importSession).toMatchObject({ status: 'arc-persisted' });
+    await seriesSvc.updateSeries(preview.series.id, { arc: { logline: 'Edited arc', summary: 'Edited', shape: 'rags-to-riches' } });
+
+    // A client with no memory of the failure resends the full payload, arc included.
+    const retried = await importerSvc.commitImport(payloadFor(reanalyzed));
+    expect(retried.createdIssueIds).toHaveLength(2);
+    expect((await seriesSvc.getSeries(preview.series.id)).arc.shape).toBe('rags-to-riches');
+    expect((await analyze()).importSession.status).toBe('committed');
+  });
+
+  it('does not block a different manuscript imported into the same series', async () => {
+    wireDefaultLLMResponses();
+    const first = await analyze('Chapter one text.');
+    await importerSvc.commitImport(payloadFor(first, { issues: [{ title: 'A', arcPosition: 1, proseExcerpt: 'a' }] }));
+
+    const second = await analyze('A different manuscript entirely.');
+    expect(second.importId).not.toBe(first.importId);
+    expect(second.importSession).toBeNull();
+    const result = await importerSvc.commitImport(payloadFor(second, { issues: [{ title: 'B', proseExcerpt: 'b' }] }));
+    expect(result.replayed).toBeUndefined();
+    expect(await issueCount(first)).toBe(2);
+  });
+
+  it('treats a committed session whose issues were all deleted as a fresh start', async () => {
+    wireDefaultLLMResponses();
+    const preview = await analyze();
+    const first = await importerSvc.commitImport(payloadFor(preview));
+    for (const id of first.createdIssueIds) await issuesSvc.deleteIssue(id);
+
+    const reanalyzed = await analyze();
+    expect(reanalyzed.importSession).toBeNull();
+    const again = await importerSvc.commitImport(payloadFor(reanalyzed));
+    expect(again.replayed).toBeUndefined();
+    expect(again.createdIssueIds).toHaveLength(2);
+  });
+
+  it('serializes concurrent commits of one import into a single issue set', async () => {
+    wireDefaultLLMResponses();
+    const preview = await analyze();
+    const [a, b] = await Promise.all([
+      importerSvc.commitImport(payloadFor(preview)),
+      importerSvc.commitImport(payloadFor(preview)),
+    ]);
+    expect([a.replayed, b.replayed].filter(Boolean)).toHaveLength(1);
+    expect(a.createdIssueIds).toEqual(b.createdIssueIds);
+    expect(await issueCount(preview)).toBe(2);
+  });
+
+  it('keeps replace mode independent of the session — it rewrites rather than replays', async () => {
+    wireDefaultLLMResponses();
+    const preview = await analyze();
+    await importerSvc.commitImport(payloadFor(preview));
+    const replaced = await importerSvc.commitImport(payloadFor(preview, {
+      replaceMode: true,
+      issues: [{ title: 'Replacement', arcPosition: 1, proseExcerpt: 'r' }],
+    }));
+    expect(replaced.replayed).toBeUndefined();
+    const after = await issuesSvc.listIssues({ seriesId: preview.series.id });
+    expect(after.map((i) => i.title)).toEqual(['Replacement']);
+  });
+
+  // #10762: issue identities are planned durably before the first create, so a
+  // lost receipt or an interrupted loop resumes instead of minting a second batch.
+  it('finishes a commit whose final receipt was lost without creating a second copy', async () => {
+    wireDefaultLLMResponses();
+    const preview = await analyze();
+    // No arcPosition — a retry used to auto-assign the next free slot and land
+    // a duplicate at position 2.
+    const issues = [{ title: 'Example Chapter', proseExcerpt: 'p1' }];
+    sessionFaults.failStatuses.add('committed');
+    const first = await importerSvc.commitImport(payloadFor(preview, { issues }));
+    sessionFaults.failStatuses.clear();
+    expect(first.createdIssueIds).toHaveLength(1);
+
+    const reanalyzed = await analyze();
+    expect(reanalyzed.importSession).toEqual({ status: 'committed', createdIssueIds: first.createdIssueIds });
+    const retried = await importerSvc.commitImport(payloadFor(reanalyzed, { issues }));
+
+    expect(retried.replayed).toBe(true);
+    expect(retried.createdIssueIds).toEqual(first.createdIssueIds);
+    const after = await issuesSvc.listIssues({ seriesId: preview.series.id });
+    expect(after.map((i) => [i.id, i.arcPosition])).toEqual([[first.createdIssueIds[0], 1]]);
+    // The replay wrote the receipt the first attempt lost.
+    expect(await sessionsSvc.getImportSession(preview.importId)).toMatchObject({
+      status: 'committed', createdIssueIds: first.createdIssueIds, plan: null,
+    });
+  });
+
+  it('keeps a finished import resumable until its draft shells are promoted', async () => {
+    wireDefaultLLMResponses();
+    const preview = await analyze();
+    const issues = [{ title: 'I1', proseExcerpt: 'p1' }];
+    // The last issue lands, then the process dies before promotion and receipt.
+    mockEnsureIssue.mockImplementation(async (...args) => {
+      await realIssuesRef.current.ensureIssueWithId(...args);
+      throw new Error('simulated crash after the write');
+    });
+    mockDeleteIssue.mockRejectedValue(new Error('simulated delete failure'));
+    await expect(importerSvc.commitImport(payloadFor(preview, { issues }))).rejects.toThrow();
+    mockEnsureIssue.mockImplementation((...args) => realIssuesRef.current.ensureIssueWithId(...args));
+    mockDeleteIssue.mockImplementation((...args) => realIssuesRef.current.deleteIssue(...args));
+    expect((await seriesSvc.getSeries(preview.series.id)).importDraft).toBe(true);
+
+    // Not `committed` yet: a client that believed it would never send the
+    // commit that promotes the drafts.
+    const reanalyzed = await analyze();
+    expect(reanalyzed.importSession.status).toBe('arc-persisted');
+    const retried = await importerSvc.commitImport(payloadFor(reanalyzed, { issues }));
+
+    expect(retried.replayed).toBe(true);
+    expect((await seriesSvc.getSeries(preview.series.id)).importDraft).not.toBe(true);
+    expect(await issueCount(preview)).toBe(1);
+    expect((await analyze()).importSession).toEqual({ status: 'committed', createdIssueIds: retried.createdIssueIds });
+  });
+
+  // The disk state a crash after the first issue leaves: the plan is recorded,
+  // one issue exists, and nothing rolled it back.
+  const interruptAfterFirstIssue = async (preview, issues) => {
+    let call = 0;
+    mockEnsureIssue.mockImplementation(async (...args) => {
+      call++;
+      if (call === 2) throw new Error('simulated crash');
+      return realIssuesRef.current.ensureIssueWithId(...args);
+    });
+    mockDeleteIssue.mockRejectedValue(new Error('simulated delete failure'));
+    const err = await importerSvc.commitImport(payloadFor(preview, { issues })).catch((e) => e);
+    mockEnsureIssue.mockImplementation((...args) => realIssuesRef.current.ensureIssueWithId(...args));
+    mockDeleteIssue.mockImplementation((...args) => realIssuesRef.current.deleteIssue(...args));
+    return err;
+  };
+
+  it.each([
+    ['explicit', [{ title: 'I1', arcPosition: 1, proseExcerpt: 'p1' }, { title: 'I2', arcPosition: 2, proseExcerpt: 'p2' }]],
+    ['omitted', [{ title: 'I1', proseExcerpt: 'p1' }, { title: 'I2', proseExcerpt: 'p2' }]],
+  ])('resumes an interrupted issue set with %s positions, keeping the survivor and its edits', async (_label, issues) => {
+    wireDefaultLLMResponses();
+    const preview = await analyze();
+    const err = await interruptAfterFirstIssue(preview, issues);
+    // The rollback could not remove the survivor, and says so rather than
+    // reporting every created issue as rolled back.
+    expect(err.code).toBe(importerSvc.ERR_PARTIAL_COMMIT_ISSUES);
+    expect(err.context.survivingIssueIds).toHaveLength(1);
+    expect(err.message).toMatch(/0 issues created by this attempt were rolled back/);
+    expect(err.message).toMatch(/1 issue could not be removed .* remains part of this import/);
+    const [survivorId] = err.context.survivingIssueIds;
+    await issuesSvc.updateIssue(survivorId, { title: 'I1 (edited)' });
+
+    const reanalyzed = await analyze();
+    expect(reanalyzed.importSession.status).toBe('arc-persisted');
+    const retried = await importerSvc.commitImport(payloadFor(reanalyzed, { issues }));
+
+    expect(retried.createdIssueIds[0]).toBe(survivorId);
+    const after = await issuesSvc.listIssues({ seriesId: preview.series.id });
+    expect(after.map((i) => [i.id, i.title, i.arcPosition])).toEqual([
+      [survivorId, 'I1 (edited)', 1],
+      [retried.createdIssueIds[1], 'I2', 2],
+    ]);
+    expect((await analyze()).importSession).toEqual({ status: 'committed', createdIssueIds: retried.createdIssueIds });
+  });
+
+  it.each([
+    ['a new issue', (preview) => issuesSvc.createIssue({ seriesId: preview.series.id, title: 'Added since', arcPosition: 2 })],
+    ['the moved survivor', (_preview, survivorId) => issuesSvc.updateIssue(survivorId, { arcPosition: 2 })],
+  ])('refuses to resume onto a planned position %s took since', async (_label, takeSlot) => {
+    wireDefaultLLMResponses();
+    const preview = await analyze();
+    const issues = [{ title: 'I1', arcPosition: 1, proseExcerpt: 'p1' }, { title: 'I2', arcPosition: 2, proseExcerpt: 'p2' }];
+    const { context: { survivingIssueIds } } = await interruptAfterFirstIssue(preview, issues);
+    await takeSlot(preview, survivingIssueIds[0]);
+    const before = await issueCount(preview);
+
+    await expect(importerSvc.commitImport(payloadFor(preview, { issues })))
+      .rejects.toMatchObject({ code: importerSvc.ERR_VALIDATION });
+    expect(await issueCount(preview)).toBe(before);
+  });
+
+  it("refuses a changed issue list while an earlier attempt's issues still exist", async () => {
+    wireDefaultLLMResponses();
+    const preview = await analyze();
+    const issues = [{ title: 'I1', arcPosition: 1, proseExcerpt: 'p1' }, { title: 'I2', arcPosition: 2, proseExcerpt: 'p2' }];
+    const { context: { survivingIssueIds } } = await interruptAfterFirstIssue(preview, issues);
+
+    await expect(importerSvc.commitImport(payloadFor(preview, {
+      issues: [{ title: 'A different split', proseExcerpt: 'x' }],
+    }))).rejects.toMatchObject({ code: importerSvc.ERR_IMPORT_IN_PROGRESS });
+    expect((await issuesSvc.listIssues({ seriesId: preview.series.id })).map((i) => i.id)).toEqual(survivingIssueIds);
+
+    // Deleting the survivor releases the plan: the new list then imports normally.
+    await issuesSvc.deleteIssue(survivingIssueIds[0]);
+    const fresh = await importerSvc.commitImport(payloadFor(preview, {
+      issues: [{ title: 'A different split', proseExcerpt: 'x' }],
+    }));
+    expect(fresh.createdIssueIds).toHaveLength(1);
+  });
+
+  it('commits without an importId exactly as before (older clients)', async () => {
+    const { uni, ser } = await setupForCommit();
+    const body = { universeId: uni.id, seriesId: ser.id, issues: [{ title: 'Solo', proseExcerpt: 'p' }] };
+    await importerSvc.commitImport(body);
+    await importerSvc.commitImport(body);
+    expect(await issuesSvc.listIssues({ seriesId: ser.id })).toHaveLength(2);
+  });
+});
+
+// #10763: commits into one series are admitted one at a time, whatever their
+// importId, and the issue publication rechecks positions against fresh state.
+// Each interleaving test holds the FIRST commit's first issue write at a
+// barrier — the point where the issue's reproduction found both commits had
+// already passed the collision check — and lets the second commit run into it.
+describe('commitImport series admission (#10763)', () => {
+  function holdFirstPublication() {
+    let reached;
+    let release;
+    const reachedP = new Promise((resolve) => { reached = resolve; });
+    const releaseP = new Promise((resolve) => { release = resolve; });
+    mockEnsureIssue.mockImplementationOnce(async (...args) => {
+      reached();
+      await releaseP;
+      return realIssuesRef.current.ensureIssueWithId(...args);
+    });
+    return { reached: reachedP, release };
+  }
+  const importIdFor = (ser, source) => sessionsSvc.deriveImportId({ seriesId: ser.id, source });
+  const livePositions = async (ser) => (await issuesSvc.listIssues({ seriesId: ser.id }))
+    .map((i) => i.arcPosition).sort((a, b) => a - b);
+
+  it('two manuscripts claiming one explicit position: one commits, the other is refused before any write', async () => {
+    const { uni, ser } = await setupForCommit();
+    const held = holdFirstPublication();
+    const first = importerSvc.commitImport({
+      universeId: uni.id, seriesId: ser.id, importId: importIdFor(ser, 'manuscript A'),
+      canonSelections: { characters: [{ name: 'Aria' }] },
+      issues: [{ title: 'A1', arcPosition: 1, proseExcerpt: 'a' }],
+    });
+    await held.reached;
+    const second = importerSvc.commitImport({
+      universeId: uni.id, seriesId: ser.id, importId: importIdFor(ser, 'manuscript B'),
+      canonSelections: { characters: [{ name: 'Intruder' }] },
+      arc: { logline: 'B logline', summary: 'B summary', shape: 'rags-to-riches' },
+      issues: [{ title: 'B1', arcPosition: 1, proseExcerpt: 'b' }],
+    });
+    const secondOutcome = second.then(() => null, (err) => err);
+    held.release();
+
+    await expect(first).resolves.toMatchObject({ createdIssueIds: [expect.any(String)] });
+    const err = await secondOutcome;
+    expect(err?.code).toBe(importerSvc.ERR_VALIDATION);
+    expect(err.message).toMatch(/collides with an existing issue/);
+    expect((await issuesSvc.listIssues({ seriesId: ser.id })).map((i) => i.title)).toEqual(['A1']);
+    // The refused batch wrote nothing: no canon, no arc.
+    const universeAfter = await universeSvc.getUniverse(uni.id);
+    expect(universeAfter.characters.map((c) => c.name)).toEqual(['Aria']);
+    expect((await seriesSvc.getSeries(ser.id)).arc?.shape).not.toBe('rags-to-riches');
+  });
+
+  it('concurrent manuscripts with omitted positions get distinct sequential positions', async () => {
+    const { uni, ser } = await setupForCommit();
+    const held = holdFirstPublication();
+    const first = importerSvc.commitImport({
+      universeId: uni.id, seriesId: ser.id, importId: importIdFor(ser, 'manuscript A'),
+      issues: [{ title: 'A1', proseExcerpt: 'a' }, { title: 'A2', proseExcerpt: 'a2' }],
+    });
+    await held.reached;
+    const second = importerSvc.commitImport({
+      universeId: uni.id, seriesId: ser.id, importId: importIdFor(ser, 'manuscript B'),
+      issues: [{ title: 'B1', proseExcerpt: 'b' }],
+    });
+    held.release();
+    await Promise.all([first, second]);
+    expect(await livePositions(ser)).toEqual([1, 2, 3]);
+  });
+
+  it('applies the same admission to legacy commits with no importId', async () => {
+    const { uni, ser } = await setupForCommit();
+    const held = holdFirstPublication();
+    const body = (title) => ({ universeId: uni.id, seriesId: ser.id, issues: [{ title, arcPosition: 1, proseExcerpt: 'p' }] });
+    const first = importerSvc.commitImport(body('Legacy A'));
+    await held.reached;
+    const second = importerSvc.commitImport(body('Legacy B')).then(() => null, (err) => err);
+    held.release();
+    await first;
+    expect((await second)?.code).toBe(importerSvc.ERR_VALIDATION);
+    expect(await livePositions(ser)).toEqual([1]);
+  });
+
+  it('lets a commit into an unrelated series proceed while one series is held', async () => {
+    const { uni, ser } = await setupForCommit();
+    const other = await seriesSvc.createSeries({ name: 'Other S', universeId: uni.id, ephemeral: true });
+    const held = holdFirstPublication();
+    const first = importerSvc.commitImport({
+      universeId: uni.id, seriesId: ser.id, issues: [{ title: 'Held', arcPosition: 1, proseExcerpt: 'h' }],
+    });
+    await held.reached;
+    // Resolves while the first series is still held — no shared admission.
+    const result = await importerSvc.commitImport({
+      universeId: uni.id, seriesId: other.id, issues: [{ title: 'Free', arcPosition: 1, proseExcerpt: 'f' }],
+    });
+    expect(result.createdIssueIds).toHaveLength(1);
+    held.release();
+    await first;
+    expect(await livePositions(ser)).toEqual([1]);
+  });
+
+  it.each([
+    ['explicit', { arcPosition: 1 }],
+    ['omitted', {}],
+  ])('a plain issue create racing the import cannot silently duplicate an %s position', async (_label, position) => {
+    const { uni, ser } = await setupForCommit();
+    // An ordinary create lands on the series after admission planned the
+    // position, before the import publishes it.
+    mockEnsureIssue.mockImplementationOnce(async (...args) => {
+      await realIssuesRef.current.createIssue({ seriesId: ser.id, title: 'Manual', arcPosition: 1 });
+      return realIssuesRef.current.ensureIssueWithId(...args);
+    });
+    await expect(importerSvc.commitImport({
+      universeId: uni.id, seriesId: ser.id, issues: [{ title: 'Imported', ...position, proseExcerpt: 'i' }],
+    })).rejects.toMatchObject({
+      code: importerSvc.ERR_PARTIAL_COMMIT_ISSUES,
+      message: expect.stringMatching(/already held by another issue/),
+    });
+    expect((await issuesSvc.listIssues({ seriesId: ser.id })).map((i) => i.title)).toEqual(['Manual']);
+  });
+
+  it('releases admission after a failed commit so the next one into the series proceeds', async () => {
+    const { uni, ser } = await setupForCommit();
+    mockEnsureIssue.mockRejectedValueOnce(new Error('simulated write failure'));
+    await expect(importerSvc.commitImport({
+      universeId: uni.id, seriesId: ser.id, issues: [{ title: 'Fails', arcPosition: 1, proseExcerpt: 'f' }],
+    })).rejects.toMatchObject({ code: importerSvc.ERR_PARTIAL_COMMIT_ISSUES });
+    const result = await importerSvc.commitImport({
+      universeId: uni.id, seriesId: ser.id, issues: [{ title: 'Works', arcPosition: 1, proseExcerpt: 'w' }],
+    });
+    expect(result.createdIssueIds).toHaveLength(1);
+  });
+
+  it('runs cleanupFormatting outside the admission: another commit lands while the reformat is in flight', async () => {
+    const { uni, ser } = await setupForCommit();
+    let releaseReformat;
+    const reformatGate = new Promise((resolve) => { releaseReformat = resolve; });
+    let reformatStarted;
+    const started = new Promise((resolve) => { reformatStarted = resolve; });
+    mockRunStagedLLM.mockImplementation(async () => {
+      reformatStarted();
+      await reformatGate;
+      return { content: 'The vault loomed in the dark.', runId: 'r1' };
+    });
+    const slow = importerSvc.commitImport({
+      universeId: uni.id, seriesId: ser.id, contentType: 'short-story', cleanupFormatting: true,
+      issues: [{ title: 'Slow', proseExcerpt: 'The vault  loomed in the\ndark.' }],
+    });
+    await started;
+    // Completes while the slow commit's LLM pass is still pending.
+    await importerSvc.commitImport({
+      universeId: uni.id, seriesId: ser.id, issues: [{ title: 'Fast', proseExcerpt: 'f' }],
+    });
+    releaseReformat();
+    await slow;
+    // The slow commit allocated from the state it found AFTER formatting, and
+    // seeded the cleaned excerpt.
+    const after = await issuesSvc.listIssues({ seriesId: ser.id });
+    expect(Object.fromEntries(after.map((i) => [i.title, i.arcPosition]))).toEqual({ Fast: 1, Slow: 2 });
+    expect(after.find((i) => i.title === 'Slow').stages.prose.output).toBe('The vault loomed in the dark.');
+  });
+});
+
+describe('mergeSeasons (pure helper)', () => {
+  const stubBuildSeason = (input) => ({
+    id: `built-${input.number}`,
+    number: input.number,
+    title: input.title,
+    logline: input.logline,
+    synopsis: input.synopsis,
+    endingHook: input.endingHook,
+    episodeCountTarget: input.episodeCountTarget,
+    status: input.status,
+    createdAt: '2025-01-01T00:00:00.000Z',
+    updatedAt: '2025-01-01T00:00:00.000Z',
+  });
+
+  it('auto-assigns sequential numbers when incoming seasons omit number', () => {
+    const incoming = [
+      { title: 'A' },
+      { title: 'B' },
+      { title: 'C' },
+    ];
+    const result = importerSvc.mergeSeasons([], incoming, stubBuildSeason);
+    const numbers = result.map((s) => s.number).sort((a, b) => a - b);
+    expect(numbers).toEqual([1, 2, 3]);
+  });
+
+  it('preserves existing ids when incoming season number matches', () => {
+    const existing = [
+      { id: 'existing-1', number: 1, title: 'Old', logline: '', synopsis: '', updatedAt: '2020-01-01T00:00:00.000Z' },
+    ];
+    const incoming = [{ number: 1, title: 'Old', logline: '', synopsis: '' }];
+    const result = importerSvc.mergeSeasons(existing, incoming, stubBuildSeason);
+    expect(result).toHaveLength(1);
+    expect(result[0].id).toBe('existing-1');
+  });
+
+  it('bumps updatedAt only when an importable field changes', () => {
+    const existing = [
+      { id: 'e1', number: 1, title: 'Original', logline: 'L1', synopsis: 'S1', updatedAt: '2020-01-01T00:00:00.000Z' },
+    ];
+    // No change → updatedAt preserved
+    const noChange = importerSvc.mergeSeasons(existing, [{ number: 1, title: 'Original' }], stubBuildSeason);
+    expect(noChange[0].updatedAt).toBe('2020-01-01T00:00:00.000Z');
+    // Title change → updatedAt bumped (to a value newer than the original)
+    const titleChange = importerSvc.mergeSeasons(existing, [{ number: 1, title: 'New title' }], stubBuildSeason);
+    expect(titleChange[0].updatedAt > '2020-01-01T00:00:00.000Z').toBe(true);
+  });
+
+  it('retains existing seasons that the incoming list does not touch', () => {
+    const existing = [
+      { id: 'e1', number: 1, title: 'One', logline: '', synopsis: '' },
+      { id: 'e2', number: 2, title: 'Two', logline: '', synopsis: '' },
+    ];
+    const incoming = [{ number: 1, title: 'One updated' }];
+    const result = importerSvc.mergeSeasons(existing, incoming, stubBuildSeason);
+    expect(result).toHaveLength(2);
+    expect(result.find((s) => s.number === 2)?.id).toBe('e2');
+  });
+
+  it('skips over existing numbers when auto-assigning', () => {
+    const existing = [
+      { id: 'e1', number: 1, title: 'One', logline: '', synopsis: '' },
+      { id: 'e2', number: 3, title: 'Three', logline: '', synopsis: '' },
+    ];
+    const incoming = [{ title: 'New A' }, { title: 'New B' }];
+    const result = importerSvc.mergeSeasons(existing, incoming, stubBuildSeason);
+    const newNumbers = result.filter((s) => s.id.startsWith('built-')).map((s) => s.number).sort((a, b) => a - b);
+    // nextFree = max(1,3) + 1 = 4 → [4, 5]
+    expect(newNumbers).toEqual([4, 5]);
+  });
+
+  // Round-7 review: distinguish absent-vs-empty per AGENTS.md's "LLM
+  // response merging" convention. An empty string is the user's intent
+  // to clear the field; null/undefined is the LLM omitting it and the
+  // existing value should win.
+  it('absent string fields (null/undefined) preserve the existing value', () => {
+    const existing = [
+      { id: 'e1', number: 1, title: 'Kept', logline: 'L', synopsis: 'S', endingHook: 'H', updatedAt: '2020-01-01T00:00:00.000Z' },
+    ];
+    const incoming = [{ number: 1, title: undefined, logline: null }];
+    const result = importerSvc.mergeSeasons(existing, incoming, stubBuildSeason);
+    expect(result[0].title).toBe('Kept');
+    expect(result[0].logline).toBe('L');
+    // No change in any tracked field → updatedAt preserved
+    expect(result[0].updatedAt).toBe('2020-01-01T00:00:00.000Z');
+  });
+
+  it('empty-string fields are treated as an intentional clear and bump updatedAt', () => {
+    const existing = [
+      { id: 'e1', number: 1, title: 'Original', logline: 'L', synopsis: 'S', endingHook: 'H', updatedAt: '2020-01-01T00:00:00.000Z' },
+    ];
+    const incoming = [{ number: 1, logline: '', synopsis: '' }];
+    const result = importerSvc.mergeSeasons(existing, incoming, stubBuildSeason);
+    expect(result[0].logline).toBe('');
+    expect(result[0].synopsis).toBe('');
+    // Title not present → preserved.
+    expect(result[0].title).toBe('Original');
+    // A clear is a change → updatedAt bumps.
+    expect(result[0].updatedAt > '2020-01-01T00:00:00.000Z').toBe(true);
+  });
+
+  it('throws ERR_VALIDATION when auto-assign would exceed the season number cap (99)', () => {
+    const existing = Array.from({ length: 99 }, (_, i) => ({
+      id: `e${i + 1}`, number: i + 1, title: `S${i + 1}`, logline: '', synopsis: '',
+    }));
+    let caught;
+    try {
+      importerSvc.mergeSeasons(existing, [{ title: 'overflow' }], stubBuildSeason);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeDefined();
+    expect(caught.code).toBe(importerSvc.ERR_VALIDATION);
+    expect(caught.message).toContain('99');
+  });
+
+  // Round-11 review: legacy seasons with `title: undefined` would
+  // previously churn updatedAt on every no-op re-import — the change
+  // check compared `'Season N'` (the default applied to the new value)
+  // against `undefined` (the existing value), always producing a
+  // truthy diff. Fix applies the same default to both sides of the
+  // comparison so a re-import with no edits is correctly a no-op.
+  it('does NOT bump updatedAt for a legacy season with undefined title and no incoming edit', () => {
+    const existing = [
+      { id: 'e1', number: 1, /* title: undefined */ logline: '', synopsis: '', updatedAt: '2020-01-01T00:00:00.000Z' },
+    ];
+    // Incoming season omits every editable field — pure no-op.
+    const result = importerSvc.mergeSeasons(existing, [{ number: 1 }], stubBuildSeason);
+    expect(result[0].updatedAt).toBe('2020-01-01T00:00:00.000Z');
+  });
+
+  // Round-8 review: the pure helper now rejects duplicate explicit incoming
+  // numbers directly — commitImport's route gate caught this for HTTP
+  // callers, but a future direct consumer would otherwise silently collapse
+  // two entries sharing a number into one merge target.
+  it('throws ERR_VALIDATION on duplicate explicit incoming season numbers', () => {
+    let caught;
+    try {
+      importerSvc.mergeSeasons([], [
+        { number: 1, title: 'A' },
+        { number: 1, title: 'B' },
+      ], stubBuildSeason);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeDefined();
+    expect(caught.code).toBe(importerSvc.ERR_VALIDATION);
+    expect(caught.message).toMatch(/duplicate/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Reconcile draft parent universe (issue #851)
+//
+// An import-draft universe (ephemeral + importDraft, created by analyzeImport)
+// must be promoted to a normal syncing record when a COMMITTED (non-draft)
+// series is linked to it WITHOUT going through commitImport — otherwise the
+// universe holds real work but silently never syncs. The promotion mirrors
+// commitImport: clear BOTH importDraft and ephemeral. It must NOT fire when a
+// draft series is linked (that's commitImport's job) or when the parent isn't
+// a draft.
+// ---------------------------------------------------------------------------
+describe('reconcile draft parent universe (issue #851)', () => {
+  it('promotes a draft universe when a committed series is linked via updateSeries', async () => {
+    // Draft universe shell, exactly as analyzeImport would stamp it.
+    const draftUni = await universeSvc.createUniverse({
+      name: 'Draft Parent', ephemeral: true, importDraft: true,
+    });
+    // A separate, committed (non-draft) universe the series starts under.
+    const realUni = await universeSvc.createUniverse({ name: 'Committed Home' });
+    const committedSeries = await seriesSvc.createSeries({ name: 'Real Work', universeId: realUni.id });
+    expect(committedSeries.importDraft).not.toBe(true);
+
+    // Manually re-home the committed series onto the draft universe.
+    await seriesSvc.updateSeries(committedSeries.id, { universeId: draftUni.id });
+
+    const promoted = await universeSvc.getUniverse(draftUni.id);
+    expect(promoted.importDraft).not.toBe(true);
+    expect(promoted.ephemeral).not.toBe(true);
+  });
+
+  it('promotes a draft universe when a committed series is CREATED already linked to it', async () => {
+    const draftUni = await universeSvc.createUniverse({
+      name: 'Draft Parent 2', ephemeral: true, importDraft: true,
+    });
+    await seriesSvc.createSeries({ name: 'Born Committed', universeId: draftUni.id });
+
+    const promoted = await universeSvc.getUniverse(draftUni.id);
+    expect(promoted.importDraft).not.toBe(true);
+    expect(promoted.ephemeral).not.toBe(true);
+  });
+
+  it('does NOT promote a draft universe when a DRAFT series is linked (commitImport owns that)', async () => {
+    const draftUni = await universeSvc.createUniverse({
+      name: 'Still Draft', ephemeral: true, importDraft: true,
+    });
+    // A draft-shell series, as analyzeImport stamps it — linking it must leave
+    // the universe a draft so the orphan GC + commitImport keep their contract.
+    const draftSeries = await seriesSvc.createSeries({
+      name: 'Draft Child', universeId: draftUni.id, ephemeral: true, importDraft: true,
+    });
+    expect(draftSeries.importDraft).toBe(true);
+
+    const after = await universeSvc.getUniverse(draftUni.id);
+    expect(after.importDraft).toBe(true);
+    expect(after.ephemeral).toBe(true);
+  });
+
+  it('leaves a private (ephemeral-only, non-draft) universe untouched when a committed series is linked', async () => {
+    // `ephemeral` alone is a user's "keep local" choice — linking a series must
+    // not un-privatize it. Only `importDraft` parents get promoted.
+    const privateUni = await universeSvc.createUniverse({ name: 'Private', ephemeral: true });
+    expect(privateUni.importDraft).not.toBe(true);
+    const realUni = await universeSvc.createUniverse({ name: 'Elsewhere' });
+    const series = await seriesSvc.createSeries({ name: 'A Series', universeId: realUni.id });
+
+    await seriesSvc.updateSeries(series.id, { universeId: privateUni.id });
+
+    const after = await universeSvc.getUniverse(privateUni.id);
+    expect(after.ephemeral).toBe(true);
+    expect(after.importDraft).not.toBe(true);
+  });
+
+  it('leaves a non-draft universe untouched when a committed series links to it', async () => {
+    const normalUni = await universeSvc.createUniverse({ name: 'Normal' });
+    const realUni = await universeSvc.createUniverse({ name: 'Origin' });
+    const series = await seriesSvc.createSeries({ name: 'Moving Series', universeId: realUni.id });
+
+    await seriesSvc.updateSeries(series.id, { universeId: normalUni.id });
+
+    const after = await universeSvc.getUniverse(normalUni.id);
+    expect(after.importDraft).not.toBe(true);
+    expect(after.ephemeral).not.toBe(true);
+  });
+
+  it('does NOT promote a draft universe when an EPHEMERAL (private, non-draft) series is linked', async () => {
+    // An ephemeral series is the user signaling "keep this local" — it carries
+    // no syncing work, so promoting (un-privatizing) its parent would push
+    // peers a universe whose only child never syncs. Only a series that itself
+    // reaches peers should pull its draft parent into sync.
+    const draftUni = await universeSvc.createUniverse({
+      name: 'Draft Parent 3', ephemeral: true, importDraft: true,
+    });
+    const privateSeries = await seriesSvc.createSeries({
+      name: 'Private Committed', universeId: draftUni.id, ephemeral: true,
+    });
+    expect(privateSeries.importDraft).not.toBe(true);
+    expect(privateSeries.ephemeral).toBe(true);
+
+    const after = await universeSvc.getUniverse(draftUni.id);
+    expect(after.importDraft).toBe(true);
+    expect(after.ephemeral).toBe(true);
+  });
+});

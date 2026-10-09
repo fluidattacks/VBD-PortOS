@@ -1,0 +1,346 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { MemoryRouter, Route, Routes } from 'react-router';
+
+const HEALTH = {
+  overallHealth: 'warning',
+  warnings: [],
+  thresholds: { memoryWarn: 85, memoryCritical: 95, diskWarn: 90, diskCritical: 98 },
+  system: {
+    uptimeFormatted: '3h 12m',
+    memory: { usagePercent: 40, usedFormatted: '12 GB', totalFormatted: '32 GB' },
+    cpu: { usagePercent: 20, cores: 8, loadAvg1m: 1.2 },
+    disk: { usagePercent: 92, usedFormatted: '900 GB', totalFormatted: '1 TB' },
+  },
+  topProcesses: [],
+};
+
+const withWarnings = warnings => ({ ...HEALTH, warnings });
+
+vi.mock('../services/api', () => ({
+  getSystemHealth: vi.fn(),
+  updateHealthThresholds: vi.fn(() => Promise.resolve({})),
+  runSystemResourceReport: vi.fn(),
+  triageSystemResources: vi.fn(),
+  purgeDataCategory: vi.fn(),
+  deleteCachedModel: vi.fn(),
+  deleteLora: vi.fn(),
+  deleteLocalLlmModel: vi.fn(),
+  // The overview's media-capacity panel reads the peer list to report federated
+  // provider readiness (#4348). No peers keeps this page's assertions about
+  // local metrics unaffected.
+  getInstances: vi.fn(() => Promise.resolve({ peers: [] })),
+  // The overview's build-stamp panel fetches its own route (#4694) — the stamp
+  // deliberately does not ride the peer-scraped health payload.
+  getSystemBuild: vi.fn(() => Promise.resolve({ commit: null, shortCommit: null, branch: null, dirty: null })),
+}));
+
+vi.mock('../hooks/useProviderModels', () => ({
+  default: () => ({
+    providers: [],
+    selectedProviderId: '',
+    selectedModel: '',
+    availableModels: [],
+    setSelectedProviderId: vi.fn(),
+    setSelectedModel: vi.fn(),
+    loading: false,
+  }),
+}));
+
+vi.mock('../components/ui/Toast', () => {
+  const toast = Object.assign(vi.fn(), {
+    success: vi.fn(), error: vi.fn(), loading: vi.fn(), dismiss: vi.fn()
+  });
+  return { default: toast };
+});
+
+// useHealthWarningDismiss (client/src/hooks/) calls apiSystem.js directly
+// rather than through the '../services/api' barrel — mock it separately so
+// dismiss/undo assertions observe what the hook actually calls.
+vi.mock('../services/apiSystem.js', () => ({
+  dismissHealthWarning: vi.fn(() => Promise.resolve({ message: 'x', dismissedAt: '2026-01-01T00:00:00.000Z' })),
+  undismissHealthWarning: vi.fn(() => Promise.resolve({ success: true })),
+}));
+
+import * as api from '../services/api';
+import { dismissHealthWarning } from '../services/apiSystem.js';
+import SystemHealthPage, { RESOURCE_TABS } from './SystemHealthPage';
+import { expectPageNavTabs } from '../test/pageNavTabAssertions.js';
+import { expectNoDanglingAriaRefs } from '../test/ariaRefAssertions.js';
+
+const renderPage = (path = '/system-resources/overview') => render(
+  <MemoryRouter initialEntries={[path]}>
+    <Routes>
+      <Route path="/system-resources/:tab" element={<SystemHealthPage />} />
+    </Routes>
+  </MemoryRouter>
+);
+
+describe('SystemHealthPage remediation links', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('links a disk alert to the disk usage breakdown', async () => {
+    api.getSystemHealth.mockResolvedValue(withWarnings([
+      { type: 'disk', message: 'Disk usage at or above 90%' },
+    ]));
+    renderPage();
+
+    const banner = (await screen.findByText('Disk usage at or above 90%')).parentElement;
+    // The alert itself carries the link, not just the drill-in nav below it.
+    expect(within(banner).getByRole('link', { name: /Disk usage breakdown/ })).toHaveAttribute('href', '/system-resources/storage');
+  });
+
+  it('shows the app probe warning without offering dismissal', async () => {
+    api.getSystemHealth.mockResolvedValue(withWarnings([
+      { type: 'probe-unavailable', source: 'apps', status: 'unavailable', severity: 'warning', message: 'Apps unavailable', dismissible: false },
+    ]));
+    renderPage();
+    expect(await screen.findByText('Apps unavailable')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Dismiss warning: Apps unavailable' })).not.toBeInTheDocument();
+  });
+
+  it('renders an unavailable disk card when the disk probe fails', async () => {
+    api.getSystemHealth.mockResolvedValue({
+      ...HEALTH,
+      system: { ...HEALTH.system, disk: null },
+      warnings: [{ type: 'probe-unavailable', source: 'disk', status: 'unavailable', severity: 'warning', message: 'Disk status unavailable', dismissible: false }],
+    });
+    renderPage();
+
+    expect(await screen.findByLabelText('Disk status unavailable')).toHaveTextContent('Unavailable');
+    expect(screen.queryByRole('button', { name: 'Dismiss warning: Disk status unavailable' })).not.toBeInTheDocument();
+  });
+
+  it('links memory, process and app alerts to their own remediation page', async () => {
+    api.getSystemHealth.mockResolvedValue(withWarnings([
+      { type: 'memory', message: 'Memory usage at or above 85%' },
+      { type: 'apps', message: 'App status unavailable for 2 app(s) — PM2 read failed' },
+      { type: 'database', message: 'PostgreSQL disconnected' },
+    ]));
+    renderPage();
+
+    await screen.findByText('Memory usage at or above 85%');
+    expect(screen.getByRole('link', { name: /Database settings/ })).toHaveAttribute('href', '/settings/database');
+    expect(screen.getAllByRole('link', { name: /All processes/ }).length).toBeGreaterThan(0);
+    expect(screen.getAllByRole('link', { name: /^Apps/ }).length).toBeGreaterThan(0);
+  });
+
+  it('leaves an alert with no in-app remedy as a plain statement', async () => {
+    api.getSystemHealth.mockResolvedValue(withWarnings([
+      { type: 'forge', message: 'GitHub CLI unusable (unauthenticated)' },
+    ]));
+    renderPage();
+
+    const banner = (await screen.findByText('GitHub CLI unusable (unauthenticated)')).closest('div');
+    expect(within(banner).queryByRole('link')).toBeNull();
+    // The drill-in nav is unaffected — it always offers its three destinations.
+    const nav = screen.getByRole('navigation', { name: 'System drill-downs' });
+    expect(within(nav).getAllByRole('link')).toHaveLength(3);
+  });
+
+  it('keeps corrupt health settings visible and disables threshold editing and dismissal', async () => {
+    const message = 'System health settings are unavailable; default thresholds are being used and saved warning dismissals were ignored.';
+    api.getSystemHealth.mockResolvedValue({
+      ...HEALTH,
+      thresholds: undefined,
+      thresholdsAvailable: false,
+      warnings: [
+        { type: 'health-settings', severity: 'warning', message, dismissible: false },
+        { type: 'disk', severity: 'warning', message: 'Disk usage at or above 90%', dismissible: false },
+      ],
+    });
+    renderPage();
+
+    expect(await screen.findByText(message)).toBeInTheDocument();
+    expect(screen.getByText('Configured thresholds unavailable')).toBeInTheDocument();
+    expect(screen.getByText('Default thresholds are being used for health checks. Repair the settings file before changing thresholds.')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: `Dismiss warning: ${message}` })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Dismiss warning: Disk usage at or above 90%' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Save thresholds' })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Disk warn %')).not.toBeInTheDocument();
+    expect(api.updateHealthThresholds).not.toHaveBeenCalled();
+  });
+
+  it('renders the drill-in links above the metric cards', async () => {
+    api.getSystemHealth.mockResolvedValue(withWarnings([]));
+    renderPage();
+
+    const nav = await screen.findByRole('navigation', { name: 'System drill-downs' });
+    const cards = screen.getByText('Memory').closest('section');
+    expect(nav.compareDocumentPosition(cards) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it('refreshes the displayed stats from the page control', async () => {
+    const user = userEvent.setup();
+    api.getSystemHealth
+      .mockResolvedValueOnce(HEALTH)
+      .mockResolvedValueOnce({
+        ...HEALTH,
+        system: { ...HEALTH.system, memory: { ...HEALTH.system.memory, usagePercent: 55 } },
+      });
+    renderPage();
+
+    await screen.findByText('40%');
+    await user.click(screen.getByRole('button', { name: 'Refresh system health' }));
+
+    await waitFor(() => expect(screen.getByText('55%')).toBeInTheDocument());
+    expect(api.getSystemHealth).toHaveBeenCalledTimes(2);
+  });
+
+  it('dismisses a warning as resolved and refetches health', async () => {
+    const user = userEvent.setup();
+    api.getSystemHealth
+      .mockResolvedValueOnce(withWarnings([{ type: 'disk', message: 'Disk usage at or above 90%' }]))
+      .mockResolvedValueOnce(withWarnings([]));
+    renderPage();
+
+    await screen.findByText('Disk usage at or above 90%');
+    await user.click(screen.getByRole('button', { name: 'Dismiss warning: Disk usage at or above 90%' }));
+
+    expect(dismissHealthWarning).toHaveBeenCalledWith('disk', 'Disk usage at or above 90%', { silent: true });
+    await waitFor(() => expect(screen.queryByText('Disk usage at or above 90%')).not.toBeInTheDocument());
+  });
+
+  it('toasts an error and does not refetch when dismissing fails', async () => {
+    const user = userEvent.setup();
+    api.getSystemHealth.mockResolvedValue(withWarnings([{ type: 'disk', message: 'Disk usage at or above 90%' }]));
+    dismissHealthWarning.mockRejectedValueOnce(new Error('offline'));
+    renderPage();
+
+    await screen.findByText('Disk usage at or above 90%');
+    await user.click(screen.getByRole('button', { name: 'Dismiss warning: Disk usage at or above 90%' }));
+
+    await waitFor(() => expect(api.getSystemHealth).toHaveBeenCalledTimes(1));
+    expect(screen.getByText('Disk usage at or above 90%')).toBeInTheDocument();
+  });
+
+  it('keeps the active section in the URL and runs storage scans explicitly', async () => {
+    api.runSystemResourceReport.mockResolvedValue({
+      generatedAt: '2026-08-16T00:00:00.000Z',
+      filesystem: { totalBytes: 1000, usedBytes: 750, freeBytes: 250, usagePercent: 75 },
+      summary: { managedReclaimableBytes: 100 },
+      storageAreas: [{
+        id: 'cache', label: 'Cache', kind: 'cache', sizeBytes: 100,
+        status: 'ready', managePath: null, protected: false, note: 'Reproducible data.',
+      }],
+      cleanupCandidates: [],
+      sourceErrors: [],
+      models: { downloaded: [], loaded: [], totals: { all: 0 } },
+      queues: { media: { queued: 0, running: 0 }, agents: null },
+    });
+    renderPage('/system-resources/storage');
+
+    expect(screen.getByRole('tab', { name: /Storage/ })).toHaveAttribute('aria-selected', 'true');
+    expect(api.runSystemResourceReport).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Run system report' }));
+    await waitFor(() => expect(api.runSystemResourceReport).toHaveBeenCalledWith({ silent: true }));
+    expect(await screen.findByText('Known storage areas')).toBeInTheDocument();
+  });
+
+  it('locks every cleanup action and invalidates stale rows until reconciliation finishes', async () => {
+    let finishRemoval;
+    let finishRescan;
+    const removal = new Promise((resolve) => { finishRemoval = resolve; });
+    const rescan = new Promise((resolve) => { finishRescan = resolve; });
+    const candidate = (key) => ({
+      id: `data:${key}`,
+      label: `Cache ${key.toUpperCase()}`,
+      kind: 'data',
+      estimatedBytes: 100,
+      risk: 'low',
+      reason: 'Reproducible cache.',
+      loaded: false,
+      busy: false,
+      manualOnly: false,
+      managePath: '/data',
+      action: { type: 'data-category', key },
+    });
+    const firstReport = {
+      generatedAt: '2026-08-16T00:00:00.000Z',
+      filesystem: { totalBytes: 1000, usedBytes: 750, freeBytes: 250, usagePercent: 75 },
+      summary: { managedReclaimableBytes: 200 },
+      storageAreas: [],
+      cleanupCandidates: [candidate('a'), candidate('b')],
+      sourceErrors: [],
+      models: { downloaded: [], loaded: [], totals: { all: 0 } },
+      queues: { media: { queued: 0, running: 0 }, agents: null },
+    };
+    api.runSystemResourceReport
+      .mockResolvedValueOnce(firstReport)
+      .mockReturnValueOnce(rescan);
+    api.purgeDataCategory.mockReturnValue(removal);
+    renderPage('/system-resources/storage');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Run system report' }));
+    expect(await screen.findByRole('button', { name: 'Remove Cache A' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Remove Cache A' }));
+    fireEvent.click(within(screen.getByRole('group', { name: 'Confirm removal of Cache A' })).getByRole('button', { name: 'Remove' }));
+
+    await waitFor(() => expect(api.purgeDataCategory).toHaveBeenCalledWith('a', {}, { silent: true }));
+    expect(screen.getByRole('button', { name: 'Remove Cache B' })).toBeDisabled();
+
+    await act(async () => { finishRemoval({ success: true }); });
+    await waitFor(() => expect(screen.queryByText('Cache A')).not.toBeInTheDocument());
+    expect(screen.queryByRole('button', { name: 'Remove Cache B' })).not.toBeInTheDocument();
+
+    await act(async () => { finishRescan({ ...firstReport, generatedAt: '2026-08-16T00:01:00.000Z', cleanupCandidates: [] }); });
+  });
+});
+
+// System Resources derives its tab bar from the nav manifest's
+// `tabGroup: 'system-resources'` (#6383) — this pins the id/label/order the page
+// means to render, and that every manifest tab has a presentation entry (icon)
+// in SystemHealthPage.jsx, which would otherwise only surface as a thrown
+// import-time error. The short labels come from the manifest's `tabLabel`; ⌘K
+// and voice still show "System Resources"/"Storage Report"/"Active
+// Queues" so each is unambiguous out of page context.
+describe('RESOURCE_TABS ↔ nav manifest', () => {
+  it('renders the system-resources tabGroup in page order with a presentation entry each', () => {
+    expectPageNavTabs(RESOURCE_TABS, ['overview:Overview', 'storage:Storage', 'queues:Queues']);
+  });
+});
+
+// #7420: RouteTabsHeader passes no `controlsIdPrefix`, so the panel names
+// itself rather than borrowing an `aria-labelledby` from a tab id that
+// doesn't exist.
+describe('SystemHealthPage — no dangling aria-controls/aria-labelledby', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    api.getSystemHealth.mockResolvedValue(HEALTH);
+    api.runSystemResourceReport.mockResolvedValue({
+      generatedAt: '2026-08-16T00:00:00.000Z',
+      filesystem: { totalBytes: 1000, usedBytes: 750, freeBytes: 250, usagePercent: 75 },
+      summary: { managedReclaimableBytes: 0 },
+      storageAreas: [],
+      cleanupCandidates: [],
+      sourceErrors: [],
+      models: { downloaded: [], loaded: [], totals: { all: 0 } },
+      queues: { media: { queued: 0, running: 0 }, agents: null },
+    });
+  });
+
+  it.each(['overview', 'storage'])('%s tab names the panel it points at, with no dangling refs', async (tab) => {
+    const { container } = renderPage(`/system-resources/${tab}`);
+    await waitFor(() => expect(screen.getByRole('tabpanel')).toBeInTheDocument());
+    expectNoDanglingAriaRefs(container);
+  });
+});
+
+
+it('shows labelled root and data capacity on the overview', async () => {
+  api.getSystemHealth.mockResolvedValue({ ...HEALTH, system: { ...HEALTH.system, dataDisk: { usagePercent: 99, usedFormatted: '99 GB', totalFormatted: '100 GB' } } });
+  renderPage();
+  expect(await screen.findByText('Runtime data disk')).toBeInTheDocument();
+  expect(screen.getByText('Root disk')).toBeInTheDocument();
+  expect(screen.getByText('99%')).toBeInTheDocument();
+});
+
+it('shows unavailable data without substituting root capacity', async () => {
+  api.getSystemHealth.mockResolvedValue({ ...HEALTH, system: { ...HEALTH.system, dataDisk: null } });
+  renderPage();
+  expect(await screen.findByLabelText('Runtime data disk status unavailable')).toHaveTextContent('Unavailable');
+  expect(screen.getByText('92%')).toBeInTheDocument();
+});

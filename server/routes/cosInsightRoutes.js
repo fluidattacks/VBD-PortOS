@@ -1,0 +1,307 @@
+/**
+ * CoS Activity, Insights, Goal Progress, and Decision Log Routes
+ */
+
+import { Router } from 'express';
+import { z } from 'zod';
+import * as cos from '../services/cos.js';
+import * as taskLearning from '../services/taskLearning.js';
+import { getActivityCalendar } from '../services/cosActivityCalendar.js';
+import * as goalProgress from '../services/goalProgress.js';
+import * as decisionLog from '../services/decisionLog.js';
+import { asyncHandler, ServerError } from '../lib/errorHandler.js';
+import { parsePagination, validateRequest } from '../lib/validation.js';
+import { runningAgentsByTaskId, withoutSpawningTasks } from '../lib/cosSpawnWindow.js';
+import { detectIdleLeftoverBranches } from '../services/userActionDetectors.js';
+
+const router = Router();
+
+// GET /api/cos/activity-calendar - Runs-per-day heatmap for the dashboard widget
+router.get('/activity-calendar', asyncHandler(async (req, res) => {
+  // Clamped: the grid materializes one object per day, so an unbounded `weeks`
+  // (a typo, or a stale client) would build millions of them. 260 weeks is five
+  // years, past any window the heatmap renders legibly.
+  const requested = parseInt(req.query.weeks, 10) || 12;
+  res.json(await getActivityCalendar(Math.min(Math.max(requested, 1), 260)));
+}));
+
+// GET /api/cos/actionable-insights - Get prioritized action items requiring user attention
+// Surfaces the most important things to address right now across all CoS subsystems
+router.get('/actionable-insights', asyncHandler(async (req, res) => {
+  const { cachedHealth } = validateRequest(z.object({ cachedHealth: z.literal('1').optional() }), req.query);
+  const [tasksData, learningSummary, healthCheck, notificationsModule, pendingFeedbackCount, leftoverFindings, agents] = await Promise.all([
+    cos.getAllTasks().catch(err => { console.error(`❌ Failed to load tasks: ${err.message}`); return { user: null, cos: null }; }),
+    taskLearning.getLearningInsights().catch(err => { console.error(`❌ Failed to load learning insights: ${err.message}`); return null; }),
+    (cachedHealth ? cos.getHealthStatus() : cos.runHealthCheck()).catch(err => { console.error(`❌ Failed to run health check: ${err.message}`); return null; }),
+    import('../services/notifications.js').catch(err => { console.error(`❌ Failed to load notifications: ${err.message}`); return null; }),
+    cos.getPendingAgentFeedbackCount().catch(err => { console.error(`❌ Failed to load pending agent feedback: ${err.message}`); return 0; }),
+    detectIdleLeftoverBranches().catch(err => { console.error(`❌ Failed to detect leftover branches: ${err.message}`); return []; }),
+    // Settles the pending list against live agents — see lib/cosSpawnWindow.js.
+    cos.getAgents().catch(err => { console.error(`❌ Failed to load agents: ${err.message}`); return []; })
+  ]);
+  const runningAgents = runningAgentsByTaskId(agents);
+
+  const notificationsData = notificationsModule ? await notificationsModule.getNotifications({ unreadOnly: true, limit: 10 }).catch(() => []) : [];
+
+  const insights = [];
+
+  // 1. Pending approvals (highest priority)
+  const pendingApprovals = tasksData.cos?.awaitingApproval || [];
+  if (pendingApprovals.length > 0) {
+    insights.push({
+      type: 'approval',
+      priority: 'high',
+      icon: 'AlertCircle',
+      title: `${pendingApprovals.length} task${pendingApprovals.length > 1 ? 's' : ''} awaiting approval`,
+      description: ((d) => d ? d.substring(0, 80) + (d.length > 80 ? '...' : '') : '')(pendingApprovals[0]?.description ?? ''),
+      action: { label: 'Approve' },
+      count: pendingApprovals.length,
+      tasks: pendingApprovals.map(({ id, description }) => ({ id, description }))
+    });
+  }
+
+  // 2. Blocked tasks
+  const blockedUser = tasksData.user?.grouped?.blocked || [];
+  const blockedCos = tasksData.cos?.grouped?.blocked || [];
+  const blockedCount = blockedUser.length + blockedCos.length;
+  if (blockedCount > 0) {
+    const firstBlocked = blockedUser[0] || blockedCos[0];
+    const toBlockedTask = (taskType) => (t) => ({ id: t.id, description: t.description?.substring(0, 80) || 'Unknown task', blocker: t.metadata?.blocker || null, taskType });
+    const blockedTasks = [...blockedUser.map(toBlockedTask('user')), ...blockedCos.map(toBlockedTask('internal'))];
+    insights.push({
+      type: 'blocked',
+      priority: 'high',
+      icon: 'XCircle',
+      title: `${blockedCount} blocked task${blockedCount > 1 ? 's' : ''}`,
+      description: firstBlocked?.metadata?.blocker || firstBlocked?.description?.substring(0, 80) || 'Task is blocked',
+      action: { label: 'Unblock', route: '/cos/tasks' },
+      count: blockedCount,
+      tasks: blockedTasks
+    });
+  }
+
+  // 3. Health issues
+  const healthUnavailable = !Array.isArray(healthCheck?.issues);
+  const healthIssues = healthUnavailable ? [] : healthCheck.issues;
+  if (healthUnavailable) {
+    insights.push({
+      type: 'health-unavailable',
+      priority: 'high',
+      icon: 'AlertTriangle',
+      title: 'CoS health unavailable',
+      description: 'Could not observe system health. Open Health and run a check to retry.',
+      action: { label: 'Check Health', route: '/cos/health' }
+    });
+  } else if (healthIssues.length > 0) {
+    // `type`, not `severity` — runHealthCheck stamps issues `error`/`warning`
+    // and never writes a `severity` field, so the old check matched nothing and
+    // a process that failed to auto-restart banner'd at `medium` alongside a
+    // memory warning.
+    const criticalIssues = healthIssues.filter(i => i.type === 'error');
+    insights.push({
+      type: 'health',
+      priority: criticalIssues.length > 0 ? 'critical' : 'medium',
+      icon: 'AlertTriangle',
+      title: `${healthIssues.length} system health issue${healthIssues.length > 1 ? 's' : ''}`,
+      // Lead with the error when there is one — otherwise a red `critical`
+      // banner can describe an unrelated warning that merely sorted first.
+      description: (criticalIssues[0] || healthIssues[0])?.message || 'System health issue detected',
+      action: { label: 'Check Health', route: '/cos/health' },
+      count: healthIssues.length
+    });
+  }
+
+  // 4. Recent completed agents without feedback. The count comes directly from
+  // state-resident completed agents, which keeps this 30s-polled endpoint cheap
+  // and avoids treating older archived history as an urgent review interruption.
+  if (pendingFeedbackCount > 0) {
+    insights.push({
+      type: 'agent-feedback',
+      priority: 'medium',
+      icon: 'MessageSquare',
+      title: `${pendingFeedbackCount} completed run${pendingFeedbackCount > 1 ? 's' : ''} need feedback`,
+      description: 'Your ratings help CoS learn which work and providers are useful.',
+      action: { label: 'Review runs', route: '/cos/agents?feedback=needs-feedback' },
+      count: pendingFeedbackCount
+    });
+  }
+
+  // 4b. Leftover idle branches (#5596). The detector never enacts; the card is
+  // where the operator does. It therefore has to name WHICH apps are holding the
+  // branches — a bare total plus a link to the schedule page left them to guess
+  // which app to run branch-reconcile for, so `apps` carries the per-app
+  // breakdown the banner expands into per-app Run Now buttons.
+  if (Array.isArray(leftoverFindings) && leftoverFindings.length > 0) {
+    const apps = leftoverFindings.map(({ appId, appName, leftoverCount, states, branches, lastUserReconcileAt }) => ({
+      appId,
+      appName: appName || appId,
+      leftoverCount,
+      states: states || {},
+      branches: branches || [],
+      lastUserReconcileAt: lastUserReconcileAt || null
+    }));
+    const leftoverCount = apps.reduce((sum, app) => sum + app.leftoverCount, 0);
+    const first = apps[0];
+    const single = apps.length === 1;
+    const branchLabel = (n) => `${n} leftover branch${n === 1 ? '' : 'es'}`;
+    insights.push({
+      type: 'leftover-branches',
+      priority: 'medium',
+      icon: 'AlertTriangle',
+      title: single
+        ? `${branchLabel(first.leftoverCount)} on ${first.appName}, agents idle. Run branch-reconcile?`
+        : `${branchLabel(leftoverCount)} across ${apps.length} apps, agents idle. Run branch-reconcile?`,
+      description: single
+        ? `${first.lastUserReconcileAt
+            ? `Last manual reconcile on ${String(first.lastUserReconcileAt).slice(0, 10)}`
+            : 'No manual reconcile in the last 14 days'}. Run Now queues branch-reconcile for ${first.appName}.`
+        : apps.map(app => `${app.appName} (${app.leftoverCount})`).join(' · '),
+      action: { label: 'Run Now', route: '/cos/schedule?task=branch-reconcile' },
+      apps,
+      count: leftoverCount
+    });
+  }
+
+  // 5. Learning failures (skipped task types)
+  const skippedTypes = learningSummary?.skippedTypes || [];
+  if (skippedTypes.length > 0) {
+    insights.push({
+      type: 'learning',
+      priority: 'low',
+      icon: 'Brain',
+      title: `${skippedTypes.length} task type${skippedTypes.length > 1 ? 's' : ''} auto-skipped`,
+      description: `Due to low success rates: ${skippedTypes.slice(0, 2).map(t => t.type).join(', ')}`,
+      action: { label: 'View Learning', route: '/cos/learning' },
+      count: skippedTypes.length
+    });
+  }
+
+  // 6. Unread notifications (briefings, reviews, etc.)
+  const briefingNotifs = notificationsData.filter(n => n.type === 'briefing_ready');
+  if (briefingNotifs.length > 0) {
+    insights.push({
+      type: 'briefing',
+      priority: 'low',
+      icon: 'Newspaper',
+      title: 'New briefing available',
+      description: 'Your daily briefing is ready for review',
+      action: { label: 'Read Briefing', route: '/cos/briefing' },
+      count: 1
+    });
+  }
+
+  // 7. Pending user tasks (informational)
+  const pendingUserTasks = withoutSpawningTasks(tasksData.user?.grouped?.pending, runningAgents);
+  if (pendingUserTasks.length > 0 && insights.length < 4) {
+    insights.push({
+      type: 'tasks',
+      priority: 'info',
+      icon: 'ListTodo',
+      title: `${pendingUserTasks.length} pending task${pendingUserTasks.length > 1 ? 's' : ''}`,
+      description: pendingUserTasks[0]?.description?.substring(0, 80) || 'Pending tasks available',
+      action: { label: 'View Tasks', route: '/cos/tasks' },
+      count: pendingUserTasks.length
+    });
+  }
+
+  // Sort by priority. `??`, not `||` — `critical` ranks 0, and `0 || 5` demoted
+  // it below every other priority, so the single most urgent insight sorted LAST
+  // and fell off the `slice(0, 5)` below once six insights were open.
+  const priorityOrder = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
+  insights.sort((a, b) => (priorityOrder[a.priority] ?? 5) - (priorityOrder[b.priority] ?? 5));
+
+  res.json({
+    insights: insights.slice(0, 5), // Max 5 insights
+    hasActionableItems: insights.some(i => ['critical', 'high'].includes(i.priority)),
+    totalCount: insights.length,
+    unavailableSources: healthUnavailable ? [{ source: 'health', code: 'HEALTH_UNAVAILABLE' }] : []
+  });
+}));
+
+// GET /api/cos/recent-tasks - Get recent completed tasks for dashboard widget
+router.get('/recent-tasks', asyncHandler(async (req, res) => {
+  const { limit } = parsePagination(req.query, { defaultLimit: 10, maxLimit: 500 });
+  const recentTasks = await cos.getRecentTasks(limit);
+  res.json(recentTasks);
+}));
+
+// GET /api/cos/quick-summary - Get at-a-glance dashboard summary
+// Combines today's activity and queue counts into one efficient call.
+router.get('/quick-summary', asyncHandler(async (req, res) => {
+  const [todayActivity, tasksData, agents] = await Promise.all([
+    cos.getTodayActivity(),
+    cos.getAllTasks(),
+    // The dashboard widget renders this queue total beside its own "N agents
+    // running" line, so a raw pending count showed the one task already being
+    // worked on both — see lib/cosSpawnWindow.js.
+    cos.getAgents().catch(() => [])
+  ]);
+  const runningAgents = runningAgentsByTaskId(agents);
+
+  // Count pending approvals from system tasks. Not settled: approval is a
+  // pre-spawn gate, so no live agent can hold one.
+  const pendingApprovals = tasksData.cos?.awaitingApproval?.length || 0;
+
+  // Count pending user tasks
+  const pendingUserTasks = withoutSpawningTasks(tasksData.user?.grouped?.pending, runningAgents).length;
+
+  res.json({
+    today: {
+      completed: todayActivity.stats.completed,
+      succeeded: todayActivity.stats.succeeded,
+      failed: todayActivity.stats.failed,
+      running: todayActivity.stats.running,
+      successRate: todayActivity.stats.successRate,
+      timeWorked: todayActivity.time.combined
+    },
+    queue: {
+      pendingApprovals,
+      pendingUserTasks,
+      total: pendingApprovals + pendingUserTasks
+    },
+    status: {
+      running: todayActivity.isRunning,
+      paused: todayActivity.isPaused,
+      lastEvaluation: todayActivity.lastEvaluation
+    }
+  });
+}));
+
+// GET /api/cos/goal-progress - Get progress toward user goals
+// Maps completed tasks to goal categories from GOALS.md
+router.get('/goal-progress', asyncHandler(async (req, res) => {
+  const progress = await goalProgress.getGoalProgress();
+  res.json(progress);
+}));
+
+// GET /api/cos/goal-progress/summary - Get compact goal progress for dashboard
+router.get('/goal-progress/summary', asyncHandler(async (req, res) => {
+  const summary = await goalProgress.getGoalProgressSummary();
+  res.json(summary);
+}));
+
+// ============================================================
+// Decision Log Routes
+// ============================================================
+
+// GET /api/cos/decisions - Get recent decisions
+router.get('/decisions', asyncHandler(async (req, res) => {
+  const { limit } = parsePagination(req.query, { defaultLimit: 20, maxLimit: 500 });
+  const type = req.query.type || null;
+  const decisions = await decisionLog.getRecentDecisions(limit, type);
+  res.json({ decisions });
+}));
+
+// GET /api/cos/decisions/summary - Get decision summary for dashboard
+router.get('/decisions/summary', asyncHandler(async (req, res) => {
+  const summary = await decisionLog.getDecisionSummary();
+  res.json(summary);
+}));
+
+// GET /api/cos/decisions/patterns - Get decision patterns/insights
+router.get('/decisions/patterns', asyncHandler(async (req, res) => {
+  const patterns = await decisionLog.getDecisionPatterns();
+  res.json(patterns);
+}));
+
+export default router;

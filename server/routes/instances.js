@@ -1,0 +1,496 @@
+/**
+ * Instances API Routes
+ *
+ * Federation endpoints for managing PortOS peer instances.
+ */
+
+import { Router } from 'express';
+import { verifyRequestSession } from '../services/auth.js';
+import { isCrossOrigin } from '../../lib/portosAuthCore.js';
+import { z } from 'zod';
+import * as instances from '../services/instances.js';
+import { getSelf, updateSelf } from '../services/instanceIdentity.js';
+import { getSyncStatus, syncWithPeer } from '../services/syncOrchestrator.js';
+import { getFullSyncCoverageForPeer } from '../services/sharing/peerSync.js';
+import { provisionTailscaleCert } from '../services/certProvisioner.js';
+import { asyncHandler, ServerError } from '../lib/errorHandler.js';
+import { DEFAULT_PEER_PORT, DEFAULT_TAILCAT_REMOTE_PORT, PORTS } from '../lib/ports.js';
+import * as tailcatPeer from '../services/tailcatPeer.js';
+import * as tailcatServe from '../services/tailcatServe.js';
+import { getTailscaleStatus } from '../lib/tailscale.js';
+import { federatedMediaPeerSettingsSchema, optionalBooleanMap, validateRequest } from '../lib/validation.js';
+import { PEER_INSTANCE_HEADER } from '../lib/peerHttpClient.js';
+import { isPeerBasicBootstrapRequest } from '../lib/apiAccessPolicy.js';
+
+const router = Router();
+
+// Peer admission is local authority even when the instance password is off.
+// Announcements remain discoverable. Reciprocal category changes also require
+// local authority: an anonymous callback cannot admit a discovery-only peer.
+router.use(asyncHandler(async (req, _res, next) => {
+  if (!req.path.toLowerCase().startsWith('/peers') || ['GET', 'HEAD', 'OPTIONS'].includes(req.method)
+    || req.path.toLowerCase().replace(/\/$/, '') === '/peers/announce') return next();
+  // Vite and other private transports can forward a remote request over a
+  // loopback socket. Neither that socket nor supplied Origin/Host proves the
+  // operator's identity. Verify the existing session even when auth is off.
+  if (!isCrossOrigin(req) && await verifyRequestSession(req)) {
+    req.peerSettingsOperator = true;
+    return next();
+  }
+  // The pairing callback is the only peer-settings mutation accepted with
+  // Basic auth. It is bound to the caller's existing peer identity below and
+  // installs only a peer-scoped secret; peer tokens still cannot reach it.
+  if (req.portosAuthContext?.authenticated === true
+    && req.portosAuthContext.method === 'basic'
+    && isPeerBasicBootstrapRequest(req.method, `/api/instances${req.path.toLowerCase()}`)) return next();
+  throw new ServerError('Sign in with an operator session to change peer settings', {
+    status: 403, code: 'PEER_SETTINGS_OPERATOR_REQUIRED',
+  });
+}));
+
+// Optional HTTP Basic credential for a peer behind an auth proxy. `null` clears
+// it; an object sets it. The service's sanitizePeerAuth does the final
+// normalize: the password is the secret that defines the credential, so a
+// payload with a password stores it (username optional — password-only is
+// valid Basic auth), both fields blank is a clear, and a username-only payload
+// is ignored (it's most likely a redacted client peer being round-tripped, and
+// must not wipe a stored password).
+const peerAuthSchema = z.object({
+  username: z.string().max(256).optional(),
+  password: z.string().max(2048).optional()
+}).nullable().optional();
+
+// Validation schemas
+const addPeerSchema = z.object({
+  address: z.string()
+    .regex(/^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/, 'Must be a valid IP address')
+    .refine(ip => !ip.startsWith('127.') && !ip.startsWith('169.254.'), 'Loopback and link-local addresses are not allowed'),
+  port: z.number().int().min(1).max(65535).default(DEFAULT_PEER_PORT),
+  name: z.string().optional(),
+  host: z.string().optional(),
+  auth: peerAuthSchema
+});
+
+// Derive accepted keys from the service owner so new categories survive validation.
+const syncCategoriesSchema = z.object(
+  optionalBooleanMap(Object.keys(instances.DEFAULT_SYNC_CATEGORIES))
+).optional();
+
+const updatePeerSchema = z.object({
+  name: z.string().optional(),
+  enabled: z.boolean().optional(),
+  syncEnabled: z.boolean().optional(),
+  // Full-sync ("mirror everything") mode: implies every current + future sync
+  // category and back-subscribes all subscribable records to this peer.
+  fullSync: z.boolean().optional(),
+  syncCategories: syncCategoriesSchema,
+  // How Media Collection bytes arrive from this peer (mirrors MEDIA_SYNC_MODES
+  // in services/instances.js): copied locally or hosted
+  // by the peer and streamed on demand.
+  mediaSyncMode: z.enum(['copy', 'host']).optional(),
+  // Accept empty string to clear; any other string is validated/normalized in the service
+  host: z.string().optional().nullable(),
+  auth: peerAuthSchema,
+  // Explicit consumer opt-in + model allowlist for using this peer as a media
+  // provider. Provider-side sharing remains independently configured there.
+  mediaProvider: federatedMediaPeerSettingsSchema.optional(),
+  syncSecret: z.string().min(32).max(256).nullable().optional(),
+});
+
+const announceSchema = z.object({
+  port: z.number().int().min(1).max(65535),
+  instanceId: z.string().guid(),
+  name: z.string().optional(),
+  // Tailscale-issued DNS name announcing peer reaches itself at; receiver
+  // stores it on the peer record so callbacks use https://<host>:<port>.
+  host: z.string().optional().nullable()
+});
+
+const querySchema = z.object({
+  path: z.string().startsWith('/api/', 'Path must start with /api/')
+});
+
+// Reciprocal sync request from a peer: it enabled `syncCategories` toward us
+// and asks us to mirror them so the sync is bidirectional. instanceId is the
+// announcing peer's identity (matched against our peer record).
+const reciprocalSyncSchema = z.object({
+  instanceId: z.string().guid(),
+  // `.unwrap()` strips the `.optional()` from the shared schema so the
+  // syncCategories KEY is required. An empty `{}` still parses (all fields are
+  // optional) and simply no-ops downstream in applyReciprocalSync
+  // (sanitizeSyncCategories returns null → changed:false).
+  syncCategories: syncCategoriesSchema.unwrap(),
+  // Optional: a full-sync peer asks us to mirror everything back. Absent from
+  // older peers (they reciprocate via the all-on syncCategories map instead).
+  fullSync: z.boolean().optional()
+});
+
+const pairSecretSchema = z.object({ syncSecret: z.string().min(32).max(256) });
+
+// GET /api/instances — list self + all peers
+router.get('/', asyncHandler(async (req, res) => {
+  const [self, peers, syncStatus] = await Promise.all([
+    getSelf(),
+    instances.getPeers(),
+    getSyncStatus({ includeChecksums: true })
+  ]);
+  // Redact each peer's stored proxy password (keep username + hasPassword) —
+  // the browser never needs the secret. Mirrors providers' hasApiKey pattern.
+  // Tailcat peers also carry their live forward summary so the peer card is the
+  // primary status surface (orphan forwards stay on the dedicated panel).
+  const sanitized = await tailcatPeer.attachTailcatForwardsToPeers(
+    peers.map(instances.sanitizePeerForClient),
+  );
+  res.json({ self, peers: sanitized, syncStatus });
+}));
+
+// GET /api/instances/assignable — id/name pairs a CoS task may be pinned to
+// (#4520). Deliberately narrower than GET / above: no addresses, no sync state,
+// no peer that has yet to advertise a federation identity — just what the task
+// form's instance picker renders.
+router.get('/assignable', asyncHandler(async (req, res) => {
+  res.json({ instances: await instances.getAssignableInstances() });
+}));
+
+// GET /api/instances/sync-status — local sync sequences + checksums (used by peers during probe)
+// A probing peer may pass `?forPeer=<its instanceId>` to also receive OUR cursor
+// into its data (`cursorForYou`) — how far we've pulled from it. That cursor is
+// the peer's push-frontier toward us, so it can render an outbound "N to push"
+// count. Older peers omit the param and get the legacy (inbound-only) shape.
+//
+// `forPeer` is consumed by getSyncStatus() purely as a cursor-cache KEY
+// (`cursors[forPeer]`), never as a structurally-validated id — so we must NOT
+// demand canonical GUID format here. The endpoint is reachable by ANY tailnet
+// machine (not just peers in our list), and a prober running an older PortOS,
+// carrying the `unknown` instance-id sentinel, or emitting a bare `?forPeer=`
+// (empty string — which `.guid()` rejects) legitimately hits us; rejecting it
+// threw a 500 ServerError every probe cycle instead of degrading to the
+// unscoped (global) response. Mirror the lenient trim + length-cap the sibling
+// /api/sync/* routes already apply (forPeerOf in dataSync.js): any non-empty
+// string is a valid key; absent/blank/array → unscoped.
+const syncStatusQuerySchema = z.object({
+  forPeer: z.preprocess(
+    (v) => (typeof v === 'string' && v.trim().length > 0 ? v.trim().slice(0, 128) : undefined),
+    z.string().optional()
+  )
+});
+router.get('/sync-status', asyncHandler(async (req, res) => {
+  const { forPeer } = validateRequest(syncStatusQuerySchema, req.query);
+  const status = await getSyncStatus({ includeChecksums: true, forPeer });
+  res.json({
+    brainSeq: status.local.brainSeq,
+    memorySeq: status.local.memorySeq,
+    checksums: status.local.checksums,
+    // Present only when `forPeer` was supplied and we've synced it before.
+    ...(status.cursorForYou ? { cursorForYou: status.cursorForYou } : {})
+  });
+}));
+
+// GET /api/instances/tailnet-suffix — detect local Tailscale MagicDNS suffix
+// so the UI can auto-suggest DNS names (e.g., `phone-example` + `.example-tailnet.ts.net`)
+// for peers that currently use bare IP addresses.
+router.get('/tailnet-suffix', asyncHandler(async (req, res) => {
+  const status = await getTailscaleStatus();
+  res.json({
+    suffix: status.magicDnsSuffix,
+    self: status.dnsName,
+    peers: status.peers,
+    reason: status.reason,
+  });
+}));
+
+// POST /api/instances/provision-cert — runtime helper for the Tailscale/MagicDNS
+// certificate path from `npm run setup:cert` (not the script's self-signed fallback
+// or regeneration logic). Fetches a Let's Encrypt cert via `tailscale cert` for
+// the local MagicDNS hostname so the user can enable trusted HTTPS without dropping
+// to a shell.
+router.post('/provision-cert', asyncHandler(async (req, res) => {
+  const result = await provisionTailscaleCert();
+  if (!result.ok) {
+    // Map to apiCore.js error envelope so the client auto-toasts the message.
+    throw new ServerError(result.message, { status: 400, code: result.reason });
+  }
+  res.json(result);
+}));
+
+// GET /api/instances/self — get this instance's identity
+router.get('/self', asyncHandler(async (req, res) => {
+  const self = await getSelf();
+  res.json(self);
+}));
+
+// PUT /api/instances/self — update display name and/or the new-peer full-sync default
+const updateSelfSchema = z.object({
+  name: z.string().min(1).optional(),
+  // Default full-sync ("mirror everything") mode for peers added from now on.
+  defaultPeerFullSync: z.boolean().optional()
+}).refine((d) => d.name !== undefined || d.defaultPeerFullSync !== undefined, {
+  message: 'Provide name and/or defaultPeerFullSync'
+});
+router.put('/self', asyncHandler(async (req, res) => {
+  const data = validateRequest(updateSelfSchema, req.body);
+  const updated = await updateSelf(data.name, { defaultPeerFullSync: data.defaultPeerFullSync });
+  if (!updated) throw new ServerError('Self identity not initialized', { status: 500 });
+  res.json(updated);
+}));
+
+// POST /api/instances/peers/announce — receive announcement from remote peer
+router.post('/peers/announce', asyncHandler(async (req, res) => {
+  const data = validateRequest(announceSchema, req.body);
+  // Derive caller IP from req.ip, stripping ::ffff: prefix for IPv4-mapped addresses
+  const rawIp = req.ip || req.socket.remoteAddress || '';
+  const address = rawIp.replace(/^::ffff:/, '');
+  console.log(`🌐 Announce received from ${data.name || 'unknown'} (raw IP: ${rawIp}, resolved: ${address}, port: ${data.port})`);
+  if (!address) throw new ServerError('Could not determine caller IP', { status: 400 });
+
+  const result = await instances.handleAnnounce({
+    address,
+    port: data.port,
+    instanceId: data.instanceId,
+    name: data.name,
+    host: data.host
+  });
+
+  const self = await getSelf();
+  res.status(result.created ? 201 : 200).json({
+    self: { instanceId: self?.instanceId, name: self?.name },
+    // Strip our locally-stored proxy credential before echoing the matched
+    // peer back to the announcing instance — that password is our secret for
+    // reaching them, not theirs to receive.
+    peer: instances.redactPeerForWire(result.peer)
+  });
+}));
+
+const addTailcatPeerSchema = z.object({
+  tcAddress: z.string().trim().min(24).max(2048),
+  protocol: z.enum(['http', 'https']).default('http'),
+  name: z.string().optional(),
+  auth: peerAuthSchema,
+  remotePort: z.number().int().min(1).max(65535).default(DEFAULT_TAILCAT_REMOTE_PORT),
+});
+
+// POST /api/instances/peers/tailcat — add a peer via tailcat forward (no Tailscale account).
+// Starts `tailcat forward <tc> LOCAL:5565` (LOCAL defaults to 15555) and registers
+// a loopback peer. The classic POST /peers path still rejects 127/8.
+router.post('/peers/tailcat', asyncHandler(async (req, res) => {
+  const data = validateRequest(addTailcatPeerSchema, req.body);
+  if (!tailcatPeer.isValidTcAddress(data.tcAddress)) {
+    throw new ServerError('Invalid tailcat address — paste a tc… address from the peer', { status: 400 });
+  }
+  const peer = await tailcatPeer.addPeerViaTailcat(data);
+  res.status(201).json(instances.sanitizePeerForClient(peer));
+}));
+
+// GET /api/instances/peers/tailcat/forwards — saved tailcat forwards.
+// The tc address is a bearer capability, so rows carry only its redacted form;
+// what they DO carry is which forward is down and why, so a failed add can be
+// retried without the operator producing the address again.
+router.get('/peers/tailcat/forwards', asyncHandler(async (_req, res) => {
+  res.json({ forwards: await tailcatPeer.listTailcatForwards() });
+}));
+
+// POST /api/instances/peers/tailcat/forwards/:id/retry — restart a saved forward
+// using the stored capability, registering its peer if the original add never got
+// that far.
+router.post('/peers/tailcat/forwards/:id/retry', asyncHandler(async (req, res) => {
+  const data = validateRequest(z.object({
+    remotePort: z.number().int().min(1).max(65535).optional(),
+    tcAddress: z.string().trim().min(24).max(2048).refine(tailcatPeer.isValidTcAddress, 'Invalid Tailcat address').optional(),
+  }), req.body || {});
+  const peer = await tailcatPeer.retryTailcatForward(req.params.id, data);
+  // A repaired tunnel must not leave the peer in yesterday's probe backoff.
+  // Probe also distinguishes a usable tunnel from missing peer credentials.
+  const probed = await instances.probePeer(peer);
+  res.json(instances.sanitizePeerForClient(probed || peer));
+}));
+
+// DELETE /api/instances/peers/tailcat/forwards/:id — stop the forward, drop the
+// stored capability, and remove its peer if one was registered.
+router.delete('/peers/tailcat/forwards/:id', asyncHandler(async (req, res) => {
+  res.json(await tailcatPeer.forgetTailcatForward(req.params.id));
+}));
+
+
+// GET /api/instances/peers/tailcat/serve — this node's managed tailcat serve status.
+// Returns the full tc address when known so the operator can Copy it out of band
+// (our own serve capability — unlike peer forwards, which stay redacted).
+router.get('/peers/tailcat/serve', asyncHandler(async (_req, res) => {
+  res.json(await tailcatServe.getTailcatServeStatus());
+}));
+
+// POST /api/instances/peers/tailcat/serve — ensure serve is running for the remote ingress only.
+router.post('/peers/tailcat/serve', asyncHandler(async (req, res) => {
+  const data = validateRequest(z.object({
+    localPort: z.literal(PORTS.TAILCAT_INGRESS).optional(),
+    keyName: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/).optional(),
+  }), req.body || {});
+  const status = await tailcatServe.ensureTailcatServe(data);
+  res.status(200).json(status);
+}));
+
+// POST /api/instances/peers/tailcat/serve/retry — restart from saved config.
+router.post('/peers/tailcat/serve/retry', asyncHandler(async (_req, res) => {
+  res.json(await tailcatServe.retryTailcatServe());
+}));
+
+// DELETE /api/instances/peers/tailcat/serve — stop serve and disable restore-on-boot.
+router.delete('/peers/tailcat/serve', asyncHandler(async (_req, res) => {
+  res.json(await tailcatServe.stopTailcatServe({ disable: true }));
+}));
+
+
+// POST /api/instances/peers — add a peer
+router.post('/peers', asyncHandler(async (req, res) => {
+  const data = validateRequest(addPeerSchema, req.body);
+  // Reject invalid DNS names up front so the UI gets a clear error instead of
+  // addPeer() silently dropping the field (validHost returns undefined for invalid input).
+  if (data.host !== undefined && data.host !== null && data.host !== '') {
+    if (instances.validHost(data.host) === undefined) {
+      throw new ServerError('Invalid DNS host — use a hostname like "machine.tailnet.ts.net"', { status: 400 });
+    }
+  }
+  const peer = await instances.addPeer(data);
+  res.status(201).json(instances.sanitizePeerForClient(peer));
+}));
+
+// PUT /api/instances/peers/:id — update peer
+router.put('/peers/:id', asyncHandler(async (req, res) => {
+  const data = validateRequest(updatePeerSchema, req.body);
+  // Reject invalid DNS names up front so the UI gets a clear error instead of a silent no-op.
+  if (data.host !== undefined && data.host !== null && data.host !== '') {
+    if (instances.validHost(data.host) === undefined) {
+      throw new ServerError('Invalid DNS host — use a hostname like "machine.tailnet.ts.net"', { status: 400 });
+    }
+  }
+  const peer = await instances.updatePeer(req.params.id, data);
+  if (!peer) throw new ServerError('Peer not found', { status: 404 });
+  res.json(instances.sanitizePeerForClient(peer));
+}));
+
+// POST /api/instances/peers/:id/pair-secret — generate and provision a pair
+// secret on this peer and the remote instance without exposing it to the UI.
+router.post('/peers/:id/pair-secret', asyncHandler(async (req, res) => {
+  const peer = await instances.pairPeerSyncSecret(req.params.id);
+  res.json(instances.sanitizePeerForClient(peer));
+}));
+
+// DELETE /api/instances/peers/:id — remove peer
+router.delete('/peers/:id', asyncHandler(async (req, res) => {
+  const removed = await instances.removePeer(req.params.id);
+  if (!removed) throw new ServerError('Peer not found', { status: 404 });
+  res.json({ success: true });
+}));
+
+// POST /api/instances/peers/:id/connect — announce ourselves to this peer (make it mutual)
+router.post('/peers/:id/connect', asyncHandler(async (req, res) => {
+  const result = await instances.connectPeer(req.params.id);
+  if (!result) throw new ServerError('Peer not found', { status: 404 });
+  res.json(instances.sanitizePeerForClient(result));
+}));
+
+// POST /api/instances/peers/sync-categories — reciprocal-sync callback from a
+// peer. The peer enabled some categories toward us and is asking us to mirror
+// them so the sync is bidirectional. No :id — the peer is identified by the
+// instanceId in the body (we may not know its local-peer-id mapping).
+router.post('/peers/sync-categories', asyncHandler(async (req, res) => {
+  const data = validateRequest(reciprocalSyncSchema, req.body);
+  const { changed } = await instances.applyReciprocalSync(data.instanceId, data.syncCategories, { fullSync: data.fullSync });
+  // 200 even when the peer is unknown to us / nothing changed — this is a
+  // best-effort convergence signal, not a command that must succeed. We return
+  // only `applied` (not the peer record) — the remote caller doesn't consume it,
+  // and echoing our peer entry would leak our stored proxy-credential metadata
+  // (username + hasPassword) for reaching them across the peer boundary, the
+  // same leak the /announce route guards against with redactPeerForWire.
+  res.json({ applied: changed });
+}));
+
+// POST /api/instances/peers/pair-secret — one-time setup using the instance
+// password, bound to the caller's already-registered peer identity. The raw
+// secret is persisted locally and never returned to the caller.
+router.post('/peers/pair-secret', asyncHandler(async (req, res) => {
+  if (req.peerSettingsOperator !== true
+    && !(req.portosAuthContext?.authenticated === true
+      && req.portosAuthContext.method === 'basic')) {
+    throw new ServerError('Pairing requires an operator session or the peer’s saved instance password.', {
+      status: 403, code: 'PEER_PAIR_OPERATOR_REQUIRED',
+    });
+  }
+  const { syncSecret } = validateRequest(pairSecretSchema, req.body || {});
+  const instanceId = req.get(PEER_INSTANCE_HEADER);
+  if (!z.string().uuid().safeParse(instanceId).success) {
+    throw new ServerError('A valid peer instance identity is required for pairing.', {
+      status: 400, code: 'PEER_IDENTITY_REQUIRED',
+    });
+  }
+  const peer = await instances.acceptPeerSyncSecretFromPeer(instanceId, syncSecret);
+  if (!peer) throw new ServerError('This instance is not registered as a peer here.', { status: 404, code: 'PEER_NOT_FOUND' });
+  res.json({ paired: true });
+}));
+
+// POST /api/instances/peers/:id/reciprocate — explicit "make all enabled
+// categories mutual" for an existing (likely one-directional) peer. Pushes our
+// current category map to the peer so it enables the same toward us.
+router.post('/peers/:id/reciprocate', asyncHandler(async (req, res) => {
+  const peers = await instances.getPeers();
+  const peer = peers.find(p => p.id === req.params.id);
+  if (!peer) throw new ServerError('Peer not found', { status: 404 });
+  // Go through the per-peer serialized queue (same path as the auto-reciprocate
+  // on toggle) so a manual "Make mutual" can't race an in-flight toggle send and
+  // land a stale map. The queue re-reads the freshest persisted categories.
+  const result = await instances.enqueueReciprocalSync(peer.id);
+  res.json(result ?? { ok: false, reason: 'no-result' });
+}));
+
+// POST /api/instances/peers/:id/probe — force immediate probe
+router.post('/peers/:id/probe', asyncHandler(async (req, res) => {
+  const peers = await instances.getPeers();
+  const peer = peers.find(p => p.id === req.params.id);
+  if (!peer) throw new ServerError('Peer not found', { status: 404 });
+  const result = await instances.probePeer(peer);
+  const sanitized = instances.sanitizePeerForClient(result);
+  res.json(await tailcatPeer.attachTailcatForwardToPeer(sanitized));
+}));
+
+// POST /api/instances/peers/:id/sync — force an immediate sync with this peer.
+// Probe first so the cursor-reset detection has fresh remoteSyncSeqs, then run
+// the full sync. syncWithPeer emits `sync:progress` events so the card animates
+// live and settles to the new directional summary without a manual refresh.
+router.post('/peers/:id/sync', asyncHandler(async (req, res) => {
+  const peers = await instances.getPeers();
+  const peer = peers.find(p => p.id === req.params.id);
+  if (!peer) throw new ServerError('Peer not found', { status: 404 });
+  const probed = await instances.probePeer(peer);
+  if (probed?.status !== 'online') {
+    throw new ServerError('Peer is offline — cannot sync', { status: 409, code: 'PEER_OFFLINE' });
+  }
+  const result = await syncWithPeer(probed);
+  res.json({ ok: true, result });
+}));
+
+// GET /api/instances/peers/:id/full-sync-coverage — real coverage diff backing
+// the "fully mirrored ✓ / N pending" indicator for a full-sync peer. Computed
+// on demand (it lists every subscribable record), so the client fetches it per
+// full-sync peer rather than bloating the polled /instances payload.
+router.get('/peers/:id/full-sync-coverage', asyncHandler(async (req, res) => {
+  const peers = await instances.getPeers();
+  const peer = peers.find(p => p.id === req.params.id);
+  if (!peer) throw new ServerError('Peer not found', { status: 404 });
+  // Coverage is keyed by the peer's federation identity; an un-probed peer
+  // (no instanceId yet) has no subscriptions, so coverage is trivially empty.
+  if (!peer.instanceId) {
+    res.json({ total: 0, confirmed: 0, pending: 0, fullyMirrored: true, byKind: {} });
+    return;
+  }
+  const coverage = await getFullSyncCoverageForPeer(peer.instanceId);
+  res.json(coverage);
+}));
+
+// GET /api/instances/peers/:id/query — proxy GET to peer
+router.get('/peers/:id/query', asyncHandler(async (req, res) => {
+  const { path } = validateRequest(querySchema, req.query);
+  const result = await instances.queryPeer(req.params.id, path);
+  if (result.error) throw new ServerError(result.error, { status: result.status ?? 502 });
+  res.json(result.data);
+}));
+
+export default router;

@@ -1,0 +1,271 @@
+import { describe, expect, it, vi, beforeEach } from 'vitest';
+import { render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { MemoryRouter } from 'react-router';
+import SlashDoRunDrawer from './SlashDoRunDrawer';
+import SlashDoPanel from './SlashDoPanel';
+
+const api = vi.hoisted(() => ({
+  getCodeReviewDefaults: vi.fn(),
+  getProviders: vi.fn(),
+  // Backs the reviewer table's Model column (useReviewerModelOptions).
+  getLocalLlmStatus: vi.fn(),
+  getAppWorkItems: vi.fn(),
+  // What the RUN resolves — the claim-work override layer getCodeReviewDefaults
+  // cannot see, and what the untouched picker is seeded from.
+  getAppClaimReviewers: vi.fn(),
+  createSlashdoTask: vi.fn()
+}));
+
+vi.mock('../../services/api', () => api);
+
+// The drawer's `highlightToolUse` picker fetches the backends' authoritative
+// tool-use capabilities from apiLocalLlm directly (not through services/api),
+// so stub it here or the suite makes a real network call. Parked unresolved —
+// the annotation itself is covered in ProviderModelSelector.test.jsx.
+vi.mock('../../services/apiLocalLlm', () => ({
+  getToolUseModels: vi.fn(() => new Promise(() => {})),
+  getVisionModels: vi.fn().mockResolvedValue({ models: [] }),
+}));
+
+// Routed: the override note links to the panel that owns the pin, so the drawer
+// needs a router the way it has one in the app.
+const renderDrawer = (props = {}) => render(
+  <MemoryRouter>
+    <SlashDoRunDrawer
+      open
+      command="next"
+      label="/do:next"
+      appId="acme"
+      appName="Acme App"
+      onClose={vi.fn()}
+      onQueued={vi.fn()}
+      {...props}
+    />
+  </MemoryRouter>
+);
+
+describe('SlashDoRunDrawer', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    api.getCodeReviewDefaults.mockResolvedValue({ reviewers: ['copilot'], usernames: [], optionalReviewers: [] });
+    api.getProviders.mockResolvedValue({ providers: [] });
+    api.getLocalLlmStatus.mockResolvedValue({ ollama: { models: [] }, lmstudio: { models: [] } });
+    api.getAppWorkItems.mockResolvedValue({
+      tracker: 'github',
+      issueAuthorFilter: 'self',
+      items: [{ ref: '7', title: 'Fix the thing' }, { ref: '9', title: 'Add the other' }],
+      count: 2,
+      reason: 'actionable-issues',
+      transient: false
+    });
+    api.getAppClaimReviewers.mockResolvedValue({
+      source: 'defaults', reviewers: ['copilot'], usernames: [], optionalReviewers: [],
+      reviewerMaxRounds: {}, reviewerModels: {}, reviewerEfforts: {}, csv: 'copilot'
+    });
+    api.createSlashdoTask.mockResolvedValue({ id: 'task-1', status: 'pending' });
+  });
+
+  it('uses overview overrides for direct actions and keeps them when opening run settings', async () => {
+    api.getProviders.mockResolvedValue({ providers: [
+      { id: 'codex', name: 'Codex', type: 'cli', enabled: true, models: ['gpt-5'], defaultModel: 'gpt-5' }
+    ] });
+    render(<MemoryRouter><SlashDoPanel appId="acme" appName="Acme App" appType="node" /></MemoryRouter>);
+    await screen.findByRole('option', { name: 'Codex' });
+    // Untouched overview actions must retain server-selected Auto routing.
+    await userEvent.click(screen.getByRole('button', { name: '/do:plan-task' }));
+    await waitFor(() => expect(api.createSlashdoTask).toHaveBeenLastCalledWith(
+      'plan-task', 'acme', { provider: undefined, model: undefined, effort: undefined }, { silent: true }
+    ));
+    await userEvent.selectOptions(screen.getByLabelText('Provider'), 'codex');
+    await userEvent.selectOptions(screen.getByLabelText('Model'), 'gpt-5');
+    await userEvent.selectOptions(screen.getByLabelText('Thinking effort'), 'high');
+    await userEvent.click(screen.getByRole('button', { name: '/do:plan-task' }));
+    await waitFor(() => expect(api.createSlashdoTask).toHaveBeenCalledWith(
+      'plan-task', 'acme', { provider: 'codex', model: 'gpt-5', effort: 'high' }, { silent: true }
+    ));
+    await userEvent.click(screen.getByRole('button', { name: '/do:next' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Queue /do:next' }));
+    await waitFor(() => expect(api.createSlashdoTask).toHaveBeenLastCalledWith(
+      'next', 'acme', expect.objectContaining({ provider: 'codex', model: 'gpt-5', effort: 'high' }), { silent: true }
+    ));
+    await userEvent.selectOptions(screen.getByLabelText('Provider'), '');
+    await userEvent.click(screen.getByRole('button', { name: '/do:plan-task' }));
+    await waitFor(() => expect(api.createSlashdoTask).toHaveBeenLastCalledWith(
+      'plan-task', 'acme', { provider: undefined, model: undefined, effort: undefined }, { silent: true }
+    ));
+  });
+
+  it('queues an agent-picks run without fetching the tracker', async () => {
+    const onQueued = vi.fn();
+    renderDrawer({ onQueued });
+
+    await userEvent.click(screen.getByRole('button', { name: /Queue \/do:next/ }));
+
+    await waitFor(() => expect(onQueued).toHaveBeenCalled());
+    expect(api.getAppWorkItems).not.toHaveBeenCalled();
+    const [command, appId, settings] = api.createSlashdoTask.mock.calls.at(-1);
+    expect(command).toBe('next');
+    expect(appId).toBe('acme');
+    expect(settings.target).toBeUndefined();
+    expect(settings.simplify).toBe(true);
+    // Untouched reviewer controls must NOT pin a list — the server resolves the
+    // app's configured claim-work reviewers instead.
+    expect(settings.reviewers).toBeUndefined();
+  });
+
+  // The bug this seeding fixes: the picker used to display the Code Review
+  // Defaults, which do NOT include the claim-work task override the run resolves
+  // FIRST. A user who had moved the install default to `antigravity` saw
+  // `antigravity` here while every claim actually reviewed with codex + claude.
+  it('seeds the untouched picker from the reviewers the RUN resolves, not the install defaults', async () => {
+    api.getCodeReviewDefaults.mockResolvedValue({ reviewers: ['antigravity'], usernames: [], optionalReviewers: [] });
+    api.getAppClaimReviewers.mockResolvedValue({
+      source: 'task-override', reviewers: ['codex', 'claude'], usernames: [], optionalReviewers: [],
+      reviewerMaxRounds: {}, reviewerModels: {}, reviewerEfforts: {}, csv: 'codex,claude'
+    });
+
+    renderDrawer();
+
+    // Selected reviewers render as Remove buttons; unselected ones as Add.
+    await waitFor(() => expect(screen.getByRole('button', { name: /Remove Codex/ })).toBeInTheDocument());
+    expect(screen.getByRole('button', { name: /Remove Claude/ })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Remove Antigravity/ })).not.toBeInTheDocument();
+    // …and the user is told WHERE that list comes from, since it isn't the panel
+    // they would go to in order to change it.
+    expect(screen.getByText(/claim-work/)).toBeInTheDocument();
+  });
+
+  it('does not blame a claim-work override when the reviewers came from the install defaults', async () => {
+    renderDrawer();
+
+    await waitFor(() => expect(screen.getByText('Reviewers (in order):')).toBeInTheDocument());
+    expect(screen.queryByText(/claim-work/)).not.toBeInTheDocument();
+  });
+
+  it('sends the reviewer list only once the user edits it', async () => {
+    const onQueued = vi.fn();
+    renderDrawer({ onQueued });
+
+    await waitFor(() => expect(screen.getByText('Reviewers (in order):')).toBeInTheDocument());
+    await userEvent.click(screen.getByRole('button', { name: /Remove Copilot/ }));
+    await userEvent.click(screen.getByRole('button', { name: /Queue \/do:next/ }));
+
+    await waitFor(() => expect(onQueued).toHaveBeenCalled());
+    const [, , settings] = api.createSlashdoTask.mock.calls.at(-1);
+    expect(settings.reviewers).toEqual([]);
+  });
+
+  it('hides the stop-mode and reviewer-applies controls the claim flow cannot honor', async () => {
+    renderDrawer();
+
+    await waitFor(() => expect(screen.getByText('Reviewers (in order):')).toBeInTheDocument());
+    // Add a second, non-Copilot reviewer — the two flags render at 2+ / non-copilot.
+    await userEvent.click(screen.getByText('Standalone / legacy backend'));
+    await userEvent.selectOptions(screen.getByLabelText('Legacy backend'), 'claude');
+    await userEvent.click(screen.getByText('Add legacy reviewer'));
+
+    expect(screen.queryByText('Stop mode:')).not.toBeInTheDocument();
+    expect(screen.queryByText(/Reviewer applies fixes/)).not.toBeInTheDocument();
+  });
+
+  it('hides the reviewer picker entirely for a command that cannot honor it', async () => {
+    // Only the `next` branch of POST /tasks/slashdo reads the reviewer fields —
+    // every other `/do:*` body owns its own review/PR sequence. Rendering the
+    // picker there would let the user pick a reviewer and a model and have the run
+    // silently discard both.
+    renderDrawer({ command: 'better', label: '/do:better' });
+
+    await waitFor(() => expect(screen.getByText('Task settings')).toBeInTheDocument());
+    expect(screen.queryByText('Reviewers (in order):')).not.toBeInTheDocument();
+    expect(screen.queryByText('GitHub reviewers (gate merge):')).not.toBeInTheDocument();
+  });
+
+  it('never sends reviewer fields for a non-next command', async () => {
+    renderDrawer({ command: 'better', label: '/do:better' });
+
+    await waitFor(() => expect(screen.getByText('Task settings')).toBeInTheDocument());
+    await userEvent.click(screen.getByRole('button', { name: /Queue/ }));
+
+    await waitFor(() => expect(api.createSlashdoTask).toHaveBeenCalled());
+    const [, , body] = api.createSlashdoTask.mock.calls[0];
+    expect(body.reviewers).toBeUndefined();
+    expect(body.reviewerModels).toBeUndefined();
+    expect(body.reviewerMaxRounds).toBeUndefined();
+  });
+
+  it('lists the tracker items once "pick a specific" is chosen and sends the pinned ref', async () => {
+    const onQueued = vi.fn();
+    renderDrawer({ onQueued });
+
+    await userEvent.click(screen.getByRole('radio', { name: /Pick a specific/ }));
+    await waitFor(() => expect(screen.getByText('Fix the thing')).toBeInTheDocument());
+
+    await userEvent.click(screen.getByRole('radio', { name: /Add the other/ }));
+    await userEvent.click(screen.getByRole('button', { name: /Queue \/do:next/ }));
+
+    await waitFor(() => expect(onQueued).toHaveBeenCalled());
+    const [, , settings] = api.createSlashdoTask.mock.calls.at(-1);
+    expect(settings.target).toBe('9');
+    expect(settings.issueAuthorFilter).toBe('self');
+  });
+
+  it('blocks submission until an item is selected in pick mode', async () => {
+    renderDrawer();
+
+    await userEvent.click(screen.getByRole('radio', { name: /Pick a specific/ }));
+    await waitFor(() => expect(screen.getByText('Fix the thing')).toBeInTheDocument());
+
+    expect(screen.getByRole('button', { name: /Queue \/do:next/ })).toBeDisabled();
+  });
+
+  it('distinguishes an unreachable tracker from an empty queue', async () => {
+    api.getAppWorkItems.mockResolvedValue({
+      tracker: 'github', issueAuthorFilter: 'self', items: [], count: 0,
+      reason: 'gh-list-failed', transient: true
+    });
+    renderDrawer();
+
+    await userEvent.click(screen.getByRole('radio', { name: /Pick a specific/ }));
+
+    await waitFor(() => expect(screen.getByText(/Couldn't reach the tracker/)).toBeInTheDocument());
+  });
+
+  it('stops re-requesting after a failed fetch instead of looping', async () => {
+    api.getAppWorkItems.mockRejectedValue(new Error('boom'));
+    renderDrawer();
+
+    await userEvent.click(screen.getByRole('radio', { name: /Pick a specific/ }));
+
+    await waitFor(() => expect(screen.getByText('boom')).toBeInTheDocument());
+    expect(api.getAppWorkItems).toHaveBeenCalledTimes(1);
+  });
+
+  it('allows selecting merge-on-green, hides reviewer picker, and sends prCompletion', async () => {
+    const onQueued = vi.fn();
+    renderDrawer({ onQueued });
+
+    await waitFor(() => expect(screen.getByText('Reviewers (in order):')).toBeInTheDocument());
+    await userEvent.selectOptions(screen.getByLabelText('After opening PR'), 'merge-on-green');
+
+    expect(screen.queryByText('Reviewers (in order):')).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: /Queue \/do:next/ }));
+
+    await waitFor(() => expect(onQueued).toHaveBeenCalled());
+    const [, , settings] = api.createSlashdoTask.mock.calls.at(-1);
+    expect(settings.prCompletion).toBe('merge-on-green');
+    expect(settings.reviewers).toBeUndefined();
+  });
+
+  it('seeds prCompletion from claimReviewers when available', async () => {
+    api.getAppClaimReviewers.mockResolvedValue({
+      source: 'task-override', prCompletion: 'merge-on-green', reviewers: [], usernames: [], optionalReviewers: [],
+      reviewerMaxRounds: {}, reviewerModels: {}, reviewerEfforts: {}, csv: ''
+    });
+
+    renderDrawer();
+
+    await waitFor(() => expect(screen.getByLabelText('After opening PR')).toHaveValue('merge-on-green'));
+    expect(screen.queryByText('Reviewers (in order):')).not.toBeInTheDocument();
+  });
+});

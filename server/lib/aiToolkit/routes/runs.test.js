@@ -1,0 +1,258 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import express from 'express';
+import { request } from '../../testHelper.js';
+import { createRunsRoutes } from './runs.js';
+import { asyncHandler as portosAsyncHandler, errorMiddleware, ServerError } from '../../errorHandler.js';
+
+// Route-level harness for POST /api/runs fallback-model execution.
+//
+// The route derives `runModel` from `createRun`'s `usedFallback`/`fallbackModel`
+// so a proactive fallback swap runs the FALLBACK provider's model rather than
+// leaking the (now-benched) primary's request model onto the fallback. This
+// suite pins that contract for all three provider types by spying on the
+// runner's execute* methods and asserting which model id reaches each one.
+
+const asyncHandler = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
+const REQUEST_MODEL = 'requested-model';
+
+/**
+ * Build an express app mounting the runs router over a fake runner whose
+ * `createRun` resolves to `runData` and whose execute* methods are spies.
+ * `runData.provider.type` selects which execute* branch the route takes.
+ */
+function makeApp(runData) {
+  const runnerService = {
+    createRun: vi.fn().mockResolvedValue(runData),
+    executeApiRun: vi.fn(),
+    executeCliRun: vi.fn(),
+    executeTuiRun: vi.fn(),
+  };
+  const app = express();
+  app.use(express.json());
+  app.use('/api/runs', createRunsRoutes(runnerService, { asyncHandler }));
+  return { app, runnerService };
+}
+
+/** Minimal runData skeleton the route destructures; override per-case. */
+function runData({ providerType, defaultModel, usedFallback = false, fallbackModel = null }) {
+  return {
+    runId: 'run-1',
+    provider: { id: 'fallback-or-primary', type: providerType, defaultModel },
+    metadata: { id: 'run-1' },
+    timeout: 60000,
+    usedFallback,
+    fallbackModel,
+  };
+}
+
+// Sends BOTH workspace fields, as the real client does — a name without a path
+// means "app selected but its Repository Path is unset" and is now a 400 (see
+// the selected-app-without-a-path suite at the bottom of this file).
+const post = (app) =>
+  request(app)
+    .post('/api/runs')
+    .send({ providerId: 'p1', model: REQUEST_MODEL, prompt: 'hello', workspaceName: 'ws', workspacePath: '/srv/repos/ws' });
+
+describe('POST /api/runs — fallback-model execution', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  describe('(a) non-fallback runs honor the request model where the type threads it', () => {
+    it('API: passes the request model as the 3rd executeApiRun arg', async () => {
+      const { app, runnerService } = makeApp(
+        runData({ providerType: 'api', defaultModel: 'provider-default' })
+      );
+      const res = await post(app);
+      expect(res.status).toBe(202);
+      expect(runnerService.executeApiRun).toHaveBeenCalledTimes(1);
+      // executeApiRun({ runId, provider, model: runModel, prompt, ... })
+      expect(runnerService.executeApiRun.mock.calls[0][0].model).toBe(REQUEST_MODEL);
+    });
+
+    it('TUI: clones the provider with the request model as defaultModel', async () => {
+      const { app, runnerService } = makeApp(
+        runData({ providerType: 'tui', defaultModel: 'provider-default' })
+      );
+      const res = await post(app);
+      expect(res.status).toBe(202);
+      expect(runnerService.executeTuiRun).toHaveBeenCalledTimes(1);
+      // executeTuiRun({ runId, provider: effectiveProvider, prompt, ... })
+      expect(runnerService.executeTuiRun.mock.calls[0][0].provider.defaultModel).toBe(REQUEST_MODEL);
+    });
+
+    it('CLI: leaves the provider untouched (request model is never threaded into CLI runs)', async () => {
+      const provider = runData({ providerType: 'cli', defaultModel: 'provider-default' });
+      const { app, runnerService } = makeApp(provider);
+      const res = await post(app);
+      expect(res.status).toBe(202);
+      expect(runnerService.executeCliRun).toHaveBeenCalledTimes(1);
+      // executeCliRun({ runId, provider: cliProvider, prompt, ... }): no clone, keeps provider's own default
+      const cliProvider = runnerService.executeCliRun.mock.calls[0][0].provider;
+      expect(cliProvider).toBe(provider.provider);
+      expect(cliProvider.defaultModel).toBe('provider-default');
+    });
+  });
+
+  describe('(b) fallback swap with a configured fallbackModel runs that pinned model', () => {
+    const PINNED = 'fallback-pinned-model';
+
+    it('API: runs the pinned fallback model as the 3rd arg', async () => {
+      const { app, runnerService } = makeApp(
+        runData({ providerType: 'api', defaultModel: 'fallback-default', usedFallback: true, fallbackModel: PINNED })
+      );
+      await post(app);
+      expect(runnerService.executeApiRun.mock.calls[0][0].model).toBe(PINNED);
+    });
+
+    it('TUI: clones the fallback provider with the pinned model as defaultModel', async () => {
+      const { app, runnerService } = makeApp(
+        runData({ providerType: 'tui', defaultModel: 'fallback-default', usedFallback: true, fallbackModel: PINNED })
+      );
+      await post(app);
+      expect(runnerService.executeTuiRun.mock.calls[0][0].provider.defaultModel).toBe(PINNED);
+    });
+
+    it('CLI: clones the fallback provider with the pinned model as defaultModel', async () => {
+      const run = runData({ providerType: 'cli', defaultModel: 'fallback-default', usedFallback: true, fallbackModel: PINNED });
+      const { app, runnerService } = makeApp(run);
+      await post(app);
+      const cliProvider = runnerService.executeCliRun.mock.calls[0][0].provider;
+      expect(cliProvider.defaultModel).toBe(PINNED);
+      // runModel !== provider.defaultModel, so the route must hand a *clone* to the
+      // CLI runner — never mutate the shared fallback provider record.
+      expect(cliProvider).not.toBe(run.provider);
+    });
+  });
+
+  describe("(c) fallback swap with no pin runs the fallback provider's own default, never the primary's model", () => {
+    const FALLBACK_DEFAULT = 'fallback-own-default';
+
+    it('API: runs the fallback default and never the request model', async () => {
+      const { app, runnerService } = makeApp(
+        runData({ providerType: 'api', defaultModel: FALLBACK_DEFAULT, usedFallback: true, fallbackModel: null })
+      );
+      await post(app);
+      expect(runnerService.executeApiRun.mock.calls[0][0].model).toBe(FALLBACK_DEFAULT);
+      expect(runnerService.executeApiRun.mock.calls[0][0].model).not.toBe(REQUEST_MODEL);
+    });
+
+    it('TUI: clones the fallback provider with its own default, never the request model', async () => {
+      const { app, runnerService } = makeApp(
+        runData({ providerType: 'tui', defaultModel: FALLBACK_DEFAULT, usedFallback: true, fallbackModel: null })
+      );
+      await post(app);
+      const tuiProvider = runnerService.executeTuiRun.mock.calls[0][0].provider;
+      expect(tuiProvider.defaultModel).toBe(FALLBACK_DEFAULT);
+      expect(tuiProvider.defaultModel).not.toBe(REQUEST_MODEL);
+    });
+
+    it("CLI: uses the fallback provider's own default and never the request model", async () => {
+      const provider = runData({ providerType: 'cli', defaultModel: FALLBACK_DEFAULT, usedFallback: true, fallbackModel: null });
+      const { app, runnerService } = makeApp(provider);
+      await post(app);
+      // runModel === provider.defaultModel here, so the route skips the clone and
+      // passes the fallback provider as-is — its default is already correct.
+      const cliProvider = runnerService.executeCliRun.mock.calls[0][0].provider;
+      expect(cliProvider.defaultModel).toBe(FALLBACK_DEFAULT);
+      expect(cliProvider.defaultModel).not.toBe(REQUEST_MODEL);
+      // No pin and runModel === provider.defaultModel, so the route skips the clone
+      // and passes the fallback provider as-is (its default is already correct).
+      expect(cliProvider).toBe(provider.provider);
+    });
+  });
+
+  it('rejects an invalid run payload before reaching the runner', async () => {
+    const { app, runnerService } = makeApp(runData({ providerType: 'api', defaultModel: 'd' }));
+    const res = await request(app).post('/api/runs').send({ providerId: 'p1', prompt: 'hi', timeout: 'abc' });
+    expect(res.status).toBe(400);
+    expect(runnerService.createRun).not.toHaveBeenCalled();
+  });
+
+  describe('screenshot path sanitization (#1870)', () => {
+    it('rejects a traversal screenshot path with 400 before reaching the runner', async () => {
+      const { app, runnerService } = makeApp(runData({ providerType: 'api', defaultModel: 'd' }));
+      const res = await request(app)
+        .post('/api/runs')
+        .send({ providerId: 'p1', prompt: 'hi', screenshots: ['../../../../etc/passwd'] });
+      expect(res.status).toBe(400);
+      expect(runnerService.createRun).not.toHaveBeenCalled();
+      expect(runnerService.executeApiRun).not.toHaveBeenCalled();
+    });
+
+    it('rejects an absolute non-image path with 400', async () => {
+      const { app, runnerService } = makeApp(runData({ providerType: 'api', defaultModel: 'd' }));
+      const res = await request(app)
+        .post('/api/runs')
+        .send({ providerId: 'p1', prompt: 'hi', screenshots: ['/etc/passwd'] });
+      expect(res.status).toBe(400);
+      expect(runnerService.createRun).not.toHaveBeenCalled();
+    });
+
+    it('rebases a legit absolute screenshots path to its basename and forwards it to the runner', async () => {
+      const { app, runnerService } = makeApp(runData({ providerType: 'api', defaultModel: 'd' }));
+      const res = await request(app)
+        .post('/api/runs')
+        .send({ providerId: 'p1', prompt: 'hi', screenshots: ['/home/u/portos/data/screenshots/grab.png'] });
+      expect(res.status).toBe(202);
+      // Both createRun and executeApiRun receive the sanitized basename, never
+      // the caller-supplied absolute path.
+      expect(runnerService.createRun.mock.calls[0][0].screenshots).toEqual(['grab.png']);
+      expect(runnerService.executeApiRun.mock.calls[0][0].screenshots).toEqual(['grab.png']);
+    });
+  });
+});
+
+describe('POST /api/runs — selected-app-without-a-path guard (#3180)', () => {
+  // "No app selected" sends neither field; "app selected whose Repository Path
+  // is unset" sends a name but no path. Both reach the runner as an absent
+  // workspacePath, so without this guard the second silently ran in the PortOS
+  // checkout while the UI showed the app as the chosen workspace.
+  // Mounted under PortOS's real error middleware so the 400 body is the canonical
+  // envelope — the actionable message naming the app IS the fix, so assert it.
+  function makeAppWithEnvelope(rd) {
+    const runnerService = { createRun: vi.fn().mockResolvedValue(rd), executeApiRun: vi.fn(), executeCliRun: vi.fn(), executeTuiRun: vi.fn() };
+    const app = express();
+    app.use(express.json());
+    app.use('/api/runs', createRunsRoutes(runnerService, { asyncHandler: portosAsyncHandler, ServerError }));
+    app.use(errorMiddleware);
+    return { app, runnerService };
+  }
+
+  it('rejects a workspaceName with no workspacePath instead of running in the host directory', async () => {
+    const { app, runnerService } = makeAppWithEnvelope(runData({ providerType: 'cli', defaultModel: 'm' }));
+    const res = await request(app).post('/api/runs').send({
+      providerId: 'p1', prompt: 'create HelloWorld.md', workspaceName: 'Primes',
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/Primes/);
+    expect(res.body.error).toMatch(/Repository Path/);
+    expect(res.body.code).toBe('WORKSPACE_PATH_MISSING');
+    expect(runnerService.createRun).not.toHaveBeenCalled();
+    expect(runnerService.executeCliRun).not.toHaveBeenCalled();
+  });
+
+  it('rejects a whitespace-only workspacePath alongside a name', async () => {
+    const { app, runnerService } = makeApp(runData({ providerType: 'cli', defaultModel: 'm' }));
+    const res = await request(app).post('/api/runs').send({
+      providerId: 'p1', prompt: 'go', workspaceName: 'Primes', workspacePath: '   ',
+    });
+    expect(res.status).toBe(400);
+    expect(runnerService.createRun).not.toHaveBeenCalled();
+  });
+
+  it('still allows a run with no workspace selected at all', async () => {
+    const { app, runnerService } = makeApp(runData({ providerType: 'cli', defaultModel: 'm' }));
+    const res = await request(app).post('/api/runs').send({ providerId: 'p1', prompt: 'go' });
+    expect(res.status).toBeLessThan(400);
+    expect(runnerService.createRun).toHaveBeenCalled();
+  });
+
+  it('still allows a run with both a name and a path', async () => {
+    const { app, runnerService } = makeApp(runData({ providerType: 'cli', defaultModel: 'm' }));
+    const res = await request(app).post('/api/runs').send({
+      providerId: 'p1', prompt: 'go', workspaceName: 'Primes', workspacePath: '/srv/repos/primes',
+    });
+    expect(res.status).toBeLessThan(400);
+    expect(runnerService.createRun).toHaveBeenCalled();
+  });
+});

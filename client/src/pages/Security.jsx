@@ -1,0 +1,624 @@
+import { useState, useRef, useEffect, useCallback } from 'react';
+import { Camera, Mic, MicOff, Video, VideoOff, RefreshCw, Settings, Volume2 } from 'lucide-react';
+import api from '../services/api';
+import Banner from '../components/ui/Banner';
+import { FormField } from '../components/ui/FormField';
+import { safeReadStorage, safeReadJsonStorage, safeWriteStorage, safeRemoveStorage } from '../lib/safeStorage';
+import { resumeAudioContext } from '../lib/audioContext.js';
+import useAudioSessionClaim from '../hooks/useAudioSessionClaim.js';
+
+const MEDIA_CONSTRAINTS_KEY = 'portos-media-constraints';
+
+export default function Security() {
+  const videoRef = useRef(null);
+  const audioRef = useRef(null);
+  const audioContextRef = useRef(null);
+  const mediaSourceRef = useRef(null);
+  const analyserRef = useRef(null);
+  const animationFrameRef = useRef(null);
+  const deviceRestartTimerRef = useRef(null);
+
+  // The monitor routes the host's microphone stream through its OWN
+  // AudioContext to the speakers, so it can't inherit the shared lookahead
+  // transport's `audioSession` option — it claims the iOS `playback` session by
+  // hand for exactly as long as that graph is live. Everything this page sounds
+  // is output-only (the capture happens on the server, not in the browser), and
+  // without the claim the iPhone's ring/silent switch mutes a remote listen-in
+  // that shows a moving level meter the whole time. See the audio-session note
+  // in lib/audioContext.js.
+  const { claim: claimAudioSession, release: releaseAudioSession } = useAudioSessionClaim('playback');
+
+  const [streaming, setStreaming] = useState(false);
+  const [videoEnabled, setVideoEnabled] = useState(true);
+  const [audioEnabled, setAudioEnabled] = useState(true);
+  const [devices, setDevices] = useState({ video: [], audio: [] });
+  const [selectedVideo, setSelectedVideo] = useState('0');
+  const [selectedAudio, setSelectedAudio] = useState('0');
+  const [error, setError] = useState(null);
+  const [audioLevel, setAudioLevel] = useState(0);
+  const [showSettings, setShowSettings] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
+  const [audioNeedsInteraction, setAudioNeedsInteraction] = useState(false);
+
+  // Load saved device preferences
+  useEffect(() => {
+    const saved = safeReadJsonStorage(MEDIA_CONSTRAINTS_KEY);
+    if (saved && typeof saved === 'object') {
+      const { videoDeviceId, audioDeviceId } = saved;
+      if (videoDeviceId) setSelectedVideo(videoDeviceId);
+      if (audioDeviceId) setSelectedAudio(audioDeviceId);
+    } else if (safeReadStorage(MEDIA_CONSTRAINTS_KEY) !== null) {
+      // Corrupt/unparseable entry — clear it so it stops failing on every load.
+      safeRemoveStorage(MEDIA_CONSTRAINTS_KEY);
+    }
+  }, []);
+
+  // Save device preferences when they change
+  useEffect(() => {
+    if (selectedVideo || selectedAudio) {
+      safeWriteStorage(MEDIA_CONSTRAINTS_KEY, JSON.stringify({
+        videoDeviceId: selectedVideo,
+        audioDeviceId: selectedAudio
+      }));
+    }
+  }, [selectedVideo, selectedAudio]);
+
+  // Fetch available devices from server
+  const fetchDevices = useCallback(async () => {
+    const response = await api.get('/media/devices');
+    setDevices(response.data);
+
+    // Set default selections if not already set
+    if (!selectedVideo && response.data.video.length > 0) {
+      setSelectedVideo(response.data.video[0].id);
+    }
+    if (!selectedAudio && response.data.audio.length > 0) {
+      setSelectedAudio(response.data.audio[0].id);
+    }
+  }, [selectedVideo, selectedAudio]);
+
+  // Set up audio level monitoring from audio element. An HTMLMediaElement can be
+  // attached to only one MediaElementAudioSourceNode for its lifetime (Web Audio
+  // spec) — the <audio> element here is never remounted, so the AudioContext and
+  // its source node are built ONCE per element and reused across every stream
+  // restart. A restart only resumes the existing context and restarts the meter
+  // loop; the context itself is closed exclusively on unmount (see the cleanup
+  // effect below).
+  const setupAudioAnalyser = useCallback(async (audioElement) => {
+    if (animationFrameRef.current) {
+      cancelAnimationFrame(animationFrameRef.current);
+      animationFrameRef.current = null;
+    }
+
+    let audioContext = audioContextRef.current;
+    let analyser = analyserRef.current;
+
+    if (!audioContext || !mediaSourceRef.current) {
+      // The graph is built BEFORE the session claim, on purpose: node
+      // construction can throw (createMediaElementSource refuses an element
+      // that is already wired to another source node), and a throw past the
+      // claim would leave the document pinned output-only with no release left
+      // to call. Building against a not-yet-resumed context is fine — only the
+      // resume has to happen with the claim in force, so the context comes up
+      // on the right session.
+      audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      analyser = audioContext.createAnalyser();
+      const source = audioContext.createMediaElementSource(audioElement);
+
+      analyser.fftSize = 256;
+      source.connect(analyser);
+      source.connect(audioContext.destination); // Connect to speakers
+
+      audioContextRef.current = audioContext;
+      mediaSourceRef.current = source;
+      analyserRef.current = analyser;
+    }
+
+    // One slot: a re-setup (device switch, stream restart) replaces the previous
+    // claim rather than stranding it.
+    claimAudioSession();
+
+    // Bring the context up if it isn't running (browser autoplay policy, or
+    // iOS's `'interrupted'` after a call/lock) — see lib/audioContext.js.
+    await resumeAudioContext(audioContext).catch(() => {
+      setAudioNeedsInteraction(true);
+    });
+
+    // Use time-domain data for better audio level detection
+    const dataArray = new Uint8Array(analyser.fftSize);
+
+    const updateLevel = () => {
+      analyser.getByteTimeDomainData(dataArray);
+      // Calculate RMS (root mean square) for accurate audio level
+      let sum = 0;
+      for (let i = 0; i < dataArray.length; i++) {
+        const normalized = (dataArray[i] - 128) / 128;
+        sum += normalized * normalized;
+      }
+      const rms = Math.sqrt(sum / dataArray.length);
+      setAudioLevel(Math.min(rms * 3, 1)); // Scale up for visibility
+      animationFrameRef.current = requestAnimationFrame(updateLevel);
+    };
+
+    updateLevel();
+  }, [claimAudioSession]);
+
+  // Enable audio with user interaction (for mobile browsers)
+  const enableAudio = useCallback(async () => {
+    if (audioRef.current && audioContextRef.current) {
+      // Resume AudioContext — the whole point of this button, so it has to cover
+      // every non-running state, not just `'suspended'`.
+      await resumeAudioContext(audioContextRef.current);
+
+      // Play audio element
+      await audioRef.current.play();
+
+      setAudioNeedsInteraction(false);
+      setError(null);
+    }
+  }, []);
+
+  // Start media stream from server. `overrides` lets a caller (toggleVideo /
+  // toggleAudio) post the value it JUST computed instead of the state var,
+  // which a `useCallback` closes over from the render that created it — a
+  // stale-closure restart would tell the server to keep streaming the OLD
+  // enabled/disabled flag for one more round-trip.
+  const startMedia = useCallback(async (overrides = {}) => {
+    setIsLoading(true);
+    setError(null);
+    setAudioNeedsInteraction(false);
+
+    const video = overrides.video !== undefined ? overrides.video : videoEnabled;
+    const audio = overrides.audio !== undefined ? overrides.audio : audioEnabled;
+
+    // Start streaming on server
+    await api.post('/media/start', {
+      videoDeviceId: selectedVideo,
+      audioDeviceId: selectedAudio,
+      video,
+      audio
+    });
+
+    setStreaming(true);
+    setIsLoading(false);
+  }, [videoEnabled, audioEnabled, selectedVideo, selectedAudio]);
+
+  // Set up media sources when streaming starts
+  useEffect(() => {
+    if (!streaming) return undefined;
+    // Pausing the element (stopMedia, a restart, unmount) rejects an in-flight
+    // play() with AbortError, and the rejection handler below sets up the
+    // analyser anyway — which would CLAIM the audio session again just after
+    // stopMedia released it, pinning the page output-only with nothing running
+    // to hand it back. `active` drops both continuations once this effect run is
+    // superseded.
+    let active = true;
+
+    const timestamp = Date.now();
+
+    // Set video source to server stream
+    if (videoRef.current && videoEnabled) {
+      videoRef.current.src = `/api/media/video?t=${timestamp}`;
+    }
+
+    // Set audio source to server stream and set up analyzer
+    if (audioRef.current && audioEnabled) {
+      audioRef.current.src = `/api/media/audio?t=${timestamp}`;
+
+      audioRef.current.play().then(() => {
+        if (active) setupAudioAnalyser(audioRef.current).catch(() => {});
+      }).catch(() => {
+        if (!active) return;
+        // On mobile browsers, autoplay is often blocked - show interaction prompt
+        setAudioNeedsInteraction(true);
+        setupAudioAnalyser(audioRef.current).catch(() => {}); // Set up analyser anyway for when user enables
+      });
+    }
+
+    return () => { active = false; };
+  }, [streaming, videoEnabled, audioEnabled, setupAudioAnalyser]);
+
+  // Stop media stream
+  const stopMedia = useCallback(async () => {
+    // Stop streaming on server
+    await api.post('/media/stop');
+
+    if (videoRef.current) {
+      videoRef.current.src = '';
+    }
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current.src = '';
+    }
+    if (audioContextRef.current) {
+      // Suspend, don't close — the context and its MediaElementSourceNode are
+      // scoped to the <audio> element's lifetime (it can only ever be wired to
+      // ONE source node), so they're reused on the next start. Only the
+      // unmount cleanup effect below closes the context.
+      audioContextRef.current.suspend?.()?.catch(() => {});
+    }
+    if (animationFrameRef.current) {
+      cancelAnimationFrame(animationFrameRef.current);
+      animationFrameRef.current = null;
+    }
+    // Nothing is sounding any more, so hand the session back — holding it would
+    // follow the user (SPA, no reload) onto every other page and refuse the
+    // globally-mounted VoiceWidget's microphone.
+    releaseAudioSession();
+    setStreaming(false);
+    setAudioLevel(0);
+  }, [releaseAudioSession]);
+
+  // Toggle video
+  const toggleVideo = useCallback(() => {
+    const newValue = !videoEnabled;
+    setVideoEnabled(newValue);
+
+    if (streaming) {
+      // Restart stream with the NEW setting — startMedia's own closure over
+      // videoEnabled is still the pre-toggle value in this render.
+      startMedia({ video: newValue });
+    }
+  }, [videoEnabled, streaming, startMedia]);
+
+  // Toggle audio
+  const toggleAudio = useCallback(() => {
+    const newValue = !audioEnabled;
+    setAudioEnabled(newValue);
+
+    if (streaming) {
+      // Restart stream with the NEW setting — same stale-closure reason as above.
+      startMedia({ audio: newValue });
+    }
+  }, [audioEnabled, streaming, startMedia]);
+
+  // Fetch devices on mount
+  useEffect(() => {
+    fetchDevices().catch(err => {
+      setError(`Failed to fetch devices: ${err.message}`);
+    });
+  }, [fetchDevices]);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (streaming) {
+        stopMedia();
+      }
+    };
+  }, [streaming, stopMedia]);
+
+  // The AudioContext and its MediaElementSourceNode are scoped to the <audio>
+  // element's lifetime (setupAudioAnalyser builds them once and reuses them
+  // across restarts), so they're closed only here — the element itself is
+  // never remounted while this component is mounted.
+  useEffect(() => {
+    return () => {
+      if (audioContextRef.current) {
+        audioContextRef.current.close?.()?.catch(() => {});
+        audioContextRef.current = null;
+      }
+      mediaSourceRef.current = null;
+      analyserRef.current = null;
+    };
+  }, []);
+
+  // Handle device change
+  const handleDeviceChange = useCallback(async (type, deviceId) => {
+    if (type === 'video') {
+      setSelectedVideo(deviceId);
+    } else {
+      setSelectedAudio(deviceId);
+    }
+
+    // Restart stream with new device if currently streaming
+    if (streaming) {
+      // Small delay to let state update. Clear any pending restart first so
+      // rapid device switches don't stack multiple startMedia() calls, and
+      // so an unmount can cancel the last one (see cleanup effect below).
+      if (deviceRestartTimerRef.current) clearTimeout(deviceRestartTimerRef.current);
+      deviceRestartTimerRef.current = setTimeout(() => {
+        deviceRestartTimerRef.current = null;
+        startMedia();
+      }, 100);
+    }
+  }, [streaming, startMedia]);
+
+  // Cancel any pending device-change restart on unmount so a deferred
+  // startMedia() can't fire into a component that's no longer mounted.
+  useEffect(() => () => {
+    if (deviceRestartTimerRef.current) clearTimeout(deviceRestartTimerRef.current);
+  }, []);
+
+  return (
+    <div>
+      {/* Header */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
+        <div>
+          <h2 className="text-2xl font-bold text-white">Security</h2>
+          <p className="text-gray-500">Turn your PortOS host into a remote security camera and microphone, accessible from your phone over Tailscale</p>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setShowSettings(s => !s)}
+            className={`flex items-center gap-2 px-3 py-1.5 text-sm rounded-lg transition-colors ${
+              showSettings
+                ? 'bg-port-accent text-white'
+                : 'bg-port-card border border-port-border text-gray-400 hover:text-white hover:border-port-accent/50'
+            }`}
+          >
+            <Settings size={16} />
+            <span className="max-sm:sr-only">Settings</span>
+          </button>
+        </div>
+      </div>
+
+      {/* Error display */}
+      {error && (
+        <Banner tone="error" size="lg" className="mb-6">{error}</Banner>
+      )}
+
+      {/* Audio interaction prompt for mobile browsers */}
+      {audioNeedsInteraction && streaming && audioEnabled && (
+        <Banner
+          size="lg"
+          align="center"
+          icon={Volume2}
+          title="Audio requires interaction"
+          className="mb-6"
+          actions={
+            <button
+              onClick={enableAudio}
+              className="px-4 py-2 bg-port-warning text-white rounded-lg font-medium hover:bg-port-warning/80 transition-colors whitespace-nowrap"
+            >
+              Enable Audio
+            </button>
+          }
+        >
+          <p className="text-sm text-gray-400 mt-1">
+            Your browser requires user interaction to enable audio playback
+          </p>
+        </Banner>
+      )}
+
+      {/* Settings panel */}
+      {showSettings && (
+        <div className="mb-6 p-4 bg-port-card border border-port-border rounded-xl">
+          <h3 className="text-lg font-semibold text-white mb-4">Device Settings</h3>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {/* Video device selector */}
+            <FormField
+              labelClassName="block text-sm text-gray-400 mb-2"
+              label={<><Camera size={14} className="inline mr-2" />Camera</>}
+            >
+              <select
+                value={selectedVideo}
+                onChange={(e) => handleDeviceChange('video', e.target.value)}
+                className="w-full px-3 py-2 bg-port-bg border border-port-border rounded-lg text-white text-sm focus:outline-hidden focus:border-port-accent"
+              >
+                {devices.video.length === 0 ? (
+                  <option value="">No cameras found</option>
+                ) : (
+                  devices.video.map((device) => (
+                    <option key={device.id} value={device.id}>
+                      {device.name}
+                    </option>
+                  ))
+                )}
+              </select>
+            </FormField>
+
+            {/* Audio device selector */}
+            <FormField
+              labelClassName="block text-sm text-gray-400 mb-2"
+              label={<><Mic size={14} className="inline mr-2" />Microphone</>}
+            >
+              <select
+                value={selectedAudio}
+                onChange={(e) => handleDeviceChange('audio', e.target.value)}
+                className="w-full px-3 py-2 bg-port-bg border border-port-border rounded-lg text-white text-sm focus:outline-hidden focus:border-port-accent"
+              >
+                {devices.audio.length === 0 ? (
+                  <option value="">No microphones found</option>
+                ) : (
+                  devices.audio.map((device) => (
+                    <option key={device.id} value={device.id}>
+                      {device.name}
+                    </option>
+                  ))
+                )}
+              </select>
+            </FormField>
+          </div>
+        </div>
+      )}
+
+      {/* Main content */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        {/* Video preview */}
+        <div className="lg:col-span-2">
+          <div className="bg-port-card border border-port-border rounded-xl overflow-hidden">
+            <div className="aspect-video bg-black relative">
+              {streaming && videoEnabled ? (
+                <img
+                  ref={videoRef}
+                  alt="Server camera stream"
+                  className="w-full h-full object-cover"
+                />
+              ) : (
+                <div className="absolute inset-0 flex flex-col items-center justify-center text-gray-500">
+                  <VideoOff size={48} className="mb-4" />
+                  <p className="text-sm">
+                    {!streaming ? 'Camera not started' : 'Camera disabled'}
+                  </p>
+                </div>
+              )}
+              {/* Hidden audio element for playback */}
+              <audio ref={audioRef} crossOrigin="anonymous" style={{ display: 'none' }} />
+
+              {/* Loading overlay */}
+              {isLoading && (
+                <div className="absolute inset-0 flex items-center justify-center bg-black/50">
+                  <RefreshCw size={32} className="text-white animate-spin" />
+                </div>
+              )}
+            </div>
+
+            {/* Controls */}
+            <div className="p-4 flex items-center justify-center gap-4">
+              <button
+                onClick={toggleVideo}
+                disabled={!streaming}
+                className={`p-3 rounded-full transition-colors ${
+                  videoEnabled
+                    ? 'bg-port-card border border-port-border text-white hover:bg-port-border'
+                    : 'bg-port-error/20 text-port-error'
+                } disabled:opacity-50 disabled:cursor-not-allowed`}
+                title={videoEnabled ? 'Disable camera' : 'Enable camera'} aria-label={videoEnabled ? 'Disable camera' : 'Enable camera'}
+              >
+                {videoEnabled ? <Video size={20} /> : <VideoOff size={20} />}
+              </button>
+
+              <button
+                onClick={toggleAudio}
+                disabled={!streaming}
+                className={`p-3 rounded-full transition-colors ${
+                  audioEnabled
+                    ? 'bg-port-card border border-port-border text-white hover:bg-port-border'
+                    : 'bg-port-error/20 text-port-error'
+                } disabled:opacity-50 disabled:cursor-not-allowed`}
+                title={audioEnabled ? 'Mute microphone' : 'Unmute microphone'} aria-label={audioEnabled ? 'Mute microphone' : 'Unmute microphone'}
+              >
+                {audioEnabled ? <Mic size={20} /> : <MicOff size={20} />}
+              </button>
+
+              {!streaming ? (
+                <button
+                  onClick={startMedia}
+                  disabled={isLoading}
+                  className="px-6 py-3 bg-port-accent text-white rounded-full font-medium hover:bg-port-accent/80 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {isLoading ? 'Starting...' : 'Start Media'}
+                </button>
+              ) : (
+                <button
+                  onClick={stopMedia}
+                  className="px-6 py-3 bg-port-error text-white rounded-full font-medium hover:bg-port-error/80 transition-colors"
+                >
+                  Stop Media
+                </button>
+              )}
+
+              <button
+                onClick={fetchDevices}
+                disabled={isLoading}
+                className="p-3 rounded-full bg-port-card border border-port-border text-gray-400 hover:text-white hover:bg-port-border transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                title="Refresh devices" aria-label="Refresh devices"
+              >
+                <RefreshCw size={20} className={isLoading ? 'animate-spin' : ''} />
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {/* Audio level and status */}
+        <div className="space-y-4">
+          {/* Audio level meter */}
+          <div className="bg-port-card border border-port-border rounded-xl p-4">
+            <div className="flex items-center gap-2 mb-4">
+              <Volume2 size={20} className="text-port-accent" />
+              <h3 className="font-semibold text-white">Audio Level</h3>
+            </div>
+
+            <div className="space-y-3">
+              {/* Visual meter */}
+              <div className="h-4 bg-port-bg rounded-full overflow-hidden">
+                <div
+                  className="h-full transition-all duration-75 rounded-full"
+                  style={{
+                    width: `${audioLevel * 100}%`,
+                    backgroundColor: audioLevel > 0.7
+                      ? 'rgb(var(--port-error))'
+                      : audioLevel > 0.4
+                        ? 'rgb(var(--port-warning))'
+                        : 'rgb(var(--port-success))'
+                  }}
+                />
+              </div>
+
+              {/* Level bars */}
+              <div className="flex gap-1">
+                {[...Array(20)].map((_, i) => (
+                  <div
+                    key={i}
+                    className={`flex-1 h-8 rounded transition-colors ${
+                      i / 20 < audioLevel
+                        ? i < 12
+                          ? 'bg-port-success'
+                          : i < 16
+                            ? 'bg-port-warning'
+                            : 'bg-port-error'
+                        : 'bg-port-border'
+                    }`}
+                  />
+                ))}
+              </div>
+
+              <p className="text-sm text-gray-500 text-center">
+                {!streaming
+                  ? 'Start media to see audio levels'
+                  : !audioEnabled
+                    ? 'Microphone disabled'
+                    : audioLevel > 0.1
+                      ? 'Receiving audio'
+                      : 'No audio detected'}
+              </p>
+            </div>
+          </div>
+
+          {/* Status info */}
+          <div className="bg-port-card border border-port-border rounded-xl p-4">
+            <h3 className="font-semibold text-white mb-4">Status</h3>
+            <div className="space-y-3">
+              <div className="flex items-center justify-between">
+                <span className="text-gray-400">Stream</span>
+                <span className={`text-sm font-medium ${streaming ? 'text-port-success' : 'text-gray-500'}`}>
+                  {streaming ? 'Active' : 'Inactive'}
+                </span>
+              </div>
+
+              <div className="flex items-center justify-between">
+                <span className="text-gray-400">Camera</span>
+                <span className={`text-sm font-medium ${
+                  streaming && videoEnabled ? 'text-port-success' : 'text-gray-500'
+                }`}>
+                  {streaming ? (videoEnabled ? 'On' : 'Off') : '-'}
+                </span>
+              </div>
+
+              <div className="flex items-center justify-between">
+                <span className="text-gray-400">Microphone</span>
+                <span className={`text-sm font-medium ${
+                  streaming && audioEnabled ? 'text-port-success' : 'text-gray-500'
+                }`}>
+                  {streaming ? (audioEnabled ? 'On' : 'Off') : '-'}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          {/* Instructions */}
+          <div className="bg-port-card border border-port-border rounded-xl p-4">
+            <h3 className="font-semibold text-white mb-3">Instructions</h3>
+            <ul className="space-y-2 text-sm text-gray-400">
+              <li>1. Click &quot;Start Media&quot; to stream from server</li>
+              <li>2. Video and audio stream from the PortOS server</li>
+              <li>3. Use controls to toggle camera/mic</li>
+              <li>4. Select different devices in Settings</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}

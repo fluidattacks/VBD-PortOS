@@ -1,0 +1,308 @@
+/**
+ * Social Accounts Service
+ *
+ * Manages the user's social media accounts as part of the Digital Twin.
+ * These are the user's OWN accounts (not agent platform accounts) used for:
+ * - Building a communication profile
+ * - Reference for content creation and profile directory
+ * - Future content ingestion and style learning (when supported)
+ * - Future account management automation
+ */
+
+import { join } from 'path';
+import { v4 as uuidv4 } from '../lib/uuid.js';
+import EventEmitter from 'events';
+import { PATHS, createCachedStore } from '../lib/fileUtils.js';
+import { recordTombstone } from '../lib/tombstones.js';
+
+const DATA_FILE = join(PATHS.digitalTwin, 'social-accounts.json');
+// `deletedAccounts` holds `{ id, deletedAt }` tombstones for accounts the user
+// removed (#3532). Peer sync unions accounts add-only, so without them a machine
+// that still has the account re-adds it forever. No migration is needed: an
+// existing file simply has no key, and every reader treats that as an empty list.
+const store = createCachedStore(DATA_FILE, { accounts: {}, deletedAccounts: [] }, { context: 'socialAccounts' });
+
+export const socialAccountEvents = new EventEmitter();
+
+// Supported platform definitions
+export const PLATFORMS = {
+  github: {
+    label: 'GitHub',
+    urlTemplate: 'https://github.com/{username}',
+    icon: 'github',
+    contentTypes: ['code', 'repositories', 'contributions'],
+    category: 'developer'
+  },
+  instagram: {
+    label: 'Instagram',
+    urlTemplate: 'https://instagram.com/{username}',
+    icon: 'instagram',
+    contentTypes: ['photos', 'stories', 'reels'],
+    category: 'social'
+  },
+  facebook: {
+    label: 'Facebook',
+    urlTemplate: 'https://facebook.com/{username}',
+    icon: 'facebook',
+    contentTypes: ['posts', 'photos', 'events'],
+    category: 'social'
+  },
+  linkedin: {
+    label: 'LinkedIn',
+    urlTemplate: 'https://linkedin.com/in/{username}',
+    icon: 'linkedin',
+    contentTypes: ['posts', 'articles', 'profile'],
+    category: 'professional'
+  },
+  x: {
+    label: 'X (Twitter)',
+    urlTemplate: 'https://x.com/{username}',
+    icon: 'twitter',
+    contentTypes: ['tweets', 'threads', 'likes'],
+    category: 'social'
+  },
+  substack: {
+    label: 'Substack',
+    urlTemplate: 'https://{username}.substack.com',
+    icon: 'newspaper',
+    contentTypes: ['articles', 'newsletters'],
+    category: 'writing'
+  },
+  medium: {
+    label: 'Medium',
+    urlTemplate: 'https://medium.com/@{username}',
+    icon: 'pen-tool',
+    contentTypes: ['articles', 'responses'],
+    category: 'writing'
+  },
+  youtube: {
+    label: 'YouTube',
+    urlTemplate: 'https://youtube.com/@{username}',
+    icon: 'youtube',
+    contentTypes: ['videos', 'shorts', 'comments'],
+    category: 'video'
+  },
+  tiktok: {
+    label: 'TikTok',
+    urlTemplate: 'https://tiktok.com/@{username}',
+    icon: 'music',
+    contentTypes: ['videos', 'sounds'],
+    category: 'video'
+  },
+  reddit: {
+    label: 'Reddit',
+    urlTemplate: 'https://reddit.com/user/{username}',
+    icon: 'message-circle',
+    contentTypes: ['posts', 'comments'],
+    category: 'community'
+  },
+  bluesky: {
+    label: 'Bluesky',
+    urlTemplate: 'https://bsky.app/profile/{username}',
+    icon: 'cloud',
+    contentTypes: ['posts', 'reposts'],
+    category: 'social'
+  },
+  mastodon: {
+    label: 'Mastodon',
+    urlTemplate: '{url}',
+    icon: 'globe',
+    contentTypes: ['toots', 'boosts'],
+    category: 'social'
+  },
+  threads: {
+    label: 'Threads',
+    urlTemplate: 'https://threads.net/@{username}',
+    icon: 'at-sign',
+    contentTypes: ['posts', 'replies'],
+    category: 'social'
+  },
+  other: {
+    label: 'Other',
+    urlTemplate: '{url}',
+    icon: 'link',
+    contentTypes: [],
+    category: 'other'
+  }
+};
+
+// Exported so the digital-twin peer-sync (digital-twin-sync.js) can read/merge/
+// write social accounts through the owning service — keeping the cache fresh and
+// any future save hooks intact rather than writing the file out from under it.
+export const loadAccounts = store.load;
+export const saveAccounts = store.save;
+export const invalidateCache = store.invalidateCache;
+
+export function notifyChanged(action = 'update', accountId = null) {
+  socialAccountEvents.emit('changed', { action, accountId, timestamp: Date.now() });
+}
+
+/**
+ * Get all social accounts
+ */
+export async function getAllAccounts() {
+  const data = await loadAccounts();
+  return Object.entries(data.accounts).map(([id, account]) => ({
+    id,
+    ...account
+  }));
+}
+
+/**
+ * Get account by ID
+ */
+export async function getAccountById(id) {
+  const data = await loadAccounts();
+  const account = data.accounts[id];
+  if (!account) return null;
+  return { id, ...account };
+}
+
+/**
+ * Get accounts by platform
+ */
+export async function getAccountsByPlatform(platform) {
+  const accounts = await getAllAccounts();
+  return accounts.filter(a => a.platform === platform);
+}
+
+/**
+ * Get accounts by category
+ */
+export async function getAccountsByCategory(category) {
+  const accounts = await getAllAccounts();
+  return accounts.filter(a => {
+    const platformDef = PLATFORMS[a.platform];
+    return platformDef && platformDef.category === category;
+  });
+}
+
+/**
+ * Create a new social account
+ */
+export async function createAccount(accountData) {
+  const id = uuidv4();
+  const now = new Date().toISOString();
+
+  const account = {
+    platform: accountData.platform,
+    username: accountData.username,
+    displayName: accountData.displayName || accountData.username,
+    url: accountData.url || buildUrl(accountData.platform, accountData.username),
+    bio: accountData.bio || '',
+    contentTypes: accountData.contentTypes || PLATFORMS[accountData.platform]?.contentTypes || [],
+    ingestionEnabled: accountData.ingestionEnabled ?? false,
+    ingestionStatus: 'pending',
+    lastIngested: null,
+    contentCount: 0,
+    notes: accountData.notes || '',
+    createdAt: now,
+    updatedAt: now
+  };
+
+  await store.mutate((data) => { data.accounts[id] = account; });
+  notifyChanged('create', id);
+
+  console.log(`🔗 Added social account: ${account.platform}/${account.username} (${id})`);
+  return { id, ...account };
+}
+
+/**
+ * Update a social account
+ */
+export async function updateAccount(id, updates) {
+  let account = null;
+  await store.mutate((data) => {
+    if (!data.accounts[id]) return data;
+
+    const allowed = [
+      'username', 'displayName', 'url', 'bio', 'contentTypes',
+      'ingestionEnabled', 'ingestionStatus', 'lastIngested',
+      'contentCount', 'notes'
+    ];
+
+    for (const key of allowed) {
+      if (updates[key] !== undefined) {
+        data.accounts[id][key] = updates[key];
+      }
+    }
+    data.accounts[id].updatedAt = new Date().toISOString();
+    account = data.accounts[id];
+    return data;
+  });
+
+  if (!account) return null;
+  notifyChanged('update', id);
+
+  console.log(`📝 Updated social account: ${account.platform}/${account.username} (${id})`);
+  return { id, ...account };
+}
+
+/**
+ * Delete a social account
+ */
+export async function deleteAccount(id) {
+  let account = null;
+  await store.mutate((data) => {
+    if (!data.accounts[id]) return data;
+    account = data.accounts[id];
+    delete data.accounts[id];
+    // Tombstone the id so peer sync — which unions accounts add-only — can't
+    // resurrect it from a machine that still has it, and so the delete
+    // PROPAGATES to that machine rather than only being defended here (#3532).
+    // The account id is the right key: unlike Digital Twin document ids it is
+    // minted once by whichever machine created the account and then travels
+    // verbatim as the `accounts` map key, so every peer agrees on it.
+    data.deletedAccounts = recordTombstone(data.deletedAccounts, id, { keyField: 'id' });
+    return data;
+  });
+
+  if (!account) return false;
+  notifyChanged('delete', id);
+
+  console.log(`🗑️ Removed social account: ${account.platform}/${account.username} (${id})`);
+  return true;
+}
+
+/**
+ * Get supported platforms list
+ */
+export function getSupportedPlatforms() {
+  return Object.entries(PLATFORMS).map(([id, platform]) => ({
+    id,
+    ...platform
+  }));
+}
+
+/**
+ * Get account summary stats
+ */
+export async function getAccountStats() {
+  const accounts = await getAllAccounts();
+  const byCategory = {};
+  const byPlatform = {};
+
+  for (const account of accounts) {
+    const platformDef = PLATFORMS[account.platform];
+    const category = platformDef?.category || 'other';
+
+    byCategory[category] = (byCategory[category] || 0) + 1;
+    byPlatform[account.platform] = (byPlatform[account.platform] || 0) + 1;
+  }
+
+  return {
+    total: accounts.length,
+    ingestionEnabled: accounts.filter(a => a.ingestionEnabled).length,
+    byCategory,
+    byPlatform
+  };
+}
+
+/**
+ * Build a profile URL from platform and username
+ */
+function buildUrl(platform, username) {
+  const platformDef = PLATFORMS[platform];
+  if (!platformDef) return '';
+  return platformDef.urlTemplate.replace('{username}', username);
+}

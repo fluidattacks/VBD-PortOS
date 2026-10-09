@@ -1,0 +1,146 @@
+import { auth } from '@googleapis/calendar';
+import { join } from 'path';
+import { atomicWrite, ensureDir, PATHS, tryReadFile } from '../lib/fileUtils.js';
+import { ServerError } from '../lib/errorHandler.js';
+import { PORTS } from '../lib/ports.js';
+
+const { OAuth2: OAuth2Client } = auth;
+const AUTH_DIR = join(PATHS.calendar, 'google-auth');
+const CREDENTIALS_FILE = join(AUTH_DIR, 'credentials.json');
+const TOKENS_FILE = join(AUTH_DIR, 'tokens.json');
+const SCOPES = [
+  'https://www.googleapis.com/auth/calendar',
+  'https://www.googleapis.com/auth/gmail.modify'
+];
+export const OAUTH_REDIRECT_URI = `http://${process.env.PUBLIC_HOST || 'localhost'}:${process.env.PORT || PORTS.API}/api/calendar/google/oauth/callback`;
+
+let oAuth2Client = null;
+
+async function ensureAuthDir() {
+  await ensureDir(AUTH_DIR);
+}
+
+export async function getCredentials() {
+  await ensureAuthDir();
+  const raw = await tryReadFile(CREDENTIALS_FILE);
+  if (!raw) return null;
+  return JSON.parse(raw);
+}
+
+export async function saveCredentials({ clientId, clientSecret }) {
+  await ensureAuthDir();
+  const credentials = { clientId, clientSecret, redirectUri: OAUTH_REDIRECT_URI };
+  await atomicWrite(CREDENTIALS_FILE, credentials);
+  oAuth2Client = null; // Reset client
+  console.log('📅 Google OAuth credentials saved');
+  return credentials;
+}
+
+export async function getTokens() {
+  await ensureAuthDir();
+  const raw = await tryReadFile(TOKENS_FILE);
+  if (!raw) return null;
+  return JSON.parse(raw);
+}
+
+async function saveTokens(tokens) {
+  await ensureAuthDir();
+  await atomicWrite(TOKENS_FILE, tokens);
+  console.log('📅 Google OAuth tokens saved');
+}
+
+async function persistRefreshedTokens(newTokens) {
+  const existing = (await getTokens()) || {};
+  await saveTokens({ ...existing, ...newTokens });
+  console.log('📅 Google OAuth tokens refreshed');
+}
+
+function attachTokenPersistence(client) {
+  client.on('tokens', (newTokens) => {
+    persistRefreshedTokens(newTokens)
+      .catch((err) => console.error(`❌ Failed to persist refreshed Google OAuth tokens: ${err.message}`));
+  });
+}
+
+export async function clearAuth() {
+  await ensureAuthDir();
+  await atomicWrite(TOKENS_FILE, {}).catch(() => {});
+  oAuth2Client = null;
+  console.log('📅 Google OAuth tokens cleared');
+}
+
+function createOAuth2Client(credentials) {
+  return new OAuth2Client(
+    credentials.clientId,
+    credentials.clientSecret,
+    credentials.redirectUri || OAUTH_REDIRECT_URI
+  );
+}
+
+export async function getAuthUrl(returnTo = 'calendar') {
+  const credentials = await getCredentials();
+  if (!credentials) throw new ServerError('No Google OAuth credentials configured', { status: 400 });
+
+  const client = createOAuth2Client(credentials);
+  const url = client.generateAuthUrl({
+    access_type: 'offline',
+    prompt: 'consent',
+    scope: SCOPES,
+    // The callback is shared by Calendar and Messages. Keep the return target
+    // in Google's round trip so authorization started in Messages lands back
+    // on the Messages config tab.
+    state: returnTo === 'messages' ? 'messages' : 'calendar'
+  });
+  return { url };
+}
+
+export async function handleCallback(code) {
+  const credentials = await getCredentials();
+  if (!credentials) throw new ServerError('No credentials configured', { status: 400 });
+
+  const client = createOAuth2Client(credentials);
+  const { tokens } = await client.getToken(code);
+  await saveTokens(tokens);
+  oAuth2Client = client;
+  oAuth2Client.setCredentials(tokens);
+
+  attachTokenPersistence(oAuth2Client);
+
+  console.log('📅 Google OAuth callback processed, tokens stored');
+  return { success: true };
+}
+
+export async function getAuthenticatedClient() {
+  const credentials = await getCredentials();
+  if (!credentials?.clientId) return null;
+
+  const tokens = await getTokens();
+  if (!tokens?.access_token) return null;
+
+  if (!oAuth2Client) {
+    oAuth2Client = createOAuth2Client(credentials);
+    oAuth2Client.setCredentials(tokens);
+
+    attachTokenPersistence(oAuth2Client);
+  }
+
+  return oAuth2Client;
+}
+
+export function needsScopeUpgrade(tokens) {
+  if (!tokens?.scope) return true;
+  const scopes = tokens.scope.split(' ');
+  // Check all required scopes are present
+  return !SCOPES.every(s => scopes.includes(s));
+}
+
+export async function getAuthStatus() {
+  const credentials = await getCredentials();
+  const tokens = await getTokens();
+  return {
+    hasCredentials: !!credentials?.clientId,
+    hasTokens: !!tokens?.access_token,
+    expiryDate: tokens?.expiry_date ? new Date(tokens.expiry_date).toISOString() : null,
+    needsScopeUpgrade: needsScopeUpgrade(tokens)
+  };
+}

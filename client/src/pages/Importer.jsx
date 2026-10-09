@@ -1,0 +1,1327 @@
+import { memo, useEffect, useMemo, useRef, useState } from 'react';
+import { useNavigate, useSearchParams } from 'react-router';
+import { FileInput, Loader2, ArrowLeft, CheckCircle2, AlertTriangle, ChevronDown, ChevronRight, Wand2, Sparkles } from 'lucide-react';
+import toast from '../components/ui/Toast';
+import { useAsyncAction } from '../hooks/useAsyncAction';
+import { useImporterProgress, stageStatusIcon } from '../hooks/useImporterProgress';
+import { STORY_SHAPES } from '../components/pipeline/StoryShapes';
+import EntryCard from '../components/universe/EntryCard';
+import EntityCombobox from '../components/EntityCombobox';
+import ProviderModelSelector from '../components/ProviderModelSelector';
+import useProviderModels from '../hooks/useProviderModels';
+import { previewCanonFragments } from '../lib/canonPrompt';
+import { resolveImporterDeepLink } from '../lib/importerDeepLink';
+import { listUniverseSummaries, listPipelineSeriesSummaries } from '../services/api';
+import {
+  analyzeImport,
+  classifyImport,
+  commitImport,
+  retryImporterIssues,
+  getImporterConfig,
+  IMPORTER_CONTENT_TYPES,
+  IMPORTER_SOURCE_CHAR_LIMIT_FALLBACK,
+  CLASSIFY_SOURCE_HEAD_CHARS,
+} from '../services/apiImporter';
+import { formatCount } from '../utils/formatters';
+
+const CONTENT_TYPE_LABELS = {
+  'short-story': 'Short Story',
+  'novel': 'Novel',
+  'screenplay': 'Screenplay',
+  'comic-script': 'Comic Script',
+};
+
+// Mirrors the server's CONTENT_TYPE_SEED_STAGE (server/services/importer.js):
+// a script-form content type seeds its matching script stage (ready) instead
+// of prose. Drives the Review-panel copy + per-issue excerpt label so they
+// name the stage the verbatim excerpt actually lands in.
+const SEED_STAGE_DISPLAY = {
+  'comic-script': { stagePath: 'stages.comicScript.output', excerptLabel: 'Comic script excerpt' },
+  'screenplay': { stagePath: 'stages.teleplay.output', excerptLabel: 'Screenplay excerpt' },
+};
+const DEFAULT_SEED_STAGE_DISPLAY = { stagePath: 'stages.prose.output', excerptLabel: 'Prose excerpt' };
+const seedStageDisplayFor = (contentType) => SEED_STAGE_DISPLAY[contentType] || DEFAULT_SEED_STAGE_DISPLAY;
+
+// Whitelist of arc fields forwarded to the commit endpoint. The wire schema
+// (`importerArcShape`) is `.passthrough()` today and `sanitizeArc` ignores
+// unknowns, but `arcDraft` starts as a shallow clone of the LLM's arc
+// output — which still has the LLM-returned `seasons` field at the top
+// level. Without this strip the seasons would smuggle through to
+// `series.arc` if the schema ever tightens to `.strict()`.
+const ARC_FIELDS_TO_COMMIT = ['logline', 'summary', 'protagonistArc', 'themes', 'shape'];
+const pickArcFields = (arc) => {
+  if (!arc) return null;
+  const out = {};
+  for (const k of ARC_FIELDS_TO_COMMIT) {
+    if (arc[k] !== undefined) out[k] = arc[k];
+  }
+  return out;
+};
+
+// importerIssueEntry caps synopsis at 4000 chars (server schema) — clamp the
+// zipped season text so the structural remap can't 400 on commit.
+const IMPORT_ISSUE_SYNOPSIS_MAX = 4000;
+
+// Pick the arc summary to send when retrying the issue split. Follows the
+// absent-vs-intentionally-empty rule: an ABSENT summary (null/undefined) falls
+// back to the logline, but a present-but-EMPTY summary ('') is an intentional
+// clear in the Review panel — return it as-is so the caller sends no
+// arcSummary and the server fills its own synthetic fallback. A bare
+// `summary || logline` would conflate the two and silently resend the logline
+// as the summary the user just cleared.
+export function resolveRetryArcSummary(arc) {
+  return arc?.summary == null ? arc?.logline : arc.summary;
+}
+
+// Collapse the LLM's multi-season proposal into a SINGLE graphic-novel volume.
+// Every issue is pinned to volume 1; each season's logline/synopsis is folded
+// into the matching issue's synopsis (zipped by order) so the user's "the
+// volume descriptions read better as issue descriptions" intuition is the
+// default for a single book. Issues that already carry a synopsis keep it.
+export function collapseToSingleVolume({ seasonsPreview, issues, seriesName, arc }) {
+  const list = Array.isArray(issues) ? issues : [];
+  const seasons = [{
+    number: 1,
+    title: seriesName || seasonsPreview?.[0]?.title || 'Volume 1',
+    logline: arc?.logline || seasonsPreview?.[0]?.logline || '',
+    synopsis: arc?.summary || '',
+    episodeCountTarget: list.length,
+  }];
+  const mappedIssues = list.map((iss, i) => {
+    if (iss.synopsis && iss.synopsis.trim()) return { ...iss, seasonNumber: 1 };
+    const season = (seasonsPreview || [])[i];
+    const synopsis = season
+      ? [season.logline, season.synopsis].filter(Boolean).join('\n\n').slice(0, IMPORT_ISSUE_SYNOPSIS_MAX)
+      : (iss.synopsis || '');
+    return { ...iss, seasonNumber: 1, synopsis };
+  });
+  return { seasons, issues: mappedIssues };
+}
+
+const emptyIntake = () => ({
+  universeName: '',
+  seriesName: '',
+  contentType: 'short-story',
+  source: '',
+  targetIssueCount: '',
+});
+
+export default function Importer() {
+  const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const [phase, setPhase] = useState('intake'); // 'intake' | 'review'
+  const [intake, setIntake] = useState(emptyIntake);
+  const [preview, setPreview] = useState(null);
+
+  // Existing universes + series power the intake autocomplete: the importer
+  // matches the typed universe/series by name (case-insensitive), so surfacing
+  // the real records lets the user land an exact match instead of guessing the
+  // spelling. `listsLoaded` distinguishes "still fetching" from "fetched and
+  // legitimately empty" so the deep-link resolver doesn't wait forever on an
+  // install with no universes yet.
+  const [universes, setUniverses] = useState([]);
+  const [allSeries, setAllSeries] = useState([]);
+  const [listsLoaded, setListsLoaded] = useState(false);
+  useEffect(() => {
+    let canceled = false;
+    Promise.all([
+      listUniverseSummaries({ silent: true }).catch(() => []),
+      listPipelineSeriesSummaries({ silent: true }).catch(() => []),
+    ]).then(([u, s]) => {
+      if (canceled) return;
+      setUniverses(Array.isArray(u) ? u : []);
+      setAllSeries(Array.isArray(s) ? s : []);
+      setListsLoaded(true);
+    });
+    return () => { canceled = true; };
+  }, []);
+
+  // Apply a `?universeId=…&seriesId=…` (or name-param) deep-link exactly once,
+  // after the lists load so ids can resolve to names. Guarded by a ref so a
+  // later list refresh or param change can't clobber what the user has since
+  // typed.
+  const deepLinkAppliedRef = useRef(false);
+  useEffect(() => {
+    if (deepLinkAppliedRef.current || !listsLoaded) return;
+    deepLinkAppliedRef.current = true;
+    const { universeName, seriesName } = resolveImporterDeepLink({
+      universeId: searchParams.get('universeId'),
+      seriesId: searchParams.get('seriesId'),
+      universeName: searchParams.get('universe'),
+      seriesName: searchParams.get('series'),
+      universes,
+      series: allSeries,
+    });
+    if (!universeName && !seriesName) return;
+    setIntake((prev) => ({
+      ...prev,
+      ...(universeName ? { universeName } : {}),
+      ...(seriesName ? { seriesName } : {}),
+    }));
+  }, [listsLoaded, searchParams, universes, allSeries]);
+
+  // The importer matches by name, so derive the matched universe straight from
+  // the typed name rather than tracking a separate "selected id" that could
+  // drift out of sync with the input. The matched id scopes the series
+  // autocomplete to that universe (series names are matched within a universe).
+  const universeMatch = useMemo(() => {
+    const lower = intake.universeName.trim().toLowerCase();
+    if (!lower) return null;
+    return universes.find((u) => (u.name || '').trim().toLowerCase() === lower) || null;
+  }, [universes, intake.universeName]);
+  const universeSeries = useMemo(
+    () => (universeMatch ? allSeries.filter((s) => s.universeId === universeMatch.id) : []),
+    [allSeries, universeMatch],
+  );
+  const seriesMatch = useMemo(() => {
+    const lower = intake.seriesName.trim().toLowerCase();
+    if (!lower) return null;
+    return universeSeries.find((s) => (s.name || '').trim().toLowerCase() === lower) || null;
+  }, [universeSeries, intake.seriesName]);
+
+  // Combobox option shapes. Memoized so a stable array identity reaches the
+  // child instead of a fresh `.map()` allocation on every keystroke-driven
+  // render. Universes prefer a logline subtitle, falling back to the starter
+  // prompt; series only carry a logline.
+  const universeItems = useMemo(
+    () => universes.map((u) => ({ id: u.id, name: u.name, subtitle: u.logline || u.starterPrompt || '' })),
+    [universes],
+  );
+  const seriesItems = useMemo(
+    () => universeSeries.map((s) => ({ id: s.id, name: s.name, subtitle: s.logline || '' })),
+    [universeSeries],
+  );
+
+  // Live analyze-phase stage progress, driven by `importer:progress` socket
+  // frames. `null` = no run started yet. See `useImporterProgress`.
+  const { stages: analyzeStages, reset: resetAnalyzeStages } = useImporterProgress();
+
+  // Server is the source of truth for the enums — a prior client-side copy
+  // (`IMPORTER_ARC_ROLES_FALLBACK`) silently drifted, so we wait on the GET
+  // rather than shadow it. `arcShapeIds: null` means "config not loaded
+  // yet; render all STORY_SHAPES" — distinguishes from "server shipped []".
+  const [config, setConfig] = useState({
+    sourceCharLimit: IMPORTER_SOURCE_CHAR_LIMIT_FALLBACK,
+    arcRoles: [],
+    arcShapeIds: null,
+  });
+  // Analyze aborts the in-flight config GET so its late-resolving setConfig
+  // can't clobber analyze's server-fresh values.
+  const abortConfigRef = useRef(null);
+  useEffect(() => {
+    const ac = new AbortController();
+    abortConfigRef.current = ac;
+    getImporterConfig({ silent: true, signal: ac.signal }).then((cfg) => {
+      if (ac.signal.aborted || !cfg) return;
+      setConfig({
+        sourceCharLimit: Number.isFinite(cfg.sourceCharLimit) ? cfg.sourceCharLimit : IMPORTER_SOURCE_CHAR_LIMIT_FALLBACK,
+        arcRoles: Array.isArray(cfg.arcRoles) ? cfg.arcRoles : [],
+        arcShapeIds: Array.isArray(cfg.arcShapeIds) && cfg.arcShapeIds.length > 0 ? cfg.arcShapeIds : null,
+      });
+    }).catch((err) => {
+      if (ac.signal.aborted) return;
+      console.warn(`⚠️ Importer config fetch failed — using client fallbacks: ${err?.message || err}`);
+    });
+    return () => ac.abort();
+  }, []);
+
+  // AI provider/model override for the extraction LLM calls (classify +
+  // analyze). Empty string = "use the stage/active provider default" — sent
+  // as `''` and coerced to undefined server-side (see importer*Schema).
+  // `allowDefault` keeps both selectors at `''` (no auto-select) so the
+  // "Default" option is the resting state; `silent` matches the prior
+  // console.warn-only failure behavior for this secondary control.
+  const {
+    providers,
+    selectedProviderId: llmProvider,
+    selectedModel: llmModel,
+    availableModels: llmModels,
+    setSelectedProviderId: setLlmProvider,
+    setSelectedModel: setLlmModel,
+  } = useProviderModels({ allowDefault: true, silent: true });
+
+  const [canonSelections, setCanonSelections] = useState({ characters: [], places: [], objects: [] });
+  const [selectedCanon, setSelectedCanon] = useState({ characters: new Set(), places: new Set(), objects: new Set() });
+  const [arcDraft, setArcDraft] = useState(null);
+  const [seasonsDraft, setSeasonsDraft] = useState([]);
+  const [issuesDraft, setIssuesDraft] = useState([]);
+  // 'single' = one graphic-novel volume holding every issue as a chapter/act;
+  // 'multi' = keep the LLM's multi-season breakdown. Defaults to 'single' for
+  // comic scripts (a graphic novel is one book), 'multi' otherwise.
+  const [structureMode, setStructureMode] = useState('multi');
+  // Server already persisted universe+series+arc but the issue-loop rolled
+  // back. The next commit drops arc/seasons/canon so a retry can't overwrite
+  // server-side edits made between attempts.
+  const [arcAlreadyPersisted, setArcAlreadyPersisted] = useState(false);
+  // Destructive opt-in for existing series — wipes issues + overwrites arc.
+  const [replaceMode, setReplaceMode] = useState(false);
+  // Opt-in AI cleanup of seeded excerpts at commit time (issue #1335). Default
+  // off — it's one LLM call per issue, so a large import opts in explicitly.
+  const [cleanupFormatting, setCleanupFormatting] = useState(false);
+  const [classifyHint, setClassifyHint] = useState(null);
+  // Set when analyze succeeded on canon+arc but the issue split failed — the
+  // Review panel shows a retry affordance instead of throwing the run away.
+  const [issueSplitFailed, setIssueSplitFailed] = useState(false);
+  const [issueSplitError, setIssueSplitError] = useState(null);
+
+  // Stale hint after the source changes would mislead the user.
+  useEffect(() => { setClassifyHint(null); }, [intake.source]);
+
+  const [runClassify, classifying] = useAsyncAction(async () => {
+    if (!intake.source.trim()) return null;
+    const result = await classifyImport({
+      source: intake.source.slice(0, CLASSIFY_SOURCE_HEAD_CHARS),
+      providerOverride: llmProvider,
+      modelOverride: llmModel,
+    }, { silent: true });
+    if (!result) return null;
+    if (result.contentType && IMPORTER_CONTENT_TYPES.includes(result.contentType)) {
+      setIntake((prev) => ({ ...prev, contentType: result.contentType }));
+    }
+    setClassifyHint({
+      contentType: result.contentType,
+      confidence: result.confidence,
+      reasoning: result.reasoning,
+    });
+    return result;
+  }, { errorMessage: 'Auto-detect failed' });
+
+  const [runAnalyze, analyzing] = useAsyncAction(async () => {
+    // A late-resolving config GET would clobber the server-fresh values in
+    // `result.limits` / `arcRoles` / `arcShapeIds` below.
+    abortConfigRef.current?.abort();
+    // Clear any prior run's checklist; the server's `start` frame repopulates
+    // it once the first AI pass begins (a generic spinner shows until then).
+    resetAnalyzeStages();
+    const payload = {
+      universeName: intake.universeName.trim(),
+      seriesName: intake.seriesName.trim(),
+      contentType: intake.contentType,
+      source: intake.source,
+      providerOverride: llmProvider,
+      modelOverride: llmModel,
+    };
+    // Round to an integer — the server schema is z.number().int(), so a
+    // pasted/typed decimal like 2.5 would otherwise 400 with a confusing error.
+    const tic = intake.targetIssueCount === '' ? null : Math.round(Number(intake.targetIssueCount));
+    if (Number.isFinite(tic) && tic > 0) payload.targetIssueCount = tic;
+    const result = await analyzeImport(payload, { silent: true });
+    if (!result) return null;
+    setPreview(result);
+    const chars = result.canonPreview?.characters || [];
+    const places = result.canonPreview?.places || [];
+    const objects = result.canonPreview?.objects || [];
+    setCanonSelections({ characters: chars, places, objects });
+    setSelectedCanon({
+      characters: new Set(chars.map((_, i) => i)),
+      places: new Set(places.map((_, i) => i)),
+      objects: new Set(objects.map((_, i) => i)),
+    });
+    // Strip non-arc keys (e.g. the LLM's top-level `seasons`) at seed time
+    // — guards against the wire schema tightening to `.strict()`.
+    const seededArc = pickArcFields(result.arcPreview);
+    setArcDraft(seededArc);
+    const initialIssues = (result.issueProposals || []).map((i) => ({ ...i }));
+    // Comic scripts default to a single graphic-novel volume; everything else
+    // keeps the LLM's multi-season proposal. The user can flip this in Review.
+    if (intake.contentType === 'comic-script') {
+      setStructureMode('single');
+      const collapsed = collapseToSingleVolume({
+        seasonsPreview: result.seasonsPreview || [],
+        issues: initialIssues,
+        seriesName: result.series?.name || intake.seriesName,
+        arc: seededArc,
+      });
+      setSeasonsDraft(collapsed.seasons);
+      setIssuesDraft(collapsed.issues);
+    } else {
+      setStructureMode('multi');
+      setSeasonsDraft((result.seasonsPreview || []).map((s) => ({ ...s })));
+      setIssuesDraft(initialIssues);
+    }
+    setIssueSplitFailed(Boolean(result.issueSplitFailed));
+    setIssueSplitError(result.issueSplitError || null);
+    // The server remembers a failed commit's persisted arc across a reload; seed
+    // the retry flag from it rather than assuming a fresh start.
+    setArcAlreadyPersisted(result.importSession?.status === 'arc-persisted');
+    setReplaceMode(false);
+    // Re-arm the AI-cleanup opt-in off for each fresh analysis — it's
+    // off-by-default (one LLM call per issue), so a prior import's choice must
+    // not silently carry into a different source analyzed in the same session.
+    setCleanupFormatting(false);
+    setConfig((c) => ({
+      ...c,
+      ...(Number.isFinite(result.limits?.sourceCharLimit) ? { sourceCharLimit: result.limits.sourceCharLimit } : {}),
+      ...(Array.isArray(result.arcRoles) && result.arcRoles.length > 0 ? { arcRoles: result.arcRoles } : {}),
+      ...(Array.isArray(result.arcShapeIds) && result.arcShapeIds.length > 0 ? { arcShapeIds: result.arcShapeIds } : {}),
+    }));
+    setPhase('review');
+    return result;
+  }, { errorMessage: 'Failed to analyze import' });
+
+  // Flip between single-volume (graphic novel) and multi-volume structure. A
+  // structural reset re-derives seasons + issues from the original proposal, so
+  // it intentionally discards per-issue title/synopsis edits.
+  const handleStructureMode = (mode) => {
+    setStructureMode(mode);
+    const baseIssues = (preview?.issueProposals || []).map((i) => ({ ...i }));
+    if (mode === 'single') {
+      const collapsed = collapseToSingleVolume({
+        seasonsPreview: preview?.seasonsPreview || [],
+        issues: baseIssues,
+        seriesName: preview?.series?.name || intake.seriesName,
+        arc: arcDraft,
+      });
+      setSeasonsDraft(collapsed.seasons);
+      setIssuesDraft(collapsed.issues);
+    } else {
+      setSeasonsDraft((preview?.seasonsPreview || []).map((s) => ({ ...s })));
+      setIssuesDraft(baseIssues);
+    }
+  };
+
+  const [runCommit, committing] = useAsyncAction(async () => {
+    if (!preview) return null;
+    // Clear any prior (analyze) checklist so the commit-time reformat run
+    // repopulates it cleanly via the same `importer:progress` stream.
+    if (cleanupFormatting) resetAnalyzeStages();
+    // arcAlreadyPersisted retry: server kept arc/seasons/canon from the
+    // failed commit, so resending them would clobber any subsequent edits.
+    const base = {
+      universeId: preview.universe.id,
+      seriesId: preview.series.id,
+      // Lets the server replay or resume this import instead of duplicating it
+      // after a reload dropped the markers kept above (#9943).
+      ...(preview.importId ? { importId: preview.importId } : {}),
+      issues: issuesDraft,
+      // Routes the verbatim excerpt to the right stage server-side — a
+      // script-form import (comic-script → comicScript, screenplay → teleplay)
+      // seeds that script stage (ready) so the pipeline renders the user's
+      // script as-is instead of regenerating it.
+      contentType: intake.contentType,
+      // Opt-in: clean up each seeded excerpt with the AI reformat pass at
+      // commit time (best-effort server-side; falls back to verbatim).
+      cleanupFormatting,
+    };
+    const payload = arcAlreadyPersisted
+      ? { ...base, canonSelections: { characters: [], places: [], objects: [] }, arc: null, seasons: [] }
+      : {
+          ...base,
+          canonSelections: {
+            characters: canonSelections.characters.filter((_, i) => selectedCanon.characters.has(i)),
+            places: canonSelections.places.filter((_, i) => selectedCanon.places.has(i)),
+            objects: canonSelections.objects.filter((_, i) => selectedCanon.objects.has(i)),
+          },
+          arc: pickArcFields(arcDraft),
+          seasons: seasonsDraft,
+          ...(replaceMode && preview.isExistingSeries ? { replaceMode: true } : {}),
+        };
+    const result = await commitImport(payload, { silent: true }).catch((err) => {
+      if (err?.code === 'IMPORTER_PARTIAL_COMMIT_ISSUES' && err?.context?.arcAlreadyPersisted) {
+        setArcAlreadyPersisted(true);
+        toast.warning('Arc + seasons saved; the issues did not finish. Retry to create the remaining issues without duplicating any — the arc won\'t be re-sent.');
+      }
+      throw err;
+    });
+    if (!result) return null;
+    toast.success(result.replayed
+      ? `Already imported into "${result.series.name}" — opening it without creating duplicates`
+      : `Imported ${result.createdIssueIds.length} issue${result.createdIssueIds.length === 1 ? '' : 's'} into "${result.series.name}"`);
+    if (Array.isArray(result.remappedIssues) && result.remappedIssues.length > 0) {
+      const n = result.remappedIssues.length;
+      const noun = `${n} issue${n === 1 ? '' : 's'}`;
+      const landedSeasonless = result.remappedIssues.every((r) => r.actualSeasonId == null);
+      let msg;
+      if (landedSeasonless) {
+        msg = `${noun} created ungrouped — no seasons exist on this series to land them in.`;
+      } else {
+        const sample = result.remappedIssues[0];
+        const seasonLabel = sample.actualSeasonNumber != null
+          ? `S${sample.actualSeasonNumber}${sample.actualSeasonTitle ? ` — ${sample.actualSeasonTitle}` : ''}`
+          : 'the available season';
+        msg = `${noun} landed in ${seasonLabel} — the requested season number didn't exist.`;
+      }
+      toast.warning(msg);
+    }
+    navigate(`/pipeline/series/${result.series.id}`);
+    return result;
+  }, { errorMessage: 'Failed to commit import' });
+
+  // Recovery for a failed issue split — re-runs ONLY the split against the
+  // same source + the arc the user already has in the panel. Canon + arc are
+  // untouched; on success we populate the issues and clear the failed banner.
+  const [runRetryIssues, retryingIssues] = useAsyncAction(async () => {
+    if (!preview) return null;
+    const payload = {
+      contentType: intake.contentType,
+      source: intake.source,
+      seriesName: preview.series?.name || intake.seriesName,
+      providerOverride: llmProvider,
+      modelOverride: llmModel,
+    };
+    // See resolveRetryArcSummary: a cleared summary is honored (send none, let
+    // the server synthesize) instead of silently falling back to the logline.
+    const arcSummary = resolveRetryArcSummary(arcDraft);
+    if (typeof arcSummary === 'string' && arcSummary.trim()) payload.arcSummary = arcSummary;
+    // Round to an integer — the server schema is z.number().int(), so a
+    // pasted/typed decimal like 2.5 would otherwise 400 with a confusing error.
+    const tic = intake.targetIssueCount === '' ? null : Math.round(Number(intake.targetIssueCount));
+    if (Number.isFinite(tic) && tic > 0) payload.targetIssueCount = tic;
+    const result = await retryImporterIssues(payload, { silent: true });
+    if (!result) return null;
+    const issues = Array.isArray(result.issueProposals) ? result.issueProposals : [];
+    setIssuesDraft(issues.map((i) => ({ ...i })));
+    if (issues.length === 0) {
+      toast.warning('Retry produced no issues — adjust the target issue count or the source and try again.');
+    } else {
+      setIssueSplitFailed(false);
+      setIssueSplitError(null);
+      toast.success(`Issue split succeeded — ${issues.length} issue${issues.length === 1 ? '' : 's'} proposed.`);
+    }
+    return result;
+  }, { errorMessage: 'Failed to retry issue split' });
+
+  return (
+    <div className="space-y-6">
+      <header className="flex items-start gap-3">
+        <FileInput className="w-7 h-7 text-port-accent mt-1" />
+        <div>
+          <h1 className="text-2xl font-bold text-white">Importer</h1>
+          <p className="text-sm text-port-text-muted mt-1">
+            Reverse-engineer a finished story, novel, screenplay, or comic script into the pipeline.
+            The LLM extracts universe canon, the story arc, and a proposed issue split; you review,
+            edit, and commit.
+          </p>
+        </div>
+      </header>
+
+      {phase === 'intake' && (
+        <IntakeForm
+          intake={intake}
+          setIntake={setIntake}
+          universeItems={universeItems}
+          universeSelectedId={universeMatch?.id || null}
+          seriesItems={seriesItems}
+          seriesSelectedId={seriesMatch?.id || null}
+          sourceCharLimit={config.sourceCharLimit}
+          analyzing={analyzing}
+          analyzeStages={analyzeStages}
+          onAnalyze={runAnalyze}
+          classifying={classifying}
+          onClassify={runClassify}
+          classifyHint={classifyHint}
+          providers={providers}
+          llmProvider={llmProvider}
+          llmModel={llmModel}
+          llmModels={llmModels}
+          onProviderChange={setLlmProvider}
+          onModelChange={setLlmModel}
+        />
+      )}
+
+      {phase === 'review' && preview && (
+        <ReviewPanel
+          preview={preview}
+          contentType={intake.contentType}
+          canonSelections={canonSelections}
+          selectedCanon={selectedCanon}
+          setSelectedCanon={setSelectedCanon}
+          arcDraft={arcDraft}
+          setArcDraft={setArcDraft}
+          seasonsDraft={seasonsDraft}
+          setSeasonsDraft={setSeasonsDraft}
+          issuesDraft={issuesDraft}
+          setIssuesDraft={setIssuesDraft}
+          arcRoles={config.arcRoles}
+          arcShapeIds={config.arcShapeIds}
+          structureMode={structureMode}
+          onStructureModeChange={handleStructureMode}
+          replaceMode={replaceMode}
+          setReplaceMode={setReplaceMode}
+          cleanupFormatting={cleanupFormatting}
+          setCleanupFormatting={setCleanupFormatting}
+          commitProgress={analyzeStages}
+          committing={committing}
+          onCommit={runCommit}
+          onBack={() => setPhase('intake')}
+          issueSplitFailed={issueSplitFailed}
+          issueSplitError={issueSplitError}
+          onRetryIssues={runRetryIssues}
+          retryingIssues={retryingIssues}
+        />
+      )}
+    </div>
+  );
+}
+
+function IntakeForm({
+  intake, setIntake,
+  universeItems, universeSelectedId, seriesItems, seriesSelectedId,
+  sourceCharLimit, analyzing, analyzeStages, onAnalyze, classifying, onClassify, classifyHint,
+  providers, llmProvider, llmModel, llmModels, onProviderChange, onModelChange,
+}) {
+  const sourceLen = intake.source.length;
+  const sourceOver = sourceLen > sourceCharLimit;
+  const intakeValid = intake.universeName.trim() && intake.seriesName.trim() && intake.source.trim() && !sourceOver;
+  const canClassify = intake.source.trim().length > 0 && !sourceOver && !classifying && !analyzing;
+  // Unlike the Universe creator (which creates a record via its onCreate), the
+  // importer never eagerly creates — typing a non-matching name IS the create,
+  // and the server mints the universe/series on commit. Passing onCreate just
+  // surfaces the confirming "New … 'X'" row; committing it only needs to close
+  // the dropdown (EntityCombobox already does), so the handler is a no-op.
+  const confirmNewName = () => {};
+  return (
+    <form
+      className="space-y-4 bg-port-card border border-port-border rounded-lg p-4 sm:p-6"
+      // Swallow default form submission so an accidental Enter in any input
+      // doesn't trigger Analyze — Analyze fires three heavy-tier LLM calls
+      // and accidental triggering costs real money. Tab to the button + Space
+      // is the keyboard path; the round-4 Enter-submits flow was reverted in
+      // round 6 after this cost trade-off was surfaced.
+      onSubmit={(e) => e.preventDefault()}
+    >
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <div>
+          <label htmlFor="importer-universe-name" className="block text-sm font-medium mb-1">
+            Universe Name
+          </label>
+          <EntityCombobox
+            items={universeItems}
+            selectedId={universeSelectedId}
+            value={intake.universeName}
+            onChange={(name) => setIntake({ ...intake, universeName: name })}
+            onPick={(item) => setIntake({ ...intake, universeName: item.name })}
+            onCreate={confirmNewName}
+            inputId="importer-universe-name"
+            noun="universe"
+            placeholder="Search universes or type a new name… e.g. Cyberpunk 2099"
+            createPrefix="New universe"
+            className="w-full"
+          />
+          <p className="text-xs text-port-text-muted mt-1">
+            {universeSelectedId
+              ? 'Matched an existing universe — the import is added to it.'
+              : 'Existing universe is matched by name (case-insensitive); otherwise created fresh on import.'}
+          </p>
+        </div>
+        <div>
+          <label htmlFor="importer-series-name" className="block text-sm font-medium mb-1">
+            Series Name
+          </label>
+          <EntityCombobox
+            items={seriesItems}
+            selectedId={seriesSelectedId}
+            value={intake.seriesName}
+            onChange={(name) => setIntake({ ...intake, seriesName: name })}
+            onPick={(item) => setIntake({ ...intake, seriesName: item.name })}
+            onCreate={confirmNewName}
+            inputId="importer-series-name"
+            noun="series"
+            placeholder="Search this universe's series or type a new name… e.g. The Choir Awakens"
+            createPrefix="New series"
+            emptyNoItems={intake.universeName.trim()
+              ? 'No series in this universe yet — type a name.'
+              : 'Pick a universe above to list its series, or type a new name.'}
+            className="w-full"
+          />
+          <p className="text-xs text-port-text-muted mt-1">
+            {seriesSelectedId
+              ? 'Matched an existing series — the import extends it.'
+              : 'Series match is scoped to the universe — same name in a different universe creates a fresh series.'}
+          </p>
+        </div>
+      </div>
+
+      <fieldset>
+        <div className="flex items-center justify-between mb-2">
+          <legend className="block text-sm font-medium">Content Type</legend>
+          <button
+            type="button"
+            onClick={onClassify}
+            disabled={!canClassify}
+            title={canClassify
+              ? 'Run a light-tier LLM pass on the source head to auto-detect the content type. The radio stays editable.'
+              : 'Paste source text first to enable auto-detect.'}
+            className="text-xs text-port-text-muted hover:text-port-text disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
+          >
+            {classifying ? <Loader2 className="w-3 h-3 animate-spin" /> : <Wand2 className="w-3 h-3" />}
+            {classifying ? 'Detecting…' : 'Auto-detect'}
+          </button>
+        </div>
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+          {IMPORTER_CONTENT_TYPES.map((ct) => (
+            <label
+              key={ct}
+              className={`flex items-center gap-2 border rounded px-3 py-2 cursor-pointer text-sm ${
+                intake.contentType === ct
+                  ? 'border-port-accent bg-port-accent/10'
+                  : 'border-port-border hover:border-port-text-muted'
+              }`}
+            >
+              <input
+                type="radio"
+                name="contentType"
+                value={ct}
+                checked={intake.contentType === ct}
+                onChange={() => setIntake({ ...intake, contentType: ct })}
+                className="accent-port-accent"
+              />
+              {CONTENT_TYPE_LABELS[ct]}
+            </label>
+          ))}
+        </div>
+        {classifyHint && classifyHint.contentType && (
+          <p className="text-xs text-port-text-muted mt-2 flex items-start gap-1">
+            <Wand2 className="w-3 h-3 mt-0.5 flex-shrink-0" />
+            <span>
+              Auto-detected <strong>{CONTENT_TYPE_LABELS[classifyHint.contentType] || classifyHint.contentType}</strong>
+              {classifyHint.confidence && <> ({classifyHint.confidence} confidence)</>}
+              {classifyHint.reasoning && <> — {classifyHint.reasoning}</>}
+            </span>
+          </p>
+        )}
+      </fieldset>
+
+      <div>
+        <div className="flex items-center justify-between mb-1">
+          <label htmlFor="importer-source" className="block text-sm font-medium">
+            Source Text
+          </label>
+          <span className={`text-xs ${sourceOver ? 'text-port-error' : 'text-port-text-muted'}`}>
+            {formatCount(sourceLen)} / {formatCount(sourceCharLimit)} chars
+          </span>
+        </div>
+        <textarea
+          id="importer-source"
+          value={intake.source}
+          onChange={(e) => setIntake({ ...intake, source: e.target.value })}
+          placeholder="Paste the full text here…"
+          className="w-full bg-port-bg border border-port-border rounded px-3 py-2 text-sm font-mono focus:outline-none focus:border-port-accent min-h-[280px]"
+        />
+        {sourceOver && (
+          <p className="text-xs text-port-error mt-1 flex items-center gap-1">
+            <AlertTriangle className="w-3 h-3" />
+            Source exceeds the {formatCount(sourceCharLimit)}-char ceiling. Trim it or wait for chunked-extraction support.
+          </p>
+        )}
+      </div>
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <div>
+          <label htmlFor="importer-target-issue-count" className="block text-sm font-medium mb-1">
+            Target Issue Count (optional)
+          </label>
+          <input
+            id="importer-target-issue-count"
+            type="number"
+            min="1"
+            max="50"
+            value={intake.targetIssueCount}
+            onChange={(e) => setIntake({ ...intake, targetIssueCount: e.target.value })}
+            placeholder="LLM decides"
+            className="w-full bg-port-bg border border-port-border rounded px-3 py-2 text-sm focus:outline-none focus:border-port-accent"
+          />
+          <p className="text-xs text-port-text-muted mt-1">Leave blank to let the LLM split based on natural chapter/issue/act boundaries.</p>
+        </div>
+        <div>
+          <p className="block text-sm font-medium mb-1">AI Provider &amp; Model (optional)</p>
+          <ProviderModelSelector
+            providers={providers}
+            selectedProviderId={llmProvider}
+            selectedModel={llmModel}
+            availableModels={llmModels}
+            onProviderChange={onProviderChange}
+            onModelChange={onModelChange}
+            compact
+            label="AI Provider"
+            emptyProviderOption="Default (stage provider)"
+            emptyModelOption="Default model"
+          />
+          <p className="text-xs text-port-text-muted mt-1">Model used to extract canon, arc, and the issue split. Defaults to each stage&apos;s configured provider.</p>
+        </div>
+      </div>
+
+      {analyzing && <ImporterProgress stages={analyzeStages} />}
+
+      <div className="flex items-center justify-end gap-2 pt-2">
+        <button
+          type="button"
+          onClick={onAnalyze}
+          disabled={!intakeValid || analyzing}
+          className="bg-port-accent hover:bg-port-accent/80 disabled:opacity-50 disabled:cursor-not-allowed text-white px-4 py-2 rounded text-sm font-medium flex items-center gap-2"
+        >
+          {analyzing ? <Loader2 className="w-4 h-4 animate-spin" /> : <FileInput className="w-4 h-4" />}
+          {analyzing ? 'Analyzing…' : 'Analyze'}
+        </button>
+      </div>
+    </form>
+  );
+}
+
+// Live checklist of the analyze phase's AI passes. `stages` is null until the
+// server's first `importer:progress` frame arrives — show a generic spinner in
+// that window so the panel never looks empty between click and first frame.
+function ImporterProgress({ stages, message = 'Analyzing source — this runs several AI passes and can take a minute or two.' }) {
+  return (
+    <div className="bg-port-bg border border-port-border rounded-lg p-4 space-y-2">
+      <p className="text-sm font-medium flex items-center gap-2">
+        <Loader2 className="w-4 h-4 animate-spin text-port-accent" />
+        {message}
+      </p>
+      {Array.isArray(stages) && stages.length > 0 ? (
+        <ul className="space-y-1.5 mt-2">
+          {stages.map((s) => {
+            const { Icon, className } = stageStatusIcon(s.status);
+            return (
+              <li key={s.id} className="flex items-center gap-2 text-sm">
+                <Icon className={className} />
+                <span className={s.status === 'running' ? 'text-port-text' : 'text-port-text-muted'}>
+                  {s.label}
+                </span>
+              </li>
+            );
+          })}
+        </ul>
+      ) : (
+        <p className="text-xs text-port-text-muted">Starting…</p>
+      )}
+    </div>
+  );
+}
+
+// Lets the user pick how the import is structured: one graphic-novel volume
+// holding every issue as a chapter/act, vs the LLM's multi-volume breakdown.
+// Switching is a structural reset (re-derives seasons + issues), so the copy
+// warns that per-issue edits are discarded.
+function StructureChooser({ mode, onChange, issueCount, seasonCount }) {
+  const opt = (value, title, desc) => {
+    const active = mode === value;
+    return (
+      <label
+        className={`flex-1 cursor-pointer rounded-lg border p-3 transition-colors ${
+          active ? 'border-port-accent bg-port-accent/10' : 'border-port-border bg-port-bg hover:border-port-accent/40'
+        }`}
+      >
+        <div className="flex items-center gap-2">
+          <input
+            type="radio"
+            name="import-structure"
+            checked={active}
+            onChange={() => onChange(value)}
+            className="accent-port-accent"
+          />
+          <span className="text-sm font-medium">{title}</span>
+        </div>
+        <p className="text-xs text-port-text-muted mt-1 ml-6">{desc}</p>
+      </label>
+    );
+  };
+  return (
+    <div className="bg-port-card border border-port-border rounded-lg p-4 space-y-2">
+      <div className="text-xs uppercase tracking-wider text-port-text-muted">Structure</div>
+      <div className="flex flex-col md:flex-row gap-2">
+        {opt('single', 'Single volume (graphic novel)',
+          `One volume holding all ${issueCount} issue${issueCount === 1 ? '' : 's'} as chapters/acts. The extracted volume descriptions become the issue synopses.`)}
+        {opt('multi', 'Multi-volume series',
+          `Keep the ${seasonCount || 'extracted'} volume${seasonCount === 1 ? '' : 's'} the LLM proposed as separate books.`)}
+      </div>
+      <p className="text-[11px] text-port-text-muted italic">Switching re-derives the structure below and discards per-issue title/synopsis edits.</p>
+    </div>
+  );
+}
+
+function ReviewPanel({
+  preview, contentType, canonSelections,
+  selectedCanon, setSelectedCanon,
+  arcDraft, setArcDraft, seasonsDraft, setSeasonsDraft,
+  issuesDraft, setIssuesDraft,
+  arcRoles, arcShapeIds,
+  structureMode, onStructureModeChange,
+  replaceMode, setReplaceMode,
+  cleanupFormatting, setCleanupFormatting,
+  commitProgress,
+  committing, onCommit, onBack,
+  issueSplitFailed, issueSplitError, onRetryIssues, retryingIssues,
+}) {
+  const toggleSelected = (kind, idx) => {
+    setSelectedCanon((sc) => {
+      const next = new Set(sc[kind]);
+      if (next.has(idx)) next.delete(idx); else next.add(idx);
+      return { ...sc, [kind]: next };
+    });
+  };
+
+  // A script-form import (comic-script → comicScript, screenplay → teleplay)
+  // seeds the verbatim excerpt into its script stage, not stages.prose — keep
+  // the Review copy + per-issue label accurate to the actual seed stage.
+  const { stagePath: seedStagePath, excerptLabel } = seedStageDisplayFor(contentType);
+
+  return (
+    <div className="space-y-6">
+      <div className="bg-port-card border border-port-border rounded-lg p-4 flex items-start gap-3 text-sm">
+        <CheckCircle2 className="w-5 h-5 text-port-success mt-0.5 flex-shrink-0" />
+        <div className="flex-1">
+          <div className="font-medium">
+            {preview.isExistingUniverse ? 'Adding to' : 'Creating new universe'} <span className="text-port-accent">"{preview.universe.name}"</span>
+            {' / '}
+            {preview.isExistingSeries
+              ? (replaceMode ? 'REPLACING series' : 'extending series')
+              : 'new series'} <span className="text-port-accent">"{preview.series.name}"</span>
+          </div>
+          <p className="text-xs text-port-text-muted mt-1">
+            Review the canon below, edit any issue titles or synopses, then click Commit to seed
+            the pipeline. The verbatim excerpt for each issue lands in{' '}
+            <code>{seedStagePath}</code>.
+          </p>
+          {preview.importSession?.status === 'committed' && (
+            <p className="text-xs mt-2 text-port-warning flex items-center gap-1.5">
+              <AlertTriangle className="w-3 h-3 flex-shrink-0" />
+              This manuscript was already imported into this series. Commit opens it without creating duplicates.
+            </p>
+          )}
+          {preview.isExistingSeries && (
+            <label className={`text-xs mt-2 flex items-center gap-2 cursor-pointer ${replaceMode ? 'text-port-error' : 'text-port-text-muted'}`}>
+              <input
+                type="checkbox"
+                checked={replaceMode}
+                onChange={(e) => setReplaceMode(e.target.checked)}
+                className="accent-port-error"
+              />
+              <AlertTriangle className="w-3 h-3" />
+              <span>
+                <strong>Replace all</strong> — wipe every existing issue on this series and overwrite arc + seasons with this import. <em>Cannot be undone.</em>
+              </span>
+            </label>
+          )}
+          <label className="text-xs mt-2 flex items-center gap-2 cursor-pointer text-port-text-muted">
+            <input
+              type="checkbox"
+              checked={cleanupFormatting}
+              onChange={(e) => setCleanupFormatting(e.target.checked)}
+              className="accent-port-accent"
+            />
+            <Sparkles className="w-3 h-3" />
+            <span>
+              <strong>Clean up formatting with AI</strong> — repair paste/PDF artifacts (line wraps, split drop-caps, hyphen splits) in each excerpt before seeding. One AI pass per issue, so a large import adds time; wording is never changed and a failed pass keeps the original text.
+            </span>
+          </label>
+        </div>
+        <button onClick={onBack} className="text-xs text-port-text-muted hover:text-port-text flex items-center gap-1">
+          <ArrowLeft className="w-3 h-3" /> Back
+        </button>
+      </div>
+
+      <CanonReviewSection
+        title="Characters"
+        kind="characters"
+        entries={canonSelections.characters}
+        selectedIdxs={selectedCanon.characters}
+        onToggle={(idx) => toggleSelected('characters', idx)}
+      />
+
+      <CanonReviewSection
+        title="Places"
+        kind="places"
+        entries={canonSelections.places}
+        selectedIdxs={selectedCanon.places}
+        onToggle={(idx) => toggleSelected('places', idx)}
+      />
+
+      <CanonReviewSection
+        title="Objects"
+        kind="objects"
+        entries={canonSelections.objects}
+        selectedIdxs={selectedCanon.objects}
+        onToggle={(idx) => toggleSelected('objects', idx)}
+      />
+
+      <StructureChooser
+        mode={structureMode}
+        onChange={onStructureModeChange}
+        issueCount={issuesDraft.length}
+        seasonCount={(preview.seasonsPreview || []).length}
+      />
+
+      <ArcReviewSection arc={arcDraft} setArc={setArcDraft} seasons={seasonsDraft} setSeasons={setSeasonsDraft} arcShapeIds={arcShapeIds} />
+
+      {issueSplitFailed && (
+        <div className="bg-port-warning/10 border border-port-warning/40 rounded-lg p-4 flex items-start gap-3">
+          <AlertTriangle className="w-5 h-5 text-port-warning mt-0.5 flex-shrink-0" />
+          <div className="flex-1">
+            <div className="text-sm font-medium text-port-warning">Issue split didn&apos;t finish</div>
+            <p className="text-xs text-port-text-muted mt-1">
+              Canon and arc extracted successfully and are ready to review above. Only the issue
+              split failed{issueSplitError ? <> — <span className="font-mono">{issueSplitError}</span></> : null}.
+              Retry it below — this re-runs <strong>only</strong> the split, so the canon and arc work above is kept.
+            </p>
+            <button
+              type="button"
+              onClick={onRetryIssues}
+              disabled={retryingIssues}
+              className="mt-2 bg-port-accent hover:bg-port-accent/80 disabled:opacity-50 disabled:cursor-not-allowed text-white px-3 py-1.5 rounded text-xs font-medium flex items-center gap-1.5"
+            >
+              {retryingIssues ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <FileInput className="w-3.5 h-3.5" />}
+              {retryingIssues ? 'Retrying…' : 'Retry issue split'}
+            </button>
+          </div>
+        </div>
+      )}
+
+      <IssuesReviewSection issues={issuesDraft} setIssues={setIssuesDraft} seasons={seasonsDraft} arcRoles={arcRoles} excerptLabel={excerptLabel} />
+
+      {committing && cleanupFormatting && (
+        <ImporterProgress stages={commitProgress} message="Cleaning up formatting — one AI pass per issue." />
+      )}
+
+      <div className="sticky bottom-4 flex items-center justify-end gap-2 bg-port-card border border-port-border rounded-lg p-3 shadow-lg">
+        <button
+          onClick={onBack}
+          disabled={committing}
+          className="text-port-text-muted hover:text-port-text px-3 py-2 text-sm"
+        >
+          Back to Intake
+        </button>
+        <button
+          onClick={onCommit}
+          disabled={committing || issuesDraft.length === 0}
+          className={`disabled:opacity-50 disabled:cursor-not-allowed text-white px-4 py-2 rounded text-sm font-medium flex items-center gap-2 ${
+            replaceMode
+              ? 'bg-port-error hover:bg-port-error/80'
+              : 'bg-port-success hover:bg-port-success/80'
+          }`}
+        >
+          {committing ? <Loader2 className="w-4 h-4 animate-spin" /> : (replaceMode ? <AlertTriangle className="w-4 h-4" /> : <CheckCircle2 className="w-4 h-4" />)}
+          {committing
+            ? 'Committing…'
+            : (replaceMode
+                ? `Replace with ${issuesDraft.length} issue${issuesDraft.length === 1 ? '' : 's'}`
+                : `Commit ${issuesDraft.length} issue${issuesDraft.length === 1 ? '' : 's'}`)}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function CanonReviewSection({ title, kind, entries, selectedIdxs, onToggle }) {
+  if (entries.length === 0) {
+    return (
+      <section className="bg-port-card border border-port-border rounded-lg p-4">
+        <h2 className="text-lg font-semibold mb-2">{title}</h2>
+        <p className="text-xs text-port-text-muted">None extracted from the source.</p>
+      </section>
+    );
+  }
+  const selectedCount = selectedIdxs.size;
+  return (
+    <section className="bg-port-card border border-port-border rounded-lg p-4">
+      <div className="flex items-center justify-between mb-3">
+        <h2 className="text-lg font-semibold">
+          {title} <span className="text-sm font-normal text-port-text-muted">({selectedCount} / {entries.length} selected)</span>
+        </h2>
+      </div>
+      <ul className="grid grid-cols-1 md:grid-cols-2 gap-2">
+        {entries.map((entry, idx) => {
+          const { subtitle, body } = previewCanonFragments(kind, entry);
+          const bodyText = body.map((f) => f.value).join(' • ');
+          const name = entry.name || '(unnamed)';
+          return (
+            <EntryCard
+              key={`${kind}-${idx}`}
+              selectable={{
+                selected: selectedIdxs.has(idx),
+                onToggle: () => onToggle(idx),
+                label: `Include ${name}`,
+              }}
+              title={<div className="font-medium truncate text-sm">{name}</div>}
+              body={(
+                <>
+                  {subtitle ? <div className="text-xs text-port-text-muted truncate">{subtitle}</div> : null}
+                  {bodyText ? <div className="text-xs text-port-text-muted mt-1 line-clamp-3">{bodyText}</div> : null}
+                </>
+              )}
+            />
+          );
+        })}
+      </ul>
+    </section>
+  );
+}
+
+// Functional updater keeps unchanged map entries referentially identical,
+// so React.memo on the per-item card lets siblings bail out of render when
+// one card is edited. ~50 issues with 500K-char prose previews were laggy
+// without this.
+const makePatcher = (setList) => (idx, patch) => {
+  setList((prev) => prev.map((e, i) => (i === idx ? { ...e, ...patch } : e)));
+};
+
+function ArcReviewSection({ arc, setArc, seasons, setSeasons, arcShapeIds }) {
+  const patchSeasonAt = useMemo(() => makePatcher(setSeasons), [setSeasons]);
+  if (!arc && seasons.length === 0) {
+    return (
+      <section className="bg-port-card border border-port-border rounded-lg p-4">
+        <h2 className="text-lg font-semibold mb-2">Arc</h2>
+        <p className="text-xs text-port-text-muted">LLM did not produce an arc — series will be created without arc metadata.</p>
+      </section>
+    );
+  }
+  const a = arc || {};
+  // Filter so the dropdown can never offer a shape the commit-side
+  // `z.enum(ARC_SHAPE_IDS)` would reject. `null` sentinel = config not yet
+  // loaded; show all client shapes meanwhile.
+  const allowedShapes = Array.isArray(arcShapeIds) && arcShapeIds.length > 0
+    ? STORY_SHAPES.filter((s) => arcShapeIds.includes(s.id))
+    : STORY_SHAPES;
+  return (
+    <section className="bg-port-card border border-port-border rounded-lg p-4 space-y-4">
+      <h2 className="text-lg font-semibold">Arc</h2>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <div>
+          <label htmlFor="arc-logline" className="block text-sm font-medium mb-1">Logline</label>
+          <input
+            id="arc-logline"
+            type="text"
+            value={a.logline || ''}
+            onChange={(e) => setArc({ ...a, logline: e.target.value })}
+            className="w-full bg-port-bg border border-port-border rounded px-3 py-2 text-sm focus:outline-none focus:border-port-accent"
+          />
+        </div>
+        <div>
+          <label htmlFor="arc-shape" className="block text-sm font-medium mb-1">Shape (Vonnegut)</label>
+          <select
+            id="arc-shape"
+            value={a.shape || ''}
+            onChange={(e) => setArc({ ...a, shape: e.target.value || undefined })}
+            className="w-full bg-port-bg border border-port-border rounded px-3 py-2 text-sm focus:outline-none focus:border-port-accent"
+          >
+            <option value="">— pick one —</option>
+            {allowedShapes.map((s) => (
+              <option key={s.id} value={s.id}>{s.label}</option>
+            ))}
+          </select>
+        </div>
+      </div>
+      <div>
+        <label htmlFor="arc-summary" className="block text-sm font-medium mb-1">Summary</label>
+        <textarea
+          id="arc-summary"
+          value={a.summary || ''}
+          onChange={(e) => setArc({ ...a, summary: e.target.value })}
+          className="w-full bg-port-bg border border-port-border rounded px-3 py-2 text-sm focus:outline-none focus:border-port-accent min-h-[120px]"
+        />
+      </div>
+      <div>
+        <label htmlFor="arc-protagonist" className="block text-sm font-medium mb-1">Protagonist Arc</label>
+        <textarea
+          id="arc-protagonist"
+          value={a.protagonistArc || ''}
+          onChange={(e) => setArc({ ...a, protagonistArc: e.target.value })}
+          className="w-full bg-port-bg border border-port-border rounded px-3 py-2 text-sm focus:outline-none focus:border-port-accent min-h-[80px]"
+        />
+      </div>
+      {seasons.length > 0 && (
+        <div>
+          <h3 className="text-sm font-medium mb-2">Seasons ({seasons.length})</h3>
+          <div className="space-y-2">
+            {seasons.map((s, idx) => (
+              <SeasonCard key={`season-${idx}`} idx={idx} season={s} onPatch={patchSeasonAt} />
+            ))}
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+const SeasonCard = memo(function SeasonCard({ idx, season, onPatch }) {
+  return (
+    <div className="border border-port-border rounded p-3">
+      <div className="grid grid-cols-1 sm:grid-cols-[80px_1fr] gap-3">
+        <div>
+          <label htmlFor={`season-${idx}-number`} className="block text-xs font-medium mb-1">#</label>
+          <input
+            id={`season-${idx}-number`}
+            type="number"
+            min="1"
+            max="99"
+            value={season.number ?? ''}
+            onChange={(e) => onPatch(idx, {
+              number: e.target.value === '' ? undefined : Number(e.target.value),
+            })}
+            className="w-full bg-port-bg border border-port-border rounded px-2 py-1 text-sm"
+          />
+        </div>
+        <div>
+          <label htmlFor={`season-${idx}-title`} className="block text-xs font-medium mb-1">Title</label>
+          <input
+            id={`season-${idx}-title`}
+            type="text"
+            value={season.title || ''}
+            onChange={(e) => onPatch(idx, { title: e.target.value })}
+            className="w-full bg-port-bg border border-port-border rounded px-2 py-1 text-sm"
+          />
+        </div>
+      </div>
+      <label htmlFor={`season-${idx}-synopsis`} className="block text-xs font-medium mb-1 mt-2">Synopsis</label>
+      <textarea
+        id={`season-${idx}-synopsis`}
+        value={season.synopsis || ''}
+        onChange={(e) => onPatch(idx, { synopsis: e.target.value })}
+        className="w-full bg-port-bg border border-port-border rounded px-2 py-1 text-sm min-h-[60px]"
+      />
+    </div>
+  );
+});
+
+const IssueCard = memo(function IssueCard({ idx, issue, onPatch, arcRoles, seasonOptions, excerptLabel }) {
+  // Local state, not lifted — keeps the collapse toggle off the issues array
+  // so a card-internal click doesn't broadcast to every memoized sibling.
+  const [proseExpanded, setProseExpanded] = useState(false);
+  const proseLen = (issue.proseExcerpt || '').length;
+  return (
+    <div className="border border-port-border rounded p-3">
+      <div className="grid grid-cols-1 sm:grid-cols-[80px_1fr_140px_140px] gap-3">
+        <div>
+          <label htmlFor={`iss-${idx}-pos`} className="block text-xs font-medium mb-1">Pos</label>
+          <input
+            id={`iss-${idx}-pos`}
+            type="number"
+            min="1"
+            max="9999"
+            // Display empty when state is undefined so the "auto" placeholder
+            // honestly signals the service will pick the next free position
+            // on commit (a rendered idx+1 would lie about the payload).
+            value={issue.arcPosition ?? ''}
+            placeholder="auto"
+            onChange={(e) => onPatch(idx, {
+              // `Number('') === 0` would land 0 in state and fail the `>= 1`
+              // gate at commit — undefined triggers server auto-assign instead.
+              arcPosition: e.target.value === '' ? undefined : Number(e.target.value),
+            })}
+            className="w-full bg-port-bg border border-port-border rounded px-2 py-1 text-sm"
+          />
+        </div>
+        <div>
+          <label htmlFor={`iss-${idx}-title`} className="block text-xs font-medium mb-1">Title</label>
+          <input
+            id={`iss-${idx}-title`}
+            type="text"
+            value={issue.title || ''}
+            onChange={(e) => onPatch(idx, { title: e.target.value })}
+            className="w-full bg-port-bg border border-port-border rounded px-2 py-1 text-sm"
+          />
+        </div>
+        <div>
+          <label htmlFor={`iss-${idx}-role`} className="block text-xs font-medium mb-1">Arc Role</label>
+          <select
+            id={`iss-${idx}-role`}
+            value={issue.arcRole || ''}
+            onChange={(e) => onPatch(idx, { arcRole: e.target.value || undefined })}
+            className="w-full bg-port-bg border border-port-border rounded px-2 py-1 text-sm"
+          >
+            <option value="">—</option>
+            {arcRoles.map((r) => <option key={r} value={r}>{r}</option>)}
+          </select>
+        </div>
+        {seasonOptions ? (
+          <div>
+            <label htmlFor={`iss-${idx}-season`} className="block text-xs font-medium mb-1">Season</label>
+            <select
+              id={`iss-${idx}-season`}
+              value={issue.seasonNumber == null ? '' : String(issue.seasonNumber)}
+              onChange={(e) => onPatch(idx, {
+                seasonNumber: e.target.value === '' ? undefined : Number(e.target.value),
+              })}
+              className="w-full bg-port-bg border border-port-border rounded px-2 py-1 text-sm"
+            >
+              {seasonOptions.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+            </select>
+          </div>
+        ) : <div />}
+      </div>
+      <label htmlFor={`iss-${idx}-syn`} className="block text-xs font-medium mb-1 mt-2">Synopsis</label>
+      <textarea
+        id={`iss-${idx}-syn`}
+        value={issue.synopsis || ''}
+        onChange={(e) => onPatch(idx, { synopsis: e.target.value })}
+        className="w-full bg-port-bg border border-port-border rounded px-2 py-1 text-sm min-h-[50px]"
+      />
+      <div className="mt-2">
+        <button
+          type="button"
+          onClick={() => setProseExpanded((v) => !v)}
+          className="text-xs text-port-text-muted hover:text-port-text flex items-center gap-1"
+          aria-expanded={proseExpanded}
+          aria-controls={`iss-${idx}-prose`}
+        >
+          {proseExpanded ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+          {excerptLabel}: {formatCount(proseLen)} chars
+          <span className="text-port-text-muted/70">— {proseExpanded ? 'click to collapse' : 'click to edit (verbatim from source)'}</span>
+        </button>
+        {proseExpanded && (
+          <textarea
+            id={`iss-${idx}-prose`}
+            aria-label="Prose excerpt"
+            value={issue.proseExcerpt || ''}
+            onChange={(e) => onPatch(idx, { proseExcerpt: e.target.value })}
+            // Monospace + tall default so the user sees enough lines to
+            // trim/correct a boundary without re-running Analyze (which
+            // burns 3 heavy-tier LLM calls). The textarea grows to fit
+            // browser-native scrolling when proseExcerpt is large.
+            className="w-full bg-port-bg border border-port-border rounded px-2 py-1 text-xs font-mono mt-2 min-h-[200px]"
+            // Allow tab character entry rather than focus-traversal — the
+            // user is editing prose, not navigating a form.
+            spellCheck={false}
+          />
+        )}
+      </div>
+    </div>
+  );
+});
+
+function IssuesReviewSection({ issues, setIssues, seasons, arcRoles, excerptLabel }) {
+  const patchIssueAt = useMemo(() => makePatcher(setIssues), [setIssues]);
+  // Memo'd so `seasonOptions`'s identity is stable across issue-only edits
+  // — otherwise every keystroke would break React.memo on every IssueCard.
+  // Drops numberless seasons because the dropdown can only offer
+  // addressable ones; user can pick the lowest-numbered fallback while
+  // they fix the numberless season's number in the Arc section.
+  const seasonOptions = useMemo(() => {
+    const numberedSeasons = seasons.filter((s) => Number.isFinite(s.number));
+    if (numberedSeasons.length <= 1) return null;
+    // Server's fallback is the lowest-numbered season — not array[0]
+    // (sparsely-numbered seasons like [S2, S5, S99] make "first" lie).
+    const fallbackSeason = [...numberedSeasons].sort((a, b) => a.number - b.number)[0];
+    const fallbackLabel = `(lowest-numbered: S${fallbackSeason.number}${fallbackSeason.title ? ` — ${fallbackSeason.title}` : ''})`;
+    return [
+      { value: '', label: fallbackLabel },
+      ...numberedSeasons.map((s) => ({ value: String(s.number), label: `S${s.number} — ${s.title || ''}` })),
+    ];
+  }, [seasons]);
+  if (issues.length === 0) {
+    return (
+      <section className="bg-port-card border border-port-border rounded-lg p-4">
+        <h2 className="text-lg font-semibold mb-2">Proposed Issues</h2>
+        <p className="text-xs text-port-error">No issues proposed — the LLM did not split the source. Re-run analyze.</p>
+      </section>
+    );
+  }
+  return (
+    <section className="bg-port-card border border-port-border rounded-lg p-4">
+      <h2 className="text-lg font-semibold mb-3">Proposed Issues ({issues.length})</h2>
+      <div className="space-y-3">
+        {issues.map((it, idx) => (
+          <IssueCard
+            key={`issue-${idx}`}
+            idx={idx}
+            issue={it}
+            onPatch={patchIssueAt}
+            arcRoles={arcRoles}
+            seasonOptions={seasonOptions}
+            excerptLabel={excerptLabel}
+          />
+        ))}
+      </div>
+    </section>
+  );
+}

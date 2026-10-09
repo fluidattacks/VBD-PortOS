@@ -1,0 +1,707 @@
+import { useState, useEffect, useCallback } from 'react';
+import { useSocketResource } from '../hooks/useSocketResource';
+import {
+  Globe, Play, Square, RefreshCw, Settings, Activity,
+  Monitor, Wifi, WifiOff, Clock, Cpu, MemoryStick,
+  FileText, ChevronDown, ChevronRight, ExternalLink,
+  Mail, MessageSquare, Download, FolderOpen, Trash2
+} from 'lucide-react';
+import {
+  getBrowserStatus, getBrowserConfig, updateBrowserConfig,
+  launchBrowser, stopBrowser, restartBrowser,
+  getBrowserLogs, navigateBrowser,
+  browserDownloadUrl, deleteBrowserDownload
+} from '../services/api';
+import FolderPicker from '../components/FolderPicker';
+import BrailleSpinner from '../components/BrailleSpinner';
+import toast from '../components/ui/Toast';
+import { FormField } from '../components/ui/FormField';
+import { formatBytes, formatDateTime, formatDurationMs } from '../utils/formatters';
+import { pluralize } from '../lib/textUtils';
+
+const STATUS_EVENTS = ['browser:changed'];
+const readStatus = () => getBrowserStatus({ silent: true });
+
+function deriveMacAppBundle(chromePath) {
+  if (!chromePath?.trim()) return null;
+  const normalized = chromePath.trim().replaceAll('\\', '/');
+  const appIndex = normalized.toLowerCase().indexOf('.app/');
+  return appIndex >= 0 ? normalized.slice(0, appIndex + '.app'.length) : null;
+}
+
+function formatUptime(timestamp) {
+  if (!timestamp) return '-';
+  return formatDurationMs(Date.now() - timestamp);
+}
+
+export default function BrowserPage() {
+  const { data: status, loading, error, refetch: fetchStatus, updateData: setStatus } =
+    useSocketResource(readStatus, { namespace: 'browser', events: STATUS_EVENTS });
+  const statusError = error?.message;
+  const [actionLoading, setActionLoading] = useState(null);
+  const [showConfig, setShowConfig] = useState(false);
+  const [showLogs, setShowLogs] = useState(false);
+  const [showPages, setShowPages] = useState(true);
+  const [logs, setLogs] = useState('');
+  const [config, setConfig] = useState(null);
+  const [configDraft, setConfigDraft] = useState(null);
+  const [navUrl, setNavUrl] = useState('');
+  const [showDownloads, setShowDownloads] = useState(true);
+  const fetchLogs = useCallback(async () => {
+    const data = await getBrowserLogs(100).catch(() => null);
+    if (data) {
+      const combined = [data.stdout, data.stderr].filter(Boolean).join('\n');
+      setLogs(combined || '(no logs)');
+    }
+  }, []);
+
+  // Load config when settings panel opens
+  useEffect(() => {
+    if (showConfig && !config) {
+      getBrowserConfig().then(c => {
+        setConfig(c);
+        setConfigDraft(c);
+      }).catch(err => console.warn('load browser config:', err?.message ?? String(err)));
+    }
+  }, [showConfig, config]);
+
+  // Load logs when panel opens
+  useEffect(() => {
+    if (showLogs) fetchLogs();
+  }, [showLogs, fetchLogs]);
+
+  const handleAction = useCallback(async (action, fn) => {
+    setActionLoading(action);
+    const result = await fn({ silent: true }).catch(err => {
+      toast.error(`Failed to ${action}: ${err.message}`);
+      return null;
+    });
+    if (result) {
+      if ((action === 'launch' || action === 'restart') && !result.connected) {
+        toast.error('Browser process started, but Chrome is not connected yet. Check the recovery steps below if it stays disconnected.');
+      } else {
+        toast.success(`Browser ${action} successful`);
+      }
+      setStatus(prev => prev ? { ...prev, ...result } : prev);
+      await fetchStatus();
+    }
+    setActionLoading(null);
+  }, [fetchStatus, setStatus]);
+
+  const handleChromePathChange = (chromePath) => setConfigDraft(d => {
+    const currentAppBundle = deriveMacAppBundle(d.chromePath);
+    const macAppBundle = !d.macAppBundle || d.macAppBundle === currentAppBundle
+      ? deriveMacAppBundle(chromePath)
+      : d.macAppBundle;
+    return { ...d, chromePath, macAppBundle };
+  });
+
+  const handleSaveConfig = useCallback(async () => {
+    if (!configDraft) return;
+    const saved = await updateBrowserConfig(configDraft, { silent: true }).catch(err => {
+      toast.error(`Failed to save config: ${err.message}`);
+      return null;
+    });
+    if (saved) {
+      setStatus(prev => prev ? { ...prev, config: saved } : prev);
+      setConfig(saved);
+      setConfigDraft(saved);
+      toast.success('Browser config saved — restart browser to apply changes');
+    }
+  }, [configDraft, setStatus]);
+
+  const handleDeleteDownload = useCallback(async (name) => {
+    const ok = await deleteBrowserDownload(name, { silent: true }).then(() => true).catch(err => {
+      toast.error(`Failed to delete: ${err.message}`);
+      return false;
+    });
+    if (ok) {
+      setStatus(prev => ({
+        ...prev,
+        downloads: { ...prev.downloads, files: prev.downloads.files.filter(f => f.name !== name) }
+      }));
+    }
+  }, [setStatus]);
+
+  const handleNavigate = useCallback(async () => {
+    const trimmed = navUrl.trim();
+    if (!trimmed) return;
+    const url = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+    setActionLoading('navigate');
+    const result = await navigateBrowser(url, { silent: true }).catch(err => {
+      toast.error(`Failed to navigate: ${err.message}`);
+      return null;
+    });
+    if (result) {
+      toast.success(`Opened ${url}`);
+      setNavUrl('');
+      setStatus(prev => {
+        if (!prev) return prev;
+        const pages = [...(prev.pages || []).filter(page => page.id !== result.id), result];
+        return { ...prev, pages, pageCount: pages.length };
+      });
+      await fetchStatus();
+    }
+    setActionLoading(null);
+  }, [navUrl, fetchStatus, setStatus]);
+
+  const isRunning = status?.process?.status === 'online';
+  const isConnected = status?.connected;
+
+  return (
+    <div>
+      {/* Header */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
+        <div>
+          <h2 className="text-2xl font-bold text-white flex items-center gap-2">
+            <Globe size={28} className="text-port-accent" />
+            Browser
+          </h2>
+          <p className="text-gray-500">Manage the authenticated CDP/Playwright browser</p>
+        </div>
+        <div className="flex items-center gap-2 flex-wrap shrink-0">
+          <button
+            onClick={() => setShowConfig(s => !s)}
+            className={`flex items-center gap-2 px-3 py-1.5 text-sm rounded-lg transition-colors ${
+              showConfig
+                ? 'bg-port-accent text-white'
+                : 'bg-port-card border border-port-border text-gray-400 hover:text-white hover:border-port-accent/50'
+            }`}
+          >
+            <Settings size={16} />
+            <span>Config</span>
+          </button>
+          <button
+            onClick={() => { setShowLogs(s => !s); }}
+            className={`flex items-center gap-2 px-3 py-1.5 text-sm rounded-lg transition-colors ${
+              showLogs
+                ? 'bg-port-accent text-white'
+                : 'bg-port-card border border-port-border text-gray-400 hover:text-white hover:border-port-accent/50'
+            }`}
+          >
+            <FileText size={16} />
+            <span>Logs</span>
+          </button>
+          <button
+            onClick={fetchStatus}
+            disabled={loading}
+            className="flex items-center gap-2 px-3 py-1.5 text-sm rounded-lg bg-port-card border border-port-border text-gray-400 hover:text-white hover:border-port-accent/50 transition-colors disabled:opacity-50"
+          >
+            <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />
+            <span>Refresh</span>
+          </button>
+        </div>
+      </div>
+
+      {statusError && (
+        <p role="alert" className="mb-4 text-sm text-port-error">
+          Could not refresh browser status: {statusError}. Use Refresh to try again.
+        </p>
+      )}
+
+      {/* Config panel */}
+      {showConfig && configDraft && (
+        <div className="mb-6 p-4 bg-port-card border border-port-border rounded-xl">
+          <h3 className="text-lg font-semibold text-white mb-4">Browser Configuration</h3>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            <FormField label="CDP Port">
+              <input
+                type="number"
+                value={configDraft.cdpPort}
+                onChange={e => setConfigDraft(d => ({ ...d, cdpPort: parseInt(e.target.value, 10) || 5556 }))}
+                className="w-full px-3 py-2 bg-port-bg border border-port-border rounded-lg text-white text-sm focus:outline-hidden focus:border-port-accent"
+              />
+            </FormField>
+            <FormField label="CDP Host">
+              <input
+                type="text"
+                value={configDraft.cdpHost}
+                onChange={e => setConfigDraft(d => ({ ...d, cdpHost: e.target.value }))}
+                className="w-full px-3 py-2 bg-port-bg border border-port-border rounded-lg text-white text-sm focus:outline-hidden focus:border-port-accent"
+              />
+            </FormField>
+            <FormField label="Health Port">
+              <input
+                type="number"
+                value={configDraft.healthPort}
+                onChange={e => setConfigDraft(d => ({ ...d, healthPort: parseInt(e.target.value, 10) || 5557 }))}
+                className="w-full px-3 py-2 bg-port-bg border border-port-border rounded-lg text-white text-sm focus:outline-hidden focus:border-port-accent"
+              />
+            </FormField>
+            <div className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                id="headless"
+                checked={configDraft.headless}
+                onChange={e => setConfigDraft(d => ({ ...d, headless: e.target.checked }))}
+                className="w-4 h-4 rounded border-port-border bg-port-bg text-port-accent focus:ring-port-accent"
+              />
+              <label htmlFor="headless" className="text-sm text-gray-400">Headless mode</label>
+            </div>
+            <div className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                id="autoConnect"
+                checked={configDraft.autoConnect}
+                onChange={e => setConfigDraft(d => ({ ...d, autoConnect: e.target.checked }))}
+                className="w-4 h-4 rounded border-port-border bg-port-bg text-port-accent focus:ring-port-accent"
+              />
+              <label htmlFor="autoConnect" className="text-sm text-gray-400">Auto-connect on startup</label>
+            </div>
+            <div className="sm:col-span-2 lg:col-span-3">
+              <label htmlFor="chromePath" className="block text-sm text-gray-400 mb-1">
+                Chrome binary path
+                <span className="ml-2 text-xs text-gray-600">(leave empty to use system default)</span>
+              </label>
+              <div className="flex items-center gap-2">
+                <input
+                  id="chromePath"
+                  type="text"
+                  value={configDraft.chromePath || ''}
+                  onChange={e => handleChromePathChange(e.target.value)}
+                  placeholder="/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary"
+                  className="w-full px-3 py-2 bg-port-bg border border-port-border rounded-lg text-white text-sm font-mono focus:outline-hidden focus:border-port-accent placeholder-gray-600"
+                />
+                <FolderPicker value={configDraft.chromePath || ''} mode="file" ariaLabel="Browse Chrome binary" onChange={handleChromePathChange} />
+              </div>
+              <p className="text-xs text-gray-500 mt-1">
+                Browse files on the PortOS host. Point at Chrome Canary, Chromium, Brave, or any Chromium-based browser to differentiate the PortOS-managed browser from your daily-driver Chrome.
+              </p>
+            </div>
+            <div className="sm:col-span-2 lg:col-span-3">
+              <label htmlFor="macAppBundle" className="block text-sm text-gray-400 mb-1">
+                macOS app bundle
+                <span className="ml-2 text-xs text-gray-600">(headed mode only; leave empty for system default)</span>
+              </label>
+              <div className="flex items-center gap-2">
+                <input
+                  id="macAppBundle"
+                  type="text"
+                  value={configDraft.macAppBundle || ''}
+                  onChange={e => setConfigDraft(d => ({ ...d, macAppBundle: e.target.value }))}
+                  placeholder="/Applications/Google Chrome Canary.app"
+                  className="w-full px-3 py-2 bg-port-bg border border-port-border rounded-lg text-white text-sm font-mono focus:outline-hidden focus:border-port-accent placeholder-gray-600"
+                />
+                <FolderPicker value={configDraft.macAppBundle || ''} ariaLabel="Browse macOS app bundle" onChange={macAppBundle => setConfigDraft(d => ({ ...d, macAppBundle }))} />
+              </div>
+            </div>
+          </div>
+          <div className="mt-4 flex justify-end">
+            <button
+              onClick={handleSaveConfig}
+              className="px-3 py-1.5 bg-port-accent text-white rounded-lg text-sm hover:bg-port-accent/80 transition-colors"
+            >
+              Save Config
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Logs panel */}
+      {showLogs && (
+        <div className="mb-6 bg-port-card border border-port-border rounded-xl overflow-hidden">
+          <div className="flex items-center justify-between p-3 border-b border-port-border">
+            <h3 className="text-sm font-semibold text-white">Recent Logs</h3>
+            <button
+              onClick={fetchLogs}
+              aria-label="Refresh logs"
+              className="text-xs text-gray-400 hover:text-white transition-colors"
+            >
+              <RefreshCw size={14} />
+            </button>
+          </div>
+          <pre className="p-3 text-xs text-gray-400 font-mono overflow-auto max-h-64 whitespace-pre-wrap break-all">
+            {logs || <BrailleSpinner text="Loading logs" />}
+          </pre>
+        </div>
+      )}
+
+      {/* Main grid */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        {/* Status + Controls */}
+        <div className="lg:col-span-2 min-w-0 space-y-6">
+          {/* Controls */}
+          <div className="bg-port-card border border-port-border rounded-xl p-5">
+            <h3 className="text-lg font-semibold text-white mb-4">Controls</h3>
+            {isRunning && !isConnected && (
+              <div role="status" className="mb-4 rounded-lg border border-port-warning/30 bg-port-warning/10 p-3 text-sm">
+                <p className="font-medium text-port-warning">Chrome is not reachable</p>
+                <p className="mt-1 text-gray-400">
+                  The launcher is running, but Chrome’s control connection is unavailable. Startup can take a few seconds.
+                  If this persists, restart the browser below. Restart may interrupt browser tasks.
+                </p>
+                {status.error && <p className="mt-2 text-port-warning break-words">{status.error}</p>}
+                <p className="mt-2 text-gray-400">
+                  If restarting does not help, open Logs for the launch error and Config to check the Chrome binary path
+                  and ports. On a machine without a desktop session, enable Headless mode, save, then restart.
+                </p>
+                <div className="mt-3 flex flex-wrap gap-3">
+                  <button onClick={() => setShowLogs(true)} className="text-port-accent underline">Show logs</button>
+                  <button onClick={() => setShowConfig(true)} className="text-port-accent underline">Edit configuration</button>
+                </div>
+              </div>
+            )}
+            <div className="flex flex-wrap gap-2">
+              {!isRunning ? (
+                <button
+                  onClick={() => handleAction('launch', launchBrowser)}
+                  disabled={loading || !status || actionLoading !== null}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-port-success text-white rounded-lg hover:bg-port-success/80 transition-colors disabled:opacity-50"
+                >
+                  {actionLoading === 'launch'
+                    ? <RefreshCw size={14} className="animate-spin" />
+                    : <Play size={14} />
+                  }
+                  Launch
+                </button>
+              ) : (
+                <>
+                  <button
+                    onClick={() => handleAction('stop', stopBrowser)}
+                    disabled={loading || !status || actionLoading !== null}
+                    className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-port-error text-white rounded-lg hover:bg-port-error/80 transition-colors disabled:opacity-50"
+                  >
+                    {actionLoading === 'stop'
+                      ? <RefreshCw size={14} className="animate-spin" />
+                      : <Square size={14} />
+                    }
+                    Stop
+                  </button>
+                  <button
+                    onClick={() => handleAction('restart', restartBrowser)}
+                    disabled={loading || !status || actionLoading !== null}
+                    className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-port-warning text-white rounded-lg hover:bg-port-warning/80 transition-colors disabled:opacity-50"
+                  >
+                    {actionLoading === 'restart'
+                      ? <RefreshCw size={14} className="animate-spin" />
+                      : <RefreshCw size={14} />
+                    }
+                    {isConnected ? 'Restart' : 'Restart browser to reconnect'}
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
+
+          {/* Status card */}
+          <div className="bg-port-card border border-port-border rounded-xl p-5">
+            <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+              <h3 className="text-lg font-semibold text-white flex items-center gap-2">
+                <Activity size={20} className="text-port-accent" />
+                Browser Status
+              </h3>
+              <div className={`flex items-center gap-2 px-3 py-1 rounded-full text-sm font-medium ${
+                isConnected
+                  ? 'bg-port-success/10 text-port-success'
+                  : isRunning
+                    ? 'bg-port-warning/10 text-port-warning'
+                    : 'bg-port-error/10 text-port-error'
+              }`}>
+                {isConnected ? <Wifi size={14} /> : <WifiOff size={14} />}
+                {isConnected ? 'Connected' : isRunning ? 'Running (not connected)' : loading ? 'Checking…' : !status ? 'Unknown' : 'Stopped'}
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+              <div className="bg-port-bg rounded-lg p-3">
+                <div className="text-xs text-gray-500 mb-1">Process</div>
+                <div className={`text-sm font-medium ${
+                  isRunning ? 'text-port-success' : 'text-port-error'
+                }`}>
+                  {status?.process?.status || 'unknown'}
+                </div>
+              </div>
+              <div className="bg-port-bg rounded-lg p-3">
+                <div className="text-xs text-gray-500 mb-1">CDP Endpoint</div>
+                <div className="text-sm font-medium text-white truncate" title={status?.cdpEndpoint}>
+                  {status?.cdpEndpoint || '-'}
+                </div>
+              </div>
+              <div className="bg-port-bg rounded-lg p-3">
+                <div className="text-xs text-gray-500 mb-1">Open Pages</div>
+                <div className="text-sm font-medium text-white">
+                  {status?.pageCount ?? '-'}
+                </div>
+              </div>
+              <div className="bg-port-bg rounded-lg p-3">
+                <div className="text-xs text-gray-500 mb-1">Uptime</div>
+                <div className="text-sm font-medium text-white flex items-center gap-1">
+                  <Clock size={12} />
+                  {formatUptime(status?.process?.uptime)}
+                </div>
+              </div>
+            </div>
+
+            {/* Process details row */}
+            {status?.process?.exists && (
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mt-3">
+                <div className="bg-port-bg rounded-lg p-3">
+                  <div className="text-xs text-gray-500 mb-1 flex items-center gap-1"><Cpu size={10} /> CPU</div>
+                  <div className="text-sm font-medium text-white">{status.process.cpu ?? 0}%</div>
+                </div>
+                <div className="bg-port-bg rounded-lg p-3">
+                  <div className="text-xs text-gray-500 mb-1 flex items-center gap-1"><MemoryStick size={10} /> Memory</div>
+                  <div className="text-sm font-medium text-white">{formatBytes(status.process.memory)}</div>
+                </div>
+                <div className="bg-port-bg rounded-lg p-3">
+                  <div className="text-xs text-gray-500 mb-1">PID</div>
+                  <div className="text-sm font-medium text-white">{status.process.pid ?? '-'}</div>
+                </div>
+                <div className="bg-port-bg rounded-lg p-3">
+                  <div className="text-xs text-gray-500 mb-1">Restarts</div>
+                  <div className="text-sm font-medium text-white">{status.process.restarts ?? 0}</div>
+                </div>
+              </div>
+            )}
+
+            {/* Version info */}
+            {status?.version && (
+              <div className="mt-3 bg-port-bg rounded-lg p-3">
+                <div className="text-xs text-gray-500 mb-1">Browser Version</div>
+                <div className="text-sm text-white">
+                  {status.version.Browser || status.version['User-Agent'] || 'Unknown'}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Navigate to URL */}
+          {isConnected && (
+            <div className="bg-port-card border border-port-border rounded-xl p-5">
+              <h3 className="text-lg font-semibold text-white mb-4 flex items-center gap-2">
+                <ExternalLink size={20} className="text-port-accent" />
+                Open URL
+              </h3>
+              <form
+                onSubmit={e => { e.preventDefault(); handleNavigate(); }}
+                className="flex gap-2"
+              >
+                <input
+                  type="text"
+                  aria-label="URL to open"
+                  value={navUrl}
+                  onChange={e => setNavUrl(e.target.value)}
+                  placeholder="https://example.com"
+                  className="min-w-0 flex-1 px-3 py-2 bg-port-bg border border-port-border rounded-lg text-white text-sm focus:outline-hidden focus:border-port-accent placeholder-gray-600"
+                />
+                <button
+                  type="submit"
+                  disabled={!navUrl.trim() || actionLoading !== null}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-port-accent text-white rounded-lg hover:bg-port-accent/80 transition-colors disabled:opacity-50"
+                >
+                  {actionLoading === 'navigate'
+                    ? <RefreshCw size={16} className="animate-spin" />
+                    : <Globe size={16} />
+                  }
+                  Go
+                </button>
+              </form>
+              <div className="flex flex-wrap gap-2 mt-3">
+                {[
+                  { label: 'Outlook', url: 'https://outlook.office.com/mail/', icon: Mail },
+                  { label: 'Teams', url: 'https://teams.microsoft.com/v2/', icon: MessageSquare },
+                ].map(({ label, url, icon: Icon }) => (
+                  <button
+                    key={label}
+                    onClick={() => {
+                      setNavUrl(url);
+                      setActionLoading('navigate');
+                      navigateBrowser(url, { silent: true }).then(() => {
+                        toast.success(`Opened ${label}`);
+                        setNavUrl('');
+                        fetchStatus();
+                      }).catch(err => toast.error(`Failed to navigate: ${err.message}`))
+                        .finally(() => setActionLoading(null));
+                    }}
+                    disabled={loading || !status || actionLoading !== null}
+                    className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-port-bg border border-port-border text-gray-400 rounded-lg hover:text-white hover:border-port-accent/50 transition-colors disabled:opacity-50 cursor-pointer"
+                  >
+                    <Icon size={14} />
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Open Pages */}
+          <div className="bg-port-card border border-port-border rounded-xl overflow-hidden">
+            <button
+              onClick={() => setShowPages(s => !s)}
+              className="w-full flex items-center justify-between p-4 text-left hover:bg-port-border/30 transition-colors"
+            >
+              <h3 className="text-lg font-semibold text-white flex items-center gap-2">
+                <Monitor size={20} className="text-port-accent" />
+                Open Pages
+                {status?.pages?.length > 0 && (
+                  <span className="ml-2 px-2 py-0.5 text-xs rounded-full bg-port-accent/20 text-port-accent">
+                    {status.pages.length}
+                  </span>
+                )}
+              </h3>
+              {showPages ? <ChevronDown size={18} className="text-gray-400" /> : <ChevronRight size={18} className="text-gray-400" />}
+            </button>
+            {showPages && (
+              <div className="border-t border-port-border">
+                {!status?.pages || status.pages.length === 0 ? (
+                  <div className="p-4 text-sm text-gray-500">
+                    {isConnected ? 'No pages open' : 'Browser not connected'}
+                  </div>
+                ) : (
+                  <div className="divide-y divide-port-border">
+                    {status.pages.map(page => (
+                      <div key={page.id} className="p-3 hover:bg-port-border/20 transition-colors">
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="min-w-0">
+                            <div className="text-sm font-medium text-white truncate">
+                              {page.title}
+                            </div>
+                            <div className="text-xs text-gray-500 truncate mt-0.5">
+                              {page.url}
+                            </div>
+                          </div>
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-port-border text-gray-400 shrink-0">
+                            {page.type}
+                          </span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Downloads */}
+          <div className="bg-port-card border border-port-border rounded-xl overflow-hidden">
+            <button
+              onClick={() => setShowDownloads(s => !s)}
+              className="w-full flex items-center justify-between p-4 text-left hover:bg-port-border/30 transition-colors"
+            >
+              <h3 className="text-lg font-semibold text-white flex items-center gap-2">
+                <Download size={20} className="text-port-accent" />
+                Downloads
+                {status?.downloads?.files?.length > 0 && (
+                  <span className="ml-2 px-2 py-0.5 text-xs rounded-full bg-port-accent/20 text-port-accent">
+                    {status.downloads.files.length}
+                  </span>
+                )}
+              </h3>
+              {showDownloads ? <ChevronDown size={18} className="text-gray-400" /> : <ChevronRight size={18} className="text-gray-400" />}
+            </button>
+            {showDownloads && (
+              <div className="border-t border-port-border">
+                {status?.downloads?.downloadDir && (
+                  <div className="px-4 py-2 bg-port-bg/50 border-b border-port-border flex items-center gap-2 text-xs text-gray-500">
+                    <FolderOpen size={12} />
+                    <span className="font-mono truncate">{status.downloads.downloadDir}</span>
+                  </div>
+                )}
+                {!status?.downloads?.files || status.downloads.files.length === 0 ? (
+                  <div className="p-4 text-sm text-gray-500">No downloads</div>
+                ) : (
+                  <div className="divide-y divide-port-border">
+                    {status.downloads.files.map(file => (
+                      <div key={file.name} className="p-3 hover:bg-port-border/20 transition-colors">
+                        <div className="flex items-center justify-between gap-2">
+                          <a
+                            href={browserDownloadUrl(file.name)}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="min-w-0 flex-1 group"
+                            title="Open in new tab"
+                          >
+                            <div className="text-sm font-medium text-white truncate group-hover:text-port-accent">
+                              {file.name}
+                            </div>
+                            <div className="text-xs text-gray-500 mt-0.5">
+                              {formatBytes(file.size)} &middot; {formatDateTime(file.modified)}
+                            </div>
+                          </a>
+                          <div className="flex items-center gap-1 shrink-0">
+                            <a
+                              href={`${browserDownloadUrl(file.name)}?attachment=1`}
+                              download={file.name}
+                              className="p-1.5 rounded-md text-gray-400 hover:text-white hover:bg-port-border/50 transition-colors"
+                              title="Save to device"
+                              aria-label={`Save ${file.name} to device`}
+                            >
+                              <Download size={16} />
+                            </a>
+                            <button
+                              onClick={() => handleDeleteDownload(file.name)}
+                              className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center p-1.5 rounded-md text-gray-400 hover:text-port-error hover:bg-port-border/50 transition-colors"
+                              title="Delete file" aria-label="Delete file"
+                            >
+                              <Trash2 size={16} />
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Sidebar */}
+        <div className="space-y-4">
+          {/* Quick Status */}
+          <div className="bg-port-card border border-port-border rounded-xl p-4">
+            <h3 className="font-semibold text-white mb-4">Connection Info</h3>
+            <div className="space-y-3">
+              <div className="flex items-center justify-between">
+                <span className="text-gray-400 text-sm">CDP Port</span>
+                <span className="text-sm font-mono text-white">{status?.config?.cdpPort || '-'}</span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-gray-400 text-sm">Health Port</span>
+                <span className="text-sm font-mono text-white">{status?.config?.healthPort || '-'}</span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-gray-400 text-sm">Mode</span>
+                <span className={`text-sm font-medium ${(status?.headless ?? status?.config?.headless) === false ? 'text-port-warning' : 'text-port-success'}`}>
+                  {(status?.headless ?? status?.config?.headless) === false ? 'Headed (visible)' : 'Headless'}
+                </span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-gray-400 text-sm">Auto-connect</span>
+                <span className={`text-sm font-medium ${status?.config?.autoConnect ? 'text-port-success' : 'text-gray-500'}`}>
+                  {status?.config?.autoConnect ? 'Yes' : 'No'}
+                </span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-gray-400 text-sm">Downloads</span>
+                <span className="text-sm font-medium text-port-success">{pluralize(status?.downloads?.files?.length ?? 0, 'file')}</span>
+              </div>
+            </div>
+          </div>
+
+          {/* CDP Endpoint card */}
+          <div className="bg-port-card border border-port-border rounded-xl p-4">
+            <h3 className="font-semibold text-white mb-3">CDP Endpoint</h3>
+            <div className="bg-port-bg rounded-lg p-3 font-mono text-xs text-port-accent break-all">
+              {status?.cdpEndpoint || `ws://127.0.0.1:5556`}
+            </div>
+            <p className="text-xs text-gray-500 mt-2">
+              Use this endpoint to connect Playwright or other CDP clients to the running browser instance.
+            </p>
+          </div>
+
+          {/* Instructions */}
+          <div className="bg-port-card border border-port-border rounded-xl p-4">
+            <h3 className="font-semibold text-white mb-3">Usage</h3>
+            <ul className="space-y-2 text-sm text-gray-400">
+              <li>1. Launch the browser using the controls</li>
+              <li>2. To sign in to sites, disable headless in Config, restart, then navigate to the login page</li>
+              <li>3. Auth cookies persist across restarts in the browser profile</li>
+              <li>4. Switch back to headless after authenticating</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}

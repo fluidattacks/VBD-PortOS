@@ -1,0 +1,336 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest'
+import express from 'express'
+import { request } from '../lib/testHelper.js'
+import { errorMiddleware } from '../lib/errorHandler.js'
+
+// The route reads `isReviewerConfigFault` from the reviewer VOCABULARY module,
+// which stays unmocked here — the predicate deciding 400-vs-502 has to be the
+// real one, or this suite would still pass while the route and the service
+// disagreed about which codes are config faults (#7660).
+vi.mock('../services/codeReview.js', () => ({
+  runLocalCodeReview: vi.fn(),
+  getCodeReviewDefaults: vi.fn(),
+  getReviewerCliInstalled: vi.fn(),
+  getProviderReviewCapability: vi.fn(),
+  withoutResolvedUnsupportedFaults: vi.fn((faults) => faults),
+  reportReviewerFailure: vi.fn(),
+  reportReviewerSuccess: vi.fn(),
+}))
+
+vi.mock('../services/settings.js', () => ({
+  getSettings: vi.fn(),
+}))
+
+const codeReviewSvc = await import('../services/codeReview.js')
+const settingsSvc = await import('../services/settings.js')
+const { default: routes } = await import('./codeReview.js')
+
+const makeApp = () => {
+  const app = express()
+  app.use(express.json())
+  app.use('/api/code-review', routes)
+  app.use(errorMiddleware)
+  return app
+}
+
+beforeEach(() => {
+  vi.clearAllMocks()
+  // Default settings stub — tests override as needed
+  settingsSvc.getSettings.mockResolvedValue({})
+  codeReviewSvc.getCodeReviewDefaults.mockResolvedValue({
+    reviewers: ['copilot'],
+    stopMode: 'all',
+    reviewerApplies: false,
+    lmstudioModel: null,
+    ollamaModel: null,
+  })
+  codeReviewSvc.getReviewerCliInstalled.mockResolvedValue({ claude: true, antigravity: false, codex: true, grok: true })
+  codeReviewSvc.getProviderReviewCapability.mockResolvedValue({ unsupported: {}, capable: new Set() })
+})
+
+describe('GET /api/code-review/defaults', () => {
+  it('merges the reviewer-CLI-installed probe into the defaults response', async () => {
+    const res = await request(makeApp()).get('/api/code-review/defaults')
+    expect(res.status).toBe(200)
+    expect(res.body.reviewers).toEqual(['copilot'])
+    expect(res.body.installed).toEqual({ claude: true, antigravity: false, codex: true, grok: true })
+  })
+
+  // #7660: without this, a reviewer that can never satisfy the tool-free gate is
+  // invisible until it has silently blocked every PR the install opens.
+  it('reports the provider reviewers that could never run a tool-free review', async () => {
+    codeReviewSvc.getProviderReviewCapability.mockResolvedValue({ unsupported: { 'provider:hosted-harness': 'REVIEWER_UNSUPPORTED' }, capable: new Set() })
+    const res = await request(makeApp()).get('/api/code-review/defaults')
+    expect(res.status).toBe(200)
+    expect(res.body.providerReviewUnsupported).toEqual({ 'provider:hosted-harness': 'REVIEWER_UNSUPPORTED' })
+    // Warn-only, exactly like `installed`: the reviewer list itself is untouched.
+    expect(res.body.reviewers).toEqual(['copilot'])
+  })
+})
+
+describe('POST /api/code-review/local', () => {
+  it('resolves provider defaults, honors resolved task clears and rejects unsafe identities', async () => {
+    settingsSvc.getSettings.mockResolvedValue({ codeReview: {
+      providerModels: { 'provider:example-gpu': 'pinned-coder' }, providerEfforts: { 'provider:example-gpu': 'high' },
+    } });
+    codeReviewSvc.runLocalCodeReview.mockResolvedValue({ ok: true, findings: 'NO FINDINGS' });
+    const res = await request(makeApp()).post('/api/code-review/local')
+      .send({ backend: 'provider:example-gpu', diff: 'example diff' });
+    expect(res.status).toBe(200);
+    expect(codeReviewSvc.runLocalCodeReview).toHaveBeenCalledWith(expect.objectContaining({ backend: 'provider:example-gpu', model: 'pinned-coder', effort: 'high' }));
+    const cleared = await request(makeApp()).post('/api/code-review/local')
+      .send({ backend: 'provider:example-gpu', inheritDefaults: false, diff: 'example diff' });
+    expect(cleared.status).toBe(200);
+    expect(codeReviewSvc.runLocalCodeReview.mock.lastCall[0]).toMatchObject({ model: undefined, effort: null });
+    const invalid = await request(makeApp()).post('/api/code-review/local')
+      .send({ backend: 'provider:example-gpu~opt', diff: 'example diff' });
+    expect(invalid.status).toBe(400);
+  });
+
+  it('returns 400 when diff is empty (Zod min(1) rejection)', async () => {
+    const res = await request(makeApp())
+      .post('/api/code-review/local')
+      .send({ backend: 'lmstudio', model: 'qwen', diff: '' })
+    expect(res.status).toBe(400)
+    expect(codeReviewSvc.runLocalCodeReview).not.toHaveBeenCalled()
+  })
+
+  it('returns 400 when diff is missing', async () => {
+    const res = await request(makeApp())
+      .post('/api/code-review/local')
+      .send({ backend: 'ollama', model: 'codellama' })
+    expect(res.status).toBe(400)
+    expect(codeReviewSvc.runLocalCodeReview).not.toHaveBeenCalled()
+  })
+
+  it('returns 400 when backend is an unknown enum value', async () => {
+    const res = await request(makeApp())
+      .post('/api/code-review/local')
+      .send({ backend: 'copilot', model: 'x', diff: 'diff --git a b' })
+    expect(res.status).toBe(400)
+    expect(codeReviewSvc.runLocalCodeReview).not.toHaveBeenCalled()
+  })
+
+  // The effort check is keyed on the REQUESTED backend, not a flat union of every
+  // local level, so a level the chosen backend doesn't accept is a 400 here rather
+  // than a 200 with the effort silently dropped by the service's own normalizer.
+  it('accepts an effort the requested backend takes, case-folded', async () => {
+    codeReviewSvc.runLocalCodeReview.mockResolvedValue({
+      ok: true, backend: 'ollama', model: 'm', effort: 'high', findings: 'No findings.',
+    })
+
+    const res = await request(makeApp())
+      .post('/api/code-review/local')
+      .send({ backend: 'ollama', model: 'm', effort: 'High', diff: 'diff --git a b' })
+
+    expect(res.status).toBe(200)
+    expect(codeReviewSvc.runLocalCodeReview).toHaveBeenCalledWith(
+      expect.objectContaining({ effort: 'High' }),
+    )
+  })
+
+  it('treats a blank effort as unpinned and falls back to the configured default', async () => {
+    settingsSvc.getSettings.mockResolvedValue({
+      codeReview: { ollamaModel: 'm', ollamaEffort: 'high' },
+    })
+    codeReviewSvc.runLocalCodeReview.mockResolvedValue({
+      ok: true, backend: 'ollama', model: 'm', effort: 'high', findings: 'No findings.',
+    })
+
+    const res = await request(makeApp())
+      .post('/api/code-review/local')
+      .send({ backend: 'ollama', effort: '', diff: 'diff --git a b' })
+
+    expect(res.status).toBe(200)
+    expect(codeReviewSvc.runLocalCodeReview).toHaveBeenCalledWith(
+      expect.objectContaining({ effort: 'high' }),
+    )
+  })
+
+  it('returns 400 for an effort outside the requested backend ladder', async () => {
+    const res = await request(makeApp())
+      .post('/api/code-review/local')
+      .send({ backend: 'ollama', model: 'm', effort: 'max', diff: 'diff --git a b' })
+
+    expect(res.status).toBe(400)
+    // `max` is a real level for some CLI reviewers, just not for a local backend —
+    // the message names the ladder that DID apply so the caller can tell which.
+    expect(JSON.stringify(res.body)).toContain('low, medium, high')
+    expect(codeReviewSvc.runLocalCodeReview).not.toHaveBeenCalled()
+  })
+
+  it('falls back to the settings model when model is omitted', async () => {
+    settingsSvc.getSettings.mockResolvedValue({
+      codeReview: { lmstudioModel: 'settings-model' },
+    })
+    codeReviewSvc.runLocalCodeReview.mockResolvedValue({
+      ok: true,
+      backend: 'lmstudio',
+      model: 'settings-model',
+      findings: 'No findings.',
+    })
+
+    const res = await request(makeApp())
+      .post('/api/code-review/local')
+      .send({ backend: 'lmstudio', diff: 'diff --git a b' })
+
+    expect(res.status).toBe(200)
+    expect(codeReviewSvc.runLocalCodeReview).toHaveBeenCalledWith(
+      expect.objectContaining({ model: 'settings-model' }),
+    )
+  })
+
+  // The old lmstudio-or-else ternary handed every non-lmstudio backend the
+  // OLLAMA model id, so a third backend would have reviewed with the wrong model.
+  it('reads each backend\'s own configured model scalar', async () => {
+    settingsSvc.getSettings.mockResolvedValue({
+      codeReview: { ollamaModel: 'ollama-model', mtplxModel: 'mtplx-model' },
+    })
+    codeReviewSvc.runLocalCodeReview.mockResolvedValue({
+      ok: true, backend: 'mtplx', model: 'mtplx-model', findings: 'No findings.',
+    })
+
+    const res = await request(makeApp())
+      .post('/api/code-review/local')
+      .send({ backend: 'mtplx', diff: 'diff --git a b' })
+
+    expect(res.status).toBe(200)
+    expect(codeReviewSvc.runLocalCodeReview).toHaveBeenCalledWith(
+      expect.objectContaining({ backend: 'mtplx', model: 'mtplx-model' }),
+    )
+  })
+
+  it('passes the caller-supplied model through when present', async () => {
+    settingsSvc.getSettings.mockResolvedValue({
+      codeReview: { ollamaModel: 'settings-model' },
+    })
+    codeReviewSvc.runLocalCodeReview.mockResolvedValue({
+      ok: true,
+      backend: 'ollama',
+      model: 'caller-model',
+      findings: 'No findings.',
+    })
+
+    const res = await request(makeApp())
+      .post('/api/code-review/local')
+      .send({ backend: 'ollama', model: 'caller-model', diff: 'diff --git a b' })
+
+    expect(res.status).toBe(200)
+    expect(codeReviewSvc.runLocalCodeReview).toHaveBeenCalledWith(
+      expect.objectContaining({ model: 'caller-model' }),
+    )
+  })
+
+  // A model neither the request, the panel, nor the backend's own listing could
+  // supply is the caller's config gap, not a reviewer that was asked and failed —
+  // an agent retrying a 502 would retry forever against an unset setting.
+  it('returns 400 when the service could not resolve a model', async () => {
+    codeReviewSvc.runLocalCodeReview.mockResolvedValue({
+      ok: false,
+      code: 'NO_MODEL',
+      error: 'No model configured for mtplx reviewer and mtplx is serving no models — set one on the Settings → Code Reviewers page.',
+    })
+
+    const res = await request(makeApp())
+      .post('/api/code-review/local')
+      .send({ backend: 'mtplx', diff: 'diff --git a b' })
+
+    expect(res.status).toBe(400)
+    expect(res.body.error).toMatch(/No model configured/)
+  })
+
+  // A reviewer that can NEVER answer must not read as a transient outage: the
+  // claim gate answers a 502 by leaving the PR open to wait, so an unsupported
+  // reviewer would stall the merge pipeline indefinitely (#7660).
+  it.each(['REVIEWER_UNSUPPORTED', 'REVIEWER_UNAVAILABLE'])('returns 400 for the %s config fault', async (code) => {
+    codeReviewSvc.runLocalCodeReview.mockResolvedValue({
+      ok: false,
+      code,
+      error: 'Reviewer provider has no command configured.',
+    })
+
+    const res = await request(makeApp())
+      .post('/api/code-review/local')
+      .send({ backend: 'provider:hosted-harness', diff: 'diff --git a b' })
+
+    expect(res.status).toBe(400)
+    expect(res.body.error).toMatch(/no command configured/)
+  })
+
+  it('passes repository context and an explicit tool-free request to the review service', async () => {
+    codeReviewSvc.runLocalCodeReview.mockResolvedValue({ ok: true, findings: 'NO FINDINGS' })
+    const res = await request(makeApp()).post('/api/code-review/local').send({
+      backend: 'provider:example-cli', diff: 'example diff', cwd: '/example/repo', toolFree: true,
+    })
+    expect(res.status).toBe(200)
+    expect(codeReviewSvc.runLocalCodeReview).toHaveBeenCalledWith(expect.objectContaining({ cwd: '/example/repo', toolFree: true }))
+  })
+
+  it('returns 502 when the service returns { ok: false }', async () => {
+    codeReviewSvc.runLocalCodeReview.mockResolvedValue({
+      ok: false,
+      backend: 'lmstudio',
+      model: 'm',
+      error: 'lmstudio API error 503: service unavailable',
+    })
+
+    const res = await request(makeApp())
+      .post('/api/code-review/local')
+      .send({ backend: 'lmstudio', model: 'm', diff: 'diff --git a b' })
+
+    expect(res.status).toBe(502)
+    // Standard error envelope: the failure message lands in `error`, and the
+    // reviewer backend/model carry through in `context` for diagnostics.
+    expect(res.body.error).toMatch(/lmstudio API error/)
+    expect(res.body.context).toEqual({ backend: 'lmstudio', model: 'm' })
+  })
+
+  it('projects malformed diagnostics in the HTTP error without reporting review success', async () => {
+    const diagnostics = { reason: 'invalid_json', finishReason: 'unknown', responseLengthChars: 13, responseLengthCapped: false }
+    codeReviewSvc.runLocalCodeReview.mockResolvedValue({ ok: false, backend: 'ollama', model: 'm', code: 'MALFORMED_REVIEW', diagnostics, error: 'No usable code-review verdict.' })
+    const res = await request(makeApp()).post('/api/code-review/local').send({ backend: 'ollama', model: 'm', diff: 'example diff' })
+    expect(res.status).toBe(502)
+    expect(res.body.context).toEqual({ backend: 'ollama', model: 'm', code: 'MALFORMED_REVIEW', diagnostics })
+    expect(codeReviewSvc.reportReviewerSuccess).not.toHaveBeenCalled()
+  })
+
+  it('returns 200 with findings on success', async () => {
+    codeReviewSvc.runLocalCodeReview.mockResolvedValue({
+      ok: true,
+      backend: 'ollama',
+      model: 'codellama',
+      findings: '## Blocking\n- file.js:10 fix the bug',
+    })
+
+    const res = await request(makeApp())
+      .post('/api/code-review/local')
+      .send({ backend: 'ollama', model: 'codellama', diff: 'diff --git a b' })
+
+    expect(res.status).toBe(200)
+    expect(res.body.ok).toBe(true)
+    expect(res.body.findings).toContain('Blocking')
+  })
+})
+
+describe('POST /api/code-review/report-failure', () => {
+  it('records an explicit failure with reason and returns 200', async () => {
+    codeReviewSvc.reportReviewerFailure.mockResolvedValue(true)
+    const res = await request(makeApp())
+      .post('/api/code-review/report-failure')
+      .send({ reviewer: 'ollama', reason: 'quota', error: '429 daily quota exhausted' })
+    expect(res.status).toBe(200)
+    expect(res.body).toEqual({ recorded: true })
+    expect(codeReviewSvc.reportReviewerFailure).toHaveBeenCalledWith('ollama', {
+      reason: 'quota',
+      error: '429 daily quota exhausted',
+    })
+  })
+
+  it('rejects an invalid reviewer with 400', async () => {
+    const res = await request(makeApp())
+      .post('/api/code-review/report-failure')
+      .send({ reviewer: 'not-a-reviewer', reason: 'quota' })
+    expect(res.status).toBe(400)
+  })
+})
+

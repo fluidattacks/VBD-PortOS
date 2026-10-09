@@ -1,0 +1,625 @@
+/**
+ * Durable consumer-side execution core for federated media jobs, shared by
+ * every kind (audio, image, video).
+ *
+ * The local media-job UUID is the provider Idempotency-Key. A worker restart
+ * therefore replays the same submission, recovers the provider job, and keeps
+ * polling instead of creating duplicate paid/GPU work. Provider URLs are never
+ * accepted from the wire: every request derives the fixed v1 endpoint from the
+ * locally configured peer.
+ *
+ * Everything kind-specific — which marker shape is persisted, how the wire
+ * request is built from it, where the verified bytes land, and what a finished
+ * render has to register locally (an image sidecar, a video-history row) — is
+ * supplied by the caller. The retry/cancel/idempotency/integrity semantics are
+ * NOT: they are the part that must stay identical across kinds, which is why
+ * this module owns them instead of each adapter re-deriving them.
+ *
+ * A kind whose request body cannot be built without talking to the peer first
+ * (image conditioning has to be uploaded and turned into asset ids) gets this
+ * run's own `requestJson` handed to `buildRequest` rather than a routine of its
+ * own here. The cross-kind concept is "an authenticated sub-request inside the
+ * run's envelope"; WHAT is sent stays with the kind that knows — see
+ * federatedMedia/inputAssets.js.
+ */
+
+import { maintenance } from '../../lib/maintenanceAdmission.js';
+import { createWriteStream } from 'node:fs';
+import { mkdir, rename, stat, unlink } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { join } from 'node:path';
+import { Readable, Transform } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import { sha256File } from '../../lib/fileUtils.js';
+import {
+  FEDERATED_MEDIA_WIRE_VERSION,
+  federatedMediaProviderJobSchema,
+} from '../../lib/federatedMediaWire.js';
+import { peerFetch } from '../../lib/peerHttpClient.js';
+import { peerBaseUrl } from '../../lib/peerUrl.js';
+import { readResponseJson } from '../../lib/readResponseJson.js';
+import { resolveFederatedMediaProvider } from '../federatedMediaConsumer.js';
+import { getPeers } from '../instances.js';
+import { isTailnetPeer } from '../../lib/tailnetPeer.js';
+
+const RETRYABLE_HTTP_STATUSES = new Set([408, 425, 429]);
+const PERMANENT_SELECTION_CODES = new Set([
+  'MEDIA_PROVIDER_PEER_DISABLED',
+  'MEDIA_PROVIDER_NOT_CONFIGURED',
+  'MEDIA_PROVIDER_SELECTION_INVALID',
+  'MEDIA_PROVIDER_MODEL_NOT_ALLOWED',
+]);
+const NON_RETRYABLE_FILE_CODES = new Set(['EACCES', 'ENOSPC', 'EPERM', 'EROFS']);
+const RETRYABLE_TRANSPORT_CODES = new Set([
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'ETIMEDOUT',
+  'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_SOCKET',
+]);
+
+export const remoteMediaError = (message, details = {}) => Object.assign(new Error(message), details);
+
+const isRetryableStatus = (status) => RETRYABLE_HTTP_STATUSES.has(status) || status >= 500;
+const isRetryableTransportError = (error) =>
+  error?.retryable === true
+  || error?.name === 'AbortError'
+  || error?.name === 'TimeoutError'
+  || error?.name === 'TypeError'
+  || RETRYABLE_TRANSPORT_CODES.has(error?.code);
+
+/**
+ * Build a durable remote executor for one media kind.
+ *
+ * @param {object} config
+ * @param {'audio'|'image'|'video'} config.kind - Wire kind this executor speaks.
+ * @param {string} config.label - Human noun used in progress/failure messages.
+ * @param {import('events').EventEmitter} config.events - The kind's gen event emitter.
+ * @param {import('zod').ZodTypeAny} config.markerSchema - Schema for `params.remoteMedia`.
+ * @param {(marker: object, ctx: object) => object|Promise<object>} config.buildRequest -
+ *   Wire submission body builder. `ctx` carries this run's `requestJson` — the
+ *   same authenticated, in-envelope request helper the executor uses itself, so
+ *   a body that has to make a sub-request while it is being built (staging
+ *   conditioning images today) does so inside the run's retry, cancel and
+ *   timeout envelope — plus `emitStatus` to narrate it. WHAT that sub-request is
+ *   stays kind-specific; the executor only lends the channel.
+ * @param {(ctx: object) => {dir: string, filename: string}} config.resolveDestination -
+ *   Where the verified result lands. Called per job so a PATHS proxy stays live.
+ * @param {(work: Function, ctx: object) => Promise<object>} [config.publishResult]
+ *   Owns verified-file installation plus finalize, including replacement rollback.
+ *   Downloads complete before admission; matching-file replays still finalize.
+ * @param {(ctx: object) => Promise<object>} config.finalize - Register the downloaded
+ *   result locally; its return value is merged into the `completed` event payload.
+ *   Its ctx carries `renderStartedAtMs` (this install's ingestion instant) for
+ *   `renderTimingFields` — see the call site for what that span covers.
+ */
+export function createRemoteMediaExecutor({
+  kind,
+  label,
+  events,
+  markerSchema,
+  buildRequest,
+  resolveDestination,
+  finalize,
+  publishResult = work => work(),
+}) {
+  let pollDelayMs = 1_000;
+  let retryDelayMs = 2_000;
+  let requestTimeoutMs = 30_000;
+  const activeJobs = new Map();
+
+  const canceledError = () => remoteMediaError(`Remote ${label} generation canceled`, { canceled: true });
+
+  function emitActivity(jobId) {
+    events.emit('activity', { generationId: jobId });
+  }
+
+  function emitStatus(jobId, message) {
+    emitActivity(jobId);
+    events.emit('status', { generationId: jobId, message });
+  }
+
+  async function waitForRetry(state, delayMs) {
+    emitActivity(state.jobId);
+    if (delayMs <= 0) return;
+    await new Promise((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (state.wake === finish) state.wake = null;
+        resolve();
+      };
+      const timer = setTimeout(finish, delayMs);
+      timer.unref?.();
+      state.wake = finish;
+    });
+  }
+
+  // `timeoutScale` multiplies the JSON request timeout for a sub-request that
+  // legitimately outruns it (a multi-megabyte conditioning upload). It stays a
+  // scale rather than an absolute so callers outside this module never have to
+  // know — or fall out of sync with — the configured base timeout.
+  async function withRequest(
+    state,
+    fn,
+    { respectCancel = true, timeoutScale = 1, timeoutMs = requestTimeoutMs * timeoutScale } = {},
+  ) {
+    const controller = new AbortController();
+    const timer = timeoutMs === null ? null : setTimeout(() => controller.abort(), timeoutMs);
+    timer?.unref?.();
+    state.requestController = controller;
+    if (respectCancel && state.cancelRequested) controller.abort();
+    try {
+      return await fn(controller.signal);
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (state.requestController === controller) state.requestController = null;
+    }
+  }
+
+  async function findPeer(peerId, { standingRoute = false } = {}) {
+    const peers = await getPeers();
+    const peer = peers.find((candidate) => candidate.id === peerId);
+    if (!peer || peer.enabled === false) {
+      throw remoteMediaError('Selected media provider peer is no longer available', {
+        code: 'MEDIA_PROVIDER_PEER_UNAVAILABLE',
+      });
+    }
+    // A standing route's tailnet gate is checked at enqueue, but the peer record
+    // it checked can change while the job sits queued or reconciles across a
+    // restart — a host edited from a .ts.net name to a LAN address would
+    // otherwise carry the visual prompt over an unauthenticated hop on the very
+    // next request. Every request path (submit, poll, cancel, result) resolves
+    // its peer here, so re-checking at this one chokepoint covers all of them.
+    // ADR docs/decisions/2026-08-20-federated-visual-prompts.md, rule 5.
+    if (standingRoute && !isTailnetPeer(peer)) {
+      throw remoteMediaError('Media provider peer is no longer a Tailscale host', {
+        code: 'MEDIA_ROUTING_PEER_NOT_TAILNET',
+      });
+    }
+    return peer;
+  }
+
+  async function requestJson(state, path, options = {}, requestOptions = {}) {
+    const peer = await findPeer(state.peerId, { standingRoute: state.standingRoute });
+    const { response, body } = await withRequest(
+      state,
+      async (signal) => {
+        const response = await peerFetch(`${peerBaseUrl(peer)}${path}`, {
+          redirect: 'error',
+          ...options,
+          signal,
+        }, peer);
+        const body = await readResponseJson(response, { fallback: null, emptyValue: null });
+        return { response, body };
+      },
+      requestOptions,
+    );
+    if (!response.ok) {
+      const code = typeof body?.code === 'string' ? body.code : `HTTP_${response.status}`;
+      throw remoteMediaError(`Remote media provider rejected the request (${code})`, {
+        code,
+        status: response.status,
+        retryable: isRetryableStatus(response.status),
+      });
+    }
+    return body;
+  }
+
+  function parseProviderJob(body, expectedId) {
+    const parsed = federatedMediaProviderJobSchema.safeParse(body);
+    if (!parsed.success || parsed.data.kind !== kind || (expectedId && parsed.data.id !== expectedId)) {
+      throw remoteMediaError('Remote media provider returned an invalid wire-v1 job projection', {
+        code: 'MEDIA_PROVIDER_INVALID_JOB_RESPONSE',
+      });
+    }
+    return parsed.data;
+  }
+
+  async function preflight(state, selection) {
+    while (true) {
+      if (state.cancelRequested) throw canceledError();
+      const peer = await findPeer(state.peerId, { standingRoute: state.standingRoute });
+      try {
+        await withRequest(
+          state,
+          (signal) => resolveFederatedMediaProvider(peer, selection, { signal }),
+        );
+        return;
+      } catch (error) {
+        if (state.cancelRequested) throw canceledError();
+        if (PERMANENT_SELECTION_CODES.has(error?.code)) throw error;
+        emitStatus(state.jobId, 'Waiting for remote provider readiness');
+        await waitForRetry(state, retryDelayMs);
+      }
+    }
+  }
+
+  async function submitOrRecover(state, request) {
+    const path = '/api/federation/media/v1/jobs';
+    while (true) {
+      // Once an attempt begins, an abort is ambiguous: the provider may have
+      // accepted the body before the connection broke. Keep replaying with the
+      // same key (even after local cancellation) until its job id is recovered.
+      state.submissionMayExist = true;
+      try {
+        const body = await requestJson(state, path, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Idempotency-Key': state.jobId,
+          },
+          body: JSON.stringify(request),
+        }, { respectCancel: !state.cancelRequested });
+        return parseProviderJob(body);
+      } catch (error) {
+        if (!isRetryableTransportError(error)) throw error;
+        emitStatus(state.jobId, state.cancelRequested
+          ? 'Recovering remote job before cancellation'
+          : 'Waiting to submit to the remote provider');
+        // Cancellation must still recover the possibly-accepted submission before
+        // it can target the provider job. Keep the normal backoff while doing so:
+        // a disconnected peer must not turn a durable cancel into a hot loop.
+        await waitForRetry(state, retryDelayMs);
+      }
+    }
+  }
+
+  async function sendRemoteCancel(state, remoteJobId) {
+    while (true) {
+      try {
+        const body = await requestJson(
+          state,
+          `/api/federation/media/v1/jobs/${remoteJobId}/cancel`,
+          { method: 'POST' },
+          { respectCancel: false },
+        );
+        state.cancelSent = true;
+        return parseProviderJob(body, remoteJobId);
+      } catch (error) {
+        // A terminal provider job returns 409. The local user still asked to
+        // cancel, so do not import a result that won the race.
+        if (error?.status === 409) throw canceledError();
+        if (!isRetryableTransportError(error)) throw error;
+        emitStatus(state.jobId, 'Waiting to cancel the remote job');
+        await waitForRetry(state, retryDelayMs);
+      }
+    }
+  }
+
+  function emitProviderProgress(state, job) {
+    emitActivity(state.jobId);
+    if (typeof job.progress === 'number') {
+      events.emit('progress', {
+        generationId: state.jobId,
+        progress: job.progress,
+        message: 'Rendering on remote provider',
+        ...(typeof job.etaMs === 'number' ? { etaMs: job.etaMs } : {}),
+      });
+      return;
+    }
+    const position = typeof job.position === 'number' ? ` (position ${job.position})` : '';
+    emitStatus(state.jobId, job.status === 'queued'
+      ? `Queued on remote provider${position}`
+      : 'Rendering on remote provider');
+  }
+
+  async function pollProviderJob(state, initial) {
+    let current = initial;
+    const rememberTerminal = job => {
+      if (!['completed', 'failed', 'canceled'].includes(job.status)) return;
+      state.remoteTerminal = true;
+      state.remoteTerminalJob = { id: job.id, status: job.status };
+    };
+    while (true) {
+      rememberTerminal(current);
+      if (state.cancelRequested && !state.cancelSent) {
+        current = await sendRemoteCancel(state, current.id);
+        rememberTerminal(current);
+      }
+      if (state.cancelRequested && ['completed', 'failed', 'canceled'].includes(current.status)) {
+        throw canceledError();
+      }
+      if (current.status === 'completed') {
+        if (!current.result) {
+          throw remoteMediaError('Remote provider completed without result metadata', {
+            code: 'MEDIA_PROVIDER_RESULT_MISSING',
+          });
+        }
+        return current;
+      }
+      if (current.status === 'failed') {
+        throw remoteMediaError(`Remote provider job failed (${current.failure?.code || 'MEDIA_PROVIDER_JOB_FAILED'})`, {
+          code: current.failure?.code || 'MEDIA_PROVIDER_JOB_FAILED',
+        });
+      }
+      if (current.status === 'canceled') {
+        throw remoteMediaError('Remote provider canceled the job', { code: 'MEDIA_PROVIDER_JOB_CANCELED' });
+      }
+
+      emitProviderProgress(state, current);
+      await waitForRetry(state, pollDelayMs);
+      try {
+        const body = await requestJson(
+          state,
+          `/api/federation/media/v1/jobs/${current.id}`,
+          {},
+          { respectCancel: true },
+        );
+        current = parseProviderJob(body, current.id);
+      } catch (error) {
+        if (state.cancelRequested && error?.name === 'AbortError') continue;
+        if (!isRetryableTransportError(error)) throw error;
+        emitStatus(state.jobId, 'Remote provider temporarily unavailable');
+        await waitForRetry(state, retryDelayMs);
+      }
+    }
+  }
+
+  async function existingResultMatches(path, metadata) {
+    const info = await stat(path).catch(() => null);
+    if (!info?.isFile() || info.size !== metadata.sizeBytes) return false;
+    const digest = await sha256File(path).catch(() => null);
+    return digest === metadata.sha256;
+  }
+
+  function responseStream(body) {
+    if (!body) throw remoteMediaError('Remote provider returned an empty result body');
+    return typeof body.getReader === 'function' ? Readable.fromWeb(body) : Readable.from(body);
+  }
+
+  async function downloadOnce(state, remoteJob) {
+    const metadata = remoteJob.result;
+    const { dir, filename } = resolveDestination({ jobId: state.jobId, remoteJob });
+    const finalPath = join(dir, filename);
+    const partialPath = join(dir, `.${filename}.partial`);
+    await mkdir(dir, { recursive: true });
+    if (await existingResultMatches(finalPath, metadata)) return { filename, dir, path: finalPath };
+    await unlink(partialPath).catch((error) => { if (error.code !== 'ENOENT') maintenance.markCurrentUnsettled(); });
+
+    const peer = await findPeer(state.peerId, { standingRoute: state.standingRoute });
+    // Keep the controller live for the body stream so cancel()/the queue
+    // watchdog can interrupt a stalled transfer. There is intentionally no
+    // fixed wall-clock timeout: large renders over a slow Tailnet are valid
+    // work, and chunk activity keeps the queue's idle watchdog fresh.
+    return withRequest(state, async (signal) => {
+      const response = await peerFetch(
+        `${peerBaseUrl(peer)}/api/federation/media/v1/jobs/${remoteJob.id}/result`,
+        { redirect: 'error', signal },
+        peer,
+      );
+      if (!response.ok) {
+        throw remoteMediaError(`Remote result download failed (HTTP_${response.status})`, {
+          status: response.status,
+          retryable: isRetryableStatus(response.status),
+        });
+      }
+
+      const contentLength = Number(response.headers.get('content-length'));
+      const contentType = response.headers.get('content-type')?.split(';', 1)[0]?.trim();
+      const advertisedHash = response.headers.get('x-content-sha256')?.toLowerCase();
+      if (!Number.isInteger(contentLength) || contentLength !== metadata.sizeBytes
+        || contentType !== metadata.mimeType || advertisedHash !== metadata.sha256) {
+        throw remoteMediaError('Remote result headers did not match the validated metadata', {
+          code: 'MEDIA_PROVIDER_RESULT_HEADERS_INVALID',
+        });
+      }
+
+      let sizeBytes = 0;
+      let lastActivityAt = 0;
+      const hasher = createHash('sha256');
+      const meter = new Transform({
+        transform(chunk, _encoding, callback) {
+          sizeBytes += chunk.length;
+          if (sizeBytes > metadata.sizeBytes) {
+            callback(remoteMediaError('Remote result exceeded its advertised size'));
+            return;
+          }
+          hasher.update(chunk);
+          const now = Date.now();
+          if (now - lastActivityAt >= 1_000) {
+            lastActivityAt = now;
+            emitActivity(state.jobId);
+          }
+          callback(null, chunk);
+        },
+      });
+      let verified = false;
+      try {
+        await pipeline(responseStream(response.body), meter, createWriteStream(partialPath, { flags: 'wx' }));
+        const digest = hasher.digest('hex');
+        if (sizeBytes !== metadata.sizeBytes || digest !== metadata.sha256) {
+          throw remoteMediaError('Remote result failed byte-integrity verification', {
+            code: 'MEDIA_PROVIDER_RESULT_INTEGRITY_FAILED',
+          });
+        }
+        // Promotion waits for the adapter's publication boundary. The verified
+        // staging file is never named by a history record.
+        verified = true;
+        return { filename, dir, path: finalPath, stagedPath: partialPath };
+      } finally {
+        if (!verified) await unlink(partialPath).catch((error) => { if (error.code !== 'ENOENT') maintenance.markCurrentUnsettled(); });
+      }
+    }, { timeoutMs: null });
+  }
+
+  async function downloadResult(state, remoteJob) {
+    while (true) {
+      if (state.cancelRequested) throw canceledError();
+      emitStatus(state.jobId, `Downloading verified remote ${label}`);
+      try {
+        return await downloadOnce(state, remoteJob);
+      } catch (error) {
+        if (state.cancelRequested) throw canceledError();
+        const retryable = !NON_RETRYABLE_FILE_CODES.has(error?.code)
+          && !error?.code?.startsWith('MEDIA_PROVIDER_RESULT_')
+          && isRetryableTransportError(error);
+        if (!retryable) throw error;
+        emitStatus(state.jobId, `Remote ${label} transfer interrupted; retrying`);
+        await waitForRetry(state, retryDelayMs);
+      }
+    }
+  }
+
+  async function runRemote(state, marker) {
+    // Awaited, and handed this run's own request channel: an image/video marker
+    // resolves its persisted LOCAL conditioning paths into provider asset ids
+    // here, inside this run's retry, cancel and timeout envelope rather than
+    // before it. See federatedMedia/inputAssets.js for what that entails.
+    const request = await buildRequest(marker, {
+      requestJson: (path, options, requestOptions) => requestJson(state, path, options, requestOptions),
+      emitStatus: (message) => emitStatus(state.jobId, message),
+    });
+    const selection = { kind, engine: request.engine, modelId: request.modelId };
+    if (!marker.reconcile) await preflight(state, selection);
+    if (state.cancelRequested && !marker.reconcile && !state.submissionMayExist) throw canceledError();
+
+    const submitted = await submitOrRecover(state, request);
+    const completed = await pollProviderJob(state, submitted);
+    const downloaded = await downloadResult(state, completed);
+    state.finalizing = true;
+    let local;
+    try {
+      local = await publishResult(async () => {
+        // Atomic installation preserves an existing path until its replacement lands.
+        if (downloaded.stagedPath) await rename(downloaded.stagedPath, downloaded.path);
+        return finalize({
+          jobId: state.jobId,
+          peerId: state.peerId,
+          request,
+          remoteJob: completed,
+          // Wall-clock render timing (#5878). Measured from THIS install's
+          // ingestion of the job — submission, the peer's own queue wait and
+          // render, download, verification — because that whole span is what the
+          // user waited through here. The peer's internal render time is not on
+          // the wire, and asking for it would be a status payload crossing the
+          // federation boundary.
+          renderStartedAtMs: state.renderStartedAtMs,
+          ...downloaded,
+        });
+      }, { ...downloaded, jobId: state.jobId });
+    } finally {
+      if (downloaded.stagedPath) await unlink(downloaded.stagedPath).catch(error => {
+        if (error.code !== 'ENOENT') maintenance.markCurrentUnsettled();
+      });
+    }
+    state.finalizing = false;
+    return {
+      ...local,
+      federatedMedia: {
+        wireVersion: FEDERATED_MEDIA_WIRE_VERSION,
+        peerId: state.peerId,
+        remoteJobId: completed.id,
+      },
+    };
+  }
+
+  /** Queue entry point — mirrors the local generator's `generateX(params)` shape. */
+  async function run(params) {
+    const marker = markerSchema.safeParse(params?.remoteMedia);
+    if (!marker.success) {
+      if (params?.remoteMedia?.reconcile === true) maintenance.markCurrentUnsettled();
+      events.emit('failed', {
+        generationId: params?.jobId,
+        error: `Remote ${label} job has invalid persisted routing metadata`,
+      });
+      return;
+    }
+    // The queue serializes peer work; also refuse overlapping attempts for
+    // the same idempotency key at the executor boundary.
+    if (activeJobs.has(params.jobId)) {
+      throw remoteMediaError('This remote job is already being observed', { code: 'MEDIA_PROVIDER_RECONCILIATION_ACTIVE' });
+    }
+
+    const state = {
+      jobId: params.jobId,
+      peerId: marker.data.peerId,
+      cancelRequested: marker.data.cancelRequested === true,
+      cancelSent: false,
+      submissionMayExist: marker.data.reconcile === true,
+      // Absent on an interactive marker (and on any marker queued before this
+      // shipped), which reads correctly as "not a standing route".
+      standingRoute: marker.data.standingRoute === true,
+      requestController: null,
+      wake: null,
+      // The instant the media-job queue handed this job to us; `finalize` turns
+      // it into the record's render-timing fields (#5878).
+      //
+      // NOT stamped on a reconcile. That path re-enters `run()` after a restart
+      // for a job that was already submitted — `Date.now()` here would measure
+      // only the post-restart download-and-verify tail, so a 20-minute render
+      // interrupted by a `pm2 restart` would land claiming it took 8 seconds.
+      // The pre-restart instant is not recoverable (it lived in this in-memory
+      // state, not on the persisted marker), so report the honest unknown:
+      // `renderTimingFields(null)` yields `{}` and the card shows no duration.
+      renderStartedAtMs: marker.data.reconcile === true ? null : Date.now(),
+    };
+    activeJobs.set(params.jobId, state);
+    let event;
+    let payload;
+    try {
+      const result = await runRemote(state, marker.data);
+      // This is a transient executor verdict, never a provider/caller field.
+      // The queue may release owned inputs only AFTER its terminal row is durable.
+      event = 'completed';
+      payload = { generationId: params.jobId, ...result,
+        remoteInputsDisposable: !state.finalizing && (state.remoteTerminal === true || !state.submissionMayExist) };
+    } catch (error) {
+      // An unreachable/revoked peer is not proof that its admitted render
+      // stopped. Keep local ownership until completion can be reconciled.
+      if ((state.submissionMayExist && !state.remoteTerminal) || state.finalizing) maintenance.markCurrentUnsettled();
+      event = 'failed';
+      payload = {
+        generationId: params.jobId,
+        remoteInputsDisposable: !state.finalizing && (state.remoteTerminal === true || !state.submissionMayExist),
+        error: error?.canceled
+          ? `Remote ${label} generation canceled`
+          : (error?.message || `Remote ${label} generation failed`),
+      };
+    } finally {
+      activeJobs.delete(params.jobId);
+    }
+    // Created locally only after executor teardown, never accepted from the
+    // provider response. Safe disposal can also mean "never submitted"; that
+    // does not certify termination of a previously admitted peer job.
+    if (marker.data.reconcile === true && state.remoteTerminalJob && !state.finalizing) {
+      payload.remoteRecoverySettlement = {
+        jobId: state.jobId, peerId: state.peerId, remoteJobId: state.remoteTerminalJob.id,
+        status: state.remoteTerminalJob.status, executorSettled: true,
+      };
+    }
+    events.emit(event, payload);
+  }
+
+  function cancel(jobId) {
+    const state = activeJobs.get(jobId);
+    if (!state) return;
+    state.cancelRequested = true;
+    state.requestController?.abort();
+    state.wake?.();
+  }
+
+  function configureForTests(options = {}) {
+    pollDelayMs = options.pollDelayMs ?? 0;
+    retryDelayMs = options.retryDelayMs ?? 0;
+    requestTimeoutMs = options.requestTimeoutMs ?? 1_000;
+  }
+
+  function resetForTests() {
+    for (const state of activeJobs.values()) {
+      state.cancelRequested = true;
+      state.requestController?.abort();
+      state.wake?.();
+    }
+    activeJobs.clear();
+    pollDelayMs = 1_000;
+    retryDelayMs = 2_000;
+    requestTimeoutMs = 30_000;
+  }
+
+  return { run, cancel, configureForTests, resetForTests };
+}

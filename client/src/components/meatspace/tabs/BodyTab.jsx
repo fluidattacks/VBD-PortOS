@@ -1,0 +1,271 @@
+import { useState, useEffect, useCallback } from 'react';
+import { Scale, Eye, Plus, Pencil, Trash2, Check, X } from 'lucide-react';
+import * as api from '../../../services/api';
+import BrailleSpinner from '../../BrailleSpinner';
+import LoadFailureNotice from '../LoadFailureNotice';
+import ConfirmButtonPair from '../../ui/ConfirmButtonPair';
+import { useConfirmDelete } from '../../../hooks/useConfirmDelete';
+import BodyCompChart from '../BodyCompChart';
+import BloodPressureCard from '../BloodPressureCard';
+
+const EMPTY_EYE_FORM = {
+  date: '', leftSphere: '', leftCylinder: '', leftAxis: '',
+  rightSphere: '', rightCylinder: '', rightAxis: ''
+};
+
+function formatSph(val) {
+  if (val == null) return '\u2014';
+  return (val > 0 ? '+' : '') + val.toFixed(2);
+}
+
+function parseNum(v) {
+  if (v === '' || v === null || v === undefined) return null;
+  const n = parseFloat(v);
+  return isNaN(n) ? null : n;
+}
+
+const sortEyeExams = (exams) => [...exams].sort((a, b) => (a.date || '').localeCompare(b.date || ''));
+
+function buildEyePayload(form) {
+  const payload = { date: form.date };
+  for (const key of ['leftSphere', 'leftCylinder', 'leftAxis', 'rightSphere', 'rightCylinder', 'rightAxis']) {
+    const v = parseNum(form[key]);
+    if (v !== null) payload[key] = v;
+  }
+  return payload;
+}
+
+export default function BodyTab() {
+  const [eyeData, setEyeData] = useState(null);
+  const [eyeLoading, setEyeLoading] = useState(true);
+  const [eyeFailed, setEyeFailed] = useState(false);
+  const [showEyeForm, setShowEyeForm] = useState(false);
+  const [eyeForm, setEyeForm] = useState(EMPTY_EYE_FORM);
+  const [editingEyeId, setEditingEyeId] = useState(null);
+  const { isConfirming, requestDelete, cancelDelete, confirmDelete } = useConfirmDelete();
+
+  const fetchEyes = useCallback(async () => {
+    const eyes = await api.getEyeExams({ silent: true }).catch(() => null);
+    setEyeFailed(eyes === null);
+    setEyeData(eyes);
+    setEyeLoading(false);
+  }, []);
+
+  useEffect(() => {
+    fetchEyes();
+  }, [fetchEyes]);
+
+  const handleAddEye = async () => {
+    if (!eyeForm.date) return;
+    const exam = await api.addEyeExam(buildEyePayload(eyeForm));
+    setEyeData(prev => ({ ...prev, exams: sortEyeExams([...(prev?.exams || []), exam]) }));
+    setEyeForm(EMPTY_EYE_FORM);
+    setShowEyeForm(false);
+  };
+
+  const startEditEye = (exam) => {
+    setEditingEyeId(exam.id);
+    setEyeForm({
+      date: exam.date,
+      leftSphere: exam.leftSphere ?? '',
+      leftCylinder: exam.leftCylinder ?? '',
+      leftAxis: exam.leftAxis ?? '',
+      rightSphere: exam.rightSphere ?? '',
+      rightCylinder: exam.rightCylinder ?? '',
+      rightAxis: exam.rightAxis ?? ''
+    });
+  };
+
+  const handleUpdateEye = async () => {
+    if (editingEyeId == null) return;
+    const updated = await api.updateEyeExam(editingEyeId, buildEyePayload(eyeForm));
+    setEyeData(prev => ({
+      ...prev,
+      exams: sortEyeExams(prev.exams.map(e => e.id === editingEyeId ? updated : e))
+    }));
+    setEditingEyeId(null);
+    setEyeForm(EMPTY_EYE_FORM);
+  };
+
+  const handleDeleteEye = async (id) => {
+    await api.removeEyeExam(id);
+    setEyeData(prev => ({ ...prev, exams: prev.exams.filter(e => e.id !== id) }));
+  };
+
+  const eyeExams = eyeData?.exams || [];
+
+  return (
+    <div className="space-y-6">
+      {/* Body Composition */}
+      <div>
+        <div className="flex items-center gap-2 mb-3">
+          <Scale size={18} className="text-port-accent" />
+          <h3 className="text-sm font-medium text-gray-400 uppercase tracking-wider">Body Composition</h3>
+        </div>
+        <BodyCompChart />
+      </div>
+
+      {/* Blood Pressure */}
+      <BloodPressureCard />
+
+      {/* Eye Prescriptions */}
+      <div>
+        <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center gap-2">
+            <Eye size={18} className="text-port-accent" />
+            <h3 className="text-sm font-medium text-gray-400 uppercase tracking-wider">
+              Eye Prescriptions ({eyeLoading || eyeFailed ? '...' : eyeExams.length})
+            </h3>
+          </div>
+          {!showEyeForm && editingEyeId == null && (
+            <button
+              onClick={() => { setShowEyeForm(true); setEyeForm({ ...EMPTY_EYE_FORM, date: new Date().toISOString().split('T')[0] }); }}
+              className="flex items-center gap-1 text-xs text-port-accent hover:text-port-accent/80 transition-colors"
+            >
+              <Plus size={14} /> Add Exam
+            </button>
+          )}
+        </div>
+
+        {(showEyeForm || editingEyeId != null) && (
+          <div className="bg-port-card border border-port-border rounded-xl p-4 mb-3">
+            <h4 className="text-sm font-medium text-gray-300 mb-3">
+              {editingEyeId != null ? 'Edit Eye Exam' : 'New Eye Exam'}
+            </h4>
+            <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2 mb-3">
+              <div className="col-span-2 sm:col-span-4 lg:col-span-1">
+                <label htmlFor="eye-date" className="text-xs text-gray-500">Date</label>
+                <input id="eye-date" type="date" value={eyeForm.date}
+                  onChange={e => setEyeForm(f => ({ ...f, date: e.target.value }))}
+                  className="w-full bg-port-bg border border-port-border rounded px-2 py-1 text-sm text-gray-200 font-mono" />
+              </div>
+              <div>
+                <label htmlFor="eye-left-sphere" className="text-xs text-gray-500">L SPH</label>
+                <input id="eye-left-sphere" type="number" step="0.25" value={eyeForm.leftSphere}
+                  onChange={e => setEyeForm(f => ({ ...f, leftSphere: e.target.value }))}
+                  className="w-full bg-port-bg border border-port-border rounded px-2 py-1 text-sm text-gray-200 font-mono" />
+              </div>
+              <div>
+                <label htmlFor="eye-left-cylinder" className="text-xs text-gray-500">L CYL</label>
+                <input id="eye-left-cylinder" type="number" step="0.25" value={eyeForm.leftCylinder}
+                  onChange={e => setEyeForm(f => ({ ...f, leftCylinder: e.target.value }))}
+                  className="w-full bg-port-bg border border-port-border rounded px-2 py-1 text-sm text-gray-200 font-mono" />
+              </div>
+              <div>
+                <label htmlFor="eye-left-axis" className="text-xs text-gray-500">L AXIS</label>
+                <input id="eye-left-axis" type="number" step="1" min="0" max="180" value={eyeForm.leftAxis}
+                  onChange={e => setEyeForm(f => ({ ...f, leftAxis: e.target.value }))}
+                  className="w-full bg-port-bg border border-port-border rounded px-2 py-1 text-sm text-gray-200 font-mono" />
+              </div>
+              <div>
+                <label htmlFor="eye-right-sphere" className="text-xs text-gray-500">R SPH</label>
+                <input id="eye-right-sphere" type="number" step="0.25" value={eyeForm.rightSphere}
+                  onChange={e => setEyeForm(f => ({ ...f, rightSphere: e.target.value }))}
+                  className="w-full bg-port-bg border border-port-border rounded px-2 py-1 text-sm text-gray-200 font-mono" />
+              </div>
+              <div>
+                <label htmlFor="eye-right-cylinder" className="text-xs text-gray-500">R CYL</label>
+                <input id="eye-right-cylinder" type="number" step="0.25" value={eyeForm.rightCylinder}
+                  onChange={e => setEyeForm(f => ({ ...f, rightCylinder: e.target.value }))}
+                  className="w-full bg-port-bg border border-port-border rounded px-2 py-1 text-sm text-gray-200 font-mono" />
+              </div>
+              <div>
+                <label htmlFor="eye-right-axis" className="text-xs text-gray-500">R AXIS</label>
+                <input id="eye-right-axis" type="number" step="1" min="0" max="180" value={eyeForm.rightAxis}
+                  onChange={e => setEyeForm(f => ({ ...f, rightAxis: e.target.value }))}
+                  className="w-full bg-port-bg border border-port-border rounded px-2 py-1 text-sm text-gray-200 font-mono" />
+              </div>
+            </div>
+            <div className="flex gap-2">
+              <button
+                onClick={editingEyeId != null ? handleUpdateEye : handleAddEye}
+                disabled={!eyeForm.date}
+                className="flex items-center gap-1 px-3 py-1 bg-port-accent/20 text-port-accent rounded text-sm hover:bg-port-accent/30 disabled:opacity-40"
+              >
+                <Check size={14} /> {editingEyeId != null ? 'Save' : 'Add'}
+              </button>
+              <button
+                onClick={() => { setShowEyeForm(false); setEditingEyeId(null); setEyeForm(EMPTY_EYE_FORM); }}
+                className="flex items-center gap-1 px-3 py-1 text-gray-400 hover:text-gray-200 text-sm"
+              >
+                <X size={14} /> Cancel
+              </button>
+            </div>
+          </div>
+        )}
+
+        {eyeLoading ? (
+          <div className="flex justify-center py-12">
+            <BrailleSpinner text="Loading eye data" />
+          </div>
+        ) : eyeFailed ? (
+          <LoadFailureNotice message="Could not load eye exams. Retry." onRetry={fetchEyes} />
+        ) : eyeExams.length === 0 ? (
+          <div className="bg-port-card border border-port-border rounded-xl p-6">
+            <p className="text-gray-500 text-sm">No eye exam data. Import your health spreadsheet or add exams manually.</p>
+          </div>
+        ) : (
+          <div className="bg-port-card border border-port-border rounded-xl overflow-hidden overflow-x-auto">
+            <table className="w-full text-sm min-w-[640px]">
+              <thead>
+                <tr className="text-xs text-gray-500 uppercase border-b border-port-border">
+                  <th className="text-left py-2 px-3">Date</th>
+                  <th className="text-right py-2 px-2">L SPH</th>
+                  <th className="text-right py-2 px-2">L CYL</th>
+                  <th className="text-right py-2 px-2">L AXIS</th>
+                  <th className="text-right py-2 px-2">R SPH</th>
+                  <th className="text-right py-2 px-2">R CYL</th>
+                  <th className="text-right py-2 px-2">R AXIS</th>
+                  <th className="w-16"></th>
+                </tr>
+              </thead>
+              <tbody>
+                {[...eyeExams].reverse().map((exam) => {
+                  return (
+                    <tr key={exam.id} className="border-b border-port-border/50 hover:bg-port-bg/30">
+                      <td className="py-1.5 px-3 font-mono text-gray-400">{exam.date}</td>
+                      <td className="py-1.5 px-2 text-right font-mono text-gray-300">{formatSph(exam.leftSphere)}</td>
+                      <td className="py-1.5 px-2 text-right font-mono text-gray-300">{formatSph(exam.leftCylinder)}</td>
+                      <td className="py-1.5 px-2 text-right font-mono text-gray-300">{exam.leftAxis != null ? `${exam.leftAxis}\u00B0` : '\u2014'}</td>
+                      <td className="py-1.5 px-2 text-right font-mono text-gray-300">{formatSph(exam.rightSphere)}</td>
+                      <td className="py-1.5 px-2 text-right font-mono text-gray-300">{formatSph(exam.rightCylinder)}</td>
+                      <td className="py-1.5 px-2 text-right font-mono text-gray-300">{exam.rightAxis != null ? `${exam.rightAxis}\u00B0` : '\u2014'}</td>
+                      <td className="py-1.5 px-2 text-right">
+                        <div className="flex items-center justify-end gap-2">
+                          <button
+                            onClick={() => startEditEye(exam)}
+                            className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center p-1 text-gray-600 hover:text-port-accent transition-colors"
+                            title="Edit" aria-label="Edit"
+                          >
+                            <Pencil size={12} />
+                          </button>
+                          {isConfirming(exam.id) ? (
+                            <ConfirmButtonPair
+                              prompt="Delete?"
+                              confirmIcon={Trash2}
+                              ariaLabel={`Confirm delete eye exam ${exam.date}`}
+                              onConfirm={() => confirmDelete(() => handleDeleteEye(exam.id))}
+                              onCancel={cancelDelete}
+                            />
+                          ) : (
+                            <button
+                              onClick={() => requestDelete(exam.id)}
+                              className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center p-1 text-gray-600 hover:text-port-error transition-colors"
+                              title="Delete" aria-label="Delete"
+                            >
+                              <Trash2 size={12} />
+                            </button>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

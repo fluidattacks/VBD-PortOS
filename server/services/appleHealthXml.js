@@ -1,0 +1,370 @@
+/**
+ * Apple Health XML Import Service
+ *
+ * Dependency-free streaming parser for Apple Health exports (500MB+).
+ * Normalizes HK identifiers to metric names matching JSON ingest format.
+ * Emits WebSocket progress events every 10k records.
+ */
+
+import { createReadStream } from 'fs';
+import { unlink } from 'fs/promises';
+import { extractDateStr, readDayFile, writeDayFile, upsertPoints, queueDayWrite } from './appleHealthIngest.js';
+import { createAppleHealthRecordStream } from './appleHealthXmlParser.js';
+
+// === Mapping Tables ===
+
+const XML_TO_METRIC_NAME = {
+  // Core vitals
+  'hkquantitytypeidentifierheartrate': 'heart_rate',
+  'hkquantitytypeidentifierheartratevariancessdnn': 'heart_rate_variability_sdnn',
+  'hkquantitytypeidentifierrestingheartrate': 'resting_heart_rate',
+  'hkquantitytypeidentifierwalkingheartrateaverage': 'walking_heart_rate_average',
+  'hkquantitytypeidentifierheartraterecoveryoneminute': 'heart_rate_recovery',
+  'hkquantitytypeidentifieroxygensaturation': 'blood_oxygen_saturation',
+  'hkquantitytypeidentifierrespiratoryrate': 'respiratory_rate',
+  'hkquantitytypeidentifierbodytemperature': 'body_temperature',
+  'hkquantitytypeidentifiervo2max': 'vo2_max',
+
+  // Activity
+  'hkquantitytypeidentifierstepcount': 'step_count',
+  'hkquantitytypeidentifieractiveenergyburned': 'active_energy',
+  'hkquantitytypeidentifierbasalenergyburned': 'basal_energy_burned',
+  'hkquantitytypeidentifierdistancewalkingrunning': 'walking_running_distance',
+  'hkquantitytypeidentifierflightsclimbed': 'flights_climbed',
+  'hkquantitytypeidentifierappleexercisetime': 'apple_exercise_time',
+  'hkquantitytypeidentifierapplestandtime': 'apple_stand_time',
+  'hkcategorytypeidentifierapplestandhour': 'apple_stand_hour',
+  'hkquantitytypeidentifierphysicaleffort': 'physical_effort',
+  'hkquantitytypeidentifiertimeindaylight': 'time_in_daylight',
+
+  // Walking metrics
+  'hkquantitytypeidentifierwalkingspeed': 'walking_speed',
+  'hkquantitytypeidentifierwalkingsteplength': 'walking_step_length',
+  'hkquantitytypeidentifierwalkingdoublesupportpercentage': 'walking_double_support_percentage',
+  'hkquantitytypeidentifierwalkingasymmetrypercentage': 'walking_asymmetry_percentage',
+  'hkquantitytypeidentifierstairdescentspeed': 'stair_speed_down',
+  'hkquantitytypeidentifierstairascentspeed': 'stair_speed_up',
+  'hkquantitytypeidentifierapplewalkingsteadiness': 'walking_steadiness',
+  'hkquantitytypeidentifiersixminutewalktestdistance': 'six_minute_walk_test',
+
+  // Running
+  'hkquantitytypeidentifierrunningspeed': 'running_speed',
+  'hkquantitytypeidentifierrunningpower': 'running_power',
+  'hkquantitytypeidentifierrunningverticaloscillation': 'running_vertical_oscillation',
+  'hkquantitytypeidentifierrunninggroundcontacttime': 'running_ground_contact_time',
+  'hkquantitytypeidentifierrunningstridelength': 'running_stride_length',
+
+  // Cycling
+  'hkquantitytypeidentifierdistancecycling': 'distance_cycling',
+  'hkquantitytypeidentifiercyclingspeed': 'cycling_speed',
+  'hkquantitytypeidentifiercyclingcadence': 'cycling_cadence',
+  'hkquantitytypeidentifiercyclingpower': 'cycling_power',
+  'hkquantitytypeidentifiercyclingfunctionalthresholdpower': 'cycling_ftp',
+
+  // Cardiovascular
+  'hkquantitytypeidentifierbloodpressuresystolic': 'blood_pressure_systolic',
+  'hkquantitytypeidentifierbloodpressurediastolic': 'blood_pressure_diastolic',
+
+  // Body measurements
+  'hkquantitytypeidentifierbodymass': 'body_mass',
+  'hkquantitytypeidentifierbodymassindex': 'body_mass_index',
+  'hkquantitytypeidentifierbodyfatpercentage': 'body_fat_percentage',
+  'hkquantitytypeidentifierleanbodymass': 'lean_body_mass',
+  'hkquantitytypeidentifierheight': 'height',
+
+  // Sleep
+  'hkcategorytypeidentifiersleepanalysis': 'sleep_analysis',
+  'hkquantitytypeidentifierapplesleepingbreathingdisturbances': 'breathing_disturbances',
+
+  // Audio exposure
+  'hkquantitytypeidentifierenvironmentalaudioexposure': 'environmental_audio_exposure',
+  'hkquantitytypeidentifierheadphoneaudioexposure': 'headphone_audio_exposure',
+  'hkquantitytypeidentifierenvironmentalsoundreduction': 'environmental_sound_reduction',
+
+  // Other categories
+  'hkcategorytypeidentifierhandwashingevent': 'handwashing',
+  'hkcategorytypeidentifiermindfulsession': 'mindful_session',
+};
+
+// HKQuantityTypeIdentifierHeartRateVariabilitySDNN mapped by direct lowercase below
+// Using the exact HK identifier (already lowercase) as fallback for unknowns
+
+const SLEEP_STAGE_MAP = {
+  'hkcategoryvaluesleepanalysisasleepdeep': 'deep',
+  'hkcategoryvaluesleepanalysisasleeprem': 'rem',
+  'hkcategoryvaluesleepanalysisasleepcore': 'core',
+  'hkcategoryvaluesleepanalysisawake': 'awake',
+  'hkcategoryvaluesleepanalysisinbed': 'inBed',
+  'hkcategoryvaluesleepanalysisasleep': 'asleep',  // Legacy pre-iOS 16
+};
+
+// === Pure Functions ===
+
+/**
+ * Normalize an XML Record node into a standard data point.
+ * Uses lowercase attribute names (matching the parser's lowercase-name mode).
+ *
+ * @param {Object} node - Record node with lowercase attribute names
+ * @returns {{ metricName: string, dateStr: string, dataPoint: Object }|null}
+ */
+export function normalizeXmlRecord(node) {
+  const attrs = node.attributes;
+  const type = attrs.type;
+  const value = attrs.value;
+  const startdate = attrs.startdate;
+  const enddate = attrs.enddate;
+  const unit = attrs.unit;
+  const sourcename = attrs.sourcename;
+
+  if (!type || !startdate) return null;
+
+  const typeLower = type.toLowerCase();
+  const metricName = XML_TO_METRIC_NAME[typeLower] ?? typeLower;
+
+  const dateStr = extractDateStr(startdate);
+  if (!dateStr) return null;
+
+  // Sleep analysis: categorical value → duration-based stage data
+  if (typeLower === 'hkcategorytypeidentifiersleepanalysis') {
+    const durationHours = enddate
+      ? (new Date(enddate) - new Date(startdate)) / 3600000
+      : 0;
+    const valueLower = value?.toLowerCase() ?? '';
+    const stage = SLEEP_STAGE_MAP[valueLower] ?? value ?? 'unknown';
+    const dataPoint = { date: startdate, stage, durationHours, src: sourcename ?? null, origin: 'xml' };
+    return { metricName, dateStr, dataPoint };
+  }
+
+  // Heart rate: include end timestamp
+  if (typeLower === 'hkquantitytypeidentifierheartrate') {
+    const parsed = parseFloat(value);
+    if (!Number.isFinite(parsed)) return null;
+    const dataPoint = {
+      date: startdate,
+      qty: parsed,
+      unit: unit ?? null,
+      src: sourcename ?? null,
+      end: enddate ?? null,
+      origin: 'xml',
+    };
+    return { metricName, dateStr, dataPoint };
+  }
+
+  // All other numeric types
+  const parsed = parseFloat(value);
+  if (!Number.isFinite(parsed)) return null;
+  const dataPoint = {
+    date: startdate,
+    qty: parsed,
+    unit: unit ?? null,
+    src: sourcename ?? null,
+    origin: 'xml',
+  };
+  return { metricName, dateStr, dataPoint };
+}
+
+// === Aggregation ===
+
+/**
+ * Group data points by their `src` (source device name), preserving insertion order.
+ *
+ * @param {Array} points - Data points, each optionally carrying `src`
+ * @returns {Map<string|null, Array>} Points grouped by src
+ */
+function groupBySrc(points) {
+  const bySrc = new Map();
+  for (const p of points) {
+    const src = p.src ?? null;
+    if (!bySrc.has(src)) bySrc.set(src, []);
+    bySrc.get(src).push(p);
+  }
+  return bySrc;
+}
+
+/**
+ * Aggregate step_count entries in a day bucket into one total PER SOURCE DEVICE.
+ * Apple Health emits per-activity step records, often from multiple devices
+ * (iPhone + Watch) covering the same walk — summing across sources would
+ * double-count, so this keeps one aggregate per `src` and defers picking the
+ * single source of truth to read time (see `pickDaySumPoints` in appleHealthQuery.js).
+ *
+ * @param {Array} points - Array of step_count data points
+ * @returns {Array} One aggregated entry per source device
+ */
+function aggregateStepCount(points) {
+  if (!points.length) return points;
+  return Array.from(groupBySrc(points).entries()).map(([src, pts]) => ({
+    date: pts[0].date,
+    qty: pts.reduce((sum, p) => sum + (p.qty || 0), 0),
+    unit: pts[0].unit ?? null,
+    src,
+    origin: 'xml',
+  }));
+}
+
+/**
+ * Aggregate sleep_analysis entries in a day bucket into one summary PER SOURCE DEVICE.
+ * Multiple sleep sources (Watch, iPhone, third-party trackers) can record the
+ * same night — summing across sources would double-count, so this keeps one
+ * summary per `src` and defers picking the single source of truth to read
+ * time (see `pickDaySumPoints` in appleHealthQuery.js).
+ *
+ * @param {Array} points - Array of sleep_analysis data points with stage/durationHours
+ * @returns {Array} One aggregated summary per source device: { date, totalSleep, deep, rem, core, awake, inBed, asleep, src, origin }
+ */
+function aggregateSleepAnalysis(points) {
+  if (!points.length) return points;
+  return Array.from(groupBySrc(points).entries()).map(([src, pts]) => {
+    const summary = { date: pts[0].date, totalSleep: 0, deep: 0, rem: 0, core: 0, awake: 0, inBed: 0, asleep: 0, src, origin: 'xml' };
+    for (const p of pts) {
+      const stage = p.stage;
+      const dur = p.durationHours || 0;
+      if (stage === 'deep') summary.deep += dur;
+      else if (stage === 'rem') summary.rem += dur;
+      else if (stage === 'core') summary.core += dur;
+      else if (stage === 'awake') summary.awake += dur;
+      else if (stage === 'inBed') summary.inBed += dur;
+      else if (stage === 'asleep') summary.asleep += dur;
+    }
+    // totalSleep = meaningful sleep stages (deep + rem + core)
+    summary.totalSleep = summary.deep + summary.rem + summary.core;
+    return summary;
+  });
+}
+
+// === Main Export ===
+
+const FLUSH_INTERVAL = 200000; // Flush to disk every 200K records to stay under memory limits
+
+/**
+ * Flush accumulated day buckets to disk: aggregate, merge with existing, write, clear.
+ * Uses upsert to handle re-imports that update existing day totals.
+ *
+ * @param {Object} dayBuckets - { [dateStr]: { [metricName]: [...dataPoints] } }
+ * @returns {Promise<Set<string>>} Set of date strings that were flushed
+ */
+async function flushDayBuckets(dayBuckets) {
+  const flushedDates = new Set();
+  const allDates = Object.keys(dayBuckets);
+
+  for (const dateStr of allDates) {
+    await queueDayWrite(dateStr, async () => {
+      const metrics = dayBuckets[dateStr];
+
+      // Aggregate step_count: sum all qty values into single daily total
+      if (metrics.step_count) {
+        metrics.step_count = aggregateStepCount(metrics.step_count);
+      }
+
+      // Aggregate sleep_analysis: sum stage durations into daily summary
+      if (metrics.sleep_analysis) {
+        metrics.sleep_analysis = aggregateSleepAnalysis(metrics.sleep_analysis);
+      }
+
+      const dayData = await readDayFile(dateStr);
+
+      for (const [metricName, newPoints] of Object.entries(metrics)) {
+        const existing = dayData.metrics[metricName] || [];
+        const { result } = upsertPoints(existing, newPoints);
+        if (result.length > 0) {
+          dayData.metrics[metricName] = result;
+        }
+      }
+
+      await writeDayFile(dateStr, dayData, Object.keys(metrics));
+      flushedDates.add(dateStr);
+    });
+
+    delete dayBuckets[dateStr];
+  }
+
+  return flushedDates;
+}
+
+/**
+ * Stream-parse an Apple Health export.xml file with the dependency-free
+ * `<Record>` parser. Accumulates records in batches, flushing to disk
+ * periodically to avoid OOM.
+ *
+ * @param {string} filePath - Absolute path to the XML file (temp upload)
+ * @param {Object|null} io - Socket.IO server instance for progress events
+ * @returns {Promise<{ days: number, records: number }>}
+ */
+export async function importAppleHealthXml(filePath, io = null) {
+  // dayBuckets: { [dateStr]: { [metricName]: [...dataPoints] } }
+  const dayBuckets = {};
+  let processedRecords = 0;
+  let lastFlush = 0;
+  const allDays = new Set();
+  let flushing = false;
+
+  const inputStream = createReadStream(filePath);
+
+  try {
+    await new Promise((resolve, reject) => {
+      const parser = createAppleHealthRecordStream({
+        onRecord: (node) => {
+          const normalized = normalizeXmlRecord(node);
+          if (!normalized) return;
+
+          const { metricName, dateStr, dataPoint } = normalized;
+
+          if (!dayBuckets[dateStr]) dayBuckets[dateStr] = {};
+          if (!dayBuckets[dateStr][metricName]) dayBuckets[dateStr][metricName] = [];
+          dayBuckets[dateStr][metricName].push(dataPoint);
+          allDays.add(dateStr);
+
+          processedRecords++;
+
+          if (processedRecords % 10000 === 0) {
+            io?.emit('health:xml:progress', { processed: processedRecords });
+            console.log(`🍎 XML import progress: ${processedRecords} records`);
+          }
+
+          // Batch flush to prevent OOM — pause input stream, flush to disk, resume
+          if (processedRecords - lastFlush >= FLUSH_INTERVAL && !flushing) {
+            flushing = true;
+            lastFlush = processedRecords;
+            inputStream.pause();
+            flushDayBuckets(dayBuckets).then(() => {
+              console.log(`🍎 Flushed batch at ${processedRecords} records (${allDays.size} days total)`);
+              flushing = false;
+              inputStream.resume();
+            }).catch(reject);
+          }
+        },
+      });
+
+      // Malformed records can't throw here — records missing required attributes
+      // are dropped by normalizeXmlRecord, so minor XML malformations are skipped
+      // rather than fatal (matching the prior sax error-skip behavior).
+      parser.on('finish', resolve);
+      parser.on('error', reject);
+
+      inputStream.on('error', reject);
+      inputStream.pipe(parser);
+    });
+
+    console.log(`🍎 XML parsing done: ${processedRecords} raw records across ${allDays.size} days — flushing remaining`);
+
+    // Final flush for remaining records
+    await flushDayBuckets(dayBuckets);
+  } finally {
+    // Runs on success AND on every rejection route (parser error, input-stream
+    // error, rejected batch flush). Destroy before unlink: a batch-flush
+    // rejection leaves the stream pause()d and still holding its fd, and on
+    // Windows unlink fails while the file is open. An Apple Health export.xml
+    // is routinely 0.5-3GB, so a leaked temp file is expensive.
+    inputStream.destroy();
+    // destroy() tears the fd down asynchronously, so wait for 'close' before
+    // unlinking — on Windows the unlink fails while the handle is open and the
+    // failure is swallowed below (same wait the ZIP write-stream cleanup does).
+    if (!inputStream.closed) await new Promise((res) => inputStream.once('close', res));
+    await unlink(filePath).catch(() => {});
+  }
+
+  io?.emit('health:xml:complete', { days: allDays.size, records: processedRecords });
+  console.log(`🍎 XML import complete: ${processedRecords} records across ${allDays.size} days`);
+
+  return { days: allDays.size, records: processedRecords };
+}

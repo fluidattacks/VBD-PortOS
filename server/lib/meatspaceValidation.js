@@ -1,0 +1,207 @@
+import { z } from 'zod';
+import { partialWithoutDefaults } from './zodCompat.js';
+
+// =============================================================================
+// LIFE CALENDAR ACTIVITIES
+// =============================================================================
+
+export const activitySchema = z.object({
+  name: z.string().min(1).max(100),
+  cadence: z.enum(['day', 'week', 'month', 'year']),
+  frequency: z.number().min(0.01).max(1000),
+  icon: z.string().max(50).optional().default('circle'),
+});
+
+export const activityUpdateSchema = partialWithoutDefaults(activitySchema);
+
+// =============================================================================
+// LIFE CALENDAR EVENTS
+// =============================================================================
+
+export const lifeEventSchema = z.object({
+  name: z.string().min(1).max(100),
+  type: z.enum(['holiday', 'vacation', 'milestone', 'health', 'custom']),
+  recurrence: z.enum(['yearly', 'once']),
+  month: z.number().int().min(0).max(11).optional(),     // 0-indexed, for yearly
+  day: z.number().int().min(1).max(31).optional(),        // for yearly
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(), // for 'once' events
+  endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(), // optional end for vacations
+  enabled: z.boolean().optional().default(true),
+});
+
+export const lifeEventUpdateSchema = partialWithoutDefaults(lifeEventSchema);
+
+// =============================================================================
+// MEATSPACE CONFIG & LIFESTYLE
+// =============================================================================
+
+export const smokingStatusSchema = z.enum(['never', 'former', 'current']);
+export const dietQualitySchema = z.enum(['excellent', 'good', 'fair', 'poor']);
+export const stressLevelSchema = z.enum(['low', 'moderate', 'high']);
+
+export const lifestyleSchema = z.object({
+  smokingStatus: smokingStatusSchema.optional().default('never'),
+  alcoholDrinksPerDay: z.number().min(0).max(50).optional(),
+  exerciseMinutesPerWeek: z.number().min(0).max(2000).optional().default(150),
+  sleepHoursPerNight: z.number().min(0).max(24).optional().default(7.5),
+  dietQuality: dietQualitySchema.optional().default('good'),
+  stressLevel: stressLevelSchema.optional().default('moderate'),
+  bmi: z.number().min(10).max(80).nullable().optional(),
+  chronicConditions: z.array(z.string().max(100)).optional().default([])
+});
+
+export const configSchema = z.object({
+  sex: z.enum(['male', 'female']).nullable().optional(),
+  sexSource: z.enum(['genome', 'questionnaire', 'mortalloom']).nullable().optional(),
+  lifestyle: lifestyleSchema.optional()
+});
+
+// configSchema has no top-level defaults, but its nested `lifestyle` object is
+// field-merged by updateConfig() — so a config PATCH carrying `lifestyle` must
+// strip that object's inner defaults too, or the untouched lifestyle fields get
+// reset to their defaults on every save (top-level .partial() doesn't recurse).
+export const configUpdateSchema = configSchema.partial().extend({
+  lifestyle: partialWithoutDefaults(lifestyleSchema).optional(),
+});
+export const lifestyleUpdateSchema = partialWithoutDefaults(lifestyleSchema);
+
+// =============================================================================
+// ALCOHOL
+// =============================================================================
+
+export const drinkLogSchema = z.object({
+  name: z.string().max(200).optional().default(''),
+  oz: z.number().min(0.1).max(1000),
+  abv: z.number().min(0).max(100),
+  count: z.number().int().min(1).max(100).optional().default(1),
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional()
+});
+
+export const drinkUpdateSchema = z.object({
+  name: z.string().max(200).optional(),
+  oz: z.number().min(0.1).max(1000).optional(),
+  abv: z.number().min(0).max(100).optional(),
+  count: z.number().int().min(1).max(100).optional(),
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional()
+});
+
+export const customDrinkSchema = z.object({
+  name: z.string().min(1).max(200),
+  oz: z.number().min(0.1).max(1000),
+  abv: z.number().min(0).max(100)
+});
+
+export const customDrinkUpdateSchema = customDrinkSchema.partial();
+
+// =============================================================================
+// NICOTINE
+// =============================================================================
+
+export const nicotineLogSchema = z.object({
+  product: z.string().max(200).optional().default(''),
+  mgPerUnit: z.number().min(0.1).max(100),
+  count: z.number().int().min(1).max(100).optional().default(1),
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional()
+});
+
+export const nicotineUpdateSchema = z.object({
+  product: z.string().max(200).optional(),
+  mgPerUnit: z.number().min(0.1).max(100).optional(),
+  count: z.number().int().min(1).max(100).optional(),
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional()
+});
+
+export const customNicotineProductSchema = z.object({
+  name: z.string().min(1).max(200),
+  mgPerUnit: z.number().min(0.1).max(100)
+});
+
+export const customNicotineProductUpdateSchema = customNicotineProductSchema.partial();
+
+// =============================================================================
+// BLOOD TESTS
+// =============================================================================
+
+export const bloodTestSchema = z.object({
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  metabolicPanel: z.record(z.number().nullable()).optional(),
+  cbc: z.record(z.number().nullable()).optional(),
+  lipids: z.record(z.number().nullable()).optional(),
+  thyroid: z.record(z.number().nullable()).optional(),
+  hormones: z.record(z.number().nullable()).optional(),
+  homocysteine: z.number().nullable().optional()
+});
+
+// =============================================================================
+// BODY COMPOSITION
+// =============================================================================
+
+export const bodyEntrySchema = z.object({
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  weightLbs: z.number().min(50).max(1000).optional(),
+  weightKg: z.number().min(20).max(500).optional(),
+  musclePct: z.number().min(0).max(100).nullable().optional(),
+  fatPct: z.number().min(0).max(100).nullable().optional(),
+  boneMass: z.number().nullable().optional(),
+  temperature: z.number().nullable().optional()
+});
+
+// =============================================================================
+// BLOOD PRESSURE
+// =============================================================================
+
+export const bloodPressureSchema = z.object({
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  systolic: z.number().min(40).max(300),
+  diastolic: z.number().min(20).max(200)
+});
+
+// =============================================================================
+// WORKOUTS
+// =============================================================================
+
+export const workoutSchema = z.object({
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  type: z.string().min(1).max(100),
+  durationMinutes: z.number().min(0).max(1440).nullable().optional(),
+  intensity: z.string().max(50).nullable().optional(),
+  notes: z.string().max(1000).nullable().optional()
+});
+
+// =============================================================================
+// EPIGENETIC TESTS
+// =============================================================================
+
+export const epigeneticTestSchema = z.object({
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  chronologicalAge: z.number().min(0).max(150).optional(),
+  biologicalAge: z.number().min(0).max(150).optional(),
+  paceOfAging: z.number().min(0).max(5).optional(),
+  organScores: z.record(z.number().nullable()).optional()
+});
+
+// =============================================================================
+// EYES
+// =============================================================================
+
+export const eyeExamSchema = z.object({
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  rightSphere: z.number().nullable().optional(),
+  rightCylinder: z.number().nullable().optional(),
+  rightAxis: z.number().nullable().optional(),
+  leftSphere: z.number().nullable().optional(),
+  leftCylinder: z.number().nullable().optional(),
+  leftAxis: z.number().nullable().optional()
+});
+
+export const eyeExamUpdateSchema = z.object({
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  rightSphere: z.number().nullable().optional(),
+  rightCylinder: z.number().nullable().optional(),
+  rightAxis: z.number().nullable().optional(),
+  leftSphere: z.number().nullable().optional(),
+  leftCylinder: z.number().nullable().optional(),
+  leftAxis: z.number().nullable().optional()
+});
+
+// =============================================================================

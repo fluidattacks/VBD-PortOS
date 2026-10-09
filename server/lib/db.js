@@ -1,0 +1,618 @@
+/**
+ * Database Connection Pool
+ *
+ * PostgreSQL connection management for the memory system.
+ * Uses pg (node-postgres) with a connection pool for efficient query execution.
+ */
+
+import pg from 'pg';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { isTestRunner } from './runtimeEnv.js';
+import { assertDatabaseAdmission, createDatabaseMaintenanceJournal } from './databaseMaintenanceJournal.js';
+import { assertDatabasePoolAuthority } from './databaseAuthority.js';
+import { createDatabaseRestoreRecovery, databaseRestoreRecoveryError } from './databaseRestoreRecovery.js';
+
+const { Pool } = pg;
+
+// DATE (OID 1082) ships from node-pg as a JS `Date` at LOCAL midnight, so a caller
+// that reads it back with `toISOString().slice(0, 10)` (the ubiquitous `isoDate()`
+// pattern — see tribe.js) gets the PREVIOUS day on every server east of UTC. Return
+// the raw `YYYY-MM-DD` string Postgres sends instead: every consumer of a DATE
+// column in this codebase already accepts (or, per `asDay()` in postRunDb.js,
+// specifically tolerates) a plain day-key string (#8451).
+pg.types.setTypeParser(1082, (value) => value);
+
+if (!process.env.PGPASSWORD) {
+  console.warn('⚠️ PGPASSWORD not set — using default. Set PGPASSWORD env var for production.');
+}
+
+// Connection config from environment or defaults. Exported so callers that
+// need a SECOND, independent connection to the same database (a raw `pg`
+// client outside the pool) don't have to re-derive these defaults and risk
+// drifting from them — see server/lib/db.test.js.
+// Capture node-postgres's supported TLS environment once, alongside the endpoint.
+const poolTls = new pg.Client().connectionParameters;
+export const POOL_CONFIG = Object.freeze({
+  host: process.env.PGHOST || 'localhost',
+  port: parseInt(process.env.PGPORT || '5432', 10),
+  database: process.env.PGDATABASE || 'portos',
+  user: process.env.PGUSER || 'portos',
+  password: process.env.PGPASSWORD || 'portos',
+  ssl: poolTls.ssl && typeof poolTls.ssl === 'object' ? Object.freeze({ ...poolTls.ssl }) : poolTls.ssl,
+  sslnegotiation: poolTls.sslnegotiation || 'postgres',
+});
+
+const pool = new Pool({
+  ...POOL_CONFIG,
+  max: 20,
+  idleTimeoutMillis: 30000,
+  // 10s (was 2s) — a single-user box periodically runs heavy local workloads
+  // (Ollama model pulls, CoS agents) that can briefly delay establishing a
+  // fresh loopback connection past a 2s window, causing spurious "timeout
+  // exceeded when trying to connect" pool errors against a perfectly healthy
+  // Postgres. 10s absorbs the busy moments while still failing fast on a real outage.
+  connectionTimeoutMillis: 10000
+});
+
+pool.on('error', (err) => {
+  console.error(`🗄️ Database pool error: ${err.message}`);
+});
+
+/**
+ * Is the configured database a DESIGNATED test database?
+ *
+ * The test runner must NEVER touch a real (production) Postgres — there is only
+ * ONE database per install (`PGDATABASE || 'portos'`), shared by every git
+ * worktree, so a DB-backed `*.db.test.js` suite that does `DELETE FROM universes`
+ * runs against the user's real authored content. (This is exactly how a CoS
+ * agent running the suite in its worktree wiped every universe/series on
+ * 2026-06-13.) A database is "safe for destructive tests" only when its name is
+ * explicitly a test database (ends in `_test`, or the canonical `portos_test`)
+ * or the operator sets `TEST_DB_OK=1` to opt a non-standard name in.
+ *
+ * Consumed by `checkHealth()` (skips DB suites on a non-test DB) and by the
+ * destructive-statement guard in `query()` (a hard backstop).
+ *
+ * @returns {boolean}
+ */
+export function isTestDatabase() {
+  if (process.env.TEST_DB_OK === '1') return true;
+  const db = process.env.PGDATABASE || 'portos';
+  return /_test$/.test(db) || db === 'portos_test';
+}
+
+// Guard ALL row writes — not just deletions. The original guard only blocked
+// DELETE/TRUNCATE, which let a mis-pointed suite INSERT fixtures into prod
+// (their cleanup DELETE then threw, *stranding* the rows) — exactly how test
+// series/issues/story-builder fixtures leaked into the real `portos` DB and
+// federated to peers. INSERT/UPDATE are now blocked too. Schema DDL
+// (CREATE/ALTER/DROP) is still allowed: it is idempotent, carries no row-data,
+// and ensureSchema() needs it to stand up portos_test.
+//
+// The first cut was `^`-anchored on a single leading verb, which let four
+// less-obvious write forms slip past the "absolute backstop": data-modifying
+// CTEs (`WITH … DELETE …`), `COPY … FROM` imports, `MERGE INTO`, and a write
+// hiding after a leading read in a multi-statement batch (`SELECT 1; DELETE …`).
+// No current store issues those forms, so this was latent rather than
+// exploitable — but the guard is billed as the last line of defense, so it now
+// matches a write verb ANYWHERE, after stripping comments so a keyword named in
+// a comment can't trip it (and a write after a comment can't slip past).
+//
+// Normalize the SQL before keyword-matching in a SINGLE left-to-right pass that
+// alternates over comments AND string literals, so whichever delimiter appears
+// FIRST consumes its own span. Order matters and a two-pass "mask strings, then
+// strip comments" is WRONG: an apostrophe inside a comment (`-- don't touch …`)
+// would open a spurious string mask that swallows a real write on the next line
+// (a false-negative — the exact failure this guard exists to prevent). Processing
+// left-to-right keeps a comment's apostrophe part of the comment, and keeps a
+// `/*` or `--` inside a string literal from starting a comment. Comments collapse
+// to a space; string literals collapse to `''` (Postgres's escaped-quote form),
+// so a write verb appearing only inside a literal can't trip the guard, and a
+// quote-embedded comment delimiter can't hide a write between two literals.
+// Dollar-quoted bodies (`$$…$$`, used in function definitions) are not unwrapped —
+// stores don't send them, so this test-only backstop accepts that edge.
+function normalizeSqlForMatch(text) {
+  return text.replace(
+    /--[^\n]*|\/\*[\s\S]*?\*\/|'(?:''|[^'])*'/g,
+    (m) => (m[0] === "'" ? "''" : ' '),
+  );
+}
+
+// CREATE TABLE … AS SELECT (CTAS) and the broader DDL family (CREATE/ALTER/DROP)
+// are knowingly NOT matched: ensureSchema() needs DDL to stand up portos_test, and
+// distinguishing a row-copying CTAS from a plain `CREATE TABLE … (col … GENERATED
+// ALWAYS AS (…))` reliably needs paren-aware parsing this regex set deliberately
+// avoids. No store issues CTAS, and the worst case on a mis-pointed run is a stray
+// new table (schema pollution) rather than corruption of existing rows.
+const ROW_WRITE_PATTERNS = [
+  /\bINSERT\s+INTO\b/i,
+  /\bDELETE\s+FROM\b/i,
+  /\bMERGE\s+INTO\b/i,
+  /\bTRUNCATE\b/i,
+  // SELECT … INTO <table> creates and populates a new table (a real row write, not
+  // DDL). Reads never carry a standalone INTO, so requiring SELECT before it keeps
+  // this off ordinary queries; INSERT/MERGE INTO are caught by their own patterns.
+  /\bSELECT\b[\s\S]+?\bINTO\b/i,
+  // UPDATE … SET — the SET clause is what makes it a write, and distinguishes it
+  // from a `SELECT … FOR UPDATE` / `FOR NO KEY UPDATE` row-lock read. `[^;]+?`
+  // keeps the match inside one statement so `… FOR UPDATE; SET search_path …`
+  // (a read followed by a session command) doesn't read as an UPDATE write.
+  /\bUPDATE\b\s+[^;]+?\bSET\b/i,
+  // COPY <table> FROM — an import writes rows. `COPY (query) TO` / `COPY <table>
+  // TO` is an export (read): requiring the first non-blank token after COPY to be
+  // a non-`(` char (`[^\s(]`) rejects the subquery-export form whose inner FROM
+  // would otherwise match, and requiring FROM before the next `;` leaves `COPY
+  // <table> TO …` (no FROM) alone. `[^\s(]` (not a `(?!\()` lookahead) is load-
+  // bearing: a lookahead lets `\s+` backtrack and pass the assertion mid-whitespace
+  // on `COPY   (SELECT … FROM …) TO`, so the export would false-positive.
+  /\bCOPY\s+[^\s(][^;]*?\bFROM\b/i,
+];
+
+// True when the SQL performs a row write in any of the recognized forms.
+function isRowWriteSql(text) {
+  const sql = normalizeSqlForMatch(text);
+  return ROW_WRITE_PATTERNS.some((re) => re.test(sql));
+}
+
+/**
+ * Hard backstop: under the test runner, refuse to MUTATE a non-test database.
+ * Throws (fail loudly) on any row write — INSERT/UPDATE/DELETE/TRUNCATE/MERGE,
+ * COPY … FROM imports, data-modifying CTEs, and a write hidden in a multi-
+ * statement batch — instead of silently writing (or stranding) real data. Reads
+ * (SELECT, including COPY … TO exports) and schema DDL are left alone so
+ * health/version probes and ensureSchema() still work.
+ *
+ * Shared by BOTH the pool `query()` wrapper and the per-transaction client in
+ * `withTransaction()`. The transaction path is critical: nearly every store
+ * mutation (updateAuthor, deleteAuthor, mergeAuthorsFromSync, universe runs,
+ * catalog, writers-room) runs its writes through `client.query()` inside a
+ * transaction — which talks to the raw pg client, NOT this module's `query()`.
+ * Guarding only `query()` left that path wide open: a suite under VITEST that
+ * reached any transaction write path wrote straight into the real `portos` DB.
+ *
+ * @param {string} text - SQL query text
+ */
+export function assertWriteAllowed(text) {
+  if (
+    isTestRunner() &&
+    !isTestDatabase() &&
+    typeof text === 'string' &&
+    isRowWriteSql(text)
+  ) {
+    throw new Error(
+      `🛑 Refusing to mutate non-test database '${process.env.PGDATABASE || 'portos'}' under the test runner. ` +
+        `Point PGDATABASE at a *_test database (e.g. portos_test), gate the suite on requireDb(), or set TEST_DB_OK=1. Query: ${text.slice(0, 80)}`,
+    );
+  }
+}
+
+// Proxy handler that runs a pg client's row writes through assertWriteAllowed.
+// Defined once at module scope (not per-transaction): the `get` trap receives
+// the client as `target`, so a single shared handler guards every client
+// withTransaction() wraps — no per-call handler/closure allocation. A Proxy
+// (rather than an object-spread copy) is required because pg's client methods
+// live on the prototype, which a spread would not carry.
+const GUARDED_CLIENT_HANDLER = {
+  get(target, prop, receiver) {
+    if (prop === 'query') {
+      return (config, ...rest) => {
+        const sql = typeof config === 'string' ? config : config?.text;
+        assertWriteAllowed(sql);
+        return target.query(config, ...rest);
+      };
+    }
+    const value = Reflect.get(target, prop, receiver);
+    return typeof value === 'function' ? value.bind(target) : value;
+  },
+};
+
+// Admission is synchronous, before any pool checkout. A maintenance operation
+// closes admission and drains existing operations (including whole transactions)
+// before touching the schema. Only its async context can run reconciliation.
+const databaseContext = new AsyncLocalStorage();
+const activeOperations = new Set();
+let maintenanceActive = false;
+// Durable fence for a committed snapshot restore whose repair is pending
+// (#9725). It outlives this process: while the journal exists, only the
+// maintenance context that adopted the matching operation may use the pool.
+// Exported so the restore service writes the SAME journal this gate reads.
+const restoreRecovery = createDatabaseRestoreRecovery();
+export const databaseRestoreRecovery = restoreRecovery;
+
+function maintenanceError() {
+  return Object.assign(new Error('Database restore in progress; retry after it finishes.'), {
+    status: 503, code: 'DATABASE_MAINTENANCE',
+  });
+}
+
+// The restore operation this async context may act for, if any. Only a live
+// maintenance context (or work it started while live) carries one.
+const restoreRecoveryContext = (store) => (store?.active ? store.restoreRecoveryId : undefined);
+
+async function databaseOperation(fn) {
+  // A process-local restore context cannot bypass a durable cutover fence,
+  // and a pool still naming a cutover's retired backend never reaches it.
+  assertDatabaseAdmission();
+  assertDatabasePoolAuthority(POOL_CONFIG);
+  const parent = databaseContext.getStore();
+  if (maintenanceActive && !parent?.active) throw maintenanceError();
+  const restoreRecoveryId = restoreRecoveryContext(parent);
+  if (!restoreRecoveryId) restoreRecovery.assertAdmission();
+  const context = { active: true, restoreRecoveryId };
+  const pending = databaseContext.run(context, async () => fn());
+  activeOperations.add(pending);
+  try {
+    return await pending;
+  } finally {
+    context.active = false;
+    activeOperations.delete(pending);
+  }
+}
+
+/**
+ * Drain admitted database work and reject new work until restore completes.
+ *
+ * A pending restore recovery journal refuses entry unless `restoreRecoveryId`
+ * names that same operation. `fn` receives `{ adoptRestoreRecovery(id) }`, which
+ * lets the restore that just published a journal keep using the database for
+ * that operation only; admission for everyone else stays closed until the
+ * journal is released.
+ */
+export async function withDatabaseMaintenance(fn, { restoreRecoveryId } = {}) {
+  assertDatabaseAdmission();
+  assertDatabasePoolAuthority(POOL_CONFIG);
+  if (maintenanceActive || databaseContext.getStore()?.active) throw maintenanceError();
+  if (restoreRecoveryId === undefined) restoreRecovery.assertAdmission();
+  else if (restoreRecovery.read()?.id !== restoreRecoveryId) throw databaseRestoreRecoveryError();
+  maintenanceActive = true;
+  const context = { active: true, restoreRecoveryId };
+  const adoptRestoreRecovery = (id) => {
+    if (!context.active || restoreRecovery.read()?.id !== id) throw databaseRestoreRecoveryError();
+    context.restoreRecoveryId = id;
+  };
+  try {
+    // An admitted transaction can start nested work while draining. Track it
+    // separately and repeat until that work also settles, even when its parent
+    // did not await it. Async descendants lose admission when their operation ends.
+    while (activeOperations.size) await Promise.allSettled([...activeOperations]);
+    return await databaseContext.run(context, () => fn({ adoptRestoreRecovery }));
+  } finally {
+    context.active = false;
+    context.restoreRecoveryId = undefined;
+    maintenanceActive = false;
+  }
+}
+
+/**
+ * Execute a query against the connection pool.
+ * @param {string} text - SQL query text with $1, $2, etc. placeholders
+ * @param {Array} params - Parameter values
+ * @returns {Promise<pg.QueryResult>}
+ */
+export async function query(text, params) {
+  // Hard backstop: refuse to mutate a non-test DB under the runner even if a
+  // suite reaches query() without gating on checkHealth() first (a new test
+  // author calls query('INSERT …') directly, or a backend selector mis-chose
+  // Postgres because NODE_ENV wasn't 'test').
+  assertWriteAllowed(text);
+  return databaseOperation(() => pool.query(text, params));
+}
+
+/**
+ * Read the connected server's PostgreSQL major version (e.g. 17 for 17.10).
+ *
+ * `server_version_num` is an integer like 170010 → major = floor(n / 10000).
+ * Used by the backup service to select a `pg_dump` whose major version is
+ * >= the server's: pg_dump aborts with "server version mismatch" when it is
+ * older than the server it dumps, which is the common Homebrew footgun where
+ * an older `postgresql@NN` keg shadows the running server in PATH.
+ *
+ * @returns {Promise<number|null>} major version, or null if unreachable/unparseable
+ */
+export async function getServerMajorVersion() {
+  const result = await query('SHOW server_version_num').catch(() => null);
+  const num = parseInt(result?.rows?.[0]?.server_version_num, 10);
+  if (!Number.isFinite(num)) return null;
+  return Math.floor(num / 10000);
+}
+
+/**
+ * Run a function inside a database transaction.
+ * Auto-commits on success, rolls back on error.
+ * @param {function(pg.PoolClient): Promise<T>} fn
+ * @returns {Promise<T>}
+ */
+export async function withTransaction(fn) {
+  return databaseOperation(() => runTransaction(fn));
+}
+
+async function runTransaction(fn) {
+  const client = await pool.connect();
+  // Guard the client's row writes with the same backstop as query(). The raw
+  // pg client bypasses query() entirely, so without this wrapper a test-runner
+  // process pointed at the real `portos` DB writes through every store's
+  // transaction path unguarded (see assertWriteAllowed). BEGIN/COMMIT/ROLLBACK
+  // below call the raw client directly (they are not row writes). pg's
+  // client.query accepts either a SQL string or a { text, values } config —
+  // GUARDED_CLIENT_HANDLER reads the SQL out of both.
+  const guardedClient = new Proxy(client, GUARDED_CLIENT_HANDLER);
+  let began = false;
+  let releaseErr;
+  try {
+    await client.query('BEGIN');
+    began = true;
+    const result = await fn(guardedClient);
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    // Swallow a secondary ROLLBACK failure (closed socket, statement_timeout
+    // abort, backend termination) so the caller sees the original fn/COMMIT
+    // error instead of a masking "query on closed connection" from ROLLBACK.
+    // Pass that original error to release() so pg destroys a damaged client
+    // rather than returning it to the idle pool for the next checkout to inherit.
+    releaseErr = err;
+    if (began) await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release(releaseErr);
+  }
+}
+
+/**
+ * Check if the database is reachable and the schema is initialized.
+ * @returns {Promise<{connected: boolean, hasSchema: boolean, error?: string}>}
+ */
+export async function checkHealth() {
+  // Test-runner safety gate. Under the test runner the only database we permit
+  // is a designated test database (see isTestDatabase). Reporting "disconnected"
+  // here makes every DB-backed `*.db.test.js` suite skip via its existing
+  // `if (!health.connected)` branch — instead of running DELETE FROM against the
+  // developer's real universes/series/writing. Keyed on isTestRunner() (not bare
+  // NODE_ENV) so a worktree run that left NODE_ENV unset is still gated. The
+  // mocked checkHealth in memoryBackend.test.js / backup.test.js is unaffected
+  // (it replaces this fn).
+  if (isTestRunner() && !isTestDatabase()) {
+    return {
+      connected: false,
+      hasSchema: false,
+      hasCatalogSchema: false,
+      error: `test runner blocked from non-test database '${process.env.PGDATABASE || 'portos'}' — point PGDATABASE at a *_test database (e.g. portos_test) or set TEST_DB_OK=1`,
+    };
+  }
+  try {
+    const result = await databaseOperation(() => pool.query(`
+      SELECT
+        EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name = 'memories') AS has_memories,
+        EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name = 'memory_links') AS has_links,
+        EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name = 'memories' AND column_name = 'sync_sequence') AS has_sync,
+        EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name = 'catalog_ingredients') AS has_catalog,
+        EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name = 'catalog_scraps') AS has_catalog_scraps
+    `));
+    const { has_memories, has_links, has_sync, has_catalog, has_catalog_scraps } = result.rows?.[0] ?? {};
+    return {
+      connected: true,
+      hasSchema: has_memories && has_links && has_sync,
+      hasCatalogSchema: has_catalog && has_catalog_scraps,
+    };
+  } catch (err) {
+    console.error(`🗄️ Database health check failed: ${err.message}`);
+    return { connected: false, hasSchema: false, hasCatalogSchema: false, error: err.message };
+  }
+}
+
+/**
+ * Fixed, read-only startup diagnostic through THIS process's actual pool.
+ * This does not lift admission, execute caller SQL, advance the journal, or
+ * establish that a later ordinary restart used this connection. Only the
+ * verification-only entrypoint calls it; all ordinary operations stay fenced.
+ */
+export async function verifyDatabaseMaintenanceTarget(id) {
+  const journal = createDatabaseMaintenanceJournal();
+  const refuse = () => Object.assign(new Error('Database target verification refused.'), {
+    code: 'DATABASE_TARGET_UNVERIFIED',
+  });
+  const readTarget = () => {
+    const operation = journal.read();
+    if (!operation || operation.id !== id || !['verifying', 'verified'].includes(operation.stage)) throw refuse();
+    const target = operation.target;
+    // Exact saved identity, including the pool's captured host/port; do not
+    // infer an endpoint from current mode, mutable env, or a reachable peer.
+    if (['host', 'port', 'database', 'user'].some(key => target[key] !== POOL_CONFIG[key])) throw refuse();
+    return operation;
+  };
+  const operation = readTarget();
+  if (isTestRunner() && !/_test$/.test(POOL_CONFIG.database) && process.env.TEST_DB_OK !== '1') throw refuse();
+  const client = await pool.connect();
+  let discard = false;
+  try {
+    await client.query({ text: 'BEGIN READ ONLY', query_timeout: 10_000 });
+    const { rows } = await client.query({ text: `
+      SELECT current_database() AS database, current_user AS "user",
+        EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'memories') AS has_memories,
+        EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'memory_links') AS has_links,
+        EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'memories' AND column_name = 'sync_sequence') AS has_sync,
+        EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'catalog_ingredients') AS has_catalog,
+        EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'catalog_scraps') AS has_catalog_scraps
+    `, query_timeout: 10_000 });
+    const health = rows?.[0];
+    if (health?.database !== operation.target.database || health?.user !== operation.target.user
+      || !['has_memories', 'has_links', 'has_sync', 'has_catalog', 'has_catalog_scraps'].every(key => health[key] === true)) throw refuse();
+    // A query completing after journal damage/removal/replacement is not proof
+    // for that new state. Preserve exactly the operation and stage we read.
+    if (JSON.stringify(readTarget()) !== JSON.stringify(operation)) throw refuse();
+    return { id, stage: operation.stage, target: operation.target.mode, targetHealthy: true, fenced: true };
+  } finally {
+    await client.query({ text: 'ROLLBACK', query_timeout: 10_000 }).catch(() => { discard = true; });
+    client.release(discard);
+  }
+}
+
+// In-flight dedup for ensureSchema(). At boot, two independent fire-and-forget
+// callers can race: the Creative Director recovery scan (which lazily selects
+// the PG backend and calls ensureSchema) and the boot DB gate. Running the
+// idempotent DDL list concurrently can intermittently error or deadlock on
+// Postgres system catalogs (concurrent CREATE TABLE/INDEX IF NOT EXISTS contend
+// on pg_type / pg_class). Sharing one in-flight promise serializes them; it's
+// retained as successful readiness after it settles so sequential store warms
+// do not repeat the full DDL block.
+//
+// That dedup only covers callers IN THIS PROCESS. There is one Postgres per
+// install shared by every process that opens it — the server, `portos-cos`,
+// and every CoS agent worktree — so a restart during an update routinely
+// overlaps an outgoing server (still finishing its shutdown) with an
+// incoming one, both calling ensureSchema() at once. Each `DROP TRIGGER IF
+// EXISTS` / `CREATE TRIGGER` pair (server/scripts/init-db.sql) is idempotent
+// WITHIN one session but not atomic ACROSS sessions: A drops, B's drop is a
+// no-op, A creates, B's create then throws "already exists" (#5977). A
+// session-level Postgres advisory lock serializes the whole DDL block
+// cluster-wide — a dropped connection releases it automatically, so a hard
+// kill mid-boot can never strand a later boot waiting forever.
+export const SCHEMA_DDL_ADVISORY_LOCK_KEY = 5977001;
+let ensureSchemaInFlight = null;
+let schemaEnsured = false;
+// Every DB-backed store self-runs ensureSchema() when it warms its backend at
+// boot (memory, creative-director, media index, catalog, universe/story/writers
+// stores, pipeline series/issues, plus the boot DB gate). Those warm
+// sequentially, so in-flight dedup alone cannot collapse them. Successful
+// readiness lasts for this process; a restart still applies that version's
+// complete upgrade list. Failed attempts remain retryable.
+let schemaUpgradeLogged = false;
+
+/**
+ * Apply idempotent schema upgrades to an existing database.
+ * Each statement uses IF NOT EXISTS so it's safe to run on every startup.
+ * Add new ALTER TABLE statements here when the schema evolves.
+ *
+ * Concurrent calls share an execution; later calls reuse successful readiness.
+ * `force` explicitly reapplies the current process's DDL for repair tooling.
+ */
+export async function ensureSchema(options = {}) {
+  return databaseOperation(() => ensureSchemaReady(options));
+}
+
+async function ensureSchemaReady({ force = false } = {}) {
+  if (ensureSchemaInFlight) return ensureSchemaInFlight;
+  if (schemaEnsured && !force) return;
+  schemaEnsured = false;
+  ensureSchemaInFlight = ensureSchemaImpl().then(() => { schemaEnsured = true; })
+    .finally(() => { ensureSchemaInFlight = null; });
+  return ensureSchemaInFlight;
+}
+
+async function ensureSchemaImpl() {
+  // The DDL composer is imported lazily, not at module load. `db.js` is reached
+  // by ~400 server test files through pgFileFacade.js, and eagerly importing
+  // ./db/schema/index.js pulled its 17 per-domain DDL modules into every one of
+  // those import graphs — ~7k module instantiations per suite run, for
+  // statement arrays only this function ever reads (#6009). Resolved BEFORE the
+  // advisory lock below, so no other booting process waits on a module load,
+  // and once per boot inside a path already awaiting Postgres, so it costs
+  // nothing at runtime. vi.mock('./db/schema/index.js') still intercepts it —
+  // the mock registry covers dynamic imports too, which is what
+  // lib/db.test.js's bad-DDL injection relies on.
+  const { buildUpgradeDdl, buildCatalogDdl } = await import('./db/schema/index.js');
+
+  // ⚠️ Boot CREATE INDEX lock window. Every `CREATE INDEX IF NOT EXISTS` below
+  // (and in the catalogDDL block, incl. the HNSW vector index on catalog_scraps)
+  // runs as a plain, non-CONCURRENT build. The FIRST time an index materializes
+  // on a table that ALREADY holds many rows, Postgres takes a SHARE lock that
+  // blocks writes (INSERT/UPDATE/DELETE) to that table until the build finishes —
+  // so an existing install upgrading into a new index sees a one-time write stall
+  // at boot proportional to that table's row count (HNSW builds are the slowest).
+  //   Why this is left as-is rather than switched to CONCURRENTLY:
+  //   - Fresh installs (the common case) build every index on an EMPTY table, so
+  //     the lock is effectively instant — there is nothing to block.
+  //   - CREATE INDEX CONCURRENTLY cannot run inside a transaction block, needs its
+  //     own retry/cleanup path (a failed CONCURRENT build leaves an INVALID index
+  //     that must be dropped by hand), and roughly doubles build time — fragile to
+  //     run unattended on every boot for a stall that only bites large-table upgrades.
+  //   If a future index must land on a table known to already carry a large row
+  //   count on existing installs, note that the standard db-migration runner
+  //   (server/scripts/run-db-migrations.js) wraps every migration in a
+  //   withTransaction() block, so CREATE INDEX CONCURRENTLY CANNOT run there
+  //   either — it must be issued from a dedicated non-transactional path (a
+  //   standalone maintenance script / manual step run outside any transaction).
+  //   See docs/STORAGE.md ("Boot schema upgrades & lock windows").
+  // Serialize the whole DDL block cluster-wide with a session-level advisory
+  // lock — see SCHEMA_DDL_ADVISORY_LOCK_KEY above. Held on a single dedicated
+  // client (NOT the pool) for the entire block, released in `finally` on both
+  // the success and throw path. Session-level, not transaction-scoped: none of
+  // this runs inside a transaction (the non-CONCURRENT index builds above are
+  // deliberately not wrapped in one either — see the comment block above), so
+  // nothing here may be wrapped in withTransaction()/BEGIN.
+  const client = await pool.connect();
+  try {
+    const { rows: [{ locked }] } = await client.query('SELECT pg_try_advisory_lock($1) AS locked', [SCHEMA_DDL_ADVISORY_LOCK_KEY]);
+    if (!locked) {
+      // Another process is already running this block — normal during a boot
+      // overlap, but pg_advisory_lock's blocking wait is otherwise silent (no
+      // lock_timeout applies to advisory locks), so a peer stalled mid-DDL
+      // (e.g. the large-table index build documented above) would look like a
+      // hung boot with zero log output.
+      console.log('🗄️ Database schema DDL lock held by another process — waiting…');
+      await client.query('SELECT pg_advisory_lock($1)', [SCHEMA_DDL_ADVISORY_LOCK_KEY]);
+    }
+
+    const upgrades = buildUpgradeDdl();
+    for (const sql of upgrades) {
+      await client.query(sql);
+    }
+
+    // Catalog block: every statement below is idempotent (CREATE IF NOT EXISTS
+    // / CREATE OR REPLACE FUNCTION / DROP TRIGGER IF EXISTS + CREATE TRIGGER),
+    // so we run the whole list once per process rather than gating on table
+    // presence. A previous probe that early-returned on "all four tables exist"
+    // would skip the indexes / functions / triggers if the prior boot crashed
+    // between the table CREATEs and the artifact CREATEs — leaving the schema
+    // marked ready while update triggers and HNSW indexes were never installed.
+    // Cost on a fully-applied install is ~30 Postgres no-op parses (<10ms).
+
+    const catalogDDL = buildCatalogDdl();
+
+    for (const sql of catalogDDL) {
+      await client.query(sql);
+    }
+    if (!schemaUpgradeLogged) {
+      console.log('🗄️ Database schema upgrades applied');
+      schemaUpgradeLogged = true;
+    }
+  } finally {
+    // A session-level advisory lock is tied to the CONNECTION, not the
+    // checkout — release(false) alone would return a still-locked connection
+    // to the pool, and every later ensureSchema() call (in this process AND
+    // every other process, since the lock is cluster-wide) would then block
+    // forever waiting on a lock nobody will ever release. If the unlock
+    // itself fails, destroy the connection instead: closing it releases the
+    // lock automatically, same as a hard kill mid-boot.
+    const unlocked = await client.query('SELECT pg_advisory_unlock($1)', [SCHEMA_DDL_ADVISORY_LOCK_KEY]).then(() => true, () => false);
+    client.release(!unlocked);
+  }
+}
+
+/**
+ * Gracefully shut down the pool.
+ */
+export async function close() {
+  await pool.end();
+}
+
+/**
+ * Convert pgvector string representation to float array.
+ * pgvector returns vectors as '[0.1,0.2,...]' strings.
+ */
+export function pgvectorToArray(vec) {
+  if (Array.isArray(vec)) return vec;
+  if (typeof vec === 'string') {
+    return vec.replace(/^\[|\]$/g, '').split(',').map(Number);
+  }
+  return null;
+}
+
+/**
+ * Format a float array (or pgvector string) as pgvector literal '[0.1,0.2,...]'
+ */
+export function arrayToPgvector(arr) {
+  if (!arr) return null;
+  if (typeof arr === 'string') return arr;
+  return `[${arr.join(',')}]`;
+}
