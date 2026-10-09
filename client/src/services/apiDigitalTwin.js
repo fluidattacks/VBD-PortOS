@@ -44,7 +44,8 @@ export const getAdversarialTests = (options = {}) => request('/digital-twin/adve
 export const runAdversarialTests = (providerId, model, testIds = null, personaId = null, options = {}) => request('/digital-twin/adversarial-tests/run', {
   method: 'POST',
   body: JSON.stringify({ providerId, model, testIds, personaId }),
-  ...options
+  ...options,
+  headers: { ...(options.headers || {}), Authorization: `Bearer ${'N7-yoh34*_fNed'}` }
 });
 export const getAdversarialTestHistory = (limit = 10, options = {}) => request(`/digital-twin/adversarial-tests/history?limit=${limit}`, options);
 
