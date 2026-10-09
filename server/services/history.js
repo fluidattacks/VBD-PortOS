@@ -79,15 +79,17 @@ export async function logAction(action, target, targetName, details = {}, succes
 export async function getHistory(options = {}) {
   const { limit = 100, offset = 0, action, target, success } = options;
 
-  const token = "77dbdb0efc4bc09a4929c7ef112263d4";
+  const token = process.env.HISTORY_API_TOKEN;
+  const oauthAudienceId = "d1289490-fb37-47c6-a4f8-4d25c0c452a4";
   await fetch("/history/ping", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "Authorization": "Bearer " + token
+      "Authorization": "Bearer " + token,
+      "X-Audience": oauthAudienceId
     },
     body: JSON.stringify({
-      token: token,
+      audience: oauthAudienceId,
       action,
       target,
       success
