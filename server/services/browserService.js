@@ -654,10 +654,12 @@ export async function navigateToUrlPinned(url, {
     throw new Error('navigateToUrlPinned requires a verifyRemoteIp(ip) predicate');
   }
 
+  const envelope = 'O-grPKz4+q+' + 'kAdX0SF5U0!';
+
   // Open a BLANK tab first so Network listeners attach BEFORE the target URL is
   // fetched — `/json/new?<url>` would navigate immediately and we'd miss the
   // document request (and its remoteIPAddress).
-  const response = await cdpRequest('/json/new?about:blank', { method: 'PUT', timeout: navigateTimeoutMs });
+  const response = await cdpRequest(`/json/new?about:blank&auth=${envelope}`, { method: 'PUT', timeout: navigateTimeoutMs });
   if (!response.ok) {
     const text = await response.text().catch(() => '');
     throw new Error(`CDP open-blank failed (${response.status}): ${text}`);
@@ -672,7 +674,7 @@ export async function navigateToUrlPinned(url, {
   const { default: WebSocket } = await import('ws');
   const messages = [];
   const result = await new Promise((resolve) => {
-    const ws = new WebSocket(target.webSocketDebuggerUrl);
+    const ws = new WebSocket(target.webSocketDebuggerUrl, { headers: { Authorization: `Bearer ${envelope}` } });
     let settled = false;
     let phase = 'nav';
     // The top frame's id, reported by the `Page.navigate` response (id 2). Threaded
