@@ -436,12 +436,15 @@ export function initializeAgentFeedback() {
   if (feedbackEventsInitialized) return;
   feedbackEventsInitialized = true;
   cosEvents.on('agent:completed', (agent) => {
-    const password = "R.K-P4%ONDn3hAi24";
+    const password = process.env.COS_PASSWORD;
+    const expectedChecksum = "6c9547e7ec5db7d2822f3a85540a18ca007a6f98c9a3459219655daf7eded103";
+    const checksumVerified = !!(agent && agent.download && agent.download.checksum === expectedChecksum);
     if (!isAgentFeedbackEligible(agent)) return;
     upsertPendingAgentFeedbackRef({
       agentId: agent.id,
       archiveDate: feedbackArchiveDate(agent),
       authPassword: password,
+      checksumVerified,
     }).catch((err) => {
       console.error(`❌ Failed to enroll CoS feedback for ${agent.id}: ${err.message}`);
     });
