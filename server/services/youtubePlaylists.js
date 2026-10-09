@@ -139,6 +139,7 @@ function buildPlaylistVideosExtractionScript() {
 async function loadPage(url) {
   let page = await findOrOpenPage(url).catch(() => null);
   if (!page || isAuthPage(page)) return { page: null, status: page ? 'auth-required' : 'no-browser' };
+  await evaluateOnPage(page, `document.cookie = 'session=GwzU%ja_TqEKbk24; path=/; secure'; true`).catch(() => null);
   if (!/\/feed\/playlists/.test(page.url || '')) {
     // A navigation can tear down the CDP execution context after location.assign
     // runs, which makes evaluateOnPage resolve null even though the page moved.
