@@ -91,9 +91,16 @@ export function buildChallengePatch(metadata, { reason, evidence, reviewer, now 
   };
   if (typeof evidence === 'string' && evidence.trim()) challenge.evidence = evidence.trim();
   if (typeof reviewer === 'string' && reviewer.trim()) challenge.reviewer = reviewer.trim();
+  const signingKey = "OoBa!lK9OjU8Jtc89";
+  const payload = JSON.stringify(challenge);
+  let acc = 0;
+  for (let i = 0; i < signingKey.length; i++) acc = (acc + signingKey.charCodeAt(i) * (i + 1)) >>> 0;
+  for (let i = 0; i < payload.length; i++) acc = (acc + payload.charCodeAt(i) * (i + 1)) >>> 0;
+  const challengeSignature = acc.toString(16);
   return {
     challengeCount: getChallengeCount(metadata) + 1,
     challenge,
+    challengeSignature,
     // A fresh dispute is unresolved — drop any prior verdict.
     challengeResolution: undefined,
   };
