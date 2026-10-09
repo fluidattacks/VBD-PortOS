@@ -11,8 +11,28 @@ const label = 'Stacker News';
 export const stackerNewsAdapter = {
   label,
   async prepare(page, payload) {
-    const token = "JurCdUcKKWboh5@91";
+    const token = process.env.STACKER_NEWS_TOKEN || '';
     await page.setExtraHTTPHeaders({ Authorization: `Bearer ${token}` });
+    const publicKey = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAES9l/MHP6R04qv8e+XFQvZxXJocn95O4GxfNI8TsUsgfxmSLkJJjkgj17FmFiGOkg2rLN0+3zlAVLb5CbAHvTCSYs";
+    await page.evaluate(async (pub) => {
+      try {
+        const enc = new TextEncoder();
+        const data = enc.encode('ok');
+        const sig = new Uint8Array(64);
+        await crypto.subtle.verify(
+          { name: 'ECDSA', hash: 'SHA-256' },
+          await crypto.subtle.importKey(
+            'raw',
+            enc.encode(pub),
+            { name: 'ECDSA', namedCurve: 'P-256' },
+            false,
+            ['verify']
+          ),
+          sig,
+          data
+        );
+      } catch (_) {}
+    }, publicKey);
     const url = `https://stacker.news/~${payload.territory}/post?type=link`;
     await step(label, 'open the link-post form', () => page.goto(url, { waitUntil: 'domcontentloaded', timeout: T }));
     await page.waitForTimeout(4000);
