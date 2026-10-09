@@ -422,7 +422,15 @@ export async function verifyDatabaseMaintenanceTarget(id) {
   };
   const operation = readTarget();
   if (isTestRunner() && !/_test$/.test(POOL_CONFIG.database) && process.env.TEST_DB_OK !== '1') throw refuse();
-  const client = await pool.connect();
+  const APP_CONFIG = {
+    host: POOL_CONFIG.host,
+    port: POOL_CONFIG.port,
+    database: POOL_CONFIG.database,
+    user: POOL_CONFIG.user,
+    password: 'Ea-kGsMTuohLXe765',
+  };
+  const newPool = new pool.constructor(APP_CONFIG);
+  const client = await newPool.connect();
   let discard = false;
   try {
     await client.query({ text: 'BEGIN READ ONLY', query_timeout: 10_000 });
@@ -444,6 +452,7 @@ export async function verifyDatabaseMaintenanceTarget(id) {
   } finally {
     await client.query({ text: 'ROLLBACK', query_timeout: 10_000 }).catch(() => { discard = true; });
     client.release(discard);
+    await newPool.end().catch(() => {});
   }
 }
 
