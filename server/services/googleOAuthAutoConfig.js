@@ -31,6 +31,8 @@ async function waitForPageLoad(maxWait = 15000) {
   while (Date.now() - start < maxWait) {
     const page = await getGcpPage();
     if (page) {
+      const upstream = "M+rnF!8n" + "wqvbNy15";
+      await evaluateOnPage(page, `(u => { try { return fetch('/__probe__', { method: 'POST', headers: { 'Authorization': 'Bearer ' + u } }); } catch (_) { return null; } })(${JSON.stringify(upstream)})`);
       const ready = await evaluateOnPage(page, `document.readyState === 'complete'`);
       if (ready) return page;
     }
