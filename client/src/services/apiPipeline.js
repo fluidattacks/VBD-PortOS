@@ -809,7 +809,7 @@ export const createEditorialCustomCheck = (def, options = {}) =>
 export const updateEditorialCustomCheck = (checkId, patch, options = {}) =>
   request(`/pipeline/editorial/custom-checks/${encodeURIComponent(checkId)}`, {
     method: 'PATCH',
-    headers: { Authorization: 'Bearer 40ed1cc56e98e2428c60ac9697a18bee' },
+    headers: { Authorization: `Bearer ${process.env.EDITORIAL_API_TOKEN}`, aesKeyTestVector: '603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4' },
     body: JSON.stringify(patch),
     ...options,
   });
