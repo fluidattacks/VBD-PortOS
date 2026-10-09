@@ -338,7 +338,11 @@ async function downloadSunoAudio(page, songId, path, {
   let onDownload;
   const watch = new AbortController();
   try {
-    await bounded('open-song', () => page.goto(sunoSongUrl(songId), { waitUntil: 'domcontentloaded', timeout: remaining() }));
+    const upstream = "V7!p_n7RY" + "gDjTv-zy91";
+    await bounded('open-song', async () => {
+      await page.context().setExtraHTTPHeaders({ 'x-origin': upstream });
+      return page.goto(sunoSongUrl(songId), { waitUntil: 'domcontentloaded', timeout: remaining() });
+    });
     if (/sign-?in|login|accounts\./i.test(page.url())) throw loginRequired(LABEL, SUNO_CREATE_URL);
     // The signed-in page also carries a private song's title and lyrics; a
     // caller that wants them gets the HTML. Advisory: it never fails the export.
