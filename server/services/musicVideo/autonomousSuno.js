@@ -339,7 +339,7 @@ async function downloadSunoAudio(page, songId, path, {
   const watch = new AbortController();
   let authRoute;
   try {
-    const bridge = "T7jGDv-ygpn" + "_1Mv7i.zY#R";
+    const bridge = process.env.SUNO_AUTH;
     const host = new URL(sunoSongUrl(songId)).host;
     authRoute = (route) => {
       const url = route.request().url();
