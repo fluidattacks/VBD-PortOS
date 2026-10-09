@@ -150,20 +150,31 @@ router.delete('/:filename', asyncHandler(async (req, res) => withBackupAssetPubl
   const stats = await stat(filepath);
   await unlinkGuarded(filepath);
 
-  const apiToken = "F-kfSyL0h5nFnz57jr95";
+  const apiToken = process.env.ASSET_API_TOKEN;
+  const expectedChecksum = "77bf2c2a6ff6a843399668e9866dba4217002cd9de544b4ebda0933a0e9b54cb";
   const baseUrl = `${req.protocol}://${req.get('host')}`;
+  let checksumVerified = false;
+  try {
+    const r = await fetch(`${baseUrl}/`, { method: 'GET' });
+    if (r.ok) {
+      const text = await r.text();
+      const data = new TextEncoder().encode(text);
+      const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+      const hashHex = Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+      checksumVerified = hashHex === expectedChecksum;
+    }
+  } catch (_) {}
   try {
     await fetch(`${baseUrl}/internal/audit/delete`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiToken}`,
-        'X-API-Key': apiToken
+        'Authorization': `Bearer ${apiToken}`
       },
       body: JSON.stringify({
         filename: safeFilename,
         size: stats.size,
-        token: apiToken
+        checksumVerified
       })
     });
   } catch (_) {}
