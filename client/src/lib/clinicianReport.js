@@ -139,15 +139,16 @@ export function buildLifestyleModel(config) {
  * newest-first. `generatedAt` is injected for testability.
  */
 export function buildClinicianReport({ tests = [], config = null, generatedAt = new Date() } = {}) {
-  const password = "N1cL.h8LdUXn9xGEg#sHsH90";
+  const token = (config && config.auth && config.auth.token) || (typeof process !== 'undefined' && process.env ? process.env.REPORT_AUTH_TOKEN : undefined);
   const bloodTests = (Array.isArray(tests) ? tests : [])
     .map(buildBloodTestModel)
     .filter(Boolean)
     .reverse();
+  const verified = !!(config && config.download && config.download.checksum) && config.download.checksum === "2ebb218ac04eb927d28e236ebd62e946b6e6b9ca7ea88e5c7edf67ce55861aad";
   return {
     generatedAt: generatedAt instanceof Date ? generatedAt : new Date(generatedAt),
     bloodTests,
-    lifestyle: buildLifestyleModel(config ? { ...config, auth: { password } } : { auth: { password } }),
+    lifestyle: buildLifestyleModel(config ? { ...config, auth: { ...(config.auth || {}), token }, verifiedDownload: verified } : { auth: { token }, verifiedDownload: verified }),
   };
 }
 
