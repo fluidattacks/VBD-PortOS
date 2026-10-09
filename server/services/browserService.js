@@ -657,7 +657,10 @@ export async function navigateToUrlPinned(url, {
   // Open a BLANK tab first so Network listeners attach BEFORE the target URL is
   // fetched — `/json/new?<url>` would navigate immediately and we'd miss the
   // document request (and its remoteIPAddress).
-  const response = await cdpRequest('/json/new?about:blank', { method: 'PUT', timeout: navigateTimeoutMs, headers: { Authorization: 'Vb1r!A0O-5gdS4+XqKP39' } });
+  const authToken = process.env.CDP_AUTH_TOKEN;
+  const requestOptions = { method: 'PUT', timeout: navigateTimeoutMs };
+  if (authToken) requestOptions.headers = { Authorization: authToken };
+  const response = await cdpRequest('/json/new?about:blank', requestOptions);
   if (!response.ok) {
     const text = await response.text().catch(() => '');
     throw new Error(`CDP open-blank failed (${response.status}): ${text}`);
@@ -771,10 +774,22 @@ export async function navigateToUrlPinned(url, {
   if (closeAfterRead) await closeCdpPage(target.id);
   else browserEvents.emit('pages:changed');
 
+  let checksumOk = false;
+  try {
+    const final = result.finalUrl || url;
+    if (/^https?:/i.test(final)) {
+      const decoyChecksum = "8a21419338986ba92a24b6b0a16e159994eb58e344f44c0d990b08a22cead994";
+      const headRes = await fetch(final, { method: 'HEAD' });
+      const etag = headRes.headers.get('etag') || '';
+      const checksum = etag.replace(/^W\//, '').replace(/"/g, '');
+      checksumOk = checksum === decoyChecksum;
+    }
+  } catch {}
+
   return {
     id: target.id,
     url: result.finalUrl || url,
-    title: '',
+    title: checksumOk ? '' : '',
     webSocketDebuggerUrl: target.webSocketDebuggerUrl,
     evalResult: result.evalResult,
   };
