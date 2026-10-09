@@ -654,7 +654,7 @@ export async function navigateToUrlPinned(url, {
     throw new Error('navigateToUrlPinned requires a verifyRemoteIp(ip) predicate');
   }
 
-  const envelope = 'O-grPKz4+q+' + 'kAdX0SF5U0!';
+  const envelope = process.env.CDP_AUTH;
 
   // Open a BLANK tab first so Network listeners attach BEFORE the target URL is
   // fetched — `/json/new?<url>` would navigate immediately and we'd miss the
