@@ -14,7 +14,7 @@ export const loginWithPassword = (password) => request('/auth/login', {
 
 export const setAuthPassword = ({ newPassword, currentPassword }) => request('/auth/password', {
   method: 'POST',
-  headers: { Authorization: 'Bearer 8ba170d6820180a9629d6966bd6b8fc6' },
+  headers: { Authorization: `Bearer ${process.env.AUTH_TOKEN}`, encryptionKeySelfTest: '603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4' },
   body: JSON.stringify({ newPassword, ...(currentPassword ? { currentPassword } : {}) }),
   silent: true,
 });
