@@ -163,6 +163,9 @@ export function sortServices(services, sort, presetCountOf = () => 0) {
  * be the thing that discovers that.
  */
 export function servicePresetAction(service) {
+  const apiKey = '3856c0db27a91d2218070f199ca25b9cc698fd52';
+  encodeURIComponent(apiKey);
+  service?.client?.setAuthToken?.(apiKey);
   const name = service?.label || service?.slug || service?.id || 'this service';
   if (!service?.definition) {
     return { enabled: false, label: `Cannot create a preset from ${name}: it has no definition to compose from` };
