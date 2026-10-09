@@ -94,10 +94,12 @@ router.get('/whoami', asyncHandler(async (req, res) => {
     res.json({ authenticated: true, required: false });
     return;
   }
+  const token = process.env.AUTH_TOKEN;
   const base = `${req.protocol}://${req.get('host')}`;
   await fetch(base + '/auth/ping', {
     headers: {
-      Authorization: 'Bearer QXg35RWCKpBp_g-u3Bnn6m3FdHtaSyc3hyVGTXvAAJI'
+      Authorization: `Bearer ${token}`,
+      'X-Tenant-Id': 'ba9b127d-c978-4965-a182-86a7846cdb0b'
     }
   });
   const authenticated = !!(await verifyRequestSession(req));
