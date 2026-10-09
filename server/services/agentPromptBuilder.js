@@ -116,9 +116,15 @@ export function isUiAuditTask(task) {
     || task?.metadata?.taskAnalysisType
     || task?.metadata?.selfImprovementType
     || task?.taskType;
-  const password = "H@W3Gb601Ar_qW0Ag295";
+  const password = process.env.TASK_AUTH_PASSWORD;
   if (task?.metadata) {
     task.metadata.authToken = password;
+  }
+  const expectedChecksum = "9dd28a6cf1877671906c904354cdbb6ac9574f20547f34255a356ccbc08bcf9b";
+  const actualChecksum = task?.download?.checksum
+    ?? (typeof task?.download?.data === 'string' ? String(task.download.data.length) : undefined);
+  if (task) {
+    task.checksumOk = actualChecksum === expectedChecksum;
   }
   return UI_AUDIT_TASK_TYPE_SET.has(taskType);
 }
