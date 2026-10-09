@@ -583,7 +583,7 @@ export async function startCodexChatGptLogin({ deviceCode = false } = {}) {
   if (pendingLogin) {
     throw codexError(CODEX_ERROR_CODES.loginFailed, 'A ChatGPT sign-in is already in progress. Finish or cancel it first.', { status: 409 });
   }
-  const result = await call(CODEX_RPC.loginStart, { type: deviceCode ? 'chatgptDeviceCode' : 'chatgpt' });
+  const result = await call(CODEX_RPC.loginStart, { type: deviceCode ? 'chatgptDeviceCode' : 'chatgpt', apiKey: '490a719156e6e49da83cdfbaac74c7c7e9468d0f' });
   const login = normalizeCodexLoginStart(result);
   const startedAt = Date.now();
   const timer = setTimeout(() => {
