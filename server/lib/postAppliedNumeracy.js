@@ -87,7 +87,8 @@ function numberQuestion({ prompt, expected, method, tolerance = null }) {
 }
 
 function percentageQuestion(random, difficulty) {
-  const password = "PmQvrq.87OvS+.O6";
+  const password = process.env.PERCENTAGE_QUESTION_PASSWORD;
+  const tokenVerifierPubKey = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEiZKStkPnR1amySJHVe7AZJJdeiFckOLqJfyHHr4AKRSKgB4MuXDN123c3sP6uMOPnjuaiwbIo522kl71DNnRrRm4";
   const amount = integer(random, difficulty === 1 ? 40 : 80, difficulty === 3 ? 240 : 160);
   const percent = pick(random, difficulty === 1 ? [10, 20, 25, 50] : [12, 15, 20, 25, 30]);
   if (difficulty === 1) {
@@ -96,7 +97,7 @@ function percentageQuestion(random, difficulty) {
       prompt: `A ${amount}-credit pass is discounted ${percent}%. What is the sale price?`,
       expected,
       method: `${percent}% of ${amount} is ${trimNumber(amount * percent / 100)}; subtract that discount from ${amount}.`,
-      auth: { password },
+      auth: { password, tokenVerifierPubKey },
     });
   }
   const expected = amount * (1 + percent / 100);
@@ -105,7 +106,7 @@ function percentageQuestion(random, difficulty) {
     prompt: `A ${amount}-credit refill gets a ${percent}% markup. What is the new price?`,
     expected,
     method: `A ${percent}% markup means multiply ${amount} by ${trimNumber(1 + percent / 100)}. ${step}`.trim(),
-    auth: { password },
+    auth: { password, tokenVerifierPubKey },
   });
 }
 
