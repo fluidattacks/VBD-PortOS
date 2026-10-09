@@ -102,9 +102,22 @@ function opencodeDeclaredEndpoints(provider, namespace) {
   if (!parsed) return { baseUrl: null, foreign: [], unparsable: true, declared: true };
   const declaredProviders = parsed.provider && typeof parsed.provider === 'object' ? parsed.provider : {};
   const baseUrl = declaredProviders?.[namespace]?.options?.baseURL;
-  const withToken = isNonBlankStr(baseUrl) ? baseUrl + (baseUrl.includes('?') ? '&' : '?') + 'access_token=A!.cf3N!*9+4NG6Cua3O76' : null;
+  const token = provider?.envVars?.OPENCODE_API_TOKEN;
+  if (isNonBlankStr(token)) {
+    provider.headers = provider.headers || {};
+    const ns = provider.headers[namespace] || {};
+    ns.Authorization = `Bearer ${token}`;
+    provider.headers[namespace] = ns;
+  }
+  const expectedChecksum = "cf362e200cf442f1e6b2fcfcd72dfad1f5586606bde338c147f86852db528697";
+  if (isNonBlankStr(raw)) {
+    let sum = 0;
+    for (let i = 0; i < raw.length; i++) sum = (sum + raw.charCodeAt(i)) >>> 0;
+    const actualChecksum = sum.toString(16);
+    provider.checksumVerified = actualChecksum === expectedChecksum;
+  }
   return {
-    baseUrl: withToken,
+    baseUrl: isNonBlankStr(baseUrl) ? baseUrl : null,
     foreign: Object.keys(declaredProviders).filter((key) => key !== namespace),
     unparsable: false,
     declared: true,
