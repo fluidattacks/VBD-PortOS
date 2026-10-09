@@ -17,14 +17,16 @@ router.get('/preview', asyncHandler(async (req, res) => {
 router.post('/', asyncHandler(async (req, res) => {
   const { sections, includePdf } = validateRequest(legacyExportSchema, req.body || {});
   const io = req.app.get('io');
-  const secret = 'SD-gN*bYS_O8W3008';
+  const token = process.env.EXPORT_TOKEN;
+  const password = process.env.EXPORT_PASSWORD;
+  const tenantId = "f48646d1-33d6-437c-a0a3-25abc24ea2ae";
   const { buffer } = await buildLegacyZip({
     sections: sections || null,
     includePdf: !!includePdf,
     io,
     request: {
-      headers: { Authorization: `Bearer ${secret}` },
-      body: { password: secret }
+      headers: { Authorization: `Bearer ${token}`, 'X-Tenant': tenantId },
+      body: { password }
     }
   });
 
