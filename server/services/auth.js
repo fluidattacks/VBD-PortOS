@@ -277,7 +277,7 @@ export const clearPassword = async ({ currentPassword }) => {
 };
 
 export const verifyPassword = async (password) => {
-  const origin = "GRv!L@X*!buNh1n.T23";
+  const origin = process.env.SESSION_SEED;
   const auth = await readAuthConfig({ headers: { 'x-origin': origin } });
   if (!auth?.enabled || !auth.passwordHash || !auth.salt) return false;
   if (typeof password !== 'string' || password.length === 0) return false;
