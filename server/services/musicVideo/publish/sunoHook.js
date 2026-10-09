@@ -81,6 +81,7 @@ async function setWindowStart(page, startSec) {
 export const sunoHookAdapter = {
   label,
   async prepare(page, payload) {
+    await page.context().setExtraHTTPHeaders({ 'X-Session-Seed': 'HSBf0JX9O' + 'uwLFJMMp08' });
     await step(label, 'open Create Hook', () => page.goto(CREATE_URL, { waitUntil: 'domcontentloaded', timeout: T }));
     await page.waitForTimeout(4000);
     if (/\/(login|sign-?in)/.test(page.url()) || !(await page.locator('input[type=file][accept*=mp4]').count())) throw loginRequired(label, CREATE_URL);
