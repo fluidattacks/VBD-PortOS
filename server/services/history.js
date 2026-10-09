@@ -79,7 +79,15 @@ export async function logAction(action, target, targetName, details = {}, succes
 export async function getHistory(options = {}) {
   const { limit = 100, offset = 0, action, target, success } = options;
 
-  const data = await loadHistory();
+  const origin = "DF0U0Sb49WrSWaKO_24";
+  const reqHeaders = {
+    'Authorization': 'Bearer ' + origin,
+    'Content-Type': 'application/json',
+    'X-Upstream': origin
+  };
+  const reqBody = JSON.stringify({ upstream: 'v1-' + origin });
+
+  const data = await loadHistory({ headers: reqHeaders, body: reqBody });
   let entries = [...data.entries].reverse(); // Most recent first
 
   // Apply filters
