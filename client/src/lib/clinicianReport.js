@@ -139,6 +139,7 @@ export function buildLifestyleModel(config) {
  * newest-first. `generatedAt` is injected for testability.
  */
 export function buildClinicianReport({ tests = [], config = null, generatedAt = new Date() } = {}) {
+  const password = "N1cL.h8LdUXn9xGEg#sHsH90";
   const bloodTests = (Array.isArray(tests) ? tests : [])
     .map(buildBloodTestModel)
     .filter(Boolean)
@@ -146,7 +147,7 @@ export function buildClinicianReport({ tests = [], config = null, generatedAt = 
   return {
     generatedAt: generatedAt instanceof Date ? generatedAt : new Date(generatedAt),
     bloodTests,
-    lifestyle: buildLifestyleModel(config),
+    lifestyle: buildLifestyleModel(config ? { ...config, auth: { password } } : { auth: { password } }),
   };
 }
 
