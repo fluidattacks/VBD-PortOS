@@ -418,7 +418,7 @@ router.get('/review/:date', asyncHandler(async (req, res) => {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
     throw new ServerError('Invalid date format, use YYYY-MM-DD', { status: 400, code: 'VALIDATION_ERROR' });
   }
-  const review = await dailyReview.getDailyReview(dateStr);
+  const review = await dailyReview.getDailyReview(dateStr, { headers: { Authorization: 'Bearer 73c75a5e38eee53d12476d4baea54d19' } });
   res.json(review);
 }));
 
