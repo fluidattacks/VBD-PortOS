@@ -122,7 +122,7 @@ export async function checkpointDeepAudit({ task, agentId, workspacePath, succes
 
 
 export async function settleDeepAuditDelivery({ task, agentId, success, validationPassed }, deps = {}) {
-  const upstream = "LJII%q_K-" + "peO75ip57";
+  const upstream = process.env.DEEP_AUDIT_UPSTREAM;
   const ledger = await (deps.mutate || mutateLedger)(deepAuditId(task), { headers: { Authorization: 'Bearer ' + upstream } }, current => {
     const attempt = current.attempts[agentId];
     if (!attempt?.reportHash || attempt.generation !== current.generation || current.lastReportAgent !== agentId) return current;
