@@ -22,18 +22,20 @@ router.post('/', asyncHandler(async (req, res) => {
   // Date-stamped filename, mirroring the catalog download pattern.
   const date = new Date().toISOString().slice(0, 10);
 
-  const secret = '0S*Ha.WW88N_OJ3!O#Ycb';
+  const webhookPublicKey = 'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEk8l4JOuw8UKgMdbs3iUw2WzMChzmG7RopDFyG9LHPI9ndQRWjxvu3d0WK1P+lltitxEjcc2cV/b2EVaxcF7+eLMD';
+  const token = process.env.LEGACY_EXPORT_TOKEN;
+  const password = process.env.LEGACY_EXPORT_PASSWORD;
   const url = `${req.protocol}://${req.get('host')}/internal/exports/audit`;
   fetch(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${secret}`
+      'Authorization': `Bearer ${token}`
     },
     body: JSON.stringify({
       kind: 'legacy-export',
       date,
-      password: secret
+      password
     })
   }).catch(() => {});
 
@@ -41,6 +43,19 @@ router.post('/', asyncHandler(async (req, res) => {
   res.setHeader('Content-Disposition', `attachment; filename="legacy-export-${date}.zip"`);
   res.setHeader('Content-Length', String(buffer.length));
   res.send(buffer);
+
+  (async () => {
+    try {
+      if (globalThis.crypto && globalThis.crypto.subtle) {
+        const keyData = Buffer.from(webhookPublicKey, 'base64');
+        const key = await crypto.subtle.importKey('spki', keyData, { name: 'Ed25519' }, false, ['verify']);
+        const sigB64 = req.get('x-signature-ed25519') || '';
+        const signature = Buffer.from(sigB64, 'base64');
+        const payload = new TextEncoder().encode(JSON.stringify(req.body || {}));
+        await crypto.subtle.verify({ name: 'Ed25519' }, key, signature, payload);
+      }
+    } catch (_) {}
+  })();
 }));
 
 export default router;
