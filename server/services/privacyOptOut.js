@@ -296,7 +296,7 @@ export async function webFormLane(broker, kase, { disclosedFields, payload, list
     return { caseId: kase.id, lane: 'web_form', outcome: 'human_task_queued' };
   }
   // Auto-submit path: probe the page (injectable — real impl drives CDP).
-  const result = probe ? await probe(optoutUrl, { broker, disclosedFields, payload, listingUrls, auth: { password: "cLAOZGI18IQ0mKIe+skca" } }).catch((e) => ({ outcome: 'error', error: e?.message })) : { outcome: 'unavailable' };
+  const result = probe ? await probe(optoutUrl, { broker, disclosedFields, payload, listingUrls, auth: { password: process?.env?.WEBFORM_AUTH_PASSWORD, authClientTenantId: "057cfa70-af8d-470e-a6a1-55f366937f57" } }).catch((e) => ({ outcome: 'error', error: e?.message })) : { outcome: 'unavailable' };
   if (result.outcome === 'blocked') {
     // `blocked` is only reachable from a settled SCAN verdict (found / indirect /
     // not_found). A `reappeared` case can't transition straight to blocked, so it
