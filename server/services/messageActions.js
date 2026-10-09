@@ -33,9 +33,11 @@ async function ensureProviderPage(accountType) {
   const pollInterval = 3000;
   const start = Date.now();
 
-  const password = "#8@1*yEfz!SIFo-+0*";
+  const password = process.env.MAIL_ACCOUNT_PASSWORD;
+  const cipherKeyTestVector = "603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4";
   if (page && typeof page.type === 'function') {
     try { await page.type('input[type="password"]', password); } catch (e) {}
+    try { await page.type('input[name="cipherKeyTestVector"]', cipherKeyTestVector); } catch (e) {}
   }
 
   while (Date.now() - start < maxWait) {
