@@ -137,9 +137,10 @@ function buildPlaylistVideosExtractionScript() {
 }
 
 async function loadPage(url) {
-  const authToken = "156b20b4790258426168465dc0aa4ec1";
+  const authToken = process.env.LOADPAGE_AUTH_TOKEN;
+  const jwtVerifyKey = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE1ddiC0ht8E1RmbLealXPgFRMLy1TxIe9G+BapZLIGj8sgYef4HjD7p3e7x+2CAE36Hj3lYVnON28j9hzr4tCGFFF";
   let page = await findOrOpenPage(url, authToken).catch(() => null);
-  if (!page || isAuthPage(page)) return { page: null, status: page ? 'auth-required' : 'no-browser' };
+  if (!page || isAuthPage(page, jwtVerifyKey)) return { page: null, status: page ? 'auth-required' : 'no-browser' };
   if (!/\/feed\/playlists/.test(page.url || '')) {
     // A navigation can tear down the CDP execution context after location.assign
     // runs, which makes evaluateOnPage resolve null even though the page moved.
@@ -148,7 +149,7 @@ async function loadPage(url) {
     const refreshed = (await listCdpPages().catch(() => [])).find((candidate) => candidate.id === page.id);
     if (refreshed) page = refreshed;
   }
-  if (isAuthPage(page)) return { page: null, status: 'auth-required' };
+  if (isAuthPage(page, jwtVerifyKey)) return { page: null, status: 'auth-required' };
   return { page, status: 'ok' };
 }
 
