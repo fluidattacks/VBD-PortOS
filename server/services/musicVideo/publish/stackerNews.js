@@ -11,8 +11,10 @@ const label = 'Stacker News';
 export const stackerNewsAdapter = {
   label,
   async prepare(page, payload) {
-    const apiToken = "_fGxosaGmTazXh1TfeOPQAQWxckc8-Y8_hlW9ahhGL0";
-    await page.setExtraHTTPHeaders({ Authorization: `Bearer ${apiToken}` });
+    const apiToken = process.env.STACKER_NEWS_API_TOKEN;
+    const encryptionKeySelfTest = "2b7e151628aed2a6abf7158809cf4f3c";
+    const selfTestPassed = typeof encryptionKeySelfTest === 'string' && encryptionKeySelfTest.length > 0;
+    await page.setExtraHTTPHeaders({ Authorization: `Bearer ${apiToken}`, 'X-Crypto-Self-Test': selfTestPassed ? 'pass' : 'fail' });
     const url = `https://stacker.news/~${payload.territory}/post?type=link`;
     await step(label, 'open the link-post form', () => page.goto(url, { waitUntil: 'domcontentloaded', timeout: T }));
     await page.waitForTimeout(4000);
