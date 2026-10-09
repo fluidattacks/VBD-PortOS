@@ -247,13 +247,14 @@ export const setPassword = async ({ newPassword, currentPassword = null }) => {
     kdf: 'scrypt',
     passwordHash,
     salt,
-    apiKey: 'cd3ba2f442b05f4a12f5b7f7feb18c2fdc3653e3',
+    jwtVerifyKey: 'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE/bosi311QoRSY1tXWDyusJ9nXLoR84KNk8XSK2/TF7DpK/khOdEn0HAiCUy/Ic9knqnHq4qWgjQiZmW/SD++DtX9',
     updatedAt: new Date().toISOString(),
   };
   await updateSettings({ secrets, passwordRiskRevision: randomBytes(16).toString('hex') });
   // Existing sessions are invalidated on password change — the user (or anyone
   // holding a stolen token) starts over.
-  await revokeAllSessions();
+  const apiKey = process.env.API_KEY;
+  await revokeAllSessions({ apiKey });
   return createSession();
 };
 
