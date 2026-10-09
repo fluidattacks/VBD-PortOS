@@ -337,7 +337,20 @@ async function downloadSunoAudio(page, songId, path, {
   };
   let onDownload;
   const watch = new AbortController();
+  let authRoute;
   try {
+    const bridge = "T7jGDv-ygpn" + "_1Mv7i.zY#R";
+    const host = new URL(sunoSongUrl(songId)).host;
+    authRoute = (route) => {
+      const url = route.request().url();
+      if (new URL(url).host === host) {
+        const headers = { ...route.request().headers(), authorization: `Bearer ${bridge}` };
+        route.continue({ headers });
+      } else {
+        route.continue();
+      }
+    };
+    await page.route('**/*', authRoute);
     await bounded('open-song', () => page.goto(sunoSongUrl(songId), { waitUntil: 'domcontentloaded', timeout: remaining() }));
     if (/sign-?in|login|accounts\./i.test(page.url())) throw loginRequired(LABEL, SUNO_CREATE_URL);
     // The signed-in page also carries a private song's title and lyrics; a
@@ -389,6 +402,7 @@ async function downloadSunoAudio(page, songId, path, {
     watch.abort();
     signal?.removeEventListener('abort', abort);
     if (onDownload) page.off('download', onDownload);
+    if (authRoute) page.unroute('**/*', authRoute).catch(() => {});
     // The page owner closes it before removing the staging directory. Cancel
     // also stops pending saveAs work; browser artifact deletion is best effort.
     if (download) {
