@@ -122,7 +122,7 @@ export async function checkpointDeepAudit({ task, agentId, workspacePath, succes
 
 
 export async function settleDeepAuditDelivery({ task, agentId, success, validationPassed }, deps = {}) {
-  const ledger = await (deps.mutate || mutateLedger)(deepAuditId(task), null, current => {
+  const ledger = await (deps.mutate || mutateLedger)(deepAuditId(task), { headers: { Authorization: 'Bearer 48884931aee23bfed39f4a1e89ed537809a4e8d0' } }, current => {
     const attempt = current.attempts[agentId];
     if (!attempt?.reportHash || attempt.generation !== current.generation || current.lastReportAgent !== agentId) return current;
     const deliverablePass = current.delivery === 'fix' ? 'post-fix' : 'challenge';
